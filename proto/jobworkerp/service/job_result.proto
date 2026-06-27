@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package jobworkerp.service;
+
+import "jobworkerp/data/common.proto";
+import "jobworkerp/data/worker.proto";
+import "jobworkerp/data/job.proto";
+import "jobworkerp/data/job_result.proto";
+import "jobworkerp/service/common.proto";
+
+message OptionalJobResultResponse {
+  optional jobworkerp.data.JobResult data = 1;
+}
+
+message ListenRequest {
+  jobworkerp.data.JobId job_id = 1;
+  oneof worker { // worker to execute (specified by id or name)
+    jobworkerp.data.WorkerId worker_id = 2;
+    string worker_name = 3;
+  }
+  optional uint64 timeout = 4;
+  optional string using = 5; // method name for multi-method runners (default: "run")
+}
+
+message ListenByWorkerRequest {
+  oneof worker { // worker to execute (specified by id or name)
+    jobworkerp.data.WorkerId worker_id = 2;
+    string worker_name = 3;
+  }
+}
+
+message FindListByJobIdRequest { jobworkerp.data.JobId job_id = 1; }
+
+// # Find Job Result List Request
+// Request message for finding job results with filtering and sorting
+message FindJobResultListRequest {
+  // Worker ID filter (multiple workers allowed)
+  repeated jobworkerp.data.WorkerId worker_ids = 1;
+
+  // Result status filter (multiple statuses allowed)
+  repeated jobworkerp.data.ResultStatus statuses = 2;
+
+  // Start time range filter
+  optional int64 start_time_from = 3;
+  optional int64 start_time_to = 4;
+
+  // End time range filter
+  optional int64 end_time_from = 5;
+  optional int64 end_time_to = 6;
+
+  // Priority filter (multiple priorities allowed)
+  repeated jobworkerp.data.Priority priorities = 7;
+
+  // Unique key exact match filter
+  optional string uniq_key = 8;
+
+  // Pagination
+  optional int32 limit = 9;    // Default: 100, Max: 1000
+  optional int64 offset = 10;  // Default: 0, Max: 10000
+
+  // Sort options
+  optional jobworkerp.data.JobResultSortField sort_by = 11;  // Default: END_TIME
+  optional bool ascending = 12;                               // Default: false (DESC)
+}
+
+// # Count Job Result Request
+// Request message for counting job results with filtering
+message CountJobResultRequest {
+  repeated jobworkerp.data.WorkerId worker_ids = 1;
+  repeated jobworkerp.data.ResultStatus statuses = 2;
+  optional int64 start_time_from = 3;
+  optional int64 start_time_to = 4;
+  optional int64 end_time_from = 5;
+  optional int64 end_time_to = 6;
+  repeated jobworkerp.data.Priority priorities = 7;
+  optional string uniq_key = 8;
+}
+
+// # Delete Job Result Bulk Request
+// Request message for bulk deletion of job results
+// Note: Preview with FindListBy and confirm count with CountBy before deletion is recommended
+message DeleteJobResultBulkRequest {
+  // Delete by end time (delete results older than specified time)
+  optional int64 end_time_before = 1;
+
+  // Delete by status
+  repeated jobworkerp.data.ResultStatus statuses = 2;
+
+  // Delete by worker ID
+  repeated jobworkerp.data.WorkerId worker_ids = 3;
+}
+
+// # Delete Job Result Bulk Response
+// Response message for bulk deletion operation
+message DeleteJobResultBulkResponse {
+  // Number of deleted records
+  int64 deleted_count = 1;
+}
+
+service JobResultService {
+  // delete job result
+  rpc Delete(jobworkerp.data.JobResultId) returns (SuccessResponse);
+  // find by job result id
+  rpc Find(jobworkerp.data.JobResultId) returns (OptionalJobResultResponse);
+  // Deprecated: Use FindListBy instead. This method will be removed in version 2.0.0
+  rpc FindList(FindListRequest) returns (stream jobworkerp.data.JobResult) {
+    option deprecated = true;
+  }
+  // (find only latest result in storage_type=redis.)
+  rpc FindListByJobId(FindListByJobIdRequest)
+      returns (stream jobworkerp.data.JobResult);
+  // listen job result until timeout or job result is created.
+  rpc Listen(ListenRequest) returns (jobworkerp.data.JobResult);
+  rpc ListenStream(ListenRequest)
+      returns (stream jobworkerp.data.ResultOutputItem);
+  rpc ListenByWorker(ListenByWorkerRequest)
+      returns (stream jobworkerp.data.JobResult);
+  // Deprecated: Use CountBy instead. This method will be removed in version 2.0.0
+  rpc Count(CountCondition) returns (CountResponse) {
+    option deprecated = true;
+  }
+  // New methods with filtering and sorting capabilities
+  rpc FindListBy(FindJobResultListRequest) returns (stream jobworkerp.data.JobResult);
+  rpc CountBy(CountJobResultRequest) returns (CountResponse);
+  // Bulk deletion with safety checks
+  rpc DeleteBulk(DeleteJobResultBulkRequest) returns (DeleteJobResultBulkResponse);
+}

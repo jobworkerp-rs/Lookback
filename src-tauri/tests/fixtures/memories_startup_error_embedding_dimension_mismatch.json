@@ -1,0 +1,1 @@
+{"timestamp":"2026-06-05T07:50:50.976570Z","level":"ERROR","fields":{"message":"embedding runner dimension does not match MEMORY_VECTOR_SIZE","code":"embedding_dimension_mismatch","expected_dim":2048,"actual_dim":768,"runner_name":"memories-mm-embedding"},"target":"app::startup_error"}

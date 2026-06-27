@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.data;
+
+// Jobworkerp server data model
+// Server connection information for distributed job execution platform
+message JobworkerpServerData {
+  string name = 1;                          // Server name (unique identifier)
+  string host = 2;                          // Hostname or IP address
+  string port = 3;                          // Port number (for gRPC connection)
+  bool ssl_enabled = 4;                     // SSL/TLS communication enabled/disabled
+  optional string description = 5;          // Server description text (optional)
+  bool enabled = 6;                         // Server enabled/disabled state
+  int64 created_at = 7;                     // Creation timestamp (Unix timestamp in seconds)
+  int64 updated_at = 8;                     // Update timestamp (Unix timestamp in seconds)
+}
+
+// Unique ID for jobworkerp server
+message JobworkerpServerId { int64 value = 1; }
+
+// Full data model for jobworkerp server entity
+// Completely represents server connection information through combination of ID + data
+message JobworkerpServer {
+  JobworkerpServerId id = 1;                // Unique ID
+  JobworkerpServerData data = 2;            // Server data
+}

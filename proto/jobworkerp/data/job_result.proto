@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package jobworkerp.data;
+
+import "jobworkerp/data/common.proto";
+import "jobworkerp/data/job.proto";
+import "jobworkerp/data/worker.proto";
+
+// # Job Result Data
+// Contains the execution result and metadata of a job
+// Note: JobResult does not have its own ID in the system
+message JobResultData {
+  // # Job ID
+  // Reference to the job that was executed
+  jobworkerp.data.JobId job_id = 1;
+
+  // # Worker ID
+  // Reference to the worker that executed the job
+  jobworkerp.data.WorkerId worker_id = 2;
+
+  // # Worker Name
+  // Name of the worker that executed the job
+  string worker_name = 3;
+
+  // # Arguments
+  // Serialized arguments that were passed to the job
+  bytes args = 4;
+
+  // # Unique Key
+  // Optional unique identifier that was used for job deduplication
+  optional string uniq_key = 5;
+
+  // # Result Status
+  // Execution status of the job (success, failure, etc.)
+  jobworkerp.data.ResultStatus status = 6;
+
+  // # Result Output
+  // Job execution output data (non-streaming)
+  jobworkerp.data.ResultOutput output = 7;
+
+  // # Retry Count
+  // Number of times this job was retried after failure
+  uint32 retried = 8;
+
+  // # Maximum Retry Count
+  // Maximum number of retry attempts allowed for this job
+  uint32 max_retry = 9;
+
+  // # Priority
+  // Execution priority level of the job
+  jobworkerp.data.Priority priority = 10;
+
+  // # Timeout
+  // from enqueue arguments
+  uint64 timeout = 11;
+
+  // Reserved field number 12 (was request_streaming, replaced by streaming_type)
+  reserved 12;
+
+  // # Streaming Type
+  // Defines how streaming is handled for this job result
+  // Values: 0=None, 1=Response (client streaming), 2=Internal (worker-side collection)
+  jobworkerp.data.StreamingType streaming_type = 21;
+
+  // # Enqueue Time
+  // Timestamp when the job was registered in the queue (Unix time in milliseconds)
+  int64 enqueue_time = 13;
+
+  // # Run After Time
+  // Timestamp when the job was scheduled to execute (specified by client)
+  int64 run_after_time = 14;
+
+  // # Start Time
+  // Timestamp when the job execution started (Unix time in milliseconds)
+  int64 start_time = 15;
+
+  // # End Time
+  // Timestamp when the job execution completed (Unix time in milliseconds)
+  int64 end_time = 16;
+
+  // # Response Type
+  // How the result should be handled (none, direct, listen after)
+  jobworkerp.data.ResponseType response_type = 17;
+
+  // # Store Success Flag
+  // from worker.data.store_success
+  bool store_success = 18;
+
+  // # Store Failure Flag
+  // from worker.data.store_failure
+  bool store_failure = 19;
+
+  // # Using
+  // Runner implementation used for MCP/Plugin runners
+  // Preserved for retry and periodic job re-execution
+  optional string using = 20;
+
+  // # Broadcast Results Flag
+  // from worker.data.broadcast_results
+  // Controls whether job results are published to broadcast channels
+  bool broadcast_results = 22;
+
+  // # Resolved Retry Policy
+  // Retry policy resolved from worker defaults and per-job overrides
+  // Used for retry decisions and periodic job re-enqueue
+  optional jobworkerp.data.RetryPolicy resolved_retry_policy = 23;
+}
+
+// # Job Result ID
+// Unique identifier for a job result record
+message JobResultId { int64 value = 1; }
+
+// # Job Result
+// Complete record of a job execution result with metadata
+// worker.data.store_success and worker.data.store_failure flags determine if
+// the result is stored in the database
+message JobResult {
+  JobResultId id = 1;
+  JobResultData data = 2;
+  map<string, string> metadata = 3;
+}
+
+// # Job Result Sort Field
+// Defines the fields available for sorting job results in queries
+enum JobResultSortField {
+  JOB_RESULT_SORT_FIELD_UNSPECIFIED = 0;
+  JOB_RESULT_SORT_FIELD_ID = 1;
+  JOB_RESULT_SORT_FIELD_START_TIME = 2;
+  JOB_RESULT_SORT_FIELD_END_TIME = 3;
+  JOB_RESULT_SORT_FIELD_STATUS = 4;
+}

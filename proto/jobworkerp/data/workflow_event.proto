@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package jobworkerp.data;
+
+import "jobworkerp/data/job.proto";
+import "jobworkerp/data/job_result.proto";
+
+// # Job Started Event
+// Event emitted when a job (RunTask) begins execution
+// Used for both streaming and non-streaming jobs
+message JobStartedEvent {
+  // # Job ID
+  // Unique identifier of the enqueued job
+  jobworkerp.data.JobId job_id = 1;
+
+  // # Runner Name
+  // Name of the runner executing the job (e.g., "LLM_CHAT", "COMMAND")
+  string runner_name = 2;
+
+  // # Worker Name
+  // Name of the worker processing the job
+  // None (empty) for Runner-based jobs (temporary worker), set for Worker-based jobs
+  optional string worker_name = 3;
+
+  // # Position
+  // Position in the workflow (JSON Pointer format, e.g., "/tasks/0/do/1")
+  string position = 4;
+}
+
+// # Job Completed Event
+// Event emitted when a job (RunTask) completes execution
+// Used for both streaming and non-streaming jobs
+message JobCompletedEvent {
+  // # Job ID
+  // Unique identifier of the completed job
+  jobworkerp.data.JobId job_id = 1;
+
+  // # Job Result ID
+  // ID of the stored job result (available when store_success=true)
+  optional jobworkerp.data.JobResultId job_result_id = 2;
+
+  // # Position
+  // Position in the workflow (JSON Pointer format)
+  string position = 3;
+}
+
+// # Task Started Event
+// Event emitted when a generic task (ForTask, SwitchTask, DoTask, etc.) begins
+// These tasks do not execute jobs directly but orchestrate other tasks
+message TaskStartedEvent {
+  // # Task Type
+  // Type of the task (e.g., "forTask", "switchTask", "doTask", "tryTask")
+  string task_type = 1;
+
+  // # Task Name
+  // Name of the task as defined in the workflow
+  string task_name = 2;
+
+  // # Position
+  // Position in the workflow (JSON Pointer format)
+  string position = 3;
+}
+
+// # Task Completed Event
+// Event emitted when a generic task completes
+message TaskCompletedEvent {
+  // # Task Type
+  // Type of the task (e.g., "forTask", "switchTask", "doTask", "tryTask")
+  string task_type = 1;
+
+  // # Task Name
+  // Name of the task as defined in the workflow
+  string task_name = 2;
+
+  // # Position
+  // Position in the workflow (JSON Pointer format)
+  string position = 3;
+}
+
+// # For Item Failed Event
+// Per-iteration failure inside a parallel/sequential ForTask running with
+// `onError: continue`. The for-task itself still emits exactly one final
+// TaskCompleted; this event surfaces the per-item failure without claiming
+// the for-task is done. Carries the captured error/item payload as JSON so
+// gRPC clients can render or count individual failures without needing a
+// follow-up call.
+message ForItemFailedEvent {
+  // # Task Name
+  // Name of the for-task as defined in the workflow.
+  string task_name = 1;
+
+  // # Position
+  // Position in the workflow (JSON Pointer format) of the failing iteration.
+  string position = 2;
+
+  // # Iteration Index
+  // Zero-based index of the failing item within the iterable.
+  uint32 index = 3;
+
+  // # Error Payload (JSON-encoded)
+  // Self-describing payload containing at least `error`, `index`, and `item`.
+  // Encoded as a JSON string to avoid coupling to the workflow Error proto.
+  string error_payload_json = 4;
+}
+
+// # Streaming Data Event
+// Event emitted for each chunk of streaming data (e.g., LLM token)
+// Used for real-time streaming to clients (e.g., AG-UI TEXT_MESSAGE_CONTENT)
+// Only emitted when emit_streaming_data flag is true (ag-ui-front)
+message StreamingDataEvent {
+  // # Job ID
+  // Unique identifier of the streaming job
+  jobworkerp.data.JobId job_id = 1;
+
+  // # Data
+  // Raw streaming data chunk (typically UTF-8 encoded text or protobuf)
+  bytes data = 2;
+}
+
+// # Workflow Event
+// Union type representing all possible events during workflow execution
+// Used for streaming workflow progress to clients (e.g., AG-UI)
+message WorkflowEvent {
+  oneof event {
+    // # Streaming Job Started
+    // Emitted when a streaming job (e.g., LLM_CHAT) begins
+    // Client can subscribe to job results via:
+    // - listen_result(streaming=true)
+    // - gRPC ListenStream
+    JobStartedEvent streaming_job_started = 1;
+
+    // # Streaming Job Completed
+    // Emitted when a streaming job finishes
+    // Result can be retrieved via job_result_id if stored
+    JobCompletedEvent streaming_job_completed = 2;
+
+    // # Non-Streaming Job Started
+    // Emitted when a regular job begins
+    // Client can subscribe to job results via:
+    // - listen_result(streaming=false)
+    // - gRPC Listen
+    JobStartedEvent job_started = 3;
+
+    // # Non-Streaming Job Completed
+    // Emitted when a regular job finishes
+    // Result can be retrieved via job_result_id if stored
+    JobCompletedEvent job_completed = 4;
+
+    // # Generic Task Started
+    // Emitted when ForTask, SwitchTask, DoTask, etc. begins
+    TaskStartedEvent task_started = 5;
+
+    // # Generic Task Completed
+    // Emitted when ForTask, SwitchTask, DoTask, etc. finishes
+    TaskCompletedEvent task_completed = 6;
+
+    // # Streaming Data
+    // Emitted for each chunk of streaming data (e.g., LLM token)
+    // Used for real-time streaming to AG-UI clients
+    // Only emitted when emit_streaming_data flag is true
+    StreamingDataEvent streaming_data = 7;
+
+    // # For Item Failed
+    // Emitted for each iteration of a ForTask that failed under
+    // `onError: continue`. The ForTask itself still emits a single final
+    // TaskCompleted alongside this stream of failure events.
+    ForItemFailedEvent for_item_failed = 8;
+  }
+}

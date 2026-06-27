@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package jobworkerp.data;
+
+import "jobworkerp/data/common.proto";
+import "jobworkerp/data/worker.proto";
+
+// # Job Execution Overrides
+// Per-job overrides for execution settings normally defined at the worker level.
+// All fields are optional; when omitted, the worker's default is used.
+message JobExecutionOverrides {
+  // # Response Type Override
+  optional jobworkerp.data.ResponseType response_type = 1;
+  // # Store Success Override
+  optional bool store_success = 2;
+  // # Store Failure Override
+  optional bool store_failure = 3;
+  // # Broadcast Results Override
+  optional bool broadcast_results = 4;
+  // # Retry Policy Override
+  optional jobworkerp.data.RetryPolicy retry_policy = 5;
+}
+
+// # Job Data
+// Configuration and state for a job that will be executed by a worker
+message JobData {
+  // # Worker ID
+  // Reference to the worker that will execute this job
+  jobworkerp.data.WorkerId worker_id = 1;
+
+  // # Job Arguments
+  // Serialized arguments that will be passed to the runner
+  bytes args = 2;
+
+  // # Unique Key
+  // Optional identifier to prevent duplicate job registration
+  // Jobs with the same unique key cannot be registered simultaneously
+  optional string uniq_key = 3;
+
+  // # Enqueue Time
+  // Timestamp when the job was registered in the queue (Unix time in milliseconds)
+  int64 enqueue_time = 4;
+
+  // # Grabbed Until Time
+  // Timestamp until which the job is locked for processing (Unix time in
+  // milliseconds) This should not be specified manually - it's set by the system
+  optional int64 grabbed_until_time = 5;
+
+  // # Run After Time
+  // Timestamp when the job should be executed (Unix time in milliseconds)
+  // Jobs will not be processed until this time is reached
+  int64 run_after_time = 6;
+
+  // # Retry Count
+  // Number of times this job has been retried after failure
+  uint32 retried = 7;
+
+  // # Priority
+  // Execution priority level: -1 (low), 0 (normal), 1 (high)
+  // Note: Using enum directly in proto is not possible due to reference
+  // limitations
+  jobworkerp.data.Priority priority = 8;
+
+  // # Timeout
+  // Maximum execution time for the job in milliseconds
+  // Job will be terminated if it exceeds this duration
+  uint64 timeout = 9;
+
+  // Reserved field number 10 (was request_streaming, replaced by streaming_type)
+  reserved 10;
+
+  // # Streaming Type
+  // Defines how streaming is handled for this job execution.
+  // - STREAMING_TYPE_NONE (default): Non-streaming execution using run()
+  // - STREAMING_TYPE_INTERNAL: Uses run_stream() internally but collects
+  //   result with collect_stream() and returns as single JobResult
+  // - STREAMING_TYPE_RESPONSE: Full streaming, results streamed to client
+  jobworkerp.data.StreamingType streaming_type = 12;
+
+  // # Using
+  // Selects which method to use for multi-method runners
+  // - Required: For multi-method runners
+  // - Auto-selected: When omitted for single-method runners
+  // - Ignored: For single-method runners
+  optional string using = 11;
+
+  // # Execution Overrides
+  // Per-job overrides for worker-level execution settings.
+  // When present, these settings override the worker's defaults.
+  optional JobExecutionOverrides overrides = 13;
+}
+
+// # Job ID
+// Unique identifier for a job
+message JobId { int64 value = 1; }
+
+// # Job
+// A job that is executed by a worker
+message Job {
+  JobId id = 1;
+  JobData data = 2;
+  map<string, string> metadata = 3;
+}
+
+// Internal transport message for feed data over Redis Pub/Sub.
+// Not part of the public gRPC API.
+message FeedDataTransport {
+  bytes data = 1;
+  bool is_final = 2;
+}

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lookback — Session Reflection</title>
+    <!-- Apply the theme before first paint to avoid a light→dark flash.
+         Mirrors src/lib/theme.ts (THEME_STORAGE_KEY + resolve rule) — keep
+         the key "lookback.theme" and the system fallback in sync. -->
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem("lookback.theme");
+          if (pref !== "light" && pref !== "dark" && pref !== "system") pref = "system";
+          var dark =
+            pref === "dark" ||
+            (pref === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          var root = document.documentElement;
+          if (dark) root.setAttribute("data-theme", "dark");
+          root.style.colorScheme = dark ? "dark" : "light";
+        } catch (e) {}
+      })();
+    </script>
+    <!-- Determine <html lang> before first paint to avoid a language flash.
+         Mirrors src/lib/locale.ts (LOCALE_STORAGE_KEY + resolveLocale rule) — keep
+         the key "lookback.locale" and the "ja" prefix system fallback in sync. -->
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem("lookback.locale");
+          if (pref !== "ja" && pref !== "en" && pref !== "system") pref = "system";
+          var lang =
+            pref === "system"
+              ? navigator.language.toLowerCase().indexOf("ja") === 0
+                ? "ja"
+                : "en"
+              : pref;
+          document.documentElement.lang = lang;
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

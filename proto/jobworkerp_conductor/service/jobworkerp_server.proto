@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.service;
+
+import "jobworkerp_conductor/data/jobworkerp_server.proto";
+import "jobworkerp_conductor/service/common.proto";
+
+// Jobworkerp server creation response
+// Response message returning the ID of newly created server
+message CreateJobworkerpServerResponse {
+    jobworkerp_conductor.data.JobworkerpServerId id = 1;                           // Generated server ID
+}
+
+// Jobworkerp server optional response
+// Response message returning single server information (null if not exists)
+message OptionalJobworkerpServerResponse {
+    optional jobworkerp_conductor.data.JobworkerpServer data = 1;                  // Server data (optional)
+}
+
+// Jobworkerp server management service
+// Provides full CRUD operations for distributed job execution platform server connection information
+service JobworkerpServerService {
+  // Create a new jobworkerp server
+  rpc Create(jobworkerp_conductor.data.JobworkerpServerData) returns (CreateJobworkerpServerResponse);
+
+  // Update an existing jobworkerp server
+  rpc Update(jobworkerp_conductor.data.JobworkerpServer) returns (jobworkerp_conductor.service.SuccessResponse);
+
+  // Delete a jobworkerp server
+  rpc Delete(jobworkerp_conductor.data.JobworkerpServerId) returns (jobworkerp_conductor.service.SuccessResponse);
+
+  // Find a jobworkerp server by ID
+  rpc Find(jobworkerp_conductor.data.JobworkerpServerId) returns (OptionalJobworkerpServerResponse);
+
+  // Find a jobworkerp server by name
+  rpc FindByName(jobworkerp_conductor.service.FindByNameRequest) returns (OptionalJobworkerpServerResponse);
+
+  // Get list of jobworkerp servers (streaming)
+  rpc FindList(jobworkerp_conductor.service.FindListRequest) returns (stream jobworkerp_conductor.data.JobworkerpServer);
+
+  // Get total count of jobworkerp servers
+  rpc Count(jobworkerp_conductor.service.FindCondition) returns (jobworkerp_conductor.service.CountResponse);
+}

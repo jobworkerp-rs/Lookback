@@ -1,0 +1,354 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: lookback-periodic-run
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [schema_version, task, runtime]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        task:
+          type: object
+          required: [name, source, task_kind, hour, minute, lookback_days]
+          properties:
+            name: { type: string }
+            source:
+              type: string
+              description: Legacy/display source. `codex+claude-code` means all supported GUI sources.
+            sources:
+              type: array
+              items: { type: string }
+              default: []
+              description: Explicit source labels selected in the UI.
+            task_kind: { type: string, enum: [regular, weekly, monthly] }
+            hour: { type: integer, minimum: 0, maximum: 23 }
+            minute: { type: integer, minimum: 0, maximum: 59 }
+            interval_hours: { type: [integer, "null"], minimum: 1 }
+            interval_days: { type: [integer, "null"], minimum: 1 }
+            weekly_day: { type: [integer, "null"], minimum: 0, maximum: 6 }
+            monthly_day: { type: [integer, "null"], minimum: 1, maximum: 28 }
+            lookback_days: { type: integer, minimum: 1 }
+            force_thread_summary: { type: boolean, default: true }
+            run_summary_daily: { type: boolean, default: true }
+            run_personality: { type: boolean, default: false }
+            run_reflection: { type: boolean, default: false }
+        runtime:
+          type: object
+          required:
+            - memories_grpc_host
+            - memories_grpc_port
+            - memories_grpc_tls
+            - llm_worker_name
+          properties:
+            memories_grpc_host: { type: string }
+            memories_grpc_port: { type: integer }
+            memories_grpc_tls: { type: boolean }
+            llm_worker_name: { type: string }
+            # Output language forwarded into each batch as `output_language`,
+            # so the batches resolve the matching language-specific single
+            # worker (`memories-<feature>-single-<lang>`). Injected by the Rust
+            # side (PeriodicRuntime) from the persisted UI locale because
+            # conductor dispatches this wrapper without the batch-input builders
+            # that import/pipeline use. The schema `default` only fills a MISSING
+            # key — a scheduler persisted by an older build sends an empty string
+            # (PeriodicRuntime.output_language is a non-optional String), which is
+            # NOT rescued by `default` nor by jq `//`, so each relay below maps
+            # "" → "ja" explicitly. Rust also normalizes "" at runtime construction
+            # (defense in depth).
+            output_language:
+              type: string
+              enum: ["ja", "en"]
+              default: "ja"
+            memories_import_bin:
+              type: string
+              default: "memories-import"
+              description: memories-import binary path used by regular tasks before generation.
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  - initResults:
+      set:
+        thread_result: "${ null }"
+        daily_result: "${ null }"
+        weekly_result: "${ null }"
+        monthly_result: "${ null }"
+        personality_result: "${ null }"
+        reflection_result: "${ null }"
+        import_codex_result: "${ null }"
+        import_claude_code_result: "${ null }"
+
+  - resolveSourceFilterSources:
+      set:
+        source_filter_sources: >-
+          ${ if (($workflow.input.task.sources // []) | length) > 0
+             then $workflow.input.task.sources
+             elif $workflow.input.task.source == "codex+claude-code"
+             then ["codex", "claude-code"]
+             else [$workflow.input.task.source]
+             end }
+
+  - resolveSourceFilterLabels:
+      set:
+        source_filter_labels: >-
+          ${ $source_filter_sources
+             | map(if . == "agent:codex" then .
+                   elif . == "agent:claude_code" then .
+                   elif . == "codex" then "agent:codex"
+                   elif . == "claude-code" then "agent:claude_code"
+                   else .
+                   end) }
+        source_filter_match_mode: >-
+          ${ if $workflow.input.task.source == "codex+claude-code"
+                or ($source_filter_sources | length) > 1
+             then "LABEL_ANY"
+             else "LABEL_ALL"
+             end }
+
+  - buildRegularImportWindow:
+      if: "${ $workflow.input.task.task_kind == \"regular\" }"
+      set:
+        regular_import_tz_offset_hours: "${ 9 }"
+        regular_import_local_start_epoch: >-
+          ${ now + (9 * 3600)
+             - (($workflow.input.task.lookback_days // 1) * 86400) }
+        regular_import_server_url: >-
+          ${ (if $workflow.input.runtime.memories_grpc_tls then "https://" else "http://" end)
+             + $workflow.input.runtime.memories_grpc_host
+             + ":"
+             + ($workflow.input.runtime.memories_grpc_port | tostring) }
+
+  - buildRegularImportSince:
+      if: "${ $workflow.input.task.task_kind == \"regular\" }"
+      set:
+        regular_import_since_iso: >-
+          ${ ($regular_import_local_start_epoch | strftime("%Y-%m-%d"))
+             + "T00:00:00+09:00" }
+
+  - buildRegularImportArgs:
+      if: "${ $workflow.input.task.task_kind == \"regular\" }"
+      set:
+        regular_import_common_args: >-
+          ${ [
+               "--user-id", "1",
+               "--server-url", $regular_import_server_url,
+               "--since", $regular_import_since_iso
+             ] }
+
+  - runImportCodex:
+      if: "${ $workflow.input.task.task_kind == \"regular\" and (($source_filter_sources | index(\"codex\")) != null) }"
+      timeout:
+        after:
+          hours: 2
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "${ $workflow.input.runtime.memories_import_bin }"
+            args: "${ $regular_import_common_args + [\"codex\", \"--all-sessions\"] }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          import_codex_result: "${ .output }"
+
+  - runImportClaudeCode:
+      if: "${ $workflow.input.task.task_kind == \"regular\" and (($source_filter_sources | index(\"claude-code\")) != null) }"
+      timeout:
+        after:
+          hours: 2
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "${ $workflow.input.runtime.memories_import_bin }"
+            args: "${ $regular_import_common_args + [\"claude-code\", \"--all-projects\"] }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          import_claude_code_result: "${ .output }"
+
+  - threadSummaryForRegular:
+      if: "${ $workflow.input.task.task_kind == \"regular\" and ($workflow.input.task.force_thread_summary // true) }"
+      do:
+        - runThreadBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                workerName: memories-summarize-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      user_id: 1,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      labels_filter: $source_filter_labels,
+                      labels_filter_match_mode: $source_filter_match_mode
+                    } | tojson }
+            export:
+              as:
+                thread_result: "${ .output | fromjson }"
+
+  - dailyForRegular:
+      if: "${ $workflow.input.task.task_kind == \"regular\" and ($workflow.input.task.run_summary_daily // true) }"
+      do:
+        - runDailyBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                workerName: memories-daily-summary-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      last_n_days: $workflow.input.task.lookback_days,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      extra_labels_filter: $source_filter_labels,
+                      extra_labels_match_mode: $source_filter_match_mode,
+                      force_resummarize: true
+                    } | tojson }
+            export:
+              as:
+                daily_result: "${ .output | fromjson }"
+
+  - personalityForRegular:
+      if: "${ $workflow.input.task.task_kind == \"regular\" and ($workflow.input.task.run_personality // false) }"
+      do:
+        - runPersonalityBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                workerName: memories-personality-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      user_id: 1,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      merge_enabled: true,
+                      labels_filter: $source_filter_labels,
+                      labels_filter_match_mode: $source_filter_match_mode,
+                      force_reextract: false,
+                      personality_user_id: 200000,
+                      summary_user_id: 100000,
+                      min_message_count: 4,
+                      min_user_messages: 2,
+                      max_context_chars: 150000
+                    } | tojson }
+            export:
+              as:
+                personality_result: "${ .output | fromjson }"
+
+  - reflectionForRegular:
+      if: "${ $workflow.input.task.task_kind == \"regular\" and ($workflow.input.task.run_reflection // false) }"
+      do:
+        - runReflectionBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                workerName: memories-reflection-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      user_id: 1,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      labels_filter: $source_filter_labels,
+                      labels_filter_match_mode: $source_filter_match_mode,
+                      prompt_version: "v1"
+                    } | tojson }
+            export:
+              as:
+                reflection_result: "${ .output | fromjson }"
+
+  - weeklyStage:
+      if: "${ $workflow.input.task.task_kind == \"weekly\" }"
+      do:
+        - runWeeklyBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                workerName: memories-weekly-summary-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      last_n_weeks: 1,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      extra_labels_filter: $source_filter_labels,
+                      extra_labels_match_mode: $source_filter_match_mode,
+                      force_resummarize: true
+                    } | tojson }
+            export:
+              as:
+                weekly_result: "${ .output | fromjson }"
+
+  - monthlyStage:
+      if: "${ $workflow.input.task.task_kind == \"monthly\" }"
+      do:
+        - runMonthlyBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                workerName: memories-monthly-summary-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      last_n_months: 1,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      extra_labels_filter: $source_filter_labels,
+                      extra_labels_match_mode: $source_filter_match_mode,
+                      force_resummarize: true
+                    } | tojson }
+            export:
+              as:
+                monthly_result: "${ .output | fromjson }"
+
+output:
+  as:
+    task_name: "${ $workflow.input.task.name }"
+    task_kind: "${ $workflow.input.task.task_kind }"
+    thread: "${ $thread_result }"
+    daily: "${ $daily_result }"
+    weekly: "${ $weekly_result }"
+    monthly: "${ $monthly_result }"
+    personality: "${ $personality_result }"
+    reflection: "${ $reflection_result }"

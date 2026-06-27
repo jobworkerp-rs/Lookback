@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package jobworkerp.data;
+
+// # Channel Config
+// Worker instance channel configuration
+message ChannelConfig {
+  // # Channel Name
+  // Empty string represents the default channel
+  string name = 1;
+
+  // # Concurrency
+  // Number of jobs that can be processed concurrently
+  uint32 concurrency = 2;
+}
+
+// # Worker Instance ID
+// Unique identifier for a worker instance
+// Generated from IP address (upper 32 bits) and process ID (lower 32 bits)
+message WorkerInstanceId {
+  int64 value = 1;
+}
+
+// # Worker Instance Data
+// Data describing a running worker instance
+message WorkerInstanceData {
+  // # IP Address
+  // IPv4 address of the worker instance (e.g., "192.168.1.100")
+  string ip_address = 1;
+
+  // # Hostname
+  // Hostname of the worker instance (if available)
+  optional string hostname = 2;
+
+  // # Channels
+  // List of channels this worker instance processes with their concurrency
+  repeated ChannelConfig channels = 3;
+
+  // # Registered At
+  // Registration timestamp (Unix timestamp in milliseconds)
+  int64 registered_at = 4;
+
+  // # Last Heartbeat
+  // Last heartbeat timestamp (Unix timestamp in milliseconds)
+  // Used for active status detection in Scalable configuration
+  // Used for freeze detection in Standalone configuration
+  int64 last_heartbeat = 5;
+}
+
+// # Worker Instance
+// A running worker process with its identification and data
+message WorkerInstance {
+  WorkerInstanceId id = 1;
+  WorkerInstanceData data = 2;
+}

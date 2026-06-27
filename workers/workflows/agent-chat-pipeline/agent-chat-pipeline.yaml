@@ -1,0 +1,778 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: agent-chat-pipeline
+  version: "1.0.0"
+
+# End-to-end pipeline: import → per-thread summary → daily aggregate,
+# chained as discrete jobworkerp tasks so failures surface at the
+# stage that owns them.
+#
+# Topology: local jobworkerp worker (with coding-agent logs at
+# ~/.claude, ~/.codex), remote memories gRPC.
+#
+# Import is loose (--since only) but daily summary's day window is
+# strict; per-day precision lives in daily-work-summary-single, not
+# in import.
+
+input:
+  schema:
+    document:
+      type: object
+      required:
+        - source
+        - user_id
+        - memories_grpc_url
+        - thread_summary_batch_yaml
+        - thread_summary_single_yaml
+        - daily_work_summary_batch_yaml
+        - daily_work_summary_single_yaml
+      properties:
+        # ---- import stage ---------------------------------------------------
+        source:
+          type: string
+          enum: ["claude-code", "codex", "plain"]
+          description: memories-import subcommand.
+        user_id:
+          type: integer
+          description: memories-import -u.
+        memories_grpc_url:
+          type: string
+          description: >-
+            memories gRPC URL (e.g. http://host:9100). Used as
+            --server-url; parsed into host/port for inner workflows.
+        since_date:
+          type: string
+          default: ""
+          description: >-
+            YYYY-MM-DD. Marks the start of the processing window — the
+            pipeline imports and summarizes everything from this date
+            up to "today" (in the configured tz), inclusive of both
+            ends. The daily-summary stage runs daily-work-summary-batch
+            over the same range, producing one daily summary per day.
+            Empty = "yesterday in tz" for since_mode="day_start" (the
+            legacy daily-cron case, equivalent to processing a single
+            day), and "today in tz" for since_mode="now_minus" (the
+            hourly case where today's in-progress summary is being
+            kept fresh). At the day boundary, today's hourly run
+            switches to the new day, so any chat written between the
+            last run of the previous day and 00:00 is captured by
+            that final run only — pick `since_lookback_seconds`
+            comfortably wider than the cron interval so nothing is
+            missed.
+        since_override:
+          type: string
+          default: ""
+          pattern: "^$|^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          description: >-
+            UTC integer-seconds ISO 8601 string (e.g.
+            "2026-05-08T08:00:00Z") used verbatim as memories-import
+            --since when non-empty, regardless of since_mode. Other
+            RFC 3339 forms (`+HH:MM` offset, `.123Z` fractional
+            seconds) are rejected here even though memories-import
+            itself would accept them — the workflow needs the `Z`
+            form to derive a precise `since_ms_utc` for
+            thread-summary's `updated_after_ms`, and silently falling
+            back to day_start would mask the misconfiguration.
+        since_mode:
+          type: string
+          enum: ["day_start", "now_minus"]
+          default: "day_start"
+          description: >-
+            How to derive --since when since_override is empty.
+            "day_start" (default, legacy behaviour) uses
+            "since_date 00:00 +tz" — pairs with the daily summary's
+            day window. "now_minus" uses (now - since_lookback_seconds)
+            in UTC ISO 8601 (Z form) — for short-span periodic runs
+            (e.g. hourly) where day_start would re-import the entire
+            current day on every tick.
+        since_lookback_seconds:
+          type: integer
+          default: 0
+          description: >-
+            Effective only when since_mode="now_minus". The since cutoff
+            becomes (now - this value). 0 silently falls back to
+            day_start, so a misconfigured input cannot accidentally
+            re-import the whole vault. Pick a value comfortably larger
+            than the periodic run interval (e.g. 3900 for hourly =
+            65 minutes) to absorb dispatch jitter.
+        timezone_offset_hours:
+          type: integer
+          minimum: 0
+          maximum: 23
+          default: 9
+          description: >-
+            Day-boundary timezone (0-23). JST (+9) by default.
+            Negative offsets unsupported; use UTC (0) for the Americas.
+        import_command:
+          type: string
+          default: "memories-import"
+          description: memories-import binary path. Absolute path recommended.
+        all_projects_or_sessions:
+          type: boolean
+          default: true
+          description: Add --all-projects / --all-sessions (ignored for plain).
+        claude_dir:
+          type: string
+          default: ""
+          description: Override --claude-dir. Empty = ~/.claude.
+        codex_dir:
+          type: string
+          default: ""
+          description: Override --codex-dir. Empty = ~/.codex.
+        strip_path_prefix:
+          type: string
+          default: ""
+          description: "CSV for memories-import -P (strips host paths from path: labels)."
+        extra_import_args:
+          type: array
+          items: { type: string }
+          default: []
+          description: Extra args appended verbatim (e.g. --prune-missing).
+        # ---- summary stages -------------------------------------------------
+        memories_grpc_host:
+          type: string
+          default: ""
+          description: >-
+            Inner-workflow GRPC host override.
+            Empty = parse from memories_grpc_url.
+        memories_grpc_port:
+          type: integer
+          default: 0
+          description: >-
+            Inner-workflow GRPC port override.
+            0 = parse from memories_grpc_url (defaults 80/443).
+        memories_grpc_tls:
+          type: string
+          default: ""
+          description: >-
+            Empty sentinel = derive from memories_grpc_url scheme.
+            Pass "true" / "false" to override when the URL scheme does
+            not match the transport (e.g. plaintext gRPC behind an
+            HTTPS-terminating proxy).
+        llm_worker_name:
+          type: string
+          default: "memories-llm"
+          description: >-
+            Named LLM worker for all downstream stages. Override to
+            route LLM calls to a different model/back-end without
+            editing each child workflow.
+        thread_summary_batch_yaml:
+          type: string
+          description: Absolute path / URL of thread-summary-batch.yaml.
+        thread_summary_single_yaml:
+          type: string
+          description: Absolute path / URL of thread-summary-single.yaml.
+        daily_work_summary_batch_yaml:
+          type: string
+          description: Absolute path / URL of daily-work-summary-batch.yaml.
+        daily_work_summary_single_yaml:
+          type: string
+          description: Absolute path / URL of daily-work-summary-single.yaml.
+        summary_user_id:
+          type: integer
+          default: 100000
+          description: Summary memory owner. Must differ from user_id.
+        # LLM model / endpoint inputs were dropped in Phase C: every
+        # LLM call now routes through the `memories-llm` named worker
+        # (workers/llm-workers.yaml), so the pipeline no longer needs to
+        # propagate Ollama URLs or model names to its child workflows.
+        memory_thread_label_prefix:
+          type: string
+          default: "summary"
+          description: thread-summary marker label.
+        force_resummarize:
+          type: boolean
+          default: false
+          description: Forwarded to both summary stages.
+        daily_summary_label:
+          type: string
+          default: "daily_summary"
+        extra_labels_filter:
+          type: array
+          items: { type: string }
+          default: []
+          description: Forwarded to daily-work-summary-single (order-independent).
+        min_thread_count:
+          type: integer
+          default: 1
+        max_context_chars:
+          type: integer
+          default: 200000
+        # ---- personality stage (optional) ----------------------------------
+        # Set `thread_personality_batch_yaml` (and the matching `*_single_yaml`
+        # / `user_personality_merge_yaml`) to opt in. Empty defaults skip
+        # the personality branch entirely so existing pipelines remain
+        # unaffected. The two-layer extraction owns its own user_id space
+        # (`personality_user_id`, default 200000) and is fully disjoint
+        # from the summary side.
+        thread_personality_batch_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of thread-personality-batch.yaml. Empty
+            disables both personality stages.
+        thread_personality_single_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of thread-personality-single.yaml.
+            Required when `thread_personality_batch_yaml` is set.
+        user_personality_merge_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of user-personality-merge.yaml. Empty
+            runs the per-thread layer only and skips the user-level
+            merge.
+        personality_user_id:
+          type: integer
+          default: 200000
+          description: >-
+            Owner user_id for personality memories. MUST differ from
+            both `user_id` and `summary_user_id`.
+        # `personality_model` removed in Phase C — see comment near
+        # `summary_user_id`. Personality LLM is routed through the same
+        # `memories-llm` named worker as the summary side.
+        min_user_messages:
+          type: integer
+          default: 2
+          description: ROLE_USER lower bound for thread-personality-single.
+        force_reextract:
+          type: boolean
+          default: false
+          description: Forwarded to thread-personality-batch.
+        force_remerge:
+          type: boolean
+          default: false
+          description: Forwarded to user-personality-merge.
+        max_signals:
+          type: integer
+          default: 100
+          description: max_signals cap for user-personality-merge.
+        # ---- reflection stage (optional; Phase C / IMPL-4b) ---------------
+        # Set `thread_reflection_batch_yaml` (and the matching `*_single_yaml`)
+        # to opt in. Empty defaults skip the reflection branch entirely so
+        # callers that don't want reflection (or run against a memories
+        # build with MEMORY_REFLECTION_DISPATCH_ENABLED=false) stay
+        # unaffected. Reflection is non-blocking: failure here is logged
+        # but does NOT fail the pipeline (parity with personality).
+        thread_reflection_batch_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of thread-reflection-batch.yaml. Empty
+            disables the reflection stage.
+        thread_reflection_single_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of thread-reflection-single.yaml.
+            Required when `thread_reflection_batch_yaml` is set.
+        reflection_prompt_version:
+          type: string
+          default: "v1"
+          description: >-
+            `prompt_version` forwarded to thread-reflection — required
+            input + idempotency key for the Reflection service.
+        reflector_id:
+          type: string
+          default: "self"
+          description: >-
+            `reflector_id` forwarded to thread-reflection. Default
+            "self" matches the convention used by the Reflection
+            service to group reflections per generator identity.
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  # Step 0: Initialize variables that may be referenced from output.as
+  # even when an early `then: exit` skips later steps.
+  - initOutputVars:
+      set:
+        since_date_resolved: "${ null }"
+        end_date_resolved: "${ null }"
+        since_iso: "${ null }"
+        range_start_ms: "${ null }"
+        since_epoch_seconds: "${ 0 }"
+        since_ms_utc: "${ 0 }"
+        import_succeeded: "${ false }"
+        thread_summary_succeeded: "${ false }"
+        daily_summary_succeeded: "${ false }"
+        thread_personality_succeeded: "${ false }"
+        user_personality_merge_succeeded: "${ false }"
+        personality_error: "${ null }"
+        thread_reflection_succeeded: "${ false }"
+        reflection_error: "${ null }"
+
+  # Step 0a: Parse memories_grpc_url into host/port for inner WORKFLOW
+  # runners (which take host/port, not URL). The optional schema
+  # inputs `memories_grpc_host` ("" sentinel) / `memories_grpc_port`
+  # (0 sentinel) override the parsed values for split-DNS setups.
+  - parseMemoriesUrl:
+      set:
+        parsed_url: >-
+          ${ $workflow.input.memories_grpc_url
+             | capture("^(?<scheme>https?)://(?<host>[^:/]+)(?::(?<port>[0-9]+))?(?:/.*)?$") }
+
+  - resolveMemoriesEndpoint:
+      set:
+        memories_host: >-
+          ${ if $workflow.input.memories_grpc_host == ""
+             then $parsed_url.host
+             else $workflow.input.memories_grpc_host
+             end }
+        memories_port: >-
+          ${ if $workflow.input.memories_grpc_port == 0
+             then ($parsed_url.port
+                   // (if $parsed_url.scheme == "https" then "443" else "80" end)
+                   | tonumber)
+             else $workflow.input.memories_grpc_port
+             end }
+        # Derive tls from URL scheme by default. Explicit
+        # `memories_grpc_tls` ("true" / "false") wins so split-transport
+        # setups can override.
+        memories_tls: >-
+          ${ if $workflow.input.memories_grpc_tls == ""
+             then ($parsed_url.scheme == "https")
+             else ($workflow.input.memories_grpc_tls == "true")
+             end }
+
+  # Step 1: Resolve since_date (range start) and end_date (range end).
+  # `local_now_epoch` is sampled once and reused so the two dates
+  # cannot straddle midnight even on a slow runner. See
+  # daily-work-summary-single for the strftime/now TZ caveats.
+  - sampleLocalNow:
+      set:
+        local_now_epoch: "${ now + ($workflow.input.timezone_offset_hours * 3600) }"
+
+  # Empty `since_date` keeps the legacy single-day behaviour:
+  #   - since_mode="day_start" (daily cron): [yesterday, yesterday]
+  #   - since_mode="now_minus" (hourly cron): [today, today]
+  # An explicit `since_date` opens up range mode: [since_date, today].
+  # end_date must NOT default to "today" when since_date is empty —
+  # daily cron would otherwise regenerate today's in-progress summary
+  # on every run.
+  - resolveDateRange:
+      set:
+        since_date_resolved: >-
+          ${ if $workflow.input.since_date != ""
+             then $workflow.input.since_date
+             elif $workflow.input.since_mode == "now_minus"
+             then ($local_now_epoch | strftime("%Y-%m-%d"))
+             else (($local_now_epoch - 86400) | strftime("%Y-%m-%d"))
+             end }
+        end_date_resolved: >-
+          ${ if $workflow.input.since_date != ""
+             then ($local_now_epoch | strftime("%Y-%m-%d"))
+             elif $workflow.input.since_mode == "now_minus"
+             then ($local_now_epoch | strftime("%Y-%m-%d"))
+             else (($local_now_epoch - 86400) | strftime("%Y-%m-%d"))
+             end }
+
+  # Step 2: Build `--since` value (ISO 8601 with explicit numeric tz
+  # offset, e.g. "2026-05-06T00:00:00+09:00") and the matching
+  # `range_start_ms` for the inner thread-summary-batch.
+  #
+  # Why ISO with explicit offset rather than "Z": memories-import
+  # parses with `chrono::DateTime::parse_from_rfc3339`, which accepts
+  # both, but the `+HH:MM` form makes log lines self-documenting.
+  #
+  # Format the +HH:MM string with leading zero. Negative offsets are
+  # not supported by this format helper — callers wanting non-Asia
+  # timezones must pass a non-negative `timezone_offset_hours`.
+  - buildTzOffsetStr:
+      set:
+        tz_offset_str: >-
+          ${ $workflow.input.timezone_offset_hours as $h
+             | "+" + (if $h < 10 then "0" + ($h | tostring) else ($h | tostring) end)
+                  + ":00" }
+
+  # Three-stage fallback for the import `--since` (spec
+  # `agent-chat-import-incremental-spec.md` §2.3):
+  #   1. since_override non-empty → use verbatim
+  #   2. since_mode="now_minus" with positive lookback → now - N (UTC, Z form)
+  #   3. fallback → "since_date 00:00 +tz" (legacy day_start)
+  #
+  # `range_start_ms` is intentionally INDEPENDENT of since_iso. It
+  # marks the start of the processing range (since_date 00:00 in tz)
+  # and stays fixed there even when --since is pushed forward by
+  # short-span runs. It is used as the lower bound for
+  # thread-summary-batch's `updated_after_ms` filter (see
+  # `updated_after_ms_effective` below).
+  #
+  # We derive `since_epoch_seconds` once (mode 1/2 only — mode 3 keeps
+  # 0), then format it into both `since_iso` (for memories-import CLI)
+  # and `since_ms_utc` (for `updated_after_ms` widening below). This
+  # avoids evaluating the same `now - lookback` / strptime branches
+  # twice and keeps the two outputs guaranteed to agree.
+  #
+  # memories-import accepts both `+HH:MM` and `Z` since strings via
+  # chrono parse_from_rfc3339, so the day_start branch keeps its legacy
+  # `+tz` form for log readability while ms math here stays in UTC.
+  # `floor` here matters: jaq's `now` returns a float (sub-second
+  # precision). Without it, since_ms_utc carries the fractional part
+  # into thread-summary-batch's `updated_after_ms`, whose schema is
+  # `type: integer` — input validation would reject a value like
+  # `1778194252007.4082`. Override / day_start branches return integer
+  # seconds already (mktime), but applying `floor` uniformly keeps the
+  # output type stable regardless of the path.
+  #
+  # `since_override` is validated explicitly: on parse failure we
+  # `error` rather than silently falling back to 0 (which would widen
+  # `updated_after_ms` to range_start_ms - 1, masking the misconfig).
+  # The schema `pattern` above is the first line of defence; this
+  # check is a runtime backup in case the runner skips schema
+  # validation.
+  - buildSinceEpoch:
+      set:
+        since_epoch_seconds: >-
+          ${ (if $workflow.input.since_override != ""
+              then (($workflow.input.since_override
+                     | strptime("%Y-%m-%dT%H:%M:%SZ")?
+                     | mktime?)
+                    // error("since_override must be UTC integer-seconds ISO 8601 (Z form), got: \($workflow.input.since_override)"))
+              elif ($workflow.input.since_mode == "now_minus"
+                    and $workflow.input.since_lookback_seconds > 0)
+              then (now - $workflow.input.since_lookback_seconds)
+              else 0
+              end) | floor }
+
+  - buildSinceWindow:
+      set:
+        since_iso: >-
+          ${ if $workflow.input.since_override != ""
+             then $workflow.input.since_override
+             elif ($workflow.input.since_mode == "now_minus"
+                   and $workflow.input.since_lookback_seconds > 0)
+             then ($since_epoch_seconds | strftime("%Y-%m-%dT%H:%M:%SZ"))
+             else $since_date_resolved + "T00:00:00" + $tz_offset_str
+             end }
+        range_start_ms: >-
+          ${ ((($since_date_resolved + "T00:00:00Z")
+                | strptime("%Y-%m-%dT%H:%M:%SZ")
+                | mktime)
+              - ($workflow.input.timezone_offset_hours * 3600)) * 1000 }
+        since_ms_utc: "${ $since_epoch_seconds * 1000 }"
+
+  # Step 3: Build memories-import argv as a single expression
+  # (jaq's `set` evaluates keys in parallel, so cross-key refs like
+  # `$common_args` from another key in the same set are undefined).
+  # Empty-string sentinel = "skip this flag".
+  - buildImportArgs:
+      set:
+        import_args: >-
+          ${ [
+               $workflow.input.source,
+               "-u", ($workflow.input.user_id | tostring),
+               "-v",
+               "--since", $since_iso,
+               "--server-url", $workflow.input.memories_grpc_url
+             ]
+             + (if $workflow.input.source == "claude-code"
+                then
+                  (if $workflow.input.all_projects_or_sessions
+                     then ["--all-projects"] else [] end)
+                  + (if $workflow.input.claude_dir != ""
+                     then ["--claude-dir", $workflow.input.claude_dir]
+                     else [] end)
+                  + (if $workflow.input.strip_path_prefix != ""
+                     then ["-P", $workflow.input.strip_path_prefix]
+                     else [] end)
+                elif $workflow.input.source == "codex"
+                then
+                  (if $workflow.input.all_projects_or_sessions
+                     then ["--all-sessions"] else [] end)
+                  + (if $workflow.input.codex_dir != ""
+                     then ["--codex-dir", $workflow.input.codex_dir]
+                     else [] end)
+                  + (if $workflow.input.strip_path_prefix != ""
+                     then ["-P", $workflow.input.strip_path_prefix]
+                     else [] end)
+                else []
+                end)
+             + $workflow.input.extra_import_args }
+
+  # Step 4: Run memories-import. treat_nonzero_as_error surfaces
+  # memories-import exit 1 as a task failure so the summary stages
+  # don't run on partial data. We avoid memories-import's built-in
+  # --summarize-after-* because it swallows dispatch failures.
+  - importChats:
+      timeout:
+        after:
+          hours: 2
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "${ $workflow.input.import_command }"
+            args: "${ $import_args }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          import_succeeded: true
+
+  # Gate the optional branches and compute the shared
+  # `updated_after_ms` cutoff. LLM model resolution was removed in
+  # Phase C: every LLM call routes through the `memories-llm` named
+  # worker (workers/llm-workers.yaml), so the pipeline no longer
+  # forwards model/endpoint inputs to its child workflows.
+  - resolveBranchGates:
+      set:
+        personality_enabled: >-
+          ${ ($workflow.input.thread_personality_batch_yaml // "") != ""
+             and ($workflow.input.thread_personality_single_yaml // "") != "" }
+        reflection_enabled: >-
+          ${ ($workflow.input.thread_reflection_batch_yaml // "") != ""
+             and ($workflow.input.thread_reflection_single_yaml // "") != "" }
+        # Common `updated_after_ms` for the downstream batch stages.
+        # Strict-`>` boundary, so `-1` keeps threads updated AT the
+        # boundary included (parity with the legacy day_start path).
+        # The max of (since_ms_utc, range_start_ms) lets short-span
+        # runs with `since_mode="now_minus"` actually narrow the fetch.
+        updated_after_ms_effective: >-
+          ${ (if $since_ms_utc > $range_start_ms
+              then $since_ms_utc
+              else $range_start_ms end) - 1 }
+
+  # Layered onto $personality_enabled so the precondition is defined
+  # once. `set` evaluates keys in parallel so the reference has to
+  # live in a separate step.
+  - resolvePersonalityMergeFlag:
+      set:
+        personality_merge_enabled: >-
+          ${ $personality_enabled
+             and ($workflow.input.user_personality_merge_yaml // "") != "" }
+
+  # Step 5: Run the summary and personality pipelines concurrently.
+  # The two systems own disjoint user_id spaces (summary_user_id vs
+  # personality_user_id) and never read each other's data, so a fork
+  # is safe. The personality branch is wrapped in try/catch — failure
+  # there is logged as a warning but does not fail the workflow,
+  # since personality is supplementary context.
+  - downstreamStages:
+      timeout:
+        after:
+          hours: 24
+      fork:
+        branches:
+          - summaryBranch:
+              do:
+                # `updated_after_ms` keeps thread-summary-batch from
+                # rescanning every thread the user owns when only a
+                # slice has advanced.
+                - threadSummaryBatch:
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.thread_summary_batch_yaml }"
+                        # Batch parent → `llm_batch` (≥2). Its child
+                        # single workflows run on `llm_workflow` (1).
+                        # Putting the parent on `llm_workflow` deadlocks
+                        # — the only slot is held by the parent waiting
+                        # for child jobs that can never start.
+                        options:
+                          channel: llm_batch
+                        arguments:
+                          input: >-
+                            ${ {
+                              user_id: $workflow.input.user_id,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              single_workflow_path: $workflow.input.thread_summary_single_yaml,
+                              updated_after_ms: $updated_after_ms_effective,
+                              memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
+                              force_resummarize: $workflow.input.force_resummarize,
+                              summary_user_id: $workflow.input.summary_user_id,
+                              min_message_count: 4,
+                              max_context_chars: $workflow.input.max_context_chars
+                            } | tojson }
+                    export:
+                      as:
+                        thread_summary_succeeded: true
+
+                # `single_workflow_path` is forwarded so batch can
+                # fan out one `daily-work-summary-single` per date in
+                # `[start_date, end_date]`. The 24h ceiling is needed
+                # for multi-month back-fills; per-day timeouts are
+                # still bounded inside batch.
+                - dailyWorkSummary:
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.daily_work_summary_batch_yaml }"
+                        options:
+                          channel: llm_batch
+                        arguments:
+                          input: >-
+                            ${ {
+                              source_user_id: $workflow.input.summary_user_id,
+                              single_workflow_path: $workflow.input.daily_work_summary_single_yaml,
+                              start_date: $since_date_resolved,
+                              end_date: $end_date_resolved,
+                              timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              summary_label: $workflow.input.memory_thread_label_prefix,
+                              daily_label: $workflow.input.daily_summary_label,
+                              extra_labels_filter: $workflow.input.extra_labels_filter,
+                              min_thread_count: $workflow.input.min_thread_count,
+                              max_context_chars: $workflow.input.max_context_chars,
+                              force_resummarize: $workflow.input.force_resummarize
+                            } | tojson }
+                    export:
+                      as:
+                        daily_summary_succeeded: true
+
+          - personalityBranch:
+              if: "${ $personality_enabled }"
+              try:
+                - threadPersonalityBatch:
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.thread_personality_batch_yaml }"
+                        options:
+                          channel: llm_batch
+                        arguments:
+                          input: >-
+                            ${ {
+                              user_id: $workflow.input.user_id,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              single_workflow_path: $workflow.input.thread_personality_single_yaml,
+                              updated_after_ms: $updated_after_ms_effective,
+                              force_reextract: $workflow.input.force_reextract,
+                              personality_user_id: $workflow.input.personality_user_id,
+                              summary_user_id: $workflow.input.summary_user_id,
+                              min_message_count: 4,
+                              min_user_messages: $workflow.input.min_user_messages,
+                              max_context_chars: $workflow.input.max_context_chars
+                            } | tojson }
+                    export:
+                      as:
+                        thread_personality_succeeded: true
+
+                - userPersonalityMerge:
+                    if: "${ $personality_merge_enabled }"
+                    timeout:
+                      after:
+                        hours: 3
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.user_personality_merge_yaml }"
+                        options:
+                          channel: llm_workflow
+                        arguments:
+                          input: >-
+                            ${ {
+                              user_id: $workflow.input.user_id,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              personality_user_id: $workflow.input.personality_user_id,
+                              summary_user_id: $workflow.input.summary_user_id,
+                              max_context_chars: $workflow.input.max_context_chars,
+                              force_remerge: $workflow.input.force_remerge,
+                              max_signals: $workflow.input.max_signals
+                            } | tojson }
+                    export:
+                      as:
+                        user_personality_merge_succeeded: true
+              catch:
+                as: error
+                do:
+                  - recordPersonalityError:
+                      set:
+                        personality_error: "${ $error }"
+
+          - reflectionBranch:
+              if: "${ $reflection_enabled }"
+              try:
+                - threadReflectionBatch:
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.thread_reflection_batch_yaml }"
+                        options:
+                          channel: llm_batch
+                        arguments:
+                          input: >-
+                            ${ {
+                              user_id: $workflow.input.user_id,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              single_workflow_path: $workflow.input.thread_reflection_single_yaml,
+                              updated_after_ms: $updated_after_ms_effective,
+                              prompt_version: $workflow.input.reflection_prompt_version,
+                              reflector_id: $workflow.input.reflector_id,
+                              force: $workflow.input.force_resummarize
+                            } | tojson }
+                    export:
+                      as:
+                        thread_reflection_succeeded: true
+              catch:
+                as: error
+                do:
+                  - recordReflectionError:
+                      set:
+                        reflection_error: "${ $error }"
+
+output:
+  as:
+    # `completed` is gated on the summary side only — personality is
+    # supplementary and its failure is intentionally non-fatal. Use
+    # `personality_error` to detect when the personality branch
+    # raised but was caught.
+    completed: ${ $daily_summary_succeeded }
+    since_date: ${ $since_date_resolved }
+    end_date: ${ $end_date_resolved }
+    since_iso: ${ $since_iso }
+    # `range_start_ms` is "since_date 00:00 in tz" expressed in epoch
+    # ms — the start of the processing range, NOT the start of a
+    # single calendar day. For range-mode runs (since_date set), the
+    # processing window extends from this point up to `end_date`'s
+    # 24:00 in tz. Downstream consumers needing a strict per-day
+    # window must compute it themselves from `since_date` / `end_date`.
+    range_start_ms: ${ $range_start_ms }
+    since_ms_utc: ${ $since_ms_utc }
+    import_succeeded: ${ $import_succeeded }
+    thread_summary_succeeded: ${ $thread_summary_succeeded }
+    daily_summary_succeeded: ${ $daily_summary_succeeded }
+    personality_enabled: ${ $personality_enabled // false }
+    thread_personality_succeeded: ${ $thread_personality_succeeded // false }
+    user_personality_merge_succeeded: ${ $user_personality_merge_succeeded // false }
+    personality_error: ${ $personality_error // null }
+    reflection_enabled: ${ $reflection_enabled // false }
+    thread_reflection_succeeded: ${ $thread_reflection_succeeded // false }
+    reflection_error: ${ $reflection_error // null }

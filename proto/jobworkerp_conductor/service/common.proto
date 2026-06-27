@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.service;
+
+// Generic success response message
+// Used to indicate success/failure of CRUD operations
+message SuccessResponse { bool is_success = 1; }               // Operation success/failure flag
+
+// List search request message
+// Used for list retrieval with pagination
+message FindListRequest {
+  optional int32 limit = 1;                                    // Limit on number of items to retrieve (optional)
+  optional int64 offset = 2;                                   // Offset for starting position (optional)
+}
+
+// Search condition message (for future extension)
+// XXX now empty...
+message FindCondition {
+}
+
+// Count result response message
+// Used to return total count of entities
+message CountResponse { int64 total = 1; }                     // Total count
+
+// Name-based search request message
+// Used when searching entities by name
+message FindByNameRequest {
+  string name = 1;                                              // Name to search for
+}

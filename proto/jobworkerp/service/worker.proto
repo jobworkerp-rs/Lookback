@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package jobworkerp.service;
+
+import "jobworkerp/data/common.proto";
+import "jobworkerp/data/worker.proto";
+import "jobworkerp/data/runner.proto";
+import "jobworkerp/service/common.proto";
+
+message CreateWorkerResponse {
+  jobworkerp.data.WorkerId id = 1; // generated id
+}
+
+message OptionalWorkerResponse { optional jobworkerp.data.Worker data = 1; }
+
+message WorkerNameRequest { string name = 1; }
+
+message FindWorkerListRequest {
+  repeated jobworkerp.data.RunnerType runner_types = 1;
+  optional string channel = 2;
+  optional int32 limit = 3;
+  optional int64 offset = 4;
+  // New fields for admin UI (backward compatible)
+  optional string name_filter = 5;                        // Prefix match search (LIKE 'keyword%')
+  optional bool is_periodic = 6;                          // true: periodic workers (periodic_interval > 0), false: non-periodic (= 0), null: all
+  repeated jobworkerp.data.RunnerId runner_ids = 7;       // Filter by runner IDs
+  optional jobworkerp.data.WorkerSortField sort_by = 8;   // Sort field
+  optional bool ascending = 9;                            // Sort order (true: ASC, false: DESC)
+}
+
+message CountWorkerRequest {
+  repeated jobworkerp.data.RunnerType runner_types = 1;
+  optional string channel = 2;
+  optional string name_filter = 3;
+  optional bool is_periodic = 4;
+  repeated jobworkerp.data.RunnerId runner_ids = 5;
+}
+
+message ChannelInfo {
+  string name = 1;
+  uint32 concurrency = 2;
+  int64 worker_count = 3;  // Number of workers in this channel
+
+  // # Total Concurrency (new)
+  // Sum of concurrency from all active worker instances for this channel
+  // If not set, clients should use 'concurrency' field value
+  optional uint32 total_concurrency = 4;
+
+  // # Active Instances (new)
+  // Number of active worker instances processing this channel
+  optional int32 active_instances = 5;
+}
+
+message FindChannelListResponse {
+  repeated ChannelInfo channels = 1;
+}
+
+message ReleaseStaticWorkerRequest {
+  // Target static worker to release.
+  // If not set, all static workers are released.
+  oneof target {
+    jobworkerp.data.WorkerId worker_id = 1;
+    string name = 2;
+  }
+}
+
+service WorkerService {
+  rpc Create(jobworkerp.data.WorkerData) returns (CreateWorkerResponse);
+  rpc UpsertByName(jobworkerp.data.WorkerData) returns (CreateWorkerResponse);
+  rpc Update(jobworkerp.data.Worker) returns (SuccessResponse);
+  rpc Delete(jobworkerp.data.WorkerId) returns (SuccessResponse);
+  rpc Find(jobworkerp.data.WorkerId) returns (OptionalWorkerResponse);
+  rpc FindByName(WorkerNameRequest) returns (OptionalWorkerResponse);
+  rpc FindList(FindWorkerListRequest) returns (stream jobworkerp.data.Worker);
+  // Deprecated: Use CountBy instead. This method will be removed in version 2.0.0
+  rpc Count(CountCondition) returns (CountResponse) {
+    option deprecated = true;
+  }
+  rpc CountBy(CountWorkerRequest) returns (CountResponse);
+  rpc FindChannelList(jobworkerp.data.Empty) returns (FindChannelListResponse);
+  // Release static worker(s) runner pool without modifying the worker definition.
+  // The pool is discarded immediately and will be lazily re-created on the next job execution.
+  // Note: When releasing all (no target specified), worker definition caches for
+  // all workers (including non-static) are also cleared as a side effect.
+  rpc ReleaseStaticWorker(ReleaseStaticWorkerRequest) returns (SuccessResponse);
+}

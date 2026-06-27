@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.service;
+
+import "google/protobuf/empty.proto";
+import "jobworkerp_conductor/data/slack_event_handler.proto";
+import "jobworkerp_conductor/service/common.proto";
+
+// Slack event handler creation response
+// Response message returning the ID of newly created handler
+message CreateSlackEventHandlerResponse {
+  jobworkerp_conductor.data.SlackEventHandlerId id = 1;                              // Generated handler ID
+}
+
+// Slack event handler optional response
+// Response message returning single handler information (null if not exists)
+message OptionalSlackEventHandlerResponse {
+  optional jobworkerp_conductor.data.SlackEventHandler data = 1;                     // Handler data (optional)
+}
+
+// Slack event handler management service
+// Provides full CRUD operations for Slack event handlers
+service SlackEventHandlerService {
+  // Create a new Slack event handler
+  rpc Create(jobworkerp_conductor.data.SlackEventHandlerData)
+      returns (CreateSlackEventHandlerResponse);
+
+  // Update an existing Slack event handler
+  rpc Update(jobworkerp_conductor.data.SlackEventHandler)
+      returns (jobworkerp_conductor.service.SuccessResponse);
+
+  // Delete a Slack event handler
+  rpc Delete(jobworkerp_conductor.data.SlackEventHandlerId)
+      returns (jobworkerp_conductor.service.SuccessResponse);
+
+  // Find a Slack event handler by ID
+  rpc Find(jobworkerp_conductor.data.SlackEventHandlerId)
+      returns (OptionalSlackEventHandlerResponse);
+
+  // Find a Slack event handler by name
+  rpc FindByName(jobworkerp_conductor.service.FindByNameRequest)
+      returns (OptionalSlackEventHandlerResponse);
+
+  // Get list of Slack event handlers (streaming)
+  rpc FindList(jobworkerp_conductor.service.FindListRequest)
+      returns (stream jobworkerp_conductor.data.SlackEventHandler);
+
+  // Get list of Slack event handlers by condition (streaming)
+  rpc FindListByCondition(jobworkerp_conductor.service.FindCondition)
+      returns (stream jobworkerp_conductor.data.SlackEventHandler);
+
+  // Get total count of Slack event handlers
+  rpc Count(google.protobuf.Empty)
+      returns (jobworkerp_conductor.service.CountResponse);
+}

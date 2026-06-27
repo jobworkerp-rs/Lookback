@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.data;
+
+import "jobworkerp_conductor/data/jobworkerp_server.proto";
+import "jobworkerp_conductor/data/common.proto";
+
+// Cron scheduler data model
+// Configuration information for schedulers that periodically execute workflows based on cron schedule expressions
+message CronSchedulerData {
+  string name = 1;                              // Scheduler name (unique identifier)
+  JobworkerpServerId jobworkerp_server_id = 2;  // Target jobworkerp server ID for execution
+  string workflow_url = 3;                      // DEPRECATED: backward compat only (use execution_target)
+  optional string channel = 4;                  // DEPRECATED: backward compat only (use execution_target)
+  string crontab = 5;                           // Cron expression (e.g., "0 */5 * * *" - every 5 minutes)
+  bool enabled = 6;                             // Scheduler enabled/disabled state
+  optional string description = 7;              // Scheduler description text (optional)
+  int64 created_at = 8;                         // Creation timestamp (Unix timestamp in seconds)
+  int64 updated_at = 9;                         // Update timestamp (Unix timestamp in seconds)
+  optional string args = 10;                    // Additional arguments string (optional)
+
+  // Execution target (mutually exclusive with deprecated fields 3/4)
+  // Field numbers 11-12 intentionally skipped for future extension
+  oneof execution_target {
+    WorkflowExecution workflow = 13;   // URL execution mode (WORKFLOW runner only)
+    WorkerExecution worker = 14;       // Worker execution mode (any runner type)
+  }
+}
+
+// Unique ID for cron scheduler
+message CronSchedulerId { int64 value = 1; }
+
+// Full data model for cron scheduler entity
+// Completely represents scheduler information through combination of ID + data
+message CronScheduler {
+  CronSchedulerId id = 1;                   // Unique ID
+  CronSchedulerData data = 2;               // Scheduler data
+}

@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.service;
+
+import "jobworkerp_conductor/data/cron_scheduler.proto";
+import "jobworkerp_conductor/service/common.proto";
+
+// Cron scheduler creation response
+// Response message returning the ID of newly created scheduler
+message CreateCronSchedulerResponse {
+  jobworkerp_conductor.data.CronSchedulerId id = 1;                              // Generated scheduler ID
+}
+
+// Cron scheduler optional response
+// Response message returning single scheduler information (null if not exists)
+message OptionalCronSchedulerResponse {
+  optional jobworkerp_conductor.data.CronScheduler data = 1;                     // Scheduler data (optional)
+}
+
+// Cron scheduler management service
+// Provides full CRUD operations for cron-based workflow schedulers
+service CronSchedulerService {
+  // Create a new cron scheduler
+  rpc Create(jobworkerp_conductor.data.CronSchedulerData)
+      returns (CreateCronSchedulerResponse);
+
+  // Update an existing cron scheduler
+  rpc Update(jobworkerp_conductor.data.CronScheduler)
+      returns (jobworkerp_conductor.service.SuccessResponse);
+
+  // Delete a cron scheduler
+  rpc Delete(jobworkerp_conductor.data.CronSchedulerId)
+      returns (jobworkerp_conductor.service.SuccessResponse);
+
+  // Find a cron scheduler by ID
+  rpc Find(jobworkerp_conductor.data.CronSchedulerId)
+      returns (OptionalCronSchedulerResponse);
+
+  // Find a cron scheduler by name
+  rpc FindByName(jobworkerp_conductor.service.FindByNameRequest)
+      returns (OptionalCronSchedulerResponse);
+
+  // Get list of cron schedulers (streaming)
+  rpc FindList(jobworkerp_conductor.service.FindListRequest)
+      returns (stream jobworkerp_conductor.data.CronScheduler);
+
+  // Get total count of cron schedulers
+  rpc Count(jobworkerp_conductor.service.FindCondition)
+      returns (jobworkerp_conductor.service.CountResponse);
+}

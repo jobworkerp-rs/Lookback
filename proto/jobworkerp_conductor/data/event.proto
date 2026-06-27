@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.data;
+
+// Import basic entity data
+import "jobworkerp_conductor/data/cron_scheduler.proto";
+import "jobworkerp_conductor/data/worker_result_handler.proto";
+import "jobworkerp_conductor/data/jobworkerp_server.proto";
+import "jobworkerp_conductor/data/slack_event_handler.proto";
+
+// Protobuf definition for configuration change events
+// Event messages for notifying changes to entities (schedulers, handlers, servers) within the system
+message ConfigChangeEvent {
+  oneof event {
+    CronSchedulerChangeEvent cron_scheduler = 1;                    // Cron scheduler change event
+    WorkerResultHandlerChangeEvent worker_result_handler = 2;       // Worker result handler change event
+    JobworkerpServerChangeEvent jobworkerp_server = 3;             // Jobworkerp server change event
+    SlackEventHandlerChangeEvent slack_event_handler = 4;          // Slack event handler change event
+  }
+}
+
+// Cron scheduler change event
+// Notifies CRUD operations and state changes (enabled/disabled) for schedulers
+message CronSchedulerChangeEvent {
+  ChangeAction action = 1;                                                     // Type of action executed
+  string name = 2;                                                             // Target scheduler name
+  optional jobworkerp_conductor.data.CronSchedulerId id = 3;                      // Target scheduler ID (optional for deletion)
+  int64 timestamp = 4;                                                         // Event occurrence time (Unix timestamp seconds)
+  optional jobworkerp_conductor.data.CronSchedulerData data = 5;                  // Updated scheduler data (optional for deletion)
+  // Contains related JobworkerpServer data for DB independence
+  optional jobworkerp_conductor.data.JobworkerpServer jobworkerp_server = 6;     // Related jobworkerp server information
+}
+
+// Worker result handler change event
+// Notifies CRUD operations and state changes (enabled/disabled) for handlers
+message WorkerResultHandlerChangeEvent {
+  ChangeAction action = 1;                                                     // Type of action executed
+  string name = 2;                                                             // Target handler name
+  optional jobworkerp_conductor.data.WorkerResultHandlerId id = 3;                // Target handler ID (optional for deletion)
+  int64 timestamp = 4;                                                         // Event occurrence time (Unix timestamp seconds)
+  optional jobworkerp_conductor.data.WorkerResultHandlerData data = 5;            // Updated handler data (optional for deletion)
+  // Contains related JobworkerpServer data for DB independence (multiple support)
+  // Note: protobuf map keys only support basic types, so int64 is used with value for type safety
+  map<int64, jobworkerp_conductor.data.JobworkerpServer> jobworkerp_servers = 6; // Related jobworkerp server information (key: server_id.value, value: server with typed id)
+}
+
+// Jobworkerp server change event
+// Notifies CRUD operations and state changes (enabled/disabled) for servers
+message JobworkerpServerChangeEvent {
+  ChangeAction action = 1;                                                     // Type of action executed
+  string name = 2;                                                             // Target server name
+  jobworkerp_conductor.data.JobworkerpServerId id = 3;                            // Target server ID
+  int64 timestamp = 4;                                                         // Event occurrence time (Unix timestamp seconds)
+  optional jobworkerp_conductor.data.JobworkerpServerData data = 5;               // Updated server data (optional for deletion)
+}
+
+// Slack event handler change event
+// Notifies CRUD operations and state changes (enabled/disabled) for Slack event handlers
+message SlackEventHandlerChangeEvent {
+  ChangeAction action = 1;                                                     // Type of action executed
+  string name = 2;                                                             // Target handler name
+  optional jobworkerp_conductor.data.SlackEventHandlerId id = 3;                  // Target handler ID (optional for deletion)
+  int64 timestamp = 4;                                                         // Event occurrence time (Unix timestamp seconds)
+  optional jobworkerp_conductor.data.SlackEventHandlerData data = 5;              // Updated handler data (optional for deletion)
+  // Contains related JobworkerpServer data for DB independence
+  optional jobworkerp_conductor.data.JobworkerpServer jobworkerp_server = 6;     // Related jobworkerp server information
+}
+
+// Enum representing types of change actions
+enum ChangeAction {
+  CHANGE_ACTION_UNSPECIFIED = 0;                                              // Unspecified (default value)
+  CHANGE_ACTION_CREATED = 1;                                                  // Create new
+  CHANGE_ACTION_UPDATED = 2;                                                  // Update
+  CHANGE_ACTION_DELETED = 3;                                                  // Delete
+  CHANGE_ACTION_ENABLED = 4;                                                  // Enable
+  CHANGE_ACTION_DISABLED = 5;                                                 // Disable
+}

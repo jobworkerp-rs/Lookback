@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package jobworkerp.service;
+
+import "jobworkerp/data/common.proto";
+import "jobworkerp/data/runner.proto";
+import "jobworkerp/service/common.proto";
+
+message CreateRunnerRequest {
+  // # Runner Name
+  // Unique key and proto message prefix (e.g. name: "command",
+  // runner_settings_proto: "CommandRunnerSettings", job_args_proto:
+  // "CommandArg")
+  string name = 1;
+  // # Runner Description
+  // Description of runner implementation
+  string description = 2;
+  // # Runner Type
+  // can create runner type only: MCP, Plugin
+  jobworkerp.data.RunnerType runner_type = 3;
+  // # definition
+  // runner definition
+  // mcp: mcp_server toml
+  // plugin: plugin filepath
+  string definition = 4;
+}
+
+message CreateRunnerResponse {
+  jobworkerp.data.RunnerId id = 1; // generated id
+}
+
+message OptionalRunnerResponse { optional jobworkerp.data.Runner data = 1; }
+
+message RunnerNameRequest { string name = 1; }
+
+message FindRunnerListRequest {
+  // Runner type filter (multiple types allowed)
+  repeated jobworkerp.data.RunnerType runner_types = 1;
+  // Name prefix match filter (LIKE 'keyword%')
+  optional string name_filter = 2;
+  // Pagination
+  optional int32 limit = 3;    // Default: 100, Max: 1000
+  optional int64 offset = 4;   // Default: 0, Max: 10000
+  // Sort options
+  optional jobworkerp.data.RunnerSortField sort_by = 5;  // Default: ID
+  optional bool ascending = 6;                            // Default: false (DESC)
+}
+
+message CountRunnerRequest {
+  repeated jobworkerp.data.RunnerType runner_types = 1;
+  optional string name_filter = 2;
+}
+
+service RunnerService {
+  rpc Create(CreateRunnerRequest) returns (CreateRunnerResponse);
+  rpc Delete(jobworkerp.data.RunnerId) returns (SuccessResponse);
+  rpc Find(jobworkerp.data.RunnerId) returns (OptionalRunnerResponse);
+  rpc FindByName(RunnerNameRequest) returns (OptionalRunnerResponse);
+  // Deprecated: Use FindListBy instead. This method will be removed in version 2.0.0
+  rpc FindList(FindListRequest) returns (stream jobworkerp.data.Runner) {
+    option deprecated = true;
+  }
+  // Deprecated: Use CountBy instead. This method will be removed in version 2.0.0
+  rpc Count(CountCondition) returns (CountResponse) {
+    option deprecated = true;
+  }
+  // New methods with filtering and sorting capabilities
+  rpc FindListBy(FindRunnerListRequest) returns (stream jobworkerp.data.Runner);
+  rpc CountBy(CountRunnerRequest) returns (CountResponse);
+}

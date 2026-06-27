@@ -1,0 +1,273 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: lookback
+  name: lookback-recall
+  version: "1.0.0"
+  summary: >
+    Search the user's past memories. A single call returns matches from
+    both the summary layer (overviews of single conversations and of each
+    day, week, and month) and the raw-message layer (the original
+    messages), and each result is tagged with its kind so you can tell a
+    high-level overview from a specific detail. Use the summary results to
+    locate the right conversation or period, and the raw-message results
+    when you need exact wording. Call this for any question about the
+    user's prior conversations, decisions, or work history.
+
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        query:
+          type: string
+          description: >-
+            Natural-language search query, written in the same language as
+            the user's question. Matched against the stored memories by both
+            keyword and meaning, so a plain description of what you are
+            looking for works well.
+        limit_per_layer:
+          type: integer
+          default: 5
+          description: >-
+            Maximum number of results to return from each layer (the summary
+            layer and the raw-message layer). The two layers are searched
+            independently, so a single call returns up to twice this number
+            of results. Increase it when you need broader coverage.
+        summary_labels:
+          type: array
+          items: { type: string }
+          description: >-
+            Optional filter that restricts the summary layer to summaries of
+            a specific kind or time period. Use it when the question targets
+            a particular kind or period rather than a general topic.
+            Available labels: "daily_summary" / "weekly_summary" /
+            "monthly_summary" / "summary" (a single conversation), plus
+            period tags "date:YYYY-MM-DD" (a specific day),
+            "iso_week:YYYY-Www" (an ISO week), and "month:YYYY-MM"
+            (a month). Omit to search across all summary kinds.
+        summary_label_match:
+          type: string
+          enum: ["ANY", "ALL"]
+          default: "ALL"
+          description: >-
+            How the labels in `summary_labels` are combined. "ALL" (default)
+            requires every label to match — use it to pin both a kind and a
+            period at once, e.g. the daily summary for a specific day:
+            summary_labels=["daily_summary","date:2026-05-29"],
+            summary_label_match="ALL". "ANY" matches a summary that carries
+            at least one of the labels, for broader lookups. Ignored when
+            `summary_labels` is omitted.
+        # The memories gRPC endpoint HybridSearch dials. Two callers, two
+        # ways the value arrives:
+        #   1. Chat (Tauri-mediated): the `chat_ask` command rewrites the
+        #      tool schema down to {query, limit_per_layer} and INJECTS
+        #      `memories_grpc_*` per-dispatch from the active connection
+        #      (chat.rs::lookback_recall_dispatch_args). The injected value
+        #      wins over the defaults below.
+        #   2. MCP (external client, e.g. Claude Desktop): jobworkerp runs
+        #      the workflow DIRECTLY with no Tauri in the loop, so there is
+        #      no per-dispatch injection — the client never sends
+        #      `memories_grpc_*`. The defaults below are therefore the only
+        #      endpoint the MCP path gets, so they are `%{...}` placeholders
+        #      that `start_inner` resolves from the SAME active connection
+        #      (resolve_targets().memories_callback()) into the Tauri process
+        #      env before registering this worker. In remote mode that points
+        #      MCP search at the configured remote memories (incl. HTTPS),
+        #      matching the chat / browse target. Quote-less for port / tls so
+        #      `expand_env` substitutes a raw integer / boolean (a quoted
+        #      scalar would fail proto-JSON type coercion — see
+        #      `llm-workers.yaml`'s `reuse_kv_prefix` note).
+        # NOT in `required`: the MCP client cannot supply them, so requiring
+        # them would reject every MCP call at schema validation; the resolved
+        # defaults stand in instead.
+        #
+        # `port` / `tls` are UNQUOTED `%{...}` so that after `expand_env`
+        # (which jobworkerp's loader runs as a text substitution BEFORE YAML
+        # parsing) they become a NATIVE integer / boolean literal — NOT a
+        # quoted string. This is load-bearing: jobworkerp's
+        # `apply_schema_defaults` copies an input `default` VERBATIM with no
+        # type coercion (it does not consult `type`), and the value flows
+        # through the jq `${...}` references below as-is. A quoted `"9010"` /
+        # `"false"` default would therefore reach the GRPC runner's
+        # `settings.port` (int) / `settings.tls` (bool) as a string and fail
+        # — the chat path never hits this because Tauri injects native
+        # numbers/booleans per-dispatch, so only the MCP default path would
+        # break. `host` stays quoted (it's a string field). The committed file
+        # is not valid YAML until expanded (a bare `%{...}` token); the
+        # `workflow_yamls_parse` unit test expands `%{VAR:-default}` to its
+        # default before parsing, mirroring the loader.
+        memories_grpc_host:
+          { type: string, default: "%{LOOKBACK_RAG_MEMORIES_HOST:-127.0.0.1}" }
+        memories_grpc_port: { type: integer, default: %{LOOKBACK_RAG_MEMORIES_PORT:-9010} }
+        memories_grpc_tls: { type: boolean, default: %{LOOKBACK_RAG_MEMORIES_TLS:-false} }
+      required: [query]
+
+do:
+  # Step 1: Embed the query once. HybridSearch is "client-side embedded"
+  # — the server fuses our vector hits with its own BM25 pass over
+  # `query_text`, so we MUST supply a vector. We reuse the same
+  # multimodal embedding worker that memory rows were embedded with so
+  # cosine similarity is in-space.
+  #
+  # The embedding runner is registered on jobworkerp as the
+  # `memories-mm-embedding` worker (overridable via env to match the
+  # auto-embedding workflow's resolution). Calling it through
+  # `worker.name` keeps the call on jobworkerp — the memories gRPC
+  # frontend does NOT expose `/jobworkerp.runner.MultimodalEmbeddingRunner`,
+  # so a GRPC-runner call to the memories port would 404 every time.
+  - embedQuery:
+      run:
+        worker:
+          name: "%{LOOKBACK_EMBED_WORKER:-memories-mm-embedding}"
+          using: embed_text
+          arguments:
+            text: "${ $workflow.input.query }"
+      export:
+        as:
+          # `embed_text` returns { embeddings: [{ values: [...] }, ...] }.
+          # Hybrid search expects exactly one vector; take the first chunk.
+          # An empty `values` here means the query was below
+          # `min_chunk_tokens` — let HybridSearch fail naturally so the
+          # caller (chat) sees a real error rather than a silent zero-hit.
+          query_vector: "${ (.embeddings // [{}])[0].values // [] }"
+
+  # Step 2: Summary layer. owner=100000 + thread_filter.labels narrows to
+  # the summary threads. `external_id_prefix` does not exist on
+  # MemorySearchFilter, so label matching is the only server-side
+  # narrowing path. When the caller supplies `summary_labels` we honour
+  # it (with `summary_label_match`, default ALL so a kind+period pair like
+  # ["daily_summary","date:2026-05-29"] pins exactly that summary);
+  # otherwise we fall back to the four summary kinds matched as ANY.
+  # `label_match_mode` is the proto enum NAME (LABEL_ANY / LABEL_ALL),
+  # mapped from the user-facing ANY/ALL here so the LLM never sees the
+  # proto prefix.
+  - searchSummaries:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryVectorService/HybridSearch"
+            json_body: >-
+              ${ ($workflow.input.summary_labels // []) as $req_labels
+               | (($req_labels | length) > 0) as $has
+               | (if $has then $req_labels
+                  else ["summary", "daily_summary",
+                        "weekly_summary", "monthly_summary"]
+                  end) as $labels
+               | (if $has and ($workflow.input.summary_label_match // "ALL") == "ALL"
+                  then "LABEL_ALL" else "LABEL_ANY"
+                  end) as $match
+               | {
+                  query_vectors: [ { values: $query_vector } ],
+                  query_text: $workflow.input.query,
+                  options: {
+                    limit: ($workflow.input.limit_per_layer // 5),
+                    filter: {
+                      user_id: "100000",
+                      thread_filter: {
+                        user_id: "100000",
+                        labels: $labels,
+                        label_match_mode: $match
+                      }
+                    }
+                  }
+                } | tojson }
+            as_json: true
+      export:
+        as:
+          summary_hits: ${ (.jsonBody // "[]") | fromjson }
+
+  # Step 3: Raw-message layer. owner=user_id=1 (the human user; spec
+  # FR-CONFIG-3 fixes this).
+  - searchRaw:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryVectorService/HybridSearch"
+            json_body: >-
+              ${ {
+                query_vectors: [ { values: $query_vector } ],
+                query_text: $workflow.input.query,
+                options: {
+                  limit: ($workflow.input.limit_per_layer // 5),
+                  filter: { user_id: "1" }
+                }
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          raw_hits: ${ (.jsonBody // "[]") | fromjson }
+
+  # Step 4: Project both layers into the compact { source_kind,
+  # memory_id, source_thread_id, period_key, scope_key, snippet, score }
+  # shape the chat command surfaces in `chat://step` Source events
+  # (FR-CHAT-4b). source_kind is derived from `externalId` — the
+  # summaries pipeline (thread-summary-single / daily / weekly /
+  # monthly) always sets it on the memory it writes. Field names use
+  # protobuf JSON's lowerCamelCase because the GRPC runner emits the
+  # response via `prost`'s JSON serializer (matches `data.updatedAt`
+  # access in thread-summary-single.yaml).
+  - projectHits:
+      set:
+        sources: >-
+          ${ ([ $summary_hits[]
+                | . as $h
+                | ($h.memory.data.externalId // "") as $ext
+                | {
+                    source_kind: (
+                      if   ($ext | startswith("summary:")) then "thread_summary"
+                      elif ($ext | startswith("daily:"))   then "period_summary"
+                      elif ($ext | startswith("weekly:"))  then "period_summary"
+                      elif ($ext | startswith("monthly:")) then "period_summary"
+                      else "thread_summary"
+                      end
+                    ),
+                    memory_id: $h.memory.id.value,
+                    source_thread_id: (
+                      if ($ext | startswith("summary:"))
+                      then ($ext | sub("^summary:"; ""))
+                      else null
+                      end
+                    ),
+                    period_key: (
+                      ($ext | capture("^(?<k>daily|weekly|monthly):(?<p>[^:]+):")
+                            | .p) // null
+                    ),
+                    scope_key: (
+                      ($ext | capture(":(?<s>[^:]+)$") | .s) // null
+                    ),
+                    snippet: ($h.memory.data.content // "" | .[0:300]),
+                    score: $h.score
+                  }
+              ]
+              + [ $raw_hits[]
+                  | {
+                      source_kind: "raw_memory",
+                      memory_id: .memory.id.value,
+                      source_thread_id: ((.threadId // {}).value // null),
+                      period_key: null,
+                      scope_key: null,
+                      snippet: (.memory.data.content // "" | .[0:300]),
+                      score: .score
+                    }
+                ])
+           }
+      export:
+        as:
+          # Quoted because the jq expression contains a flow-style `{...}`
+          # whose inner `sources:` would otherwise be parsed as a nested
+          # YAML mapping ("mapping values are not allowed here").
+          result: "${ { sources: $sources } }"

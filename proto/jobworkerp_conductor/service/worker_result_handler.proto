@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.service;
+
+import "jobworkerp_conductor/data/worker_result_handler.proto";
+import "jobworkerp_conductor/service/common.proto";
+
+// Worker result handler creation response
+// Response message returning the ID of newly created handler
+message CreateWorkerResultHandlerResponse {
+  jobworkerp_conductor.data.WorkerResultHandlerId id = 1;                         // Generated handler ID
+}
+
+// Worker result handler optional response
+// Response message returning single handler information (null if not exists)
+message OptionalWorkerResultHandlerResponse {
+  optional jobworkerp_conductor.data.WorkerResultHandler data = 1;                // Handler data (optional)
+}
+
+// Worker result handler management service
+// Provides full CRUD operations for handlers that monitor worker execution results and execute subsequent workflows upon completion
+service WorkerResultHandlerService {
+  // Create a new worker result handler
+  rpc Create(jobworkerp_conductor.data.WorkerResultHandlerData)
+      returns (CreateWorkerResultHandlerResponse);
+
+  // Update an existing worker result handler
+  rpc Update(jobworkerp_conductor.data.WorkerResultHandler)
+      returns (jobworkerp_conductor.service.SuccessResponse);
+
+  // Delete a worker result handler
+  rpc Delete(jobworkerp_conductor.data.WorkerResultHandlerId)
+      returns (jobworkerp_conductor.service.SuccessResponse);
+
+  // Find a worker result handler by ID
+  rpc Find(jobworkerp_conductor.data.WorkerResultHandlerId)
+      returns (OptionalWorkerResultHandlerResponse);
+
+  // Find a worker result handler by name
+  rpc FindByName(jobworkerp_conductor.service.FindByNameRequest)
+      returns (OptionalWorkerResultHandlerResponse);
+
+  // Get list of worker result handlers (streaming)
+  rpc FindList(jobworkerp_conductor.service.FindListRequest)
+      returns (stream jobworkerp_conductor.data.WorkerResultHandler);
+
+  // Get total count of worker result handlers
+  rpc Count(jobworkerp_conductor.service.FindCondition)
+      returns (jobworkerp_conductor.service.CountResponse);
+}

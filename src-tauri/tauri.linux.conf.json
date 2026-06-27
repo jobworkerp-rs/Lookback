@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "plugins/*.so": "plugins/",
+      "plugins/*.so.*": "plugins/",
+      "../workers/": "workers/",
+      "../dict/": "dict/"
+    }
+  }
+}

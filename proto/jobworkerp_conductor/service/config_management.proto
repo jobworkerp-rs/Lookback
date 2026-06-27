@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.service;
+
+import "jobworkerp_conductor/service/common.proto";
+import "google/protobuf/empty.proto";
+
+// TOML configuration import request (with validation options)
+// Request message for importing workflows.toml file content into the system
+message ImportTomlRequest {
+    string toml_content = 1;                                    // TOML file content string
+    bool overwrite_existing = 2;                                // Flag to allow overwriting existing data
+    bool validate_only = 3;                                     // Validation-only mode (do not actually import)
+}
+
+// TOML configuration import response (with detailed results)
+// Response message returning import processing results and statistics
+message ImportTomlResponse {
+    bool is_success = 1;                                        // Import success/failure flag
+    string message = 2;                                         // Processing result message
+    int32 imported_servers = 3;                                 // Number of imported servers
+    int32 imported_schedulers = 4;                              // Number of imported schedulers
+    int32 imported_listeners = 5;                               // Number of imported listeners
+    repeated string validation_errors = 6;                      // Detailed validation error message list
+}
+
+// TOML configuration export request (with filtering options)
+// Request message for outputting system configuration in TOML file format
+message ExportTomlRequest {
+    bool enabled_only = 1;                                      // Export only enabled configurations
+}
+
+// TOML configuration export response (with export statistics)
+// Response message returning export processing results and TOML file content
+message ExportTomlResponse {
+    bool is_success = 1;                                        // Export success/failure flag
+    string message = 2;                                         // Processing result message
+    string toml_content = 3;                                    // Generated TOML file content
+}
+
+// Configuration error types (for detailed error reporting)
+// Defines types of errors that may occur during TOML configuration processing
+enum ConfigErrorType {
+    INVALID_TOML_FORMAT = 0;                                   // Invalid TOML format
+    DUPLICATE_NAME = 1;                                        // Duplicate name
+    INVALID_ADDRESS_FORMAT = 2;                                // Invalid address format
+    MISSING_REQUIRED_FIELD = 3;                                // Missing required field
+    DATABASE_CONSTRAINT_VIOLATION = 4;                         // Database constraint violation
+}
+
+// Structured configuration error
+// Message for structured representation of error details
+message ConfigError {
+    ConfigErrorType error_type = 1;                            // Error type
+    string message = 2;                                        // Error message
+    string field_name = 3;                                     // Field name where error occurred
+    string field_value = 4;                                    // Field value where error occurred
+}
+
+// Configuration management service for TOML import/export
+// Provides workflows.toml file read/write/validation functionality
+service ConfigManagementService {
+    // Import TOML configuration
+    rpc ImportToml(ImportTomlRequest) returns (ImportTomlResponse);
+
+    // Export TOML configuration
+    rpc ExportToml(ExportTomlRequest) returns (ExportTomlResponse);
+
+    // Clear all configurations (for cleanup before import)
+    rpc ClearAllConfigs(google.protobuf.Empty) returns (jobworkerp_conductor.service.SuccessResponse);
+
+    // Validate configuration without importing
+    rpc ValidateConfig(ImportTomlRequest) returns (ImportTomlResponse);
+}
