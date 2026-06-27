@@ -1,0 +1,283 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: summaries-pipeline
+  version: "1.0.0"
+
+# Chains per-thread → daily → weekly → monthly summary batches sequentially,
+# each gated by a `run_<kind>` flag. Stages are sequential (not forked)
+# because they all funnel into the single-slot `memories-llm` channel, so a
+# fork would only serialize on the LLM slot while inflating timeout risk.
+#
+# Failure handling per stage: the child batch never raises (it catches
+# per-item failures and returns counts). The WORKFLOW runner returns the
+# child's `output.as` JSON as a string in WorkflowResult.output, so the parent
+# parses it once into `<kind>_result`. FATAL (every attempted item failed:
+# processed > 0, succeeded == 0) raises to fault the pipeline and stop the
+# chain; PARTIAL (some succeeded) and SKIP (nothing to do) fall through to the
+# next stage so produced summaries are kept.
+
+input:
+  schema:
+    document:
+      type: object
+      required:
+        - per_thread_batch_yaml
+        - daily_batch_yaml
+        - weekly_batch_yaml
+        - monthly_batch_yaml
+      properties:
+        # ---- output language ----
+        # Forwarded into every child batch so each resolves the matching
+        # `memories-<feature>-single-<lang>` worker. The child batches own the
+        # single-worker name resolution now (the old `*_single_yaml` path relay
+        # is gone). `enum` keeps an unsupported value from reaching a worker
+        # that was never registered.
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+
+        # ---- stage gates ----
+        run_per_thread: { type: boolean, default: false }
+        run_daily: { type: boolean, default: false }
+        run_weekly: { type: boolean, default: false }
+        run_monthly: { type: boolean, default: false }
+
+        # ---- per-thread range (epoch ms; omit = unbounded) ----
+        # No `default`: an absent field stays null so the `== null` guards
+        # below drop it from the child input (parity with thread-summary-batch).
+        updated_after_ms: { type: integer, minimum: 0 }
+        updated_before_ms: { type: integer, minimum: 0 }
+
+        # ---- period ranges (granularity tokens; "" = no range / fallback) ----
+        daily_start: { type: string, default: "" }
+        daily_end: { type: string, default: "" }
+        weekly_start: { type: string, default: "" }
+        weekly_end: { type: string, default: "" }
+        monthly_start: { type: string, default: "" }
+        monthly_end: { type: string, default: "" }
+
+        # ---- shared ----
+        # Day-boundary tz for the period single workflows (range expansion is
+        # UTC-only and ignores it).
+        timezone_offset_hours: { type: integer, default: 9 }
+        user_id: { type: integer, default: 1 }
+        summary_user_id: { type: integer, default: 100000 }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name:
+          type: string
+          default: "memories-llm"
+          description: >-
+            Named worker that handles LLM completion in all downstream
+            stages. Forwarded to per-thread / daily / weekly / monthly
+            batches so they can route LLM calls to a non-default worker.
+
+        # ---- child workflow YAML paths (resolved by Rust pipeline_input) ----
+        # The source→output labels (summary/daily_summary/...) are left to each
+        # period batch's schema defaults so they stay defined in one place.
+        # Only the `*_batch_yaml` paths are relayed now — each batch resolves its
+        # own `*-single-<lang>` worker by name from `output_language`.
+        per_thread_batch_yaml: { type: string }
+        daily_batch_yaml: { type: string }
+        weekly_batch_yaml: { type: string }
+        monthly_batch_yaml: { type: string }
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  # Initialize the per-stage results so `output.as` can reference them even
+  # when a stage is gated off. An `if: false` stage never runs its `export`,
+  # leaving the variable unbound — and an unbound `$var` is a jq COMPILE error
+  # (not caught by `// null`), which would fail the whole pipeline at the final
+  # output evaluation despite the executed stages succeeding.
+  - initResults:
+      set:
+        per_thread_result: "${ null }"
+        daily_result: "${ null }"
+        weekly_result: "${ null }"
+        monthly_result: "${ null }"
+
+  # ===================== Stage 1: per-thread summary =====================
+  - perThreadStage:
+      if: "${ $workflow.input.run_per_thread }"
+      do:
+        - runPerThreadBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                runnerName: WORKFLOW
+                settings:
+                  workflow_url: "${ $workflow.input.per_thread_batch_yaml }"
+                options:
+                  channel: llm_batch
+                arguments:
+                  input: >-
+                    ${ ({
+                      user_id: $workflow.input.user_id,
+                      memories_grpc_host: $workflow.input.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.llm_worker_name,
+                      output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                      summary_user_id: $workflow.input.summary_user_id,
+                      updated_after_ms: $workflow.input.updated_after_ms,
+                      updated_before_ms: $workflow.input.updated_before_ms
+                    }
+                    | if $workflow.input.updated_after_ms == null then del(.updated_after_ms) else . end
+                    | if $workflow.input.updated_before_ms == null then del(.updated_before_ms) else . end
+                    | tojson) }
+            export:
+              as:
+                per_thread_result: "${ .output | fromjson }"
+        - perThreadFatalCheck:
+            if: >-
+              ${ ($per_thread_result.processed_threads // 0) > 0
+                 and ($per_thread_result.succeeded_count // 0) == 0
+                 and ($per_thread_result.failed_count // 0) > 0 }
+            raise:
+              error:
+                type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+                status: 500
+                title: "per-thread summary stage failed entirely"
+                detail: "all per-thread summaries failed; aborting before daily"
+
+  # ========================= Stage 2: daily =============================
+  - dailyStage:
+      if: "${ $workflow.input.run_daily }"
+      do:
+        - runDailyBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                runnerName: WORKFLOW
+                settings:
+                  workflow_url: "${ $workflow.input.daily_batch_yaml }"
+                options:
+                  channel: llm_batch
+                arguments:
+                  input: >-
+                    ${ {
+                      source_user_id: $workflow.input.summary_user_id,
+                      output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                      start_date: $workflow.input.daily_start,
+                      end_date: $workflow.input.daily_end,
+                      timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                      memories_grpc_host: $workflow.input.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.llm_worker_name
+                    } | tojson }
+            export:
+              as:
+                daily_result: "${ .output | fromjson }"
+        - dailyFatalCheck:
+            if: >-
+              ${ ($daily_result.processed_dates // 0) > 0
+                 and ($daily_result.succeeded_count // 0) == 0
+                 and ($daily_result.failed_count // 0) > 0 }
+            raise:
+              error:
+                type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+                status: 500
+                title: "daily summary stage failed entirely"
+                detail: "all daily summaries failed; aborting before weekly"
+
+  # ========================= Stage 3: weekly ============================
+  - weeklyStage:
+      if: "${ $workflow.input.run_weekly }"
+      do:
+        - runWeeklyBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                runnerName: WORKFLOW
+                settings:
+                  workflow_url: "${ $workflow.input.weekly_batch_yaml }"
+                options:
+                  channel: llm_batch
+                arguments:
+                  input: >-
+                    ${ {
+                      source_user_id: $workflow.input.summary_user_id,
+                      output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                      start_week: $workflow.input.weekly_start,
+                      end_week: $workflow.input.weekly_end,
+                      timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                      memories_grpc_host: $workflow.input.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.llm_worker_name
+                    } | tojson }
+            export:
+              as:
+                weekly_result: "${ .output | fromjson }"
+        - weeklyFatalCheck:
+            if: >-
+              ${ ($weekly_result.processed_weeks // 0) > 0
+                 and ($weekly_result.succeeded_count // 0) == 0
+                 and ($weekly_result.failed_count // 0) > 0 }
+            raise:
+              error:
+                type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+                status: 500
+                title: "weekly summary stage failed entirely"
+                detail: "all weekly summaries failed; aborting before monthly"
+
+  # ========================= Stage 4: monthly ===========================
+  - monthlyStage:
+      if: "${ $workflow.input.run_monthly }"
+      do:
+        - runMonthlyBatch:
+            timeout:
+              after:
+                hours: 24
+            run:
+              function:
+                runnerName: WORKFLOW
+                settings:
+                  workflow_url: "${ $workflow.input.monthly_batch_yaml }"
+                options:
+                  channel: llm_batch
+                arguments:
+                  input: >-
+                    ${ {
+                      source_user_id: $workflow.input.summary_user_id,
+                      output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                      start_month: $workflow.input.monthly_start,
+                      end_month: $workflow.input.monthly_end,
+                      timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                      memories_grpc_host: $workflow.input.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.llm_worker_name
+                    } | tojson }
+            export:
+              as:
+                monthly_result: "${ .output | fromjson }"
+        - monthlyFatalCheck:
+            if: >-
+              ${ ($monthly_result.processed_months // 0) > 0
+                 and ($monthly_result.succeeded_count // 0) == 0
+                 and ($monthly_result.failed_count // 0) > 0 }
+            raise:
+              error:
+                type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+                status: 500
+                title: "monthly summary stage failed entirely"
+                detail: "all monthly summaries failed"
+
+output:
+  as:
+    completed: true
+    per_thread: "${ $per_thread_result }"
+    daily: "${ $daily_result }"
+    weekly: "${ $weekly_result }"
+    monthly: "${ $monthly_result }"

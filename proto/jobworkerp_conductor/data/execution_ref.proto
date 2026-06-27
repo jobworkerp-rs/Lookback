@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.data;
+
+import "jobworkerp_conductor/data/jobworkerp_server.proto";
+
+// Source type for a conductor-triggered jobworkerp execution.
+enum ExecutionSourceType {
+  EXECUTION_SOURCE_TYPE_UNSPECIFIED = 0;
+  EXECUTION_SOURCE_TYPE_CRON_SCHEDULER = 1;
+  EXECUTION_SOURCE_TYPE_SLACK_EVENT_HANDLER = 2;
+  EXECUTION_SOURCE_TYPE_WORKER_RESULT_HANDLER = 3;
+}
+
+// Runtime status resolved from jobworkerp at read time.
+enum ResolvedExecutionStatus {
+  RESOLVED_EXECUTION_STATUS_UNSPECIFIED = 0;
+  RESOLVED_EXECUTION_STATUS_PENDING = 1;
+  RESOLVED_EXECUTION_STATUS_RUNNING = 2;
+  RESOLVED_EXECUTION_STATUS_WAIT_RESULT = 3;
+  RESOLVED_EXECUTION_STATUS_CANCELLING = 4;
+  RESOLVED_EXECUTION_STATUS_SUCCEEDED = 5;
+  RESOLVED_EXECUTION_STATUS_FAILED = 6;
+  RESOLVED_EXECUTION_STATUS_CANCELLED = 7;
+  RESOLVED_EXECUTION_STATUS_UNKNOWN = 8;
+  RESOLVED_EXECUTION_STATUS_UNAVAILABLE = 9;
+  RESOLVED_EXECUTION_STATUS_ENQUEUE_FAILED = 10;
+}
+
+// Source used to resolve the runtime status.
+enum ExecutionStatusSource {
+  EXECUTION_STATUS_SOURCE_UNSPECIFIED = 0;
+  EXECUTION_STATUS_SOURCE_JOB_PROCESSING_STATUS = 1;
+  EXECUTION_STATUS_SOURCE_JOB_RESULT = 2;
+  EXECUTION_STATUS_SOURCE_EXECUTION_REF = 3;
+  EXECUTION_STATUS_SOURCE_UNAVAILABLE = 4;
+}
+
+message ExecutionRefId { int64 value = 1; }
+
+// Conductor-side correlation record for a jobworkerp job.
+message ExecutionRef {
+  ExecutionRefId id = 1;
+  ExecutionSourceType source_type = 2;
+  int64 source_id = 3;
+  string source_name = 4;
+  JobworkerpServerId jobworkerp_server_id = 5;
+  optional int64 job_id = 6;
+  int64 triggered_at = 7;
+  optional string trigger_context_json = 8;
+  optional string enqueue_error = 9;
+  int64 created_at = 10;
+  // Terminal jobworkerp ResultStatus observed at execution time. Recorded because a finished
+  // job may leave no persisted JobResult (worker store_failure=false, or a cancelled PENDING
+  // job), in which case the read-time status lookup cannot tell success from failure on its
+  // own. Absent for enqueue failures and for executions recorded before this field existed.
+  optional int32 result_status = 11;
+}
+
+message ExecutionRuntimeStatus {
+  ExecutionRef execution_ref = 1;
+  ResolvedExecutionStatus resolved_status = 2;
+  ExecutionStatusSource status_source = 3;
+  int64 observed_at = 4;
+  optional string detail = 5;
+}

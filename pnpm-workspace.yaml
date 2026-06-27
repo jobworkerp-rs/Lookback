@@ -1,0 +1,10 @@
+# pnpm settings. Since pnpm v11 the `pnpm` field in package.json is no longer
+# read; package-level settings live here instead.
+#
+# `.npmrc` sets ignore-scripts=true (supply-chain hardening), which makes pnpm
+# skip every dependency's build script. esbuild needs its postinstall to place
+# its native binary, and vite depends on esbuild — so allow just esbuild's build
+# (a clean install otherwise fails with ERR_PNPM_IGNORED_BUILDS). `allowBuilds`
+# is the pnpm v11 setting that replaces onlyBuiltDependencies.
+allowBuilds:
+  esbuild: true

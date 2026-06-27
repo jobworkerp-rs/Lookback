@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.data;
+
+import "jobworkerp_conductor/data/jobworkerp_server.proto";
+import "jobworkerp_conductor/data/common.proto";
+
+// Reaction operation type enum
+enum ReactionOperation {
+  REACTION_OPERATION_UNSPECIFIED = 0;  // Not specified
+  REACTION_OPERATION_ADDED = 1;        // Only reaction_added events
+  REACTION_OPERATION_REMOVED = 2;      // Only reaction_removed events
+  REACTION_OPERATION_BOTH = 3;         // Both reaction_added and reaction_removed events
+}
+
+// Slack event handler data model
+// Configuration for dynamically handling Slack events (message, app_mention, reaction_added/removed)
+// and executing workflows based on matching conditions
+message SlackEventHandlerData {
+  // Basic information
+  string name = 1;                          // Handler name (unique identifier)
+  string description = 2;                   // Handler description (empty string = no description)
+  bool enabled = 3;                         // Enabled/disabled state (default: false)
+
+  // Common conditions
+  optional string slack_channel_id = 4;     // Target Slack channel ID (default: all channels)
+
+  // Message event conditions
+  optional string message_pattern = 5;      // Message content regex pattern (default: no pattern matching)
+  bool mention_required = 6;                // Mention required flag (default: false = not required)
+
+  // Reaction event conditions
+  optional string reaction_names = 7;            // Target reaction names (comma-separated, default: all reactions)
+  ReactionOperation reaction_operation = 8;      // Reaction operation filter (default: UNSPECIFIED)
+  optional string reaction_user_filter = 9;      // Reaction user filter (regex, default: all users)
+
+  // Workflow execution settings
+  JobworkerpServerId jobworkerp_server_id = 10; // Target jobworkerp server ID (typed ID)
+  string workflow_url = 11;                     // DEPRECATED: backward compat only (use execution_target)
+  string channel = 12;                          // DEPRECATED: backward compat only (use execution_target)
+  optional int32 timeout_sec = 13;              // Job timeout in seconds (default: 3600 = 1 hour)
+  optional string args = 14;                    // Additional arguments (JSON format, empty string = no args)
+
+  // Metadata
+  int64 created_at = 15;                    // Creation timestamp (Unix timestamp in seconds)
+  int64 updated_at = 16;                    // Update timestamp (Unix timestamp in seconds)
+
+  // Execution target (mutually exclusive with deprecated fields 11/12)
+  oneof execution_target {
+    WorkflowExecution workflow = 17;   // URL execution mode (WORKFLOW runner only)
+    WorkerExecution worker = 18;       // Worker execution mode (any runner type)
+  }
+}
+
+// Unique ID for Slack event handler
+message SlackEventHandlerId {
+  int64 value = 1;
+}
+
+// Full data model for Slack event handler entity
+// Completely represents handler information through combination of ID + data
+message SlackEventHandler {
+  SlackEventHandlerId id = 1;               // Unique ID
+  SlackEventHandlerData data = 2;           // Handler data
+}
+
+// Event execution log (for future extension)
+message SlackEventLog {
+  int64 id = 1;
+  int64 handler_id = 2;
+  string event_type = 3;
+  string slack_channel_id = 4;
+  string event_payload = 5;                 // JSON string
+  optional int64 job_id = 6;
+  bool success = 7;
+  optional string error_message = 8;
+  int64 created_at = 9;                     // Creation timestamp (Unix timestamp in seconds)
+}

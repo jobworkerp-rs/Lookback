@@ -1,0 +1,269 @@
+syntax = "proto3";
+
+package jobworkerp.service;
+
+import "jobworkerp/data/common.proto";
+import "jobworkerp/data/job_result.proto";
+import "jobworkerp/data/worker.proto";
+import "jobworkerp/data/job.proto";
+import "jobworkerp/service/common.proto";
+
+
+message CreateJobResponse {
+  jobworkerp.data.JobId id = 1; // generated id
+  optional jobworkerp.data.JobResult result =
+      2; // direct job result worker only
+}
+
+message OptionalJobResponse { optional jobworkerp.data.Job data = 1; }
+
+message JobRequest {
+  // worker to execute (specified by id or name)
+  oneof worker {
+    jobworkerp.data.WorkerId worker_id = 1;
+    string worker_name = 2;
+  }
+  // argument for the job(protobuf serialized)
+  bytes args = 3;
+  // prevent from registering the same keys job in queue at the same time
+  optional string uniq_key = 4;
+  // time to execute job (epoch milliseconds)(not specify 0 explicitly)
+  // job priority(high, medium, low)
+  optional int64 run_after_time = 5;
+  optional jobworkerp.data.Priority priority = 6;
+  // valid only for run_after or periodic worker jobs
+  optional uint64 timeout = 7;
+  // Runner implementation to use for MCP/Plugin runners
+  // - Optional: For normal runners (will be ignored)
+  // - Required: For multi-tool MCP runners
+  // - Auto-selected: When omitted for single-tool MCP runners
+  optional string using = 8;
+  // Per-job execution overrides (response_type, store_success, etc.)
+  // When present, these settings override the worker's defaults.
+  optional jobworkerp.data.JobExecutionOverrides overrides = 9;
+}
+
+// # Client Stream Request
+// Client-to-server message for client streaming.
+// The first message MUST contain `job_request`. Subsequent messages contain `feed_data`.
+message ClientStreamRequest {
+  oneof request {
+    // Initial message: job enqueue request (MUST be the first message)
+    JobRequest job_request = 1;
+
+    // Subsequent messages: feed data chunks using existing FeedDataTransport
+    jobworkerp.data.FeedDataTransport feed_data = 2;
+  }
+}
+
+service JobService {
+  rpc Enqueue(JobRequest) returns (CreateJobResponse);
+  // Direct response only, JobResult on metadata header of grpc response
+  // TODO Now support only for worker with storage_type: Scalable
+  rpc EnqueueForStream(JobRequest)
+      returns (stream jobworkerp.data.ResultOutputItem);
+
+  // Client streaming with server streaming response.
+  // Client sends initial job request followed by feed data chunks.
+  // streaming_type is fixed to Response (Internal is for internal workflow use only).
+  // Server response behavior depends on worker's response_type:
+  //   - Response + Direct: Returns streaming results (ResultOutputItem) as bidirectional stream
+  //   - Response + NoResult: Feed-only stream; results available via ListenStream
+  //
+  // broadcast_results=true is required when response_type=NoResult.
+  rpc EnqueueWithClientStream(stream ClientStreamRequest)
+      returns (stream jobworkerp.data.ResultOutputItem);
+
+  // Delete/Cancel job
+  //
+  // - Before execution (PENDING): Deletes the job from queue (no JobResult created)
+  // - During/After execution (RUNNING, WAIT_RESULT): Cancels the job and generates JobResult with CANCELLED status
+  //
+  // Note: Job records are always deleted after execution. JobResult records remain for audit purposes.
+  rpc Delete(jobworkerp.data.JobId) returns (SuccessResponse);
+
+  // only use db or redis+db queue type, run after or periodic worker jobs
+  rpc Find(jobworkerp.data.JobId) returns (OptionalJobResponse);
+  // only use db or redis+db queue type, run after or periodic worker jobs
+  rpc FindList(FindListRequest) returns (stream jobworkerp.data.Job);
+  rpc FindQueueList(FindQueueListRequest) returns (stream JobAndStatus);
+  // find jobs by processing status (Pending, Running, WaitResult, Cancelling)
+  rpc FindListWithProcessingStatus(FindListWithProcessingStatusRequest) returns (stream JobAndStatus);
+  rpc Count(CountCondition) returns (CountResponse);
+}
+
+message FindQueueListRequest {
+  optional int32 limit = 1;
+  optional string channel = 2;
+}
+
+message FindListWithProcessingStatusRequest {
+  jobworkerp.data.JobProcessingStatus status = 1;
+  optional int32 limit = 2;
+}
+
+message JobAndStatus {
+  jobworkerp.data.Job job = 1;
+  optional jobworkerp.data.JobProcessingStatus status = 2;
+}
+
+message JobProcessingStatusResponse {
+  jobworkerp.data.JobId id = 1;
+  jobworkerp.data.JobProcessingStatus status = 2;
+}
+
+message OptionalJobProcessingStatusResponse {
+  optional jobworkerp.data.JobProcessingStatus status = 1;
+}
+
+message FindJobProcessingStatusRequest {
+  // Status filter
+  optional jobworkerp.data.JobProcessingStatus status = 1;
+
+  // Worker ID filter
+  optional int64 worker_id = 2;
+
+  // Channel filter
+  optional string channel = 3;
+
+  // Long-running job filter (milliseconds)
+  // Example: 600000 (10 minutes) to filter jobs running for more than 10 minutes
+  optional int64 min_elapsed_time_ms = 4;
+
+  // Pagination
+  optional int32 limit = 5;   // Default: 100, Max: 1000
+  optional int32 offset = 6;  // Default: 0
+
+  // Sort order
+  optional bool descending = 7;  // Default: true (newest first)
+}
+
+message JobProcessingStatusDetailResponse {
+  jobworkerp.data.JobId id = 1;
+  jobworkerp.data.JobProcessingStatus status = 2;
+  int64 worker_id = 3;
+  string channel = 4;
+  int32 priority = 5;
+  int64 enqueue_time = 6;
+  optional int64 start_time = 7;
+  optional int64 pending_time = 8;
+  optional bool is_streamable = 9;
+  optional bool broadcast_results = 10;
+  int64 updated_at = 11;  // Last RDB update time (for detecting sync delay)
+}
+
+// Cleanup request message
+message CleanupRequest {
+  // Optional: Override default retention hours (for testing purposes)
+  // If not set, uses JOB_STATUS_RETENTION_HOURS from environment
+  optional uint64 retention_hours_override = 1;
+}
+
+// Cleanup response message
+message CleanupResponse {
+  // Number of records deleted
+  uint64 deleted_count = 1;
+
+  // Cutoff timestamp used for deletion (milliseconds since epoch)
+  int64 cutoff_time = 2;
+
+  // Human-readable message
+  string message = 3;
+}
+
+// Purge stale job processing status records
+message PurgeStaleJobsRequest {
+  // Stale threshold in hours: records with updated_at older than this are candidates
+  uint64 stale_threshold_hours = 1;
+
+  // When true, only purge stale RDB index rows whose job is no longer
+  // referenced by either the live JobProcessingStatusRepository (Redis/Memory)
+  // or the `job` table. The live status repository is the source of truth for
+  // normal jobs; the `job` table is the SoT for queue types that don't keep a
+  // live status entry (DbOnly, periodic, future run_after). A row is orphan
+  // only when both sources have let go of the job_id, so still-queued or
+  // long-running jobs are preserved.
+  //
+  // When false (default), purge all stale records in bulk regardless of
+  // source-of-truth state.
+  optional bool orphaned_only = 2;
+}
+
+// Response for PurgeStaleJobs
+message PurgeStaleJobsResponse {
+  // Number of records marked as deleted
+  uint64 marked_count = 1;
+
+  // Cutoff timestamp used for stale detection (milliseconds since epoch)
+  int64 cutoff_time = 2;
+
+  // Human-readable message
+  string message = 3;
+}
+
+service JobProcessingStatusService {
+  rpc Find(jobworkerp.data.JobId) returns (OptionalJobProcessingStatusResponse);
+  rpc FindAll(jobworkerp.data.Empty) returns (stream JobProcessingStatusResponse);
+
+  // Advanced search using RDB index
+  // Returns UNIMPLEMENTED error if JOB_STATUS_RDB_INDEXING=false
+  rpc FindByCondition(FindJobProcessingStatusRequest)
+      returns (stream JobProcessingStatusDetailResponse);
+
+  // Cleanup logically deleted records from job_processing_status table
+  //
+  // This operation physically deletes records marked as deleted (deleted_at IS NOT NULL)
+  // that are older than JOB_STATUS_RETENTION_HOURS (default: 24 hours).
+  //
+  // Requirements:
+  // - JOB_STATUS_RDB_INDEXING=true (returns FAILED_PRECONDITION if disabled)
+  // - AUTH_TOKEN environment variable must match jobworkerp-auth header (if set)
+  //
+  // Returns:
+  // - deleted_count: Number of deleted records
+  // - cutoff_time: Timestamp used for deletion cutoff (milliseconds since epoch)
+  //
+  // Errors:
+  // - UNAUTHENTICATED: Missing or invalid AUTH_TOKEN (if AUTH_TOKEN env is set)
+  // - FAILED_PRECONDITION: JOB_STATUS_RDB_INDEXING is disabled
+  // - INTERNAL: Database error during cleanup
+  rpc Cleanup(CleanupRequest) returns (CleanupResponse);
+
+  // Purge stale job processing status records
+  //
+  // Marks stale records (deleted_at IS NULL, updated_at older than threshold) as logically deleted.
+  // Records whose job has a future run_after_time are excluded.
+  //
+  // Modes:
+  // - orphaned_only=false (default): Purges all stale records in bulk.
+  // - orphaned_only=true: Purges stale records whose job_id is absent from BOTH the live JobProcessingStatusRepository (Redis/Memory) AND the `job` table.
+  //
+  // Redis/Memory is the source of truth for live job processing state; the
+  // `job` table is the SoT for queue types without a live-status entry
+  // (DbOnly, periodic, future run_after). The RDB `job_processing_status`
+  // table is an eventually-consistent search view that may lag. The
+  // orphaned_only=true mode is intended to sweep leftover index rows when
+  // `cleanup_job`'s best-effort `mark_deleted_by_job_id` write failed
+  // (terminal state, no self-healing).
+  //
+  // Requirements:
+  // - JOB_STATUS_RDB_INDEXING=true (returns FAILED_PRECONDITION if disabled)
+  // - AUTH_TOKEN environment variable must match jobworkerp-auth header (if set)
+  // - stale_threshold_hours must be > 0 (returns INVALID_ARGUMENT if 0)
+  rpc PurgeStaleJobs(PurgeStaleJobsRequest) returns (PurgeStaleJobsResponse);
+}
+
+message JobRestoreRequest {
+  // restore jobs includes grabbed to run process (maybe run twice or more)
+  optional bool include_grabbed = 1;
+  optional int32 limit = 2;
+}
+
+// [for Scalable storage only] restore jobs from rdb to redis
+// (for lost job insident in redis)
+// (except for periodic jobs and jobs with run_after_time)
+service JobRestoreService {
+  rpc Restore(JobRestoreRequest) returns (SuccessResponse);
+  // find all jobs to restore
+  rpc FindAll(JobRestoreRequest) returns (stream jobworkerp.data.Job);
+}

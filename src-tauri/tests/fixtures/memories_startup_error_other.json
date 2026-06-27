@@ -1,0 +1,1 @@
+{"timestamp":"2026-06-05T07:50:50.976570Z","level":"ERROR","fields":{"code":"other","component":"front","message":"unexpected error: foo"},"target":"app::startup_error"}

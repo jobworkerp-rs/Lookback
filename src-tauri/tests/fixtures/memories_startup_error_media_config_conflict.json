@@ -1,0 +1,1 @@
+{"timestamp":"2026-06-05T07:50:50.976570Z","level":"ERROR","fields":{"message":"MEDIA_STORAGE_BACKEND incompatible with MEMORY_IMAGE_SEARCH_MODE","code":"media_config_conflict","backend":"inline","image_search_mode":"clip"},"target":"app::startup_error"}

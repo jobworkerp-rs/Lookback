@@ -1,0 +1,278 @@
+# LLM worker definitions for Lookback Tauri MVP (Phase C / IMPL-1).
+#
+# Registered at sidecar startup via `jobworkerp-client worker apply`
+# (see agent-app/src-tauri/src/workers/mod.rs). The thread-summary /
+# thread-personality / thread-reflection / user-personality-merge
+# workflows all invoke this worker by name (`workerName: memories-llm`)
+# instead of carrying inline `runnerName: LLM` + `settings.ollama`
+# blocks, so the LLM back-end can be swapped centrally without editing
+# every workflow YAML.
+#
+# Channel layout (paired with jobworkerp env `WORKER_CHANNELS` /
+# `WORKER_CHANNEL_CONCURRENCIES` in lifecycle.rs):
+#
+#   llm           — concurrency 1. The actual LLMPromptRunner jobs
+#                   live here so only one job at a time touches the
+#                   GPU / model memory.
+#   llm_workflow  — concurrency 1. WORKFLOW workers that *contain*
+#                   LLM steps (thread-summary-single etc.) run on
+#                   this channel so the parent workflow does not
+#                   occupy the same `llm` slot that its child LLM job
+#                   needs (would otherwise deadlock).
+#   llm_batch     — concurrency 2. Batch workflows that fan out into
+#                   many `llm_workflow` jobs.
+#   llm_pipeline  — concurrency 1. The summaries-pipeline parent that
+#                   chains the per-thread/daily/weekly/monthly batches
+#                   sequentially. Separate channel from `llm_batch` so
+#                   it never competes for its children's slots.
+#   llm_periodic  — concurrency 1. Conductor-triggered Lookback periodic
+#                   wrapper. Serialized so scheduled runs do not stack up
+#                   and starve manual generation.
+#
+# `use_static: true` keeps the loaded model resident across jobs so
+# the second and later jobs avoid the multi-second cold-start cost.
+
+defaults:
+  response_type: DIRECT
+  store_failure: true
+  broadcast_results: false
+  retry_policy:
+    type: EXPONENTIAL
+    interval: 800
+    max_interval: 60000
+    max_retry: 0
+    basis: 2.0
+
+workers:
+  - name: memories-llm
+    description: "Local Lookback LLM for chat responses and generation steps in summary, reflection, and personality workflows."
+    runner: LLMPromptRunner
+    use_static: true
+    channel: llm
+    # Fields below map 1:1 to llama_cpp.LlamaRunnerSettings
+    # (llama-cpp-plugin/github/llama-protobuf/protobuf/llama_cpp/llama_cpp_runner.proto).
+    # Do NOT wrap in a `llama_cpp:` sub-block — that would be encoded as
+    # an unrecognized field and apply would fail.
+    settings:
+      # Default to Qwen3.6-27B (Unsloth GGUF, Q4_K_XL). Override via env
+      # (e.g. LOOKBACK_LLM_MODEL / LOOKBACK_LLM_HF_REPO) when the Tauri
+      # side resolves a different runtime selection.
+      model: "%{LOOKBACK_LLM_MODEL:-Qwen3.6-27B-UD-Q4_K_XL.gguf}"
+      hf_repo: "%{LOOKBACK_LLM_HF_REPO:-unsloth/Qwen3.6-27B-GGUF}"
+      # Qwen3.6-27B native context = 262144 tokens (HF model card). The
+      # reflection workflow's `context_limit_tokens: 222000` is the hard
+      # upper bound we have to cover, plus a few thousand for the
+      # model-side `max_tokens` output budget. Set just below the
+      # native limit so KV-cache RAM stays bounded; users on memory-tight
+      # machines can shrink via LOOKBACK_LLM_CTX_SIZE.
+      ctx_size: "%{LOOKBACK_LLM_CTX_SIZE:-262144}"
+      # --- KV cache optimization ---
+      # The chat path now runs a 2-hop agent loop (model hop → tool →
+      # model hop). Without these, each hop re-evaluates the full
+      # context (system prompt + history + tool result), so the
+      # second-turn time-to-first-token balloons.
+      #
+      # - `use_flash_attention: true` is the plugin's stated default;
+      #   pin it explicitly because `type_v` quantization REQUIRES it.
+      # - `type_k`/`type_v` default to Q4_0 because Lookback commonly runs
+      #   on 8-16GB-class VRAM/RAM where long-context KV cache dominates
+      #   memory. Settings can raise this to Q8_0 when quality/compatibility
+      #   is preferred over memory.
+      # - `reuse_kv_prefix: true` skips re-evaluating the shared
+      #   `system_prompt` + replayed conversation prefix on subsequent
+      #   hops. Output is bit-identical to a fresh clear (same KV
+      #   computation); a cache miss simply degrades to the default
+      #   full-eval path, so there's no determinism risk for summary /
+      #   reflection / personality jobs that share this worker.
+      use_flash_attention: true
+      type_k: %{LOOKBACK_LLM_KV_CACHE_TYPE:-KV_CACHE_TYPE_Q4_0}
+      type_v: %{LOOKBACK_LLM_KV_CACHE_TYPE:-KV_CACHE_TYPE_Q4_0}
+      # Quote-less: `%{...}` is string-substituted into the raw YAML
+      # BEFORE parsing (both by jobworkerp's apply path and by the
+      # Settings UI loader, which now also runs `expand_env`). Quoting
+      # would force a string scalar and the proto deserializer would
+      # reject "true"/"false" with "invalid type: string, expected a
+      # boolean" (string→bool coercion is not in proto-JSON; the
+      # uint32 coercion used by `ctx_size` is a separate path).
+      reuse_kv_prefix: %{LOOKBACK_REUSE_KV_PREFIX:-true}
+
+  # ---- external LLM worker (genai multi-provider) ----
+  #
+  # Registered alongside `memories-llm` at startup. When the user selects
+  # "External API" in Settings, all chat / workflow dispatches target this
+  # worker instead. Uses the built-in `LLM` runner (not the llama-cpp
+  # plugin), which auto-detects the provider from the model name via the
+  # rust-genai crate (gpt-* → OpenAI, claude-* → Anthropic, etc.).
+  #
+  # `channel: llm_external` (concurrency 4) — API-bound, not GPU-bound.
+  # The channel name + concurrency are registered together in
+  # `sidecar/lifecycle.rs` via `WORKER_CHANNELS` / `WORKER_CHANNEL_CONCURRENCIES`;
+  # keep them in sync (see workers/README.md channel table).
+  # `use_static: false` — no local model to keep resident.
+  - name: memories-llm-external
+    description: "External API LLM used for chat and generation workflows when External API is selected in Settings."
+    runner: LLM
+    use_static: false
+    channel: llm_external
+    settings:
+      genai:
+        model: "%{LOOKBACK_EXTERNAL_LLM_MODEL:-gpt-4o}"
+        # OpenAI-compatible proxy / custom endpoint URL. The upstream genai
+        # runner treats an empty string the same as "unset" (see
+        # app-wrapper/src/llm/{chat,completion}/genai.rs), so the env
+        # placeholder defaulting to "" cleanly preserves provider
+        # auto-detection (gpt-* → OpenAI, claude-* → Anthropic, …) when
+        # the user did not configure a base_url in Settings.
+        base_url: "%{LOOKBACK_EXTERNAL_LLM_BASE_URL:-}"
+
+  # ---- batch parents (streamed via JobworkerpHandle::dispatch_stream) ----
+  #
+  # `response_type: DIRECT` is REQUIRED: the Tauri side enqueues these via
+  # gRPC `enqueue_for_stream` and drains the result stream to await batch
+  # completion (and to surface per-step progress in the import toast). With
+  # `NO_RESULT` the server returns an empty stream immediately (see
+  # grpc-front job service / `app::job` response_type branch), so the drain
+  # finishes at once — the batch runs fire-and-forget, no progress reaches
+  # the UI, and the first LLM job (which triggers the GGUF model download)
+  # never gets awaited. `broadcast_results: true` is an independent channel
+  # (JobResultService/listen_*) and does NOT feed the enqueue_for_stream
+  # stream; kept for any future listen-based consumer.
+  #
+  # `channel: llm_batch` (concurrency 2 per `lifecycle.rs::WORKER_CHANNELS`)
+  # — child `*-single.yaml` workflows claim slots on `llm_workflow`
+  # (concurrency 1); see `agent-app/workers/README.md` for the
+  # parent-vs-child concurrency rule.
+
+  - name: memories-summarize-batch
+    description: "Summarizes selected conversation threads and creates or updates per-thread summary memories."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: llm_batch
+    settings:
+      workflow_data:
+        $file: workflows/thread-summary/thread-summary-batch.yaml
+
+  - name: memories-personality-batch
+    description: "Extracts user personality signals from selected conversation threads and optionally merges them into a profile."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: llm_batch
+    settings:
+      workflow_data:
+        $file: workflows/personality/thread-personality-batch.yaml
+
+  - name: memories-reflection-batch
+    description: "Reflects on selected conversation threads and creates or updates memories about intent, decisions, and lessons."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: llm_batch
+    settings:
+      workflow_data:
+        $file: workflows/thread-reflection/thread-reflection-batch.yaml
+
+  # ---- period (daily/weekly/monthly) work-summary batch parents ----
+  #
+  # Aggregate per-thread summaries into daily, then daily into weekly, then
+  # weekly into monthly (each layer reads the layer below — see the staged
+  # workflows under workflows/{daily,weekly,monthly}-work-summary/). Same
+  # `llm_batch` parent channel and DIRECT/broadcast contract as the batches
+  # above; their `*-single` children claim `llm_workflow` slots.
+
+  - name: memories-daily-summary-batch
+    description: "Aggregates thread summaries within a date range into daily work-summary memories."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: llm_batch
+    settings:
+      workflow_data:
+        $file: workflows/daily-work-summary/daily-work-summary-batch.yaml
+
+  - name: memories-weekly-summary-batch
+    description: "Aggregates daily summaries within a week range into weekly work-summary memories."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: llm_batch
+    settings:
+      workflow_data:
+        $file: workflows/weekly-work-summary/weekly-work-summary-batch.yaml
+
+  - name: memories-monthly-summary-batch
+    description: "Aggregates weekly summaries within a month range into monthly work-summary memories."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: llm_batch
+    settings:
+      workflow_data:
+        $file: workflows/monthly-work-summary/monthly-work-summary-batch.yaml
+
+  # ---- staged summaries pipeline parent ----
+  #
+  # Single entry point for the generate dialog's checkbox staging: chains
+  # per-thread → daily → weekly → monthly batches sequentially, each gated
+  # by a `run_<kind>` flag, with the lower layer's range derived from the
+  # top-most selected granularity (so a "weekly" run also produces the
+  # daily summaries weekly depends on). Stops on a *fatal* stage (every
+  # item failed) via `raise`; a partial success or a skip (nothing to do)
+  # lets the next stage run.
+  #
+  # `channel: llm_pipeline` (concurrency 1) keeps it OFF the `llm_batch`
+  # channel its children claim — sharing would deadlock (the parent holds
+  # the only batch slot while waiting for a child batch that can't start).
+  # DIRECT/broadcast contract identical to the batch parents above so the
+  # Tauri side can drain progress through enqueue_for_stream.
+  - name: memories-summaries-pipeline
+    description: "Runs the staged summary pipeline, generating thread, daily, weekly, and monthly summaries as requested."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: llm_pipeline
+    settings:
+      workflow_data:
+        $file: workflows/summaries-pipeline/summaries-pipeline.yaml
+
+  - name: memories-lookback-periodic-run
+    description: "Runs a configured Lookback periodic task from conductor CronScheduler."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: llm_periodic
+    settings:
+      workflow_data:
+        $file: workflows/lookback-periodic-run.yaml
+
+  # ---- RAG retrieval tool (PR1 of the RAG chat feature) ----
+  #
+  # `lookback_recall` is the single tool the chat LLM auto-calls (via
+  # function_options.is_auto_calling) to retrieve grounding from BOTH
+  # the summary layer (owner=100000, label LABEL_ANY) and the raw layer
+  # (user_id=1) in one shot. See specs/rag-chat-design.md DECIDE-CHAT-1.
+  #
+  # `channel: rag` (concurrency 2) is intentionally separate from `llm`
+  # (concurrency 1) — sharing would deadlock when the chat LLM holds
+  # its only slot waiting for the tool result that needs the same slot
+  # to run (DECIDE-CHAT-3). `response_type: DIRECT` because the chat
+  # LLM blocks on the tool's return value; `broadcast_results: false`
+  # because nobody listens externally (the chat workflow consumes the
+  # value through the function_calling path).
+  - name: lookback_recall
+    description: "RAG retrieval tool for Lookback memories; searches both summary and raw-message layers and returns grounded evidence."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: false
+    channel: rag
+    settings:
+      workflow_data:
+        $file: workflows/rag/lookback-recall.yaml
+
+# The RAG chat does NOT register a parent workflow worker. The
+# `dispatch_stream` over a WORKFLOW worker aggregates the inner LLM's
+# per-token chunks (only `execute_workflow_with_events` emits raw
+# `StreamingData`, and it isn't exposed over gRPC). Instead the Tauri
+# `chat_ask` command dispatches `memories-llm` directly with
+# `using: chat` + `function_options` per ARCH-CHAT-1 / DECIDE-CHAT-2.

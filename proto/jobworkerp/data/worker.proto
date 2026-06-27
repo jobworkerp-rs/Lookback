@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package jobworkerp.data;
+
+import "jobworkerp/data/common.proto";
+import "jobworkerp/data/runner.proto";
+
+// # Worker Data
+// Configuration for worker execution
+message WorkerData {
+  // # Worker Name
+  // Unique identifier for the worker
+  string name = 1;
+  // # Description
+  // Description of the worker
+  string description = 2;
+  // # Runner ID
+  // Reference to the runner implementation to use
+  jobworkerp.data.RunnerId runner_id = 3;
+  // # Runner Settings
+  // Configuration bytes for the specific runner (e.g. docker runner settings)
+  bytes runner_settings = 4;
+  // # Retry Policy
+  // Configuration for job retry behavior on failure
+  jobworkerp.data.RetryPolicy retry_policy = 5;
+  // # Periodic Interval
+  // Milliseconds between periodic job executions (0: non-periodic)
+  // If enabled, direct_response cannot be used
+  uint32 periodic_interval = 6;
+  // # Channel Name
+  // Message channel for job (if empty, default channel will be used)
+  optional string channel = 7;
+  // # Queue Type
+  // 0: normal (no backup to database)
+  // 1: with backup to database
+  // 2: only to database (not in memory queue)
+  jobworkerp.data.QueueType queue_type = 8;
+  // # Response Type
+  // 0: no result
+  // 1: direct response
+  jobworkerp.data.ResponseType response_type = 9;
+  // # Store Success Flag
+  // If true, job results will be stored in database when execution succeeds
+  bool store_success = 10;
+  // # Store Failure Flag
+  // If true, job results will be stored in database when execution fails
+  bool store_failure = 11;
+  // # Static Execution Flag
+  // If true, fixed number instance of this worker will run at a time (with
+  // lock)
+  bool use_static = 13;
+  // # Output Broadcast Flag
+  // Broadcast job results to all result listeners or not.
+  // If false, cannot use JobResultService/{Listen, ListenStream,
+  // ListenByWorker}.
+  bool broadcast_results = 14;
+}
+
+message WorkerId { int64 value = 1; }
+
+// # Worker
+// A worker that loads a runner with specified settings and executes jobs by
+// providing arguments
+message Worker {
+  WorkerId id = 1;
+  WorkerData data = 2;
+}
+
+// # Worker Sort Field
+// Defines the fields available for sorting workers in queries
+enum WorkerSortField {
+  WORKER_SORT_FIELD_UNSPECIFIED = 0;
+  WORKER_SORT_FIELD_ID = 1;
+  WORKER_SORT_FIELD_NAME = 2;
+  WORKER_SORT_FIELD_RUNNER_ID = 3;
+  WORKER_SORT_FIELD_PERIODIC_INTERVAL = 4;
+  WORKER_SORT_FIELD_CREATED_AT = 5;
+}

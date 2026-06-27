@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.data;
+
+// Workflow execution via URL with optional channel
+message WorkflowExecution {
+  string workflow_url = 1;             // Workflow file URL (local path or HTTP URL)
+  optional string channel = 2;        // Channel name for job execution
+}
+
+// Job execution via pre-registered worker (any runner type)
+message WorkerExecution {
+  string worker_name = 1;             // jobworkerp worker name
+  optional string using = 2;          // Method name for multi-method runners (e.g., "run", "chat")
+}

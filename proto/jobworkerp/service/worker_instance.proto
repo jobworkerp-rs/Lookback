@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package jobworkerp.service;
+
+import "jobworkerp/data/common.proto";
+import "jobworkerp/data/worker_instance.proto";
+
+// # Find Instance List Request
+// Request to retrieve worker instances
+message FindInstanceListRequest {
+  // # Channel Filter
+  // Filter by specific channel (optional)
+  optional string channel = 1;
+
+  // # Active Only
+  // If true, only return active instances (default: true)
+  optional bool active_only = 2;
+}
+
+// # Count Instance Response
+// Response containing worker instance counts
+message CountInstanceResponse {
+  // # Total Count
+  // Total number of registered instances
+  int64 total = 1;
+
+  // # Active Count
+  // Number of active instances (heartbeat within timeout)
+  int64 active = 2;
+}
+
+// # Instance Channel Info
+// Channel information aggregated from worker instances
+message InstanceChannelInfo {
+  // # Channel Name
+  // Channel name (default channel is displayed as "[default]")
+  string name = 1;
+
+  // # Total Concurrency
+  // Sum of concurrency from all active instances
+  uint32 total_concurrency = 2;
+
+  // # Active Instances
+  // Number of active instances processing this channel
+  int32 active_instances = 3;
+
+  // # Worker Count
+  // Number of Worker definitions registered for this channel
+  int64 worker_count = 4;
+}
+
+// # Find Instance Channel List Response
+// Response containing aggregated channel information from instances
+message FindInstanceChannelListResponse {
+  repeated InstanceChannelInfo channels = 1;
+}
+
+// # Worker Instance Service
+// Service for managing and querying worker instances
+service WorkerInstanceService {
+  // # Find List
+  // Retrieve worker instances as a stream
+  rpc FindList(FindInstanceListRequest) returns (stream jobworkerp.data.WorkerInstance);
+
+  // # Count
+  // Get total and active instance counts
+  rpc Count(jobworkerp.data.Empty) returns (CountInstanceResponse);
+
+  // # Find
+  // Retrieve a specific worker instance by ID
+  rpc Find(jobworkerp.data.WorkerInstanceId) returns (jobworkerp.data.WorkerInstance);
+
+  // # Find Channel List
+  // Get channel information aggregated from all active instances
+  // This is the recommended API for getting accurate channel information
+  rpc FindChannelList(jobworkerp.data.Empty) returns (FindInstanceChannelListResponse);
+}

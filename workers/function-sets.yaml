@@ -1,0 +1,54 @@
+# Function set definitions for the Lookback RAG chat (spec §4.3,
+# rag-chat-design.md DECIDE-CHAT-9). The `chat-rag` workflow narrows
+# the LLM's callable tool surface to this set by passing
+# `function_options.function_set_name: lookback-rag`, so the chat LLM
+# does NOT see batch / import / summary workers as callable tools.
+#
+# Loaded by the sidecar startup path via
+# `jobworkerp_client::client::function_set_yaml::register_function_sets_from_yaml`,
+# layered AFTER the worker YAML so target name → WorkerId resolution
+# can find `lookback_recall` (registered in workers/llm-workers.yaml).
+#
+# Kept in a separate file because the worker-YAML deserializer is
+# `deny_unknown_fields` — `function_sets:` can't coexist with
+# `workers:` in the same document.
+
+defaults:
+  category: 0
+
+function_sets:
+  - name: lookback-rag
+    description: >-
+      Tools for recalling the user's past Lookback memories. Use these
+      whenever the question depends on prior conversations, decisions,
+      or work history. `lookback_recall` searches BOTH the summary
+      layer (per-thread / daily / weekly / monthly) and the raw-message
+      layer in a single call.
+    targets:
+      - type: WORKER
+        name: lookback_recall
+        # The WORKFLOW runner exposes two methods (`run` / `create`). The
+        # function-spec converter has a special-case for workflow workers
+        # that defaults to `run` when `using` is unset, so this is
+        # belt-and-suspenders; explicit is cheaper to read than relying
+        # on that default for code we don't own.
+        using: run
+
+  # MCP-exposed retrieval tools (FR-MCP-1). Surfaced to EXTERNAL MCP clients
+  # (e.g. Claude Desktop) when the user enables the MCP server in Settings —
+  # the sidecar is then spawned with `MCP_SET_NAME=lookback-mcp-rag`, which
+  # narrows jobworkerp's MCP tool surface to exactly this set. Kept SEPARATE
+  # from `lookback-rag` (the in-app chat tool set) so the MCP-visible surface
+  # can grow independently of what the chat LLM may call. Today both sets
+  # expose the same single tool; the split is the extension point.
+  - name: lookback-mcp-rag
+    description: >-
+      Tools for searching the user's saved memories of their past work and
+      conversations. Use these whenever the question depends on what the
+      user did, decided, or discussed before. `lookback_recall` searches
+      both the summaries (of single conversations and of each day, week, and
+      month) and the original messages in a single call.
+    targets:
+      - type: WORKER
+        name: lookback_recall
+        using: run

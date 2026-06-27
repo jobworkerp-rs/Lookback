@@ -1,0 +1,880 @@
+{
+  "locale": {
+    "label": "言語",
+    "system": "システム",
+    "ja": "日本語",
+    "en": "English"
+  },
+  "theme": {
+    "label": "テーマ",
+    "option": {
+      "system": "システム",
+      "light": "ライト",
+      "dark": "ダーク"
+    }
+  },
+  "nav": {
+    "section": {
+      "browse": "ブラウズ",
+      "system": "システム"
+    },
+    "threads": "スレッド",
+    "summaries": "要約",
+    "reflections": "自省",
+    "personality": "パーソナリティ",
+    "chat": "チャット",
+    "periodic": "定期実行",
+    "settings": "設定"
+  },
+  "sidecar": {
+    "title": "Sidecar",
+    "phase": {
+      "ready": "ready",
+      "error": "error",
+      "starting": "starting…"
+    },
+    "warning": {
+      "worker_apply_failed": "worker 登録失敗",
+      "plugins_stage_failed": "plugin 配備失敗"
+    }
+  },
+  "common": {
+    "loading": "読み込み中…",
+    "reload": "再読み込み",
+    "import": "Import",
+    "cancel": "キャンセル",
+    "delete": "削除"
+  },
+  "memoryRefs": {
+    "open": "{{entity}} {{id}} を開く",
+    "label": "{{entity}} {{id}}"
+  },
+  "summaryKind": {
+    "per-thread": "スレッド",
+    "daily": "日次",
+    "weekly": "週次",
+    "monthly": "月次"
+  },
+  "labelPrefix": {
+    "category": "カテゴリ"
+  },
+  "taxonomy": {
+    "unknown": "?({{value}})",
+    "taskCategory": {
+      "0": "未指定",
+      "1": "コーディング",
+      "2": "相談",
+      "3": "調査",
+      "4": "創作",
+      "5": "一般"
+    },
+    "outcome": {
+      "0": "未指定",
+      "1": "成功",
+      "2": "部分的",
+      "3": "失敗",
+      "4": "中断",
+      "5": "不明"
+    },
+    "reflectionAspect": {
+      "0": "未指定",
+      "1": "タスク結果",
+      "2": "対話スタイル",
+      "3": "両方"
+    }
+  },
+  "search": {
+    "mode": {
+      "browse": "一覧",
+      "keyword": "Keyword",
+      "semantic": "Semantic",
+      "hybrid": "Hybrid"
+    },
+    "modeTitle": {
+      "keyword": "BM25 keyword 検索",
+      "semantic": "サーバ側で embed (GPU MultimodalEmbeddingRunner 必須)",
+      "hybrid": "ベクトル + BM25 融合 (クライアント側で embed → HybridSearch)"
+    },
+    "hint": {
+      "keyword": "BM25 keyword 検索",
+      "semantic": "サーバ側で embed (GPU MultimodalEmbeddingRunner)。未配備時は失敗します",
+      "hybrid": "ベクトル + BM25 融合。クライアント側で embed (embedding worker 必須)"
+    },
+    "errorHint": {
+      "shortQuery": "検索語をもう少し長くするか、複数の語句で検索してください。短い語句だけで探す場合は Keyword 検索を試してください。",
+      "embeddingWorker": "{{mode}} 検索を実行できませんでした。Settings で embedding モデルまたは worker の準備状態を確認してください。"
+    },
+    "searching": "検索中…",
+    "enterQuery": "クエリを入力してください"
+  },
+  "threads": {
+    "title": "Threads",
+    "fallbackTitle": "スレッド #{{id}}",
+    "subtitleHits_other": "{{count}} 件ヒット",
+    "subtitleImported": "{{count}} imported",
+    "searchPlaceholder": "検索クエリ",
+    "filterPlaceholder": "スレッドをフィルタ",
+    "createdAfterTitle": "作成日 下限 (strict >)",
+    "createdBeforeTitle": "作成日 上限 (inclusive <=)",
+    "delete": {
+      "title": "スレッドを削除しますか?",
+      "message": "このスレッドと会話メッセージを削除します。元に戻せません。生成済みの要約・自省は残るので、不要なら各画面から個別に削除してください。",
+      "confirm": "スレッドを削除"
+    },
+    "empty": {
+      "title": "スレッドがありません",
+      "descSuffix": " からセッションログを取り込んでください"
+    },
+    "search": {
+      "noHitsTitle": "ヒットなし",
+      "noHitsDesc": "期間や検索モードを変えて試してください",
+      "messageLabel": "Message {{position}} / {{total}}",
+      "score": "score {{score}} · {{count}} hit",
+      "score_other": "score {{score}} · {{count}} hits"
+    }
+  },
+  "periodic": {
+    "title": "定期実行",
+    "subtitle": "Lookback の要約生成を conductor でスケジュール",
+    "new": "新規",
+    "intro": {
+      "title": "スケジュール",
+      "desc": "ローカル sidecar の conductor が cron に従って Lookback の要約生成 workflow を実行します。"
+    },
+    "loadError": "定期実行を読み込めませんでした。",
+    "empty": {
+      "title": "定期実行はまだありません",
+      "desc": "新規ボタンから要約生成のスケジュールを追加できます。"
+    },
+    "card": {
+      "unknownSource": "unknown",
+      "unsupportedFormat": "未対応形式",
+      "unnamed": "(名称なし)",
+      "lookback_other": "過去{{count}}日分"
+    },
+    "enabled": "有効",
+    "disabled": "無効",
+    "edit": "編集",
+    "history": "履歴",
+    "delete": {
+      "title": "定期実行を削除します",
+      "message": "{{name}} を削除します。この操作は元に戻せません。"
+    },
+    "status": {
+      "latestLoading": "最新: 取得中…",
+      "notStarted": "まだ実行されていません",
+      "latest": "最新: {{time}}",
+      "job": "job {{jobId}}",
+      "unavailable": "状態を取得できません"
+    },
+    "cancel": {
+      "button": "停止",
+      "title": "実行を停止します",
+      "message": "{{name}} の実行中 job に停止要求を送ります。",
+      "busy": "停止中…"
+    },
+    "historyModal": {
+      "title": "実行履歴: {{name}}",
+      "refresh": "更新",
+      "loadError": "履歴を読み込めませんでした。",
+      "empty": "実行履歴はまだありません。",
+      "close": "閉じる"
+    },
+    "dialog": {
+      "createTitle": "定期実行を作成",
+      "editTitle": "定期実行を編集",
+      "name": "名前",
+      "source": "対象ソース",
+      "kind": "種別",
+      "kindRegular": "定期",
+      "kindWeekly": "週次",
+      "kindMonthly": "月次",
+      "hour": "基準時刻（時）",
+      "minute": "基準時刻（分）",
+      "intervalUnit": "間隔単位",
+      "intervalUnitHours": "時間",
+      "intervalUnitDays": "日",
+      "interval": "間隔",
+      "hoursOption_other": "{{count}}時間",
+      "outputs": "生成内容",
+      "summaryThread": "要約: スレッド",
+      "summaryDaily": "要約: 日次",
+      "summaryWeekly": "要約: 週次",
+      "summaryMonthly": "要約: 月次",
+      "personality": "パーソナリティ",
+      "reflection": "自省",
+      "weekday": "曜日",
+      "monthlyDay": "日付",
+      "lookbackDays": "処理対象期間（過去日数）",
+      "save": "保存"
+    },
+    "weekday": {
+      "sun": "日",
+      "mon": "月",
+      "tue": "火",
+      "wed": "水",
+      "thu": "木",
+      "fri": "金",
+      "sat": "土"
+    },
+    "kindLabel": {
+      "regular": "定期",
+      "weekly": "週次",
+      "monthly": "月次"
+    },
+    "statusLabel": {
+      "pending": "待機中",
+      "running": "実行中",
+      "wait_result": "結果待ち",
+      "cancelling": "取消中",
+      "succeeded": "成功",
+      "failed": "失敗",
+      "cancelled": "取消済み",
+      "unknown": "状態不明",
+      "unavailable": "状態取得不可",
+      "enqueue_failed": "起動失敗",
+      "not_started": "未実行"
+    },
+    "validation": {
+      "nameRequired": "名前を入力してください",
+      "sourceRequired": "対象 source を選択してください",
+      "sourceInvalid": "source は codex / claude-code / codex + claude-code から選択してください",
+      "hourRange": "時刻の時は 0-23 で入力してください",
+      "minuteRange": "時刻の分は 0-59 で入力してください",
+      "lookbackRange": "Lookback 日数は 1 以上で入力してください",
+      "intervalRange": "実行間隔は 1 以上で入力してください",
+      "intervalHourChoice": "時間間隔は 1/2/3/4/6/8/12/24 から選択してください",
+      "weekdayInvalid": "曜日が不正です",
+      "monthlyDayRange": "月次の日付は 1-28 の範囲で入力してください"
+    },
+    "cronInvalidInterval": "不正な時間間隔",
+    "unknownSource": "unknown"
+  },
+  "personality": {
+    "title": "パーソナリティ",
+    "updatedAt": "更新 {{time}}",
+    "profileNotGenerated": "プロファイル未生成",
+    "forceReextract": "Force 再抽出",
+    "forceReextractHint": "Force 再抽出: 既存のシグナルがあるスレッドも含めて全件再抽出します (target_signal_count の早期終了も無効化)。プロンプト変更を歴史データに反映するときに使います。",
+    "forceReextractConfirm": "Force 再抽出を有効にすると、既存のシグナルもすべて再抽出します。LLM 負荷が高く、件数次第で時間がかかります。実行しますか?",
+    "stop": "停止",
+    "stopHint": "生成中のジョブを中断",
+    "generate": "パーソナリティを生成",
+    "generateForce": "Force で生成",
+    "generateHint": "memories-personality-batch を jobworkerp に dispatch します",
+    "enqueuing": "投入中…",
+    "mergeOnly": "マージのみ",
+    "mergeForce": "Force でマージ",
+    "mergeOnlyHint": "user-personality-merge のみを実行します。per-thread の再抽出はスキップして既存シグナルから profile を再生成します (rate-limit 等で merge だけ失敗した場合の復旧用)。",
+    "statThreads": "Threads",
+    "statThreadsHint": "スレッド一覧を開く",
+    "statSignals": "Signals",
+    "statSignalsHint": "根拠となったシグナル一覧を表示",
+    "statCategories": "Categories",
+    "statCategoriesHint": "カテゴリ詳細へスクロール",
+    "statProfileVersion": "Profile version",
+    "emptyTitle": "プロファイルがまだありません",
+    "emptyDesc": "Import 完了後に thread-personality-batch → user-personality-merge が実行されると生成されます。シグナルが既にあるのに profile が出ていない場合は「マージのみ」で復旧できます。",
+    "deleteProfile": "プロフィールを削除",
+    "deleteProfileConfirmTitle": "パーソナリティ プロフィールを削除しますか?",
+    "deleteProfileConfirmMessage": "マージ済みプロフィールを削除します。シグナルや元スレッドは残ります。再度「生成」で作り直せます。",
+    "signalsDrawerAria": "根拠シグナル",
+    "signalsDrawerTitle": "根拠シグナル",
+    "signalsUsedCount_other": "マージに使われた {{formatted}} 件のシグナル",
+    "close": "閉じる",
+    "signalsEmptyTitle": "シグナルがありません",
+    "signalsEmptyDesc": "thread-personality-batch を実行するとシグナルが抽出されます",
+    "deleteSignalConfirmTitle": "シグナルを削除しますか?",
+    "deleteSignalConfirmMessage": "このパーソナリティ シグナルを削除します。元スレッドは残ります。マージ済みプロフィールには次回の生成まで反映されません。",
+    "threadFallback": "スレッド #{{id}}",
+    "noDisplayableContent": "表示できる内容がありません",
+    "noInfo": "情報なし"
+  },
+  "chat": {
+    "title": "RAG チャット",
+    "subtitle": "memories を根拠に回答します",
+    "clearTitle": "画面内の会話履歴を消去",
+    "clear": "履歴をクリア",
+    "jumpLatestTitle": "最新へ",
+    "jumpLatest": "↓ 最新へ",
+    "empty": {
+      "line1": "過去のスレッド・要約・原文から RAG 検索して回答します。",
+      "line2": "例: 「最近キャッシュについて何を話した?」/「reflection の自省はいつ書いた?」"
+    },
+    "you": "あなた",
+    "status": {
+      "preparing": "準備中…",
+      "searching": "記憶を検索中…",
+      "generating": "回答を生成中…"
+    },
+    "errorPrefix": "エラー:",
+    "sources": {
+      "label": "出典 ({{count}})",
+      "threadDetail": "thread #{{id}}"
+    },
+    "sourceKind": {
+      "raw_memory": "原文",
+      "thread_summary": "スレッド要約",
+      "period_summary": "期間要約"
+    },
+    "composer": {
+      "placeholder": "質問を入力 (⌘Enter で送信)",
+      "stop": "停止",
+      "send": "送信"
+    }
+  },
+  "reflections": {
+    "title": "自省",
+    "subtitleCount": "{{count}} 件",
+    "cancelTitle": "実行中の自省生成を中断します",
+    "cancel": "中断",
+    "generateTitle": "memories-reflection-batch を jobworkerp に dispatch します",
+    "generate": "自省を生成",
+    "enqueuing": "投入中…",
+    "intentPlaceholder": "意図テキストで自然言語検索 (例: フレーキーなテストの直し方)",
+    "intentTitle": "intent_embedding に対する意味検索 (GPU embedding worker 必須)",
+    "createdAfterTitle": "作成日下限",
+    "progress": {
+      "done": "生成完了",
+      "failed": "生成失敗",
+      "active": "生成中",
+      "close": "閉じる"
+    },
+    "empty": {
+      "title": "自省がまだありません",
+      "desc": "Import で自動生成されるか、上の「自省を生成」ボタンから単発実行できます"
+    },
+    "delete": {
+      "title": "自省を削除しますか?",
+      "message": "この自省を削除します。元スレッドは削除されません。再度「自省を生成」で作り直せます。"
+    },
+    "card": {
+      "openThread": "元スレッドを開く →",
+      "lessons": "Lessons",
+      "keyDecisions": "Key decisions",
+      "mitigationHint": "Mitigation hint"
+    }
+  },
+  "summaries": {
+    "title": "Summaries",
+    "subtitleCount": "{{count}} 件",
+    "fallbackTitle": "スレッド #{{id}}",
+    "cancelTitle": "生成中のジョブを中断",
+    "cancel": "停止",
+    "generateTitle": "要約を生成 (粒度・期間はダイアログで選択)",
+    "generate": "生成",
+    "view": {
+      "list": "一覧",
+      "search": "検索",
+      "calendar": "カレンダー"
+    },
+    "calendarDisabledTitle": "スレッド要約には期間がありません",
+    "searchPlaceholder": "検索クエリ",
+    "date": {
+      "createdAfter": "作成日 下限 (strict >)",
+      "createdBefore": "作成日 上限 (inclusive <=)",
+      "updatedAfter": "更新日 下限 (strict >)",
+      "updatedBefore": "更新日 上限 (strict <)"
+    },
+    "calendar": {
+      "selectPrompt": "日付/週/月を選択すると要約を表示します",
+      "noEntries": "{{key}} の要約はありません"
+    },
+    "list": {
+      "emptyTitle": "要約はまだ生成されていません",
+      "emptyDesc": "Import 完了後、自動で生成されます (FR-IMPORT-6)"
+    },
+    "card": {
+      "openThreadTitle": "元スレッドを開く",
+      "noId": "(no id)"
+    },
+    "delete": {
+      "title": "要約を削除しますか?",
+      "message": "この要約を削除します。元スレッドや会話は削除されません。再度「生成」で作り直せます。"
+    },
+    "hit": {
+      "score": "score {{score}} · {{count}} hit",
+      "score_other": "score {{score}} · {{count}} hits",
+      "close": "閉じる",
+      "show": "要約を表示"
+    }
+  },
+  "confirm": {
+    "confirmLabel": "削除する",
+    "busyLabel": "削除中…"
+  },
+  "settingsSaveBar": {
+    "aria": "未保存の変更",
+    "count": "未保存の変更があります ({{count}}件)",
+    "restartHint": "保存すると sidecar が再起動されます。",
+    "resetWarning": "⚠ embedding のモデル/次元が変わります。既存の vectordb はリセット (退避/削除) され、全 embedding の再生成が必要になります (数十分〜数時間)。",
+    "discard": "破棄",
+    "saving": "保存中…",
+    "save": "保存して適用 (再起動)"
+  },
+  "settings": {
+    "title": "Settings",
+    "titleAdvanced": "Settings — 高度な設定",
+    "backToBasic": "← 設定に戻る",
+    "advanced": {
+      "title": "高度な設定",
+      "desc": "Connection / Embedding model / MCP サーバ / Data location / 全データ削除。変更頻度が低く影響の大きい設定です。",
+      "open": "高度な設定を開く…",
+      "notice": "これらは変更頻度が低く、影響の大きい設定です。接続先・Embedding モデル・MCP サーバ・データ保存先の変更、および全データ削除を行えます。"
+    },
+    "vectordbBackup": {
+      "evacuated": "既存 vectordb を退避しました: ",
+      "manualDelete": "手動で削除する場合は上記パスを直接 rm -rf してください。"
+    },
+    "modelState": {
+      "preparing": "未ダウンロード",
+      "ready": "準備完了",
+      "failed": "失敗",
+      "fetching": "取得中…"
+    },
+    "modelStatus": {
+      "currentModel": "現在のモデル",
+      "provider": "プロバイダ",
+      "readiness": "準備状態",
+      "retryTitle": "プラグイン配備と sidecar 起動を再実行します",
+      "retrying": "再試行中…",
+      "retry": "再試行",
+      "preparingHintPre": "モデルは初回の{{purpose}}ジョブが走るときに Hugging Face からダウンロードされます (回線により数分〜数十分)。",
+      "preparingHintRunImport": "Import を一度実行する",
+      "preparingHintPost": "とジョブが始まり、ダウンロードが開始されます。完了すると「準備完了」に変わります。",
+      "readyHint": "モデルはキャッシュ済みで、{{purpose}}が利用できます。",
+      "failedDefault": "モデルを準備できませんでした。",
+      "failedHint": "sidecar が起動しない、またはプラグイン (dylib) が見つからない場合は、環境を確認のうえアプリを再起動してください。"
+    },
+    "llm": {
+      "modeLocal": "Local LLM",
+      "modeExternal": "External API",
+      "title": "LLM Provider",
+      "desc": "要約・自省・パーソナリティ・チャットの LLM バックエンドを選択します。External API はモデル名から自動でプロバイダーを検出します (gpt-* = OpenAI, claude-* = Anthropic, gemini-* = Gemini 等)。",
+      "modelPurpose": "要約・自省・パーソナリティの生成",
+      "backend": "バックエンド",
+      "modelName": "モデル名",
+      "apiKey": "API キー",
+      "apiKeyPlaceholderDelete": "(保存時に削除されます)",
+      "apiKeyPlaceholderStored": "(Keychain に保存済み)",
+      "cancelDeleteKeyTitle": "削除をキャンセルします",
+      "cancelDeleteKey": "削除を取消",
+      "deleteKeyTitle": "保存時に Keychain の API キーを削除します",
+      "deleteKey": "キーを削除",
+      "deleteKeyWarning": "保存すると Keychain の API キーが削除されます。",
+      "baseUrlPlaceholder": "(省略可) https://proxy.example.com/v1",
+      "apiKeyHint": "API キーは macOS Keychain に保存されます。モデル名やキーの変更時は sidecar の再起動が実行されます。",
+      "proxyNoteLabel": "注意: ",
+      "proxyNotePre": "LiteLLM 等の OpenAI 互換プロキシ経由で非 OpenAI モデルを利用する場合、モデル名に ",
+      "proxyNoteMid": " プレフィックスを付けてください",
+      "proxyNoteExample": "例: ",
+      "proxyNotePost": "。プレフィックスがないとモデル名からプロバイダーが推測され、プロキシと互換性のないプロトコルが使用されます。",
+      "maxTokensChat": "Max tokens (chat)",
+      "temperatureChat": "Temperature (chat)",
+      "genParamsHintPre": "Max tokens / Temperature は ",
+      "genParamsHintChat": "チャット応答",
+      "genParamsHintPost": " にのみ適用されます。要約・自省・パーソナリティの各バッチは出力ボリュームが用途別に最適化されているため、YAML 既定値 (例: 月次要約 50000) を使用します。空欄にすると既定値 (4000 / 0.3) に戻ります。",
+      "preset": "プリセット",
+      "presetOption": "{{name}} (≈ {{ram}}GB)",
+      "ramEstimate": "Model: {{model}}GB / KV cache: {{kv}}GB ({{ctx}} ctx, {{kvType}}) / Total: {{total}}GB",
+      "ramEstimateWithEmbedding": "Embedding: {{embedding}}GB / LLM + Embedding total: {{total}}GB",
+      "embeddingRamUnavailable": "Embedding RAM: custom embedding model / LLM + Embedding total は算出できません",
+      "customOption": "カスタム…",
+      "ggufFile": "GGUF ファイル",
+      "customHintPre": "Hugging Face のリポジトリ",
+      "customHintMid": "と、その中の",
+      "customHintPost": "ファイル名を指定します。サポート対象は Qwen3.5 系と Gemma 4 系のみです。形式チェックのみ行います (HF 上に実在するかは検証しません)。",
+      "advancedToggleOpen": "▼ 上級設定",
+      "advancedToggleClosed": "▶ 上級設定",
+      "ctxSizeHint": "空欄でプリセット推奨値 ({{value}}) を使用",
+      "ctxSizeNote": "メモリ制約に応じて縮小できます。reflection workflow は 222k 程度の context を要求しますが、小さくすると長文要約が分割されます。",
+      "kvCacheType": "KV cache type",
+      "kvCacheTypeHint": "小さいほどRAM消費は減りますが、モデル品質への影響が出る場合があります。",
+      "customRamUnavailable": "RAM目安はモデル構造が分かるプリセット選択時のみ算出します。",
+      "localHint": "ローカル LLM (llama-cpp) を使用します。保存すると sidecar が自動再起動され、未ダウンロードのモデルは Hugging Face から取得されます (初回は数分〜数十分かかります)。",
+      "externalIncomplete": "モデル名を入力してください。",
+      "customIncomplete": "カスタムモデルの HF repo と .gguf ファイル名を正しく入力してください。"
+    },
+    "connection": {
+      "modeLocal": "Local sidecar",
+      "modeRemote": "Remote server",
+      "title": "Connection",
+      "desc": "既定では同梱 sidecar に接続します。実ポートは起動時に決定され、Local 選択時は読み取り専用で表示されます (ARCH-7)。Remote を選ぶと既存サーバの gRPC URL に接続先を上書きできます (http/https)。",
+      "target": "接続先",
+      "starting": "starting…",
+      "saving": "保存中…",
+      "save": "接続先を保存",
+      "saved": "保存しました",
+      "testing": "テスト中…",
+      "test": "接続をテスト",
+      "testOk": "接続できました"
+    },
+    "logs": {
+      "title": "Logs",
+      "desc": "app / sidecar のログ末尾を表示します (NFR-6)。障害切り分け用。app は Import の失敗理由などアプリ側のログです。",
+      "process": "プロセス",
+      "stream": "ストリーム",
+      "singleFile": "単一ファイル (stdout/stderr 共通)",
+      "loading": "読込中…",
+      "tailOnly": "(末尾のみ表示)",
+      "empty": "ログがありません"
+    },
+    "embedding": {
+      "title": "Embedding model",
+      "desc": "Memory / Reflection の埋め込みに使うモデル。モデルまたはベクトル次元が変わる場合は既存のインデックスがリセットされます (再生成が必要)。dtype / 最大シーケンス長 / tokenizer のみの変更ではインデックスは保持されます。",
+      "modelPurpose": "検索 (Semantic / Hybrid / 自然言語) の埋め込み",
+      "resetBanner": "⚠ embedding のモデル/次元が変わるため、既存の全 embedding が リセット (退避/削除) され、再生成が必要になります (数十分〜数時間)。",
+      "noResetNote": "この変更ではモデル/次元が変わらないため、既存の vectordb は保持されます（再生成は不要）。保存時に sidecar が再起動されます。",
+      "remoteDisabled": "リモート接続中は embedding 設定を変更できません。リモート memories が独自の vectordb を保持しているため、ローカル側の切替は反映されません。",
+      "currentSettings": "現在の設定",
+      "preset": "プリセット",
+      "presetOption": "{{name}} (≈ {{ram}}GB)",
+      "ramEstimate": "Embedding RAM: {{ram}}GB",
+      "customOption": "Custom…",
+      "tokenizer": "Tokenizer (任意)",
+      "tokenizerPlaceholder": "空欄なら HF Repo と同じ",
+      "multimodal": "マルチモーダル",
+      "multimodalLabel": "テキストと画像を同じベクトル空間に埋め込む (チェックを外すと画像検索は無効化)",
+      "existingVectordb": "既存 vectordb",
+      "evacuateLabel": "退避する (チェックを外すと削除)",
+      "customRequired": "カスタムモデルは HF Repo と Vector size が必須です。"
+    },
+    "embeddingIndex": {
+      "title": "Embedding index",
+      "desc": "Memory (要約・スレッド本文) の埋め込みインデックスの状態と再生成。検索 (Semantic / Hybrid / 自然言語) が当たる対象です。",
+      "tableMissing": "memory_vector テーブルが未作成です (sidecar 未起動、または埋め込みが無効)。",
+      "total": "Memory 総数",
+      "embedded": "埋め込み済み",
+      "pending": "未生成",
+      "allDone": "全件生成済みです (自動生成が機能しています)。",
+      "redispatch": "再生成",
+      "redispatchTitle": "未生成分の補填、または embedding モデル変更後の張り直しに使います (時間がかかります)",
+      "redispatching": "再生成中…",
+      "redispatchButton": "再生成する",
+      "redispatchConfirm": "Memory {{count}} 件分の embedding を再生成します。完了までに時間がかかります。続行しますか?",
+      "result": "再生成: 投入 {{dispatched}} / スキップ {{skipped}} / 失敗 {{failed}} ({{ms}} ms)"
+    },
+    "mcp": {
+      "title": "MCP Server",
+      "descPre": "Lookback の検索ツール",
+      "descMid": "を MCP サーバとして外部の MCP クライアント (Claude Desktop 等) に公開します。jobworkerp の gRPC と並行して動作するため、アプリの既存機能には影響しません。公開されるツールは function-set ",
+      "descPost": " に限定されます。",
+      "server": "MCP サーバ",
+      "enable": "有効にする",
+      "url": "接続先 URL",
+      "urlPending": "保存して sidecar が再起動すると表示されます",
+      "clientConfigExample": "MCP クライアントの設定例 (streamable HTTP transport):",
+      "advancedToggleOpen": "▼ 上級設定",
+      "advancedToggleClosed": "▶ 上級設定",
+      "streamingDefault": "既定 (無効)",
+      "streamingOn": "有効",
+      "streamingOff": "無効",
+      "timeout": "タイムアウト (秒)",
+      "timeoutHint": "空欄で既定値 (60)",
+      "timeoutInvalid": "タイムアウトは {{min}}〜{{max}} 秒の整数で入力してください。",
+      "restartHint": "変更を保存すると sidecar が再起動されます (MCP の有効/無効は起動時に決まるため)。"
+    },
+    "savingModal": {
+      "title": "設定を適用中…",
+      "descWithVectordbReset": "sidecar を再起動し、新しい設定 (embedding model を含む) を読み込みます。vectordb のリセットと初回モデルダウンロードを含むため、完了まで数十分〜数時間かかる場合があります。",
+      "desc": "sidecar を再起動し、新しい設定を読み込みます。完了まで数十秒〜数分かかります。初回は Hugging Face からのモデルダウンロードを含むためさらに時間がかかる場合があります。"
+    },
+    "unsavedDialog": {
+      "title": "保存していない変更があります",
+      "message": "このビューに未保存の変更があります。破棄して移動しますか? (キャンセルでとどまります)",
+      "confirm": "破棄して移動"
+    },
+    "purge": {
+      "title": "Destructive",
+      "desc": "sidecar を停止し、データルート配下を一括削除します。元に戻せません。",
+      "label": "全データを削除",
+      "button": "全データを削除…",
+      "warningsAlert": "全データを削除しましたが、以下の警告があります:\n\n{{warnings}}",
+      "modalTitle": "全データを削除しますか?",
+      "modalBody": "以下のディレクトリが完全に削除されます: ",
+      "modalWarning": "この操作は元に戻せません。sidecar が停止された後、データが削除されます。",
+      "deleting": "削除中…",
+      "confirm": "削除する"
+    },
+    "hfHome": {
+      "modeGlobal": "OS グローバル",
+      "helpGlobal": "シェル環境変数 $HF_HOME、未設定なら ~/.cache/huggingface を使います (デフォルト)。huggingface-cli / transformers / Ollama などとキャッシュを共有でき、巨大なモデルの重複ダウンロードを避けられます。",
+      "modeDataRoot": "App data dir 配下",
+      "helpDataRoot": "<App data dir>/models に保存します。「全データを削除」で巻き添えに消えるので、アプリ専用にモデルを管理したいときに選びます。",
+      "modeCustom": "カスタムパス",
+      "helpCustom": "任意の絶対パスを指定します。外付けディスクなどに置く用途向け。",
+      "title": "Hugging Face cache (HF_HOME)",
+      "desc": "LLM / Embedding モデルを置くキャッシュディレクトリです。容量は数 GB〜数十 GB になります。",
+      "location": "場所",
+      "path": "パス",
+      "pick": "選択…",
+      "effectivePathAfter": "保存後の実効パス",
+      "effectivePathCurrent": "現在の実効パス",
+      "customIncomplete": "カスタムパスを入力してください。"
+    },
+    "dataRoot": {
+      "title": "Data location",
+      "desc": "sqlite / LanceDB / プラグイン / ログの保存先。空欄でデフォルト ({{defaultRoot}}) に戻ります。「全データを削除」から一括削除できます (ARCH-4 / NFR-5)。",
+      "pick": "選択…",
+      "createTitle": "このパスに新規ディレクトリを作成します (mkdir -p)",
+      "creating": "作成中…",
+      "create": "このディレクトリを作成",
+      "currentRunning": "現在実行中: ",
+      "nextLaunch": "次回起動時: ",
+      "nextLaunchNote": "(アプリ再起動が必要です)",
+      "saveConfirmChange": "App data dir を変更します。現在開いているデータ (sqlite / LanceDB / tonic 接続) はこのまま使い続け、変更は次回アプリ起動から有効になります。続行しますか?",
+      "saveConfirmReset": "App data dir をデフォルトに戻します。現在開いているデータ (sqlite / LanceDB / tonic 接続) はこのまま使い続け、変更は次回アプリ起動から有効になります。続行しますか?",
+      "savedMsgChange": "次回起動から {{path}} を使用します。アプリを再起動してください。",
+      "savedMsgReset": "次回起動からデフォルトの場所を使用します。アプリを再起動してください。",
+      "saving": "保存中…",
+      "save": "保存",
+      "validation": {
+        "empty": "パスが空です",
+        "notAbsolute": "絶対パスを指定してください",
+        "notExist": "ディレクトリが存在しません",
+        "notDir": "ディレクトリではありません",
+        "notWritable": "書込権限がありません",
+        "existingRoot": "既存の Lookback データルートを再利用します"
+      }
+    },
+    "llmPreset": {
+      "desc": {
+        "qwen3-6-27b-ud-q4-k-xl": "日本語の要約・自省・チャット品質が最も安定。長文 context (262k) 対応。実際のRAM目安はctx_sizeとKV cache typeで変わります。",
+        "qwen3-6-35b-a3b-ud-iq4-nl": "MoE (active 3B)。27B 密モデルに近い品質を比較的小さいggufで得られる省メモリ版。実際のRAM目安はctx_sizeとKV cache typeで変わります。",
+        "qwen3-5-9b-ud-q4-k-xl": "軽量・高速な Qwen3.5。日常チャットや日次要約に十分な日本語品質。ctx_sizeを小さくすると16GB級でも扱いやすくなります。",
+        "gemma-4-26b-a4b-it-ud-iq4-nl": "MoE (active 4B)。日本語応答が良好な中規模 Gemma 4。実際のRAM目安はctx_sizeとKV cache typeで変わります。",
+        "gemma-4-e4b-it-ud-q4-k-xl": "軽量な Gemma 4 マルチモーダル版。最小構成で動作。ctx_sizeを小さくすると低メモリ環境でも扱いやすくなります。",
+        "gemma-4-e2b-it-ud-q4-k-xl": "デフォルト。最軽量の Gemma 4 IT。小さいRAM環境でローカルチャットを試しやすい構成。最大 context は 131k です。",
+        "qwen3-5-122b-a10b-ud-iq4-xs": "最大規模。MoE 122B (active 10B)。最高品質を狙うフラッグシップ。gguf本体が大きいため大容量RAM環境向けです。"
+      }
+    },
+    "embeddingPreset": {
+      "desc": {
+        "qwen3-vl-embedding-2b": "テキストと画像を同一ベクトル空間に埋め込めるマルチモーダル版。画像検索を使う場合はこれ。",
+        "qwen3-embedding-0-6b": "デフォルト。軽量・高速。日常運用に十分な品質で、消費メモリも小さい。",
+        "qwen3-embedding-4b": "中規模・高品質。長文 context (40k) 対応で要約や日本語検索の精度が安定。画像検索は無効化される。"
+      }
+    }
+  },
+  "import": {
+    "title": "セッションログを取り込む",
+    "llmDownTitle": "LLM プラグインが初期化されていません",
+    "llmDownBody": "Import (取り込み) は実行できますが、要約・パーソナリティ・自省・Semantic 検索は生成されません。<code1>{{pluginPath}}</code1>に <code2>{{dylib}}</code2> 等が存在することを確認してください。詳細はサイドバーの Sidecar 状態を参照。",
+    "targetType": "対象タイプ",
+    "targetPlain": "プレーンテキスト (ディレクトリ)",
+    "plainRoot": "対象ディレクトリ",
+    "plainChoose": "選択…",
+    "plainSourceName": "ソース名 (任意・a-z0-9_- 32字以内)",
+    "plainStrategy": "スレッド分割",
+    "plainStrategyPerFile": "ファイルごと",
+    "plainStrategyPerDir": "ディレクトリごと",
+    "plainStrategySingle": "全体で1つ",
+    "errorNoPlainRoot": "対象ディレクトリを選択してください",
+    "errorInvalidSourceName": "ソース名は a-z0-9_- の32字以内で指定してください",
+    "period": "期間",
+    "periodAll": "全件",
+    "periodFrom": "指定日以降",
+    "labels": "ラベル (任意・カンマ区切り)",
+    "dryRun": "dry-run (取り込まず件数のみ確認)",
+    "postGen": "取り込み後の生成 (任意)",
+    "runSummary": "スレッド要約",
+    "runPersonality": "パーソナリティ生成",
+    "runReflection": "自省生成",
+    "errorNoSource": "少なくとも1つのソースを選択してください",
+    "errorInvalidDate": "有効な日付を指定してください",
+    "starting": "起動中…",
+    "start": "Import を開始"
+  },
+  "importToast": {
+    "head": "Importing sessions",
+    "close": "閉じる",
+    "detail": "詳細",
+    "cancel": "中断",
+    "cancelHint": "現在実行中のステップを中断し、残りはスキップ",
+    "detailDialogAria": "取り込みステップの詳細",
+    "detailTitle": "{{step}} の詳細",
+    "detailTitleFailed": "{{step}} の失敗詳細",
+    "detailTitleWarning": "{{step}} の警告詳細",
+    "statusWaiting": "待機中",
+    "statusActive": "実行中…",
+    "statusDone": "完了",
+    "statusWarning": "一部失敗",
+    "statusFailed": "失敗"
+  },
+  "summaryGen": {
+    "title": "要約を生成",
+    "llmDownTitle": "LLM プラグインが初期化されていません",
+    "llmDownBody": "要約の生成には LLM が必要です。サイドバーの Sidecar 状態を確認してください。",
+    "stages": "生成する段階",
+    "dependencyHint": "上位を選ぶと依存する下位も自動で選択されます (週次→日次→スレッド)。",
+    "targetPeriod": "対象期間",
+    "rangeStart": "開始",
+    "rangeEnd": "終了",
+    "rangeHintPerThread": "日付で範囲指定 (両端空 = 全スレッド)",
+    "rangeHintDaily": "日付で範囲指定 (両端空 = 昨日)",
+    "rangeHintWeekly": "週で範囲指定 (両端空 = 先週)",
+    "rangeHintMonthly": "月で範囲指定 (両端空 = 先月)",
+    "errorOneSided": "開始・終了の両方を指定してください。",
+    "errorReversed": "開始は終了より前にしてください。",
+    "errorInvalid": "期間の指定が正しくありません。",
+    "submitting": "投入中…",
+    "submit": "生成を開始"
+  },
+  "analysis": {
+    "done": "生成完了",
+    "failed": "生成失敗",
+    "running": "生成中",
+    "close": "閉じる"
+  },
+  "dateInput": {
+    "clearDate": "日付をクリア",
+    "clearMonth": "月をクリア",
+    "clearWeek": "週をクリア"
+  },
+  "labelFilter": {
+    "loading": "ラベル読み込み中…",
+    "title": "ラベルで絞り込む ({{count}})",
+    "matchAnyHint": "いずれかのラベルを含むスレッド (OR)",
+    "matchAllHint": "すべてのラベルを含むスレッド (AND)",
+    "selectAll": "全選択",
+    "deselectAll": "全解除"
+  },
+  "calendar": {
+    "prevMonth": "前の月",
+    "nextMonth": "次の月",
+    "yearMonth": "{{year}}年{{month}}月",
+    "monthSummary": "この月の要約",
+    "noSummary": "要約なし",
+    "weekdayMon": "月",
+    "weekdayTue": "火",
+    "weekdayWed": "水",
+    "weekdayThu": "木",
+    "weekdayFri": "金",
+    "weekdaySat": "土",
+    "weekdaySun": "日"
+  },
+  "markdown": {
+    "toolOutput": "Tool 出力 ({{count}} 文字)",
+    "toolOutputTruncated": "Tool 出力 ({{count}} 文字 · 切詰表示)",
+    "systemMessage": "システムメッセージ"
+  },
+  "threadDetail": {
+    "noChannel": "(no channel)",
+    "noLabels": "no labels",
+    "roleFilter": "Role filter",
+    "deleteThread": "スレッドを削除",
+    "showSummary": "要約を表示",
+    "loadingPrev": "前のメッセージを読み込み中…",
+    "noMessages": "メッセージが見つかりません",
+    "noRoleMatch": "表示中の Role に一致するメッセージがありません",
+    "loadingNext": "次のメッセージを読み込み中…",
+    "close": "閉じる"
+  },
+  "errorBoundary": {
+    "title": "表示中に問題が発生しました"
+  },
+  "boot": {
+    "startingSidecar": "sidecar を起動中…",
+    "checkingSetup": "セットアップ状態を確認中…",
+    "setupCheckFailed": "セットアップ状態を確認できませんでした。",
+    "retry": "再試行"
+  },
+  "app": {
+    "leaveGuard": {
+      "title": "保存していない変更があります",
+      "message": "設定に未保存の変更があります。破棄して移動しますか? (キャンセルで設定にとどまります)",
+      "confirm": "破棄して移動"
+    }
+  },
+  "setup": {
+    "title": "Lookback セットアップ",
+    "welcome": {
+      "title": "ようこそ",
+      "intro": "Claude Code / Codex のログを取り込み、作業を振り返るための設定を行います。",
+      "note": "保存先とモデルは、セットアップ後も設定タブから変更できます。"
+    },
+    "dataRoot": {
+      "title": "App data dir",
+      "desc": "空欄では現在の保存先を使います。現在: ",
+      "choose": "選択…",
+      "dialogError": "ディレクトリ選択ダイアログを開けませんでした。パスを直接入力してください。詳細: {{error}}"
+    },
+    "apply": {
+      "restartTitle": "保存先を変更しました",
+      "preparingTitle": "モデルを準備中…",
+      "resultTitle": "適用結果",
+      "preparingDesc": "設定を保存し、モデルを準備しています。",
+      "restartDesc": "新しい保存先を反映するため、Lookbackを再起動します。",
+      "restartButton": "再起動して続ける",
+      "backToFix": "戻って修正",
+      "retry": "リトライ"
+    },
+    "nav": {
+      "back": "戻る",
+      "skipAndStart": "スキップしてはじめる",
+      "skip": "スキップ",
+      "start": "設定をはじめる",
+      "next": "次へ"
+    }
+  },
+  "bootError": {
+    "raw": {
+      "title": "サイドカーの起動に失敗しました"
+    },
+    "other": {
+      "title": "サイドカーの起動に失敗しました",
+      "body": "[{{component}}] {{message}}"
+    },
+    "lancedbSchemaMismatch": {
+      "title": "Embedding ベクトルの次元が変わりました",
+      "body": "保存されているベクトル DB の次元 ({{actualDim}}) が、現在の Embedding モデルの次元 ({{expectedDim}}) と一致しません。\nこれは Embedding モデルを切り替えた後によく起こります。"
+    },
+    "lancedbInitFailed": {
+      "title": "ベクトル DB の初期化に失敗しました",
+      "body": "URI: {{uri}}\n原因: {{message}}\nパーミッション・ディスク残量・ファイル破損を確認してください。"
+    },
+    "embeddingDimensionMismatch": {
+      "title": "Embedding モデルの次元が一致しません",
+      "body": "Embedding ランナー ({{runnerName}}) が報告する次元 ({{actualDim}}) が、保存された MEMORY_VECTOR_SIZE ({{expectedDim}}) と一致しません。\nモデルを切り替えた直後によく起こります。"
+    },
+    "mediaConfigConflict": {
+      "title": "メディア保存設定が不整合です",
+      "body": "MEDIA_STORAGE_BACKEND={{backend}} は MEMORY_IMAGE_SEARCH_MODE={{imageSearchMode}} と組み合わせて使用できません。\n.env を確認してください。"
+    },
+    "rdbPoolInitFailed": {
+      "title": "データベース接続に失敗しました",
+      "body": "URL: {{url}}\n原因: {{message}}\nファイルパス・権限・ディスク残量を確認してください。"
+    },
+    "envVarInvalid": {
+      "title": "環境変数の値が不正です",
+      "body": "{{name}}: {{message}}\n.env またはアプリ設定を確認してください。"
+    },
+    "configLoadFailed": {
+      "title": "設定の読み込みに失敗しました",
+      "body": "{{component}}: {{message}}\n関連する環境変数 ({{component}} のプレフィックス) を確認してください。"
+    },
+    "action": {
+      "evacuate": {
+        "label": "ベクトル DB をバックアップして再起動",
+        "pending": "ベクトル DB を退避してサイドカーを再起動中…"
+      },
+      "purge": {
+        "label": "ベクトル DB を削除して再起動 (復元不可)",
+        "pending": "ベクトル DB を削除してサイドカーを再起動中…"
+      },
+      "resetEmbedding": {
+        "label": "Embedding 設定をリセットして再起動",
+        "pending": "Embedding 設定をリセットしてサイドカーを再起動中…"
+      },
+      "openLog": {
+        "label": "ログを開く"
+      },
+      "quit": {
+        "label": "アプリを終了"
+      }
+    },
+    "actionRunning": "実行中…",
+    "restartFailed": "再起動に失敗しました: {{message}}",
+    "restartFailedFallback": "サイドカーが再起動できませんでした。"
+  }
+}

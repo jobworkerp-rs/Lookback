@@ -1,0 +1,183 @@
+syntax = "proto3";
+package jobworkerp.runner.llm;
+
+// Completion request (text completion)
+message LLMChatArgs {
+  // LLM request options for generation configuration
+  // To specify to change the default behavior of the LLM
+  message LLMOptions {
+    // The length of the sample to generate (in tokens) (default: context size).
+    optional int32 max_tokens = 1;
+
+    // The temperature used to generate samples.
+    optional float temperature = 2;
+
+    // Nucleus sampling probability cutoff.
+    optional float top_p = 3;
+
+    // Penalty to be applied for repeating tokens, 1. means no penalty.
+    optional float repeat_penalty = 4;
+
+    // The context size to consider for the repeat penalty.
+    optional int32 repeat_last_n = 5;
+
+    // The seed to use when generating random samples.
+    optional int32 seed = 6;
+
+    // extract reasoning content from the response
+    optional bool extract_reasoning_content = 7;
+  }
+
+  message FunctionOptions {
+    // use function calling
+    bool use_function_calling = 1;
+    // function set name
+    optional string function_set_name = 2;
+    // use runners as function (exclusive with function_set_name)
+    optional bool use_runners_as_function = 3;
+    // use workers as function (exclusive with function_set_name)
+    optional bool use_workers_as_function = 4;
+    // automatically execute tool calls (default: false = manual mode)
+    // When false, tool calls are returned to the client for approval before execution
+    optional bool is_auto_calling = 5;
+    // When true, automatically inject FunctionSet selector tools to enable
+    // LLM-driven FunctionSet selection. Requires use_function_calling = true.
+    // Lower priority than function_set_name: ignored when function_set_name is set.
+    // When function_set_name is not specified, LLM discovers and selects
+    // appropriate FunctionSets dynamically via pseudo-tool calls.
+    optional bool auto_select_function_set = 6;
+
+    // OpenAI-compatible tools JSON array for client-side tool execution.
+    // Pass the verbatim JSON the OpenAI Chat Completions API expects, e.g.
+    // '[{"type":"function","function":{"name":"get_weather", ...}}]'.
+    // Mutually exclusive with use_function_calling (server-side execution)
+    // and with LLMChatArgs.json_schema (grammar conflict). When set, the
+    // model output is parsed and returned via pending_tool_calls /
+    // requires_tool_execution for client-side execution.
+    optional string client_tools_json = 7;
+    // OpenAI-compatible tool_choice. Accepts:
+    //   - "auto" | "none" | "required" (passed through to llama.cpp)
+    //   - {"type":"function","function":{"name":"<n>"}} JSON object: the
+    //     plugin filters client_tools_json down to that single function so
+    //     the model can only invoke it (function-specific semantics).
+    // Function names that are not present in client_tools_json are
+    // rejected. Default (when omitted): "auto".
+    optional string tool_choice = 8;
+    // Allow the model to emit multiple tool calls in a single response
+    // (OpenAI-compatible). Default: false.
+    optional bool parallel_tool_calls = 9;
+    // Reasoning extraction format hint forwarded to the chat template
+    // (e.g. "deepseek"). When set, llama.cpp may surface reasoning as
+    // `reasoning_content` deltas instead of inlining it into content.
+    optional string reasoning_format = 10;
+    // Arbitrary chat_template_kwargs JSON object forwarded to the jinja
+    // template, e.g. '{"enable_thinking":false}'. Use this to set
+    // model-specific switches without hard-coding them in the plugin.
+    optional string chat_template_kwargs = 11;
+  }
+
+  enum ChatRole {
+    // The role of the message.
+    UNSPECIFIED = 0;
+    SYSTEM = 1;    // System message
+    USER = 2;      // User message
+    ASSISTANT = 3; // Assistant message
+    TOOL = 4;      // Tool message
+  }
+
+  message MessageContent {
+    message ImageSource {
+      // For models/services that support URL as input
+      string url = 1;
+
+      // The base64 string of the image
+      string base64 = 2;
+    }
+
+    message Image {
+      string content_type = 1;
+      ImageSource source = 2;
+    }
+
+    message ToolCall {
+      string call_id = 1;
+      string fn_name = 2;
+      string fn_arguments = 3;
+    }
+
+    // Tool calls
+    message ToolCalls { repeated ToolCall calls = 1; }
+
+    // Tool execution request (client requesting server to execute a tool)
+    message ToolExecutionRequest {
+      string call_id = 1;
+      string fn_name = 2;
+      string fn_arguments = 3;  // JSON string of arguments (can be modified by client)
+    }
+
+    // Multiple tool execution requests
+    message ToolExecutionRequests { repeated ToolExecutionRequest requests = 1; }
+
+    // One client-executed tool result. Carried on a ChatRole::TOOL message
+    // that follows an ASSISTANT message whose ToolCalls included a matching
+    // call_id. The runner translates this into the underlying provider's
+    // tool-result convention.
+    message ToolResult {
+      string call_id = 1;
+      // MAY be empty. The runner resolves it from the preceding ASSISTANT
+      // ToolCalls by call_id (reverse scan, newest → oldest). Required at
+      // the wire layer because some providers refuse to accept a tool
+      // response without a function name.
+      string fn_name = 2;
+      // Tool output text (typically JSON). Empty is allowed (a tool may
+      // legitimately return nothing).
+      string content = 3;
+      // True if the tool failed. The runner maps this to the underlying
+      // provider's error representation.
+      bool is_error = 4;
+    }
+
+    // Multiple client-executed tool results bundled into one TOOL message.
+    // Array order is preserved when expanded into provider messages.
+    message ToolResults { repeated ToolResult results = 1; }
+
+    oneof content {
+      // The role of the message.
+      string text = 1;
+
+      // The content of the message.
+      Image image = 2;
+
+      // Tool calls from LLM (ASSISTANT role)
+      ToolCalls tool_calls = 3;
+
+      // Tool execution requests from client (TOOL role, requesting server to execute)
+      ToolExecutionRequests tool_execution_requests = 4;
+
+      // Client-executed tool results (TOOL role).
+      ToolResults tool_results = 5;
+    }
+  }
+
+  message ChatMessage {
+    /// The role of the message.
+    ChatRole role = 1;
+
+    /// The content of the message.
+    MessageContent content = 2;
+  }
+
+  // The name of the model (override default in runner settings).
+  optional string model = 1;
+
+  // The options to use for the model.
+  optional LLMOptions options = 2;
+
+  // The function options to use for the model.
+  optional FunctionOptions function_options = 4;
+
+  repeated ChatMessage messages = 5;
+  
+  // JSON Schema for structured output (optional)
+  optional string json_schema = 6;
+}

@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package jobworkerp_conductor.service;
+
+import "jobworkerp_conductor/data/execution_ref.proto";
+import "jobworkerp_conductor/data/jobworkerp_server.proto";
+import "jobworkerp_conductor/service/common.proto";
+
+message CreateExecutionRefResponse {
+  jobworkerp_conductor.data.ExecutionRefId id = 1;
+}
+
+message OptionalExecutionRefResponse {
+  optional jobworkerp_conductor.data.ExecutionRef data = 1;
+}
+
+message ExecutionSourceRequest {
+  jobworkerp_conductor.data.ExecutionSourceType source_type = 1;
+  int64 source_id = 2;
+  optional int32 limit = 3;
+  optional int64 offset = 4;
+}
+
+message ExecutionRuntimeStatusRequest {
+  jobworkerp_conductor.data.ExecutionRefId id = 1;
+}
+
+message OptionalExecutionRuntimeStatusResponse {
+  optional jobworkerp_conductor.data.ExecutionRuntimeStatus data = 1;
+}
+
+// Delete all execution refs for a given source.
+message DeleteExecutionRefsBySourceRequest {
+  jobworkerp_conductor.data.ExecutionSourceType source_type = 1;
+  int64 source_id = 2;
+  // When true, the terminal-only protection is bypassed and every ref of the source is deleted
+  // (force cleanup, e.g. when jobworkerp is unreachable and status cannot be resolved). Default
+  // false: only refs resolved to a terminal status are deleted.
+  optional bool include_active = 3;
+}
+
+// Number of execution refs deleted.
+message DeleteCountResponse { int64 deleted = 1; }
+
+// Manually trigger one execution of a configured source, without waiting for its schedule/event.
+// MVP supports CRON_SCHEDULER only; SLACK_EVENT_HANDLER / WORKER_RESULT_HANDLER need a synthetic
+// event / result to build args and return UNIMPLEMENTED.
+message TriggerExecutionRequest {
+  jobworkerp_conductor.data.ExecutionSourceType source_type = 1;
+  int64 source_id = 2;
+  // Optional override args (JSON), Cron only. When unset the source's configured args are used;
+  // when set they replace (not merge) the configured args.
+  optional string args_json = 3;
+}
+
+message TriggerExecutionResponse {
+  // Created ExecutionRef id. Present even when the job fails terminally (recorded for tracking);
+  // absent only when no ExecutionRef could be created.
+  optional jobworkerp_conductor.data.ExecutionRefId execution_ref_id = 1;
+  jobworkerp_conductor.data.ExecutionRuntimeStatus status = 2;
+}
+
+// Re-run the source that an existing ExecutionRef points at, using the source's CURRENT config
+// (args are not carried over from the original ref). Cron source only (MVP).
+message ReExecuteResponse {
+  optional jobworkerp_conductor.data.ExecutionRefId execution_ref_id = 1;
+  jobworkerp_conductor.data.ExecutionRuntimeStatus status = 2;
+}
+
+// Cross-source listing filter. All fields optional / AND-combined. Status is intentionally absent:
+// resolved_status is computed at read time against jobworkerp and is not stored, so it cannot be
+// filtered in SQL (status narrowing is done client-side after fetch).
+message FindExecutionListRequest {
+  optional jobworkerp_conductor.data.ExecutionSourceType source_type = 1;
+  optional jobworkerp_conductor.data.JobworkerpServerId jobworkerp_server_id = 2;
+  // Time window on triggered_at (epoch seconds, inclusive).
+  optional int64 triggered_after = 3;
+  optional int64 triggered_before = 4;
+  optional int32 limit = 5;
+  optional int64 offset = 6;
+}
+
+service ExecutionStatusService {
+  rpc CreateExecutionRef(jobworkerp_conductor.data.ExecutionRef)
+      returns (CreateExecutionRefResponse);
+  rpc FindExecutionRef(jobworkerp_conductor.data.ExecutionRefId)
+      returns (OptionalExecutionRefResponse);
+  rpc FindLatestBySource(ExecutionSourceRequest)
+      returns (OptionalExecutionRefResponse);
+  rpc FindListBySource(ExecutionSourceRequest)
+      returns (stream jobworkerp_conductor.data.ExecutionRef);
+  rpc FindRuntimeStatus(ExecutionRuntimeStatusRequest)
+      returns (OptionalExecutionRuntimeStatusResponse);
+  rpc FindLatestRuntimeStatusBySource(ExecutionSourceRequest)
+      returns (OptionalExecutionRuntimeStatusResponse);
+  rpc CancelExecution(jobworkerp_conductor.data.ExecutionRefId)
+      returns (SuccessResponse);
+  // Delete a single execution ref. Only terminal refs may be deleted; an active or
+  // status-indeterminate ref returns FAILED_PRECONDITION. A missing ref returns is_success=false.
+  rpc DeleteExecutionRef(jobworkerp_conductor.data.ExecutionRefId)
+      returns (SuccessResponse);
+  // Delete execution refs of a source. With include_active=false (default) only terminal refs are
+  // deleted; with include_active=true every ref of the source is deleted.
+  rpc DeleteExecutionRefsBySource(DeleteExecutionRefsBySourceRequest)
+      returns (DeleteCountResponse);
+  // Cross-source listing ordered by triggered_at DESC, id DESC (consistent with FindListBySource).
+  rpc FindList(FindExecutionListRequest)
+      returns (stream jobworkerp_conductor.data.ExecutionRef);
+  // Total count for the same filter (pager totals).
+  rpc CountList(FindExecutionListRequest) returns (CountResponse);
+  // Manually trigger one execution of a configured source (Cron only in MVP). Returns immediately
+  // after the job_id is assigned; terminal monitoring continues in the background.
+  rpc TriggerExecution(TriggerExecutionRequest) returns (TriggerExecutionResponse);
+  // Re-run the source an existing ExecutionRef points at with its current config (Cron only).
+  rpc ReExecute(jobworkerp_conductor.data.ExecutionRefId) returns (ReExecuteResponse);
+}

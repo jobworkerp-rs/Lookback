@@ -1,0 +1,1 @@
+{"timestamp":"2026-06-05T07:50:50.976570Z","level":"ERROR","fields":{"code":"env_var_invalid","name":"GRPC_ADDR","message":"invalid socket address: not_a_socket_addr"},"target":"app::startup_error"}

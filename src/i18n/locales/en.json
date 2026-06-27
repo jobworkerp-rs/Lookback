@@ -1,0 +1,886 @@
+{
+  "locale": {
+    "label": "Language",
+    "system": "System",
+    "ja": "日本語",
+    "en": "English"
+  },
+  "theme": {
+    "label": "Theme",
+    "option": {
+      "system": "System",
+      "light": "Light",
+      "dark": "Dark"
+    }
+  },
+  "nav": {
+    "section": {
+      "browse": "Browse",
+      "system": "System"
+    },
+    "threads": "Threads",
+    "summaries": "Summaries",
+    "reflections": "Reflections",
+    "personality": "Personality",
+    "chat": "Chat",
+    "periodic": "Periodic Tasks",
+    "settings": "Settings"
+  },
+  "sidecar": {
+    "title": "Sidecar",
+    "phase": {
+      "ready": "ready",
+      "error": "error",
+      "starting": "starting…"
+    },
+    "warning": {
+      "worker_apply_failed": "worker registration failed",
+      "plugins_stage_failed": "plugin staging failed"
+    }
+  },
+  "common": {
+    "loading": "Loading…",
+    "reload": "Reload",
+    "import": "Import",
+    "cancel": "Cancel",
+    "delete": "Delete"
+  },
+  "memoryRefs": {
+    "open": "Open {{entity}} {{id}}",
+    "label": "{{entity}} {{id}}"
+  },
+  "summaryKind": {
+    "per-thread": "Thread",
+    "daily": "Daily",
+    "weekly": "Weekly",
+    "monthly": "Monthly"
+  },
+  "labelPrefix": {
+    "category": "Category"
+  },
+  "taxonomy": {
+    "unknown": "?({{value}})",
+    "taskCategory": {
+      "0": "Unspecified",
+      "1": "Coding",
+      "2": "Consultation",
+      "3": "Research",
+      "4": "Creative",
+      "5": "General"
+    },
+    "outcome": {
+      "0": "Unspecified",
+      "1": "Success",
+      "2": "Partial",
+      "3": "Failure",
+      "4": "Aborted",
+      "5": "Unknown"
+    },
+    "reflectionAspect": {
+      "0": "Unspecified",
+      "1": "Task outcome",
+      "2": "Interaction style",
+      "3": "Both"
+    }
+  },
+  "search": {
+    "mode": {
+      "browse": "Browse",
+      "keyword": "Keyword",
+      "semantic": "Semantic",
+      "hybrid": "Hybrid"
+    },
+    "modeTitle": {
+      "keyword": "BM25 keyword search",
+      "semantic": "Embed server-side (requires GPU MultimodalEmbeddingRunner)",
+      "hybrid": "Vector + BM25 fusion (embed client-side → HybridSearch)"
+    },
+    "hint": {
+      "keyword": "BM25 keyword search",
+      "semantic": "Embed server-side (GPU MultimodalEmbeddingRunner). Fails if not deployed.",
+      "hybrid": "Vector + BM25 fusion. Embed client-side (embedding worker required)."
+    },
+    "errorHint": {
+      "shortQuery": "Try a longer search term, or combine several words. To search with short terms only, use Keyword search.",
+      "embeddingWorker": "Could not run {{mode}} search. Check the embedding model or worker readiness in Settings."
+    },
+    "searching": "Searching…",
+    "enterQuery": "Enter a query"
+  },
+  "threads": {
+    "title": "Threads",
+    "fallbackTitle": "Thread #{{id}}",
+    "subtitleHits_one": "{{count}} hit",
+    "subtitleHits_other": "{{count}} hits",
+    "subtitleImported": "{{count}} imported",
+    "searchPlaceholder": "Search query",
+    "filterPlaceholder": "Filter threads",
+    "createdAfterTitle": "Created after (strict >)",
+    "createdBeforeTitle": "Created before (inclusive <=)",
+    "delete": {
+      "title": "Delete this thread?",
+      "message": "This deletes the thread and its conversation messages. It cannot be undone. Generated summaries and reflections remain, so delete them individually from their screens if unwanted.",
+      "confirm": "Delete thread"
+    },
+    "empty": {
+      "title": "No threads",
+      "descSuffix": " to import session logs"
+    },
+    "search": {
+      "noHitsTitle": "No hits",
+      "noHitsDesc": "Try a different period or search mode",
+      "messageLabel": "Message {{position}} / {{total}}",
+      "score_one": "score {{score}} · {{count}} hit",
+      "score_other": "score {{score}} · {{count}} hits"
+    }
+  },
+  "periodic": {
+    "title": "Periodic tasks",
+    "subtitle": "Schedule Lookback summary generation with conductor",
+    "new": "New",
+    "intro": {
+      "title": "Schedule",
+      "desc": "The local sidecar's conductor runs the Lookback summary-generation workflow on a cron schedule."
+    },
+    "loadError": "Failed to load periodic tasks.",
+    "empty": {
+      "title": "No periodic tasks yet",
+      "desc": "Use the New button to add a summary-generation schedule."
+    },
+    "card": {
+      "unknownSource": "unknown",
+      "unsupportedFormat": "Unsupported format",
+      "unnamed": "(Unnamed)",
+      "lookback_one": "last {{count}} day",
+      "lookback_other": "last {{count}} days"
+    },
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "edit": "Edit",
+    "history": "History",
+    "delete": {
+      "title": "Delete periodic task",
+      "message": "Delete {{name}}. This action cannot be undone."
+    },
+    "status": {
+      "latestLoading": "Latest: loading…",
+      "notStarted": "Not run yet",
+      "latest": "Latest: {{time}}",
+      "job": "job {{jobId}}",
+      "unavailable": "Status unavailable"
+    },
+    "cancel": {
+      "button": "Stop",
+      "title": "Stop execution",
+      "message": "Send a stop request to the running job for {{name}}.",
+      "busy": "Stopping…"
+    },
+    "historyModal": {
+      "title": "Execution history: {{name}}",
+      "refresh": "Refresh",
+      "loadError": "Failed to load history.",
+      "empty": "No execution history yet.",
+      "close": "Close"
+    },
+    "dialog": {
+      "createTitle": "Create periodic task",
+      "editTitle": "Edit periodic task",
+      "name": "Name",
+      "source": "Source",
+      "kind": "Kind",
+      "kindRegular": "Regular",
+      "kindWeekly": "Weekly",
+      "kindMonthly": "Monthly",
+      "hour": "Base time (hour)",
+      "minute": "Base time (minute)",
+      "intervalUnit": "Interval unit",
+      "intervalUnitHours": "Hours",
+      "intervalUnitDays": "Days",
+      "interval": "Interval",
+      "hoursOption_one": "{{count}} hour",
+      "hoursOption_other": "{{count}} hours",
+      "outputs": "Outputs",
+      "summaryThread": "Summary: thread",
+      "summaryDaily": "Summary: daily",
+      "summaryWeekly": "Summary: weekly",
+      "summaryMonthly": "Summary: monthly",
+      "personality": "Personality",
+      "reflection": "Reflection",
+      "weekday": "Day of week",
+      "monthlyDay": "Day of month",
+      "lookbackDays": "Lookback days",
+      "save": "Save"
+    },
+    "weekday": {
+      "sun": "Sun",
+      "mon": "Mon",
+      "tue": "Tue",
+      "wed": "Wed",
+      "thu": "Thu",
+      "fri": "Fri",
+      "sat": "Sat"
+    },
+    "kindLabel": {
+      "regular": "Regular",
+      "weekly": "Weekly",
+      "monthly": "Monthly"
+    },
+    "statusLabel": {
+      "pending": "Pending",
+      "running": "Running",
+      "wait_result": "Awaiting result",
+      "cancelling": "Cancelling",
+      "succeeded": "Succeeded",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "unknown": "Unknown",
+      "unavailable": "Unavailable",
+      "enqueue_failed": "Enqueue failed",
+      "not_started": "Not run"
+    },
+    "validation": {
+      "nameRequired": "Enter a name",
+      "sourceRequired": "Select a target source",
+      "sourceInvalid": "Choose source from codex / claude-code / codex + claude-code",
+      "hourRange": "Enter the hour as 0-23",
+      "minuteRange": "Enter the minute as 0-59",
+      "lookbackRange": "Enter lookback days as 1 or more",
+      "intervalRange": "Enter the interval as 1 or more",
+      "intervalHourChoice": "Choose the hour interval from 1/2/3/4/6/8/12/24",
+      "weekdayInvalid": "Invalid day of week",
+      "monthlyDayRange": "Enter the monthly day in the range 1-28"
+    },
+    "cronInvalidInterval": "Invalid hour interval",
+    "unknownSource": "unknown"
+  },
+  "personality": {
+    "title": "Personality",
+    "updatedAt": "Updated {{time}}",
+    "profileNotGenerated": "Profile not generated",
+    "forceReextract": "Force re-extract",
+    "forceReextractHint": "Force re-extract: re-extracts all threads including those that already have signals (also disables the target_signal_count early stop). Use this to apply prompt changes to historical data.",
+    "forceReextractConfirm": "Enabling Force re-extract re-extracts all existing signals as well. This puts heavy load on the LLM and may take time depending on the volume. Proceed?",
+    "stop": "Stop",
+    "stopHint": "Abort the running job",
+    "generate": "Generate personality",
+    "generateForce": "Generate with Force",
+    "generateHint": "Dispatches memories-personality-batch to jobworkerp",
+    "enqueuing": "Enqueuing…",
+    "mergeOnly": "Merge only",
+    "mergeForce": "Merge with Force",
+    "mergeOnlyHint": "Runs only user-personality-merge. Skips per-thread re-extraction and regenerates the profile from existing signals (for recovery when only the merge failed, e.g. due to rate limits).",
+    "statThreads": "Threads",
+    "statThreadsHint": "Open the thread list",
+    "statSignals": "Signals",
+    "statSignalsHint": "Show the list of backing signals",
+    "statCategories": "Categories",
+    "statCategoriesHint": "Scroll to category details",
+    "statProfileVersion": "Profile version",
+    "emptyTitle": "No profile yet",
+    "emptyDesc": "It is generated when thread-personality-batch → user-personality-merge run after an import completes. If signals already exist but no profile appears, you can recover with \"Merge only\".",
+    "deleteProfile": "Delete profile",
+    "deleteProfileConfirmTitle": "Delete the personality profile?",
+    "deleteProfileConfirmMessage": "Deletes the merged profile. Signals and source threads remain. You can rebuild it with \"Generate\" again.",
+    "signalsDrawerAria": "Personality signals",
+    "signalsDrawerTitle": "Backing signals",
+    "signalsUsedCount_one": "{{formatted}} signal used for the merge",
+    "signalsUsedCount_other": "{{formatted}} signals used for the merge",
+    "close": "Close",
+    "signalsEmptyTitle": "No signals",
+    "signalsEmptyDesc": "Signals are extracted when thread-personality-batch runs",
+    "deleteSignalConfirmTitle": "Delete the signal?",
+    "deleteSignalConfirmMessage": "Deletes this personality signal. The source thread remains. The change is not reflected in the merged profile until the next generation.",
+    "threadFallback": "Thread #{{id}}",
+    "noDisplayableContent": "No displayable content",
+    "noInfo": "No information"
+  },
+  "chat": {
+    "title": "RAG Chat",
+    "subtitle": "Answers grounded in your memories",
+    "clearTitle": "Clear the on-screen conversation history",
+    "clear": "Clear history",
+    "jumpLatestTitle": "Jump to latest",
+    "jumpLatest": "↓ Latest",
+    "empty": {
+      "line1": "Answers by RAG search over your past threads, summaries, and raw logs.",
+      "line2": "e.g. \"What did we discuss about caching recently?\" / \"When did I write that reflection?\""
+    },
+    "you": "You",
+    "status": {
+      "preparing": "Preparing…",
+      "searching": "Searching memories…",
+      "generating": "Generating answer…"
+    },
+    "errorPrefix": "Error:",
+    "sources": {
+      "label": "Sources ({{count}})",
+      "threadDetail": "thread #{{id}}"
+    },
+    "sourceKind": {
+      "raw_memory": "Raw",
+      "thread_summary": "Thread summary",
+      "period_summary": "Period summary"
+    },
+    "composer": {
+      "placeholder": "Type a question (⌘Enter to send)",
+      "stop": "Stop",
+      "send": "Send"
+    }
+  },
+  "reflections": {
+    "title": "Reflections",
+    "subtitleCount_one": "{{count}} item",
+    "subtitleCount_other": "{{count}} items",
+    "cancelTitle": "Cancel the running reflection generation",
+    "cancel": "Cancel",
+    "generateTitle": "Dispatch memories-reflection-batch to jobworkerp",
+    "generate": "Generate reflection",
+    "enqueuing": "Enqueuing…",
+    "intentPlaceholder": "Natural-language search by intent (e.g. how to fix flaky tests)",
+    "intentTitle": "Semantic search over intent_embedding (requires GPU embedding worker)",
+    "createdAfterTitle": "Created after",
+    "progress": {
+      "done": "Generation complete",
+      "failed": "Generation failed",
+      "active": "Generating",
+      "close": "Close"
+    },
+    "empty": {
+      "title": "No reflections yet",
+      "desc": "Generated automatically on import, or run once from the \"Generate reflection\" button above"
+    },
+    "delete": {
+      "title": "Delete this reflection?",
+      "message": "This deletes the reflection. The source thread is not removed. You can recreate it with \"Generate reflection\"."
+    },
+    "card": {
+      "openThread": "Open source thread →",
+      "lessons": "Lessons",
+      "keyDecisions": "Key decisions",
+      "mitigationHint": "Mitigation hint"
+    }
+  },
+  "summaries": {
+    "title": "Summaries",
+    "subtitleCount_one": "{{count}} item",
+    "subtitleCount_other": "{{count}} items",
+    "fallbackTitle": "Thread #{{id}}",
+    "cancelTitle": "Cancel the running job",
+    "cancel": "Stop",
+    "generateTitle": "Generate summaries (pick granularity/period in the dialog)",
+    "generate": "Generate",
+    "view": {
+      "list": "List",
+      "search": "Search",
+      "calendar": "Calendar"
+    },
+    "calendarDisabledTitle": "Thread summaries have no period",
+    "searchPlaceholder": "Search query",
+    "date": {
+      "createdAfter": "Created after (strict >)",
+      "createdBefore": "Created before (inclusive <=)",
+      "updatedAfter": "Updated after (strict >)",
+      "updatedBefore": "Updated before (strict <)"
+    },
+    "calendar": {
+      "selectPrompt": "Select a day/week/month to show its summary",
+      "noEntries": "No summary for {{key}}"
+    },
+    "list": {
+      "emptyTitle": "No summaries generated yet",
+      "emptyDesc": "Generated automatically after import completes (FR-IMPORT-6)"
+    },
+    "card": {
+      "openThreadTitle": "Open the source thread",
+      "noId": "(no id)"
+    },
+    "delete": {
+      "title": "Delete this summary?",
+      "message": "This deletes the summary. The source thread and conversation are not removed. You can recreate it with \"Generate\"."
+    },
+    "hit": {
+      "score_one": "score {{score}} · {{count}} hit",
+      "score_other": "score {{score}} · {{count}} hits",
+      "close": "Close",
+      "show": "Show summary"
+    }
+  },
+  "confirm": {
+    "confirmLabel": "Delete",
+    "busyLabel": "Deleting…"
+  },
+  "settingsSaveBar": {
+    "aria": "Unsaved changes",
+    "count": "You have unsaved changes ({{count}})",
+    "restartHint": "Saving restarts the sidecar.",
+    "resetWarning": "⚠ The embedding model/dimension will change. The existing vectordb will be reset (evacuated/deleted) and all embeddings must be regenerated (tens of minutes to hours).",
+    "discard": "Discard",
+    "saving": "Saving…",
+    "save": "Save and apply (restart)"
+  },
+  "settings": {
+    "title": "Settings",
+    "titleAdvanced": "Settings — Advanced",
+    "backToBasic": "← Back to settings",
+    "advanced": {
+      "title": "Advanced",
+      "desc": "Connection / Embedding model / MCP server / Data location / Delete all data. Low-frequency, high-impact settings.",
+      "open": "Open advanced settings…",
+      "notice": "These are low-frequency, high-impact settings. You can change the connection target, embedding model, MCP server, and data location, and delete all data."
+    },
+    "vectordbBackup": {
+      "evacuated": "The existing vectordb was moved aside to: ",
+      "manualDelete": "To delete it manually, run rm -rf on the path above."
+    },
+    "modelState": {
+      "preparing": "Not downloaded",
+      "ready": "Ready",
+      "failed": "Failed",
+      "fetching": "Loading…"
+    },
+    "modelStatus": {
+      "currentModel": "Current model",
+      "provider": "Provider",
+      "readiness": "Readiness",
+      "retryTitle": "Re-runs plugin staging and sidecar startup",
+      "retrying": "Retrying…",
+      "retry": "Retry",
+      "preparingHintPre": "The model is downloaded from Hugging Face the first time a {{purpose}} job runs (a few to tens of minutes depending on your connection).",
+      "preparingHintRunImport": "Run Import once",
+      "preparingHintPost": " to start a job and begin the download. It changes to \"Ready\" once complete.",
+      "readyHint": "The model is cached and {{purpose}} is available.",
+      "failedDefault": "The model could not be prepared.",
+      "failedHint": "If the sidecar won't start or the plugin (dylib) is missing, check your environment and restart the app."
+    },
+    "llm": {
+      "modeLocal": "Local LLM",
+      "modeExternal": "External API",
+      "title": "LLM Provider",
+      "desc": "Choose the LLM backend for summaries, reflections, personality, and chat. External API auto-detects the provider from the model name (gpt-* = OpenAI, claude-* = Anthropic, gemini-* = Gemini, etc.).",
+      "modelPurpose": "generating summaries, reflections, and personality",
+      "backend": "Backend",
+      "modelName": "Model name",
+      "apiKey": "API key",
+      "apiKeyPlaceholderDelete": "(will be deleted on save)",
+      "apiKeyPlaceholderStored": "(stored in Keychain)",
+      "cancelDeleteKeyTitle": "Cancels the deletion",
+      "cancelDeleteKey": "Undo delete",
+      "deleteKeyTitle": "Deletes the Keychain API key on save",
+      "deleteKey": "Delete key",
+      "deleteKeyWarning": "Saving will delete the API key from the Keychain.",
+      "baseUrlPlaceholder": "(optional) https://proxy.example.com/v1",
+      "apiKeyHint": "The API key is stored in the macOS Keychain. Changing the model name or key restarts the sidecar.",
+      "proxyNoteLabel": "Note: ",
+      "proxyNotePre": "When using a non-OpenAI model via an OpenAI-compatible proxy such as LiteLLM, prefix the model name with ",
+      "proxyNoteMid": "",
+      "proxyNoteExample": "e.g. ",
+      "proxyNotePost": ". Without the prefix, the provider is inferred from the model name and a protocol incompatible with the proxy is used.",
+      "maxTokensChat": "Max tokens (chat)",
+      "temperatureChat": "Temperature (chat)",
+      "genParamsHintPre": "Max tokens / Temperature apply only to ",
+      "genParamsHintChat": "chat responses",
+      "genParamsHintPost": ". The summary / reflection / personality batches use the YAML defaults (e.g. 50000 for monthly summaries) since their output volume is tuned per purpose. Leave blank to restore the defaults (4000 / 0.3).",
+      "preset": "Preset",
+      "presetOption": "{{name}} (≈ {{ram}}GB)",
+      "ramEstimate": "Model: {{model}}GB / KV cache: {{kv}}GB ({{ctx}} ctx, {{kvType}}) / Total: {{total}}GB",
+      "ramEstimateWithEmbedding": "Embedding: {{embedding}}GB / LLM + Embedding total: {{total}}GB",
+      "embeddingRamUnavailable": "Embedding RAM: custom embedding model / LLM + Embedding total unavailable",
+      "customOption": "Custom…",
+      "ggufFile": "GGUF file",
+      "customHintPre": "Specify the Hugging Face repository",
+      "customHintMid": "and the",
+      "customHintPost": "file name inside it. Only Qwen3.5-family and Gemma 4-family models are supported. Only the format is checked (existence on HF is not verified).",
+      "advancedToggleOpen": "▼ Advanced",
+      "advancedToggleClosed": "▶ Advanced",
+      "ctxSizeHint": "Leave blank to use the preset's recommended value ({{value}})",
+      "ctxSizeNote": "You can reduce it for memory constraints. The reflection workflow needs roughly 222k of context; smaller values split long summaries.",
+      "kvCacheType": "KV cache type",
+      "kvCacheTypeHint": "Smaller values reduce RAM use but can affect model quality.",
+      "customRamUnavailable": "RAM estimates are available only for presets with known model structure.",
+      "localHint": "Uses a local LLM (llama-cpp). Saving restarts the sidecar automatically; a not-yet-downloaded model is fetched from Hugging Face (the first time takes a few to tens of minutes).",
+      "externalIncomplete": "Enter a model name.",
+      "customIncomplete": "Enter a valid HF repo and .gguf file name for the custom model."
+    },
+    "connection": {
+      "modeLocal": "Local sidecar",
+      "modeRemote": "Remote server",
+      "title": "Connection",
+      "desc": "By default it connects to the bundled sidecar. The actual port is chosen at startup and shown read-only when Local is selected (ARCH-7). Choosing Remote lets you override the target with an existing server's gRPC URL (http/https).",
+      "target": "Target",
+      "starting": "starting…",
+      "saving": "Saving…",
+      "save": "Save target",
+      "saved": "Saved",
+      "testing": "Testing…",
+      "test": "Test connection",
+      "testOk": "Connection OK"
+    },
+    "logs": {
+      "title": "Logs",
+      "desc": "Shows the tail of the app / sidecar logs (NFR-6), for troubleshooting. \"app\" is Lookback's own log, including import failure reasons.",
+      "process": "Process",
+      "stream": "Stream",
+      "singleFile": "Single file (shared stdout/stderr)",
+      "loading": "Loading…",
+      "tailOnly": "(showing tail only)",
+      "empty": "No logs"
+    },
+    "embedding": {
+      "title": "Embedding model",
+      "desc": "The model used to embed Memory / Reflection. If the model or vector dimension changes, the existing index is reset (re-generation required). Changing only dtype / max sequence length / tokenizer keeps the index.",
+      "modelPurpose": "embedding for search (Semantic / Hybrid / natural language)",
+      "resetBanner": "⚠ Because the embedding model/dimension changes, all existing embeddings will be reset (moved aside/deleted) and must be re-generated (tens of minutes to hours).",
+      "noResetNote": "This change does not alter the model/dimension, so the existing vectordb is kept (no re-generation needed). Saving restarts the sidecar.",
+      "remoteDisabled": "Embedding settings can't be changed while connected remotely. The remote memories keeps its own vectordb, so a local switch has no effect.",
+      "currentSettings": "Current settings",
+      "preset": "Preset",
+      "presetOption": "{{name}} (≈ {{ram}}GB)",
+      "ramEstimate": "Embedding RAM: {{ram}}GB",
+      "customOption": "Custom…",
+      "tokenizer": "Tokenizer (optional)",
+      "tokenizerPlaceholder": "Same as HF Repo if blank",
+      "multimodal": "Multimodal",
+      "multimodalLabel": "Embed text and images in the same vector space (unchecking disables image search)",
+      "existingVectordb": "Existing vectordb",
+      "evacuateLabel": "Move aside (uncheck to delete)",
+      "customRequired": "Custom models require an HF Repo and Vector size."
+    },
+    "embeddingIndex": {
+      "title": "Embedding index",
+      "desc": "Status and re-generation of the Memory (summaries / thread bodies) embedding index. This is what search (Semantic / Hybrid / natural language) hits.",
+      "tableMissing": "The memory_vector table has not been created (sidecar not running, or embedding disabled).",
+      "total": "Total memories",
+      "embedded": "Embedded",
+      "pending": "Not generated",
+      "allDone": "All generated (auto-generation is working).",
+      "redispatch": "Re-generate",
+      "redispatchTitle": "Use this to fill gaps or rebuild after changing the embedding model (this takes a while)",
+      "redispatching": "Re-generating…",
+      "redispatchButton": "Re-generate",
+      "redispatchConfirm": "This will re-generate embeddings for {{count}} memories. It will take a while. Continue?",
+      "result": "Re-generation: dispatched {{dispatched}} / skipped {{skipped}} / failed {{failed}} ({{ms}} ms)"
+    },
+    "mcp": {
+      "title": "MCP Server",
+      "descPre": "Exposes Lookback's search tool",
+      "descMid": "as an MCP server to external MCP clients (e.g. Claude Desktop). It runs alongside jobworkerp's gRPC, so it doesn't affect the app's existing features. The exposed tools are limited to the function-set ",
+      "descPost": ".",
+      "server": "MCP server",
+      "enable": "Enable",
+      "url": "Connection URL",
+      "urlPending": "Shown after you save and the sidecar restarts",
+      "clientConfigExample": "Example MCP client config (streamable HTTP transport):",
+      "advancedToggleOpen": "▼ Advanced",
+      "advancedToggleClosed": "▶ Advanced",
+      "streamingDefault": "Default (disabled)",
+      "streamingOn": "Enabled",
+      "streamingOff": "Disabled",
+      "timeout": "Timeout (sec)",
+      "timeoutHint": "Leave blank for the default (60)",
+      "timeoutInvalid": "Enter the timeout as an integer between {{min}} and {{max}} seconds.",
+      "restartHint": "Saving changes restarts the sidecar (MCP enable/disable is decided at startup)."
+    },
+    "savingModal": {
+      "title": "Applying settings…",
+      "descWithVectordbReset": "Restarting the sidecar and loading the new settings (including the embedding model). Because this includes a vectordb reset and the first model download, it may take tens of minutes to several hours.",
+      "desc": "Restarting the sidecar and loading the new settings. This takes tens of seconds to a few minutes. The first time may take longer because it includes a model download from Hugging Face."
+    },
+    "unsavedDialog": {
+      "title": "You have unsaved changes",
+      "message": "This view has unsaved changes. Discard them and leave? (Cancel to stay)",
+      "confirm": "Discard and leave"
+    },
+    "purge": {
+      "title": "Destructive",
+      "desc": "Stops the sidecar and deletes everything under the data root. This cannot be undone.",
+      "label": "Delete all data",
+      "button": "Delete all data…",
+      "warningsAlert": "All data was deleted, but the following warnings occurred:\n\n{{warnings}}",
+      "modalTitle": "Delete all data?",
+      "modalBody": "The following directory will be permanently deleted: ",
+      "modalWarning": "This cannot be undone. After the sidecar is stopped, the data is deleted.",
+      "deleting": "Deleting…",
+      "confirm": "Delete"
+    },
+    "hfHome": {
+      "modeGlobal": "OS global",
+      "helpGlobal": "Uses the shell variable $HF_HOME, or ~/.cache/huggingface if unset (default). Shares the cache with huggingface-cli / transformers / Ollama, avoiding redundant downloads of huge models.",
+      "modeDataRoot": "Under App data dir",
+      "helpDataRoot": "Stores under <App data dir>/models. It is also removed by \"Delete all data\", so choose this when you want to manage models exclusively for this app.",
+      "modeCustom": "Custom path",
+      "helpCustom": "Specify any absolute path. For placing on an external disk, etc.",
+      "title": "Hugging Face cache (HF_HOME)",
+      "desc": "The cache directory for LLM / Embedding models. It can grow to several to tens of GB.",
+      "location": "Location",
+      "path": "Path",
+      "pick": "Choose…",
+      "effectivePathAfter": "Effective path after save",
+      "effectivePathCurrent": "Current effective path",
+      "customIncomplete": "Enter a custom path."
+    },
+    "dataRoot": {
+      "title": "Data location",
+      "desc": "Where sqlite / LanceDB / plugins / logs are stored. Leave blank to revert to the default ({{defaultRoot}}). Use \"Delete all data\" to remove everything (ARCH-4 / NFR-5).",
+      "pick": "Choose…",
+      "createTitle": "Creates a new directory at this path (mkdir -p)",
+      "creating": "Creating…",
+      "create": "Create this directory",
+      "currentRunning": "Currently running: ",
+      "nextLaunch": "On next launch: ",
+      "nextLaunchNote": "(an app restart is required)",
+      "saveConfirmChange": "This will change the App data dir. The currently open data (sqlite / LanceDB / tonic connection) keeps being used as-is, and the change takes effect from the next app launch. Continue?",
+      "saveConfirmReset": "This will reset the App data dir to the default. The currently open data (sqlite / LanceDB / tonic connection) keeps being used as-is, and the change takes effect from the next app launch. Continue?",
+      "savedMsgChange": "From the next launch, {{path}} will be used. Please restart the app.",
+      "savedMsgReset": "From the next launch, the default location will be used. Please restart the app.",
+      "saving": "Saving…",
+      "save": "Save",
+      "validation": {
+        "empty": "Path is empty",
+        "notAbsolute": "Specify an absolute path",
+        "notExist": "Directory does not exist",
+        "notDir": "Not a directory",
+        "notWritable": "No write permission",
+        "existingRoot": "Reusing the existing Lookback data root"
+      }
+    },
+    "llmPreset": {
+      "desc": {
+        "qwen3-6-27b-ud-q4-k-xl": "The most stable for Japanese summary / reflection / chat quality. Supports long context (262k). The actual RAM estimate changes with ctx_size and KV cache type.",
+        "qwen3-6-35b-a3b-ud-iq4-nl": "MoE (active 3B). A memory-efficient variant that delivers near-27B-dense quality from a comparatively small gguf. The actual RAM estimate changes with ctx_size and KV cache type.",
+        "qwen3-5-9b-ud-q4-k-xl": "Lightweight and fast Qwen3.5. Japanese quality sufficient for everyday chat and daily summaries. Lower ctx_size makes it easier to run on 16GB-class machines.",
+        "gemma-4-26b-a4b-it-ud-iq4-nl": "MoE (active 4B). A mid-size Gemma 4 with good Japanese responses. The actual RAM estimate changes with ctx_size and KV cache type.",
+        "gemma-4-e4b-it-ud-q4-k-xl": "A lightweight Gemma 4 multimodal variant. Runs in a minimal configuration. Lower ctx_size makes it easier to run in low-memory environments.",
+        "gemma-4-e2b-it-ud-q4-k-xl": "Default. The lightest Gemma 4 IT preset. A practical local-chat option for smaller RAM environments. Maximum context is 131k.",
+        "qwen3-5-122b-a10b-ud-iq4-xs": "Largest scale. MoE 122B (active 10B). A flagship aiming for top quality. The gguf itself is large, so this targets high-memory machines."
+      }
+    },
+    "embeddingPreset": {
+      "desc": {
+        "qwen3-vl-embedding-2b": "A multimodal variant that embeds text and images into the same vector space. Use this if you want image search.",
+        "qwen3-embedding-0-6b": "Default. Lightweight and fast. Quality sufficient for everyday use with a small memory footprint.",
+        "qwen3-embedding-4b": "Mid-size, high quality. Supports long context (40k); summary and Japanese search accuracy stay stable. Image search is disabled."
+      }
+    }
+  },
+  "import": {
+    "title": "Import session logs",
+    "llmDownTitle": "LLM plugin is not initialized",
+    "llmDownBody": "Import can run, but summaries, personality, reflections, and semantic search will not be generated. Make sure <code1>{{pluginPath}}</code1> contains <code2>{{dylib}}</code2> etc. See the Sidecar status in the sidebar for details.",
+    "targetType": "Target type",
+    "targetPlain": "Plain text (directory)",
+    "plainRoot": "Target directory",
+    "plainChoose": "Choose…",
+    "plainSourceName": "Source name (optional, a-z0-9_- up to 32 chars)",
+    "plainStrategy": "Thread split",
+    "plainStrategyPerFile": "Per file",
+    "plainStrategyPerDir": "Per directory",
+    "plainStrategySingle": "Single thread",
+    "errorNoPlainRoot": "Please choose a target directory",
+    "errorInvalidSourceName": "Source name must be a-z0-9_- up to 32 chars",
+    "period": "Period",
+    "periodAll": "All",
+    "periodFrom": "From date",
+    "labels": "Labels (optional, comma-separated)",
+    "dryRun": "dry-run (count only, no import)",
+    "postGen": "Post-import generation (optional)",
+    "runSummary": "Thread summary",
+    "runPersonality": "Personality generation",
+    "runReflection": "Reflection generation",
+    "errorNoSource": "Select at least one source",
+    "errorInvalidDate": "Specify a valid date",
+    "starting": "Starting…",
+    "start": "Start import"
+  },
+  "importToast": {
+    "head": "Importing sessions",
+    "close": "Close",
+    "detail": "Details",
+    "cancel": "Stop",
+    "cancelHint": "Stop the current step and skip the rest",
+    "detailDialogAria": "Import step details",
+    "detailTitle": "{{step}} details",
+    "detailTitleFailed": "{{step}} failure details",
+    "detailTitleWarning": "{{step}} warning details",
+    "statusWaiting": "Waiting",
+    "statusActive": "Running…",
+    "statusDone": "Done",
+    "statusWarning": "Partially failed",
+    "statusFailed": "Failed"
+  },
+  "summaryGen": {
+    "title": "Generate summaries",
+    "llmDownTitle": "LLM plugin is not initialized",
+    "llmDownBody": "Summary generation requires the LLM. Check the Sidecar status in the sidebar.",
+    "stages": "Stages to generate",
+    "dependencyHint": "Selecting a higher level auto-selects its dependencies (weekly → daily → thread).",
+    "targetPeriod": "Target period",
+    "rangeStart": "Start",
+    "rangeEnd": "End",
+    "rangeHintPerThread": "Specify a date range (both empty = all threads)",
+    "rangeHintDaily": "Specify a date range (both empty = yesterday)",
+    "rangeHintWeekly": "Specify a week range (both empty = last week)",
+    "rangeHintMonthly": "Specify a month range (both empty = last month)",
+    "errorOneSided": "Specify both start and end.",
+    "errorReversed": "Start must be before end.",
+    "errorInvalid": "The period is invalid.",
+    "submitting": "Submitting…",
+    "submit": "Start generation"
+  },
+  "analysis": {
+    "done": "Generation complete",
+    "failed": "Generation failed",
+    "running": "Generating",
+    "close": "Close"
+  },
+  "dateInput": {
+    "clearDate": "Clear date",
+    "clearMonth": "Clear month",
+    "clearWeek": "Clear week"
+  },
+  "labelFilter": {
+    "loading": "Loading labels…",
+    "title": "Filter by label ({{count}})",
+    "matchAnyHint": "Threads with any of the labels (OR)",
+    "matchAllHint": "Threads with all of the labels (AND)",
+    "selectAll": "Select all",
+    "deselectAll": "Deselect all"
+  },
+  "calendar": {
+    "prevMonth": "Previous month",
+    "nextMonth": "Next month",
+    "yearMonth": "{{year}}-{{month}}",
+    "monthSummary": "This month's summary",
+    "noSummary": "No summary",
+    "weekdayMon": "Mon",
+    "weekdayTue": "Tue",
+    "weekdayWed": "Wed",
+    "weekdayThu": "Thu",
+    "weekdayFri": "Fri",
+    "weekdaySat": "Sat",
+    "weekdaySun": "Sun"
+  },
+  "markdown": {
+    "toolOutput": "Tool output ({{count}} chars)",
+    "toolOutputTruncated": "Tool output ({{count}} chars · truncated)",
+    "systemMessage": "System message"
+  },
+  "threadDetail": {
+    "noChannel": "(no channel)",
+    "noLabels": "no labels",
+    "roleFilter": "Role filter",
+    "deleteThread": "Delete thread",
+    "showSummary": "Show summary",
+    "loadingPrev": "Loading previous messages…",
+    "noMessages": "No messages found",
+    "noRoleMatch": "No messages match the visible roles",
+    "loadingNext": "Loading next messages…",
+    "close": "Close"
+  },
+  "errorBoundary": {
+    "title": "Something went wrong while rendering"
+  },
+  "boot": {
+    "startingSidecar": "Starting sidecar…",
+    "checkingSetup": "Checking setup status…",
+    "setupCheckFailed": "Could not check setup status.",
+    "retry": "Retry"
+  },
+  "app": {
+    "leaveGuard": {
+      "title": "You have unsaved changes",
+      "message": "You have unsaved settings changes. Discard them and leave? (Cancel keeps you on Settings)",
+      "confirm": "Discard and leave"
+    }
+  },
+  "setup": {
+    "title": "Lookback setup",
+    "welcome": {
+      "title": "Welcome",
+      "intro": "Set up importing your Claude Code / Codex logs to look back on your work.",
+      "note": "The data location and models can be changed later from the Settings tab."
+    },
+    "dataRoot": {
+      "title": "App data dir",
+      "desc": "Leave blank to keep the current location. Current: ",
+      "choose": "Choose…",
+      "dialogError": "Could not open the directory picker. Enter the path manually. Details: {{error}}"
+    },
+    "apply": {
+      "restartTitle": "Data location changed",
+      "preparingTitle": "Preparing models…",
+      "resultTitle": "Result",
+      "preparingDesc": "Saving settings and preparing models…",
+      "restartDesc": "Lookback will restart to apply the new data location.",
+      "restartButton": "Restart and continue",
+      "backToFix": "Go back and fix",
+      "retry": "Retry"
+    },
+    "nav": {
+      "back": "Back",
+      "skipAndStart": "Skip and start",
+      "skip": "Skip",
+      "start": "Start setup",
+      "next": "Next"
+    }
+  },
+  "bootError": {
+    "raw": {
+      "title": "Sidecar failed to start"
+    },
+    "other": {
+      "title": "Sidecar failed to start",
+      "body": "[{{component}}] {{message}}"
+    },
+    "lancedbSchemaMismatch": {
+      "title": "The embedding vector dimension has changed",
+      "body": "The stored vector DB dimension ({{actualDim}}) does not match the current embedding model dimension ({{expectedDim}}).\nThis commonly happens after switching the embedding model."
+    },
+    "lancedbInitFailed": {
+      "title": "Failed to initialize the vector DB",
+      "body": "URI: {{uri}}\nCause: {{message}}\nCheck permissions, free disk space, and file corruption."
+    },
+    "embeddingDimensionMismatch": {
+      "title": "Embedding model dimension mismatch",
+      "body": "The dimension ({{actualDim}}) reported by the embedding runner ({{runnerName}}) does not match the stored MEMORY_VECTOR_SIZE ({{expectedDim}}).\nThis commonly happens right after switching models."
+    },
+    "mediaConfigConflict": {
+      "title": "Media storage settings conflict",
+      "body": "MEDIA_STORAGE_BACKEND={{backend}} cannot be combined with MEMORY_IMAGE_SEARCH_MODE={{imageSearchMode}}.\nCheck your .env."
+    },
+    "rdbPoolInitFailed": {
+      "title": "Database connection failed",
+      "body": "URL: {{url}}\nCause: {{message}}\nCheck the file path, permissions, and free disk space."
+    },
+    "envVarInvalid": {
+      "title": "Invalid environment variable value",
+      "body": "{{name}}: {{message}}\nCheck your .env or app settings."
+    },
+    "configLoadFailed": {
+      "title": "Failed to load configuration",
+      "body": "{{component}}: {{message}}\nCheck the related environment variables (the {{component}} prefix)."
+    },
+    "action": {
+      "evacuate": {
+        "label": "Back up vector DB and restart",
+        "pending": "Backing up the vector DB and restarting the sidecar…"
+      },
+      "purge": {
+        "label": "Delete vector DB and restart (irreversible)",
+        "pending": "Deleting the vector DB and restarting the sidecar…"
+      },
+      "resetEmbedding": {
+        "label": "Reset embedding settings and restart",
+        "pending": "Resetting embedding settings and restarting the sidecar…"
+      },
+      "openLog": {
+        "label": "Open logs"
+      },
+      "quit": {
+        "label": "Quit the app"
+      }
+    },
+    "actionRunning": "Running…",
+    "restartFailed": "Restart failed: {{message}}",
+    "restartFailedFallback": "The sidecar could not be restarted."
+  }
+}

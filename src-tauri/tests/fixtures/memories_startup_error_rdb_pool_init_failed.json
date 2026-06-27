@@ -1,0 +1,1 @@
+{"timestamp":"2026-06-05T07:50:50.976570Z","level":"ERROR","fields":{"code":"rdb_pool_init_failed","url_sanitized":"sqlite:///Users/x/Library/Application%20Support/lookback/db/jobworkerp.sqlite3","message":"error returned from database: unable to open database file"},"target":"app::startup_error"}

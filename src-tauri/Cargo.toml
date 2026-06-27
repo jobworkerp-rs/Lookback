@@ -1,0 +1,91 @@
+[package]
+name = "lookback-tauri"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+
+# Library target for tauri-mobile compatibility / shared use by integration tests.
+[lib]
+name = "lookback_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "lookback-tauri"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-shell = { workspace = true }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tonic-health = { workspace = true }
+# Installs the ring CryptoProvider before the first TLS handshake so an
+# https:// memories endpoint connects (mirrors jobworkerp-client's grpc setup).
+rustls = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+dirs = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+which = { workspace = true }
+dotenvy = { workspace = true }
+sha2 = "0.10"
+# keyring backend is platform-specific (see [target.*] sections below): macOS
+# uses the native Keychain; Linux uses the Secret Service over D-Bus. The
+# `keyring::Entry` API is identical across backends so no code path branches.
+
+# Phase C-2.6: direct jobworkerp client instead of subprocess CLI calls.
+# Pinned to a git `rev` (NOT a `path` into the sibling memories checkout — that
+# repo isn't guaranteed to exist next to this one on every clone). The rev is
+# the same commit the local submodule tracked; it carries the `Load` RPC and
+# `register_workers_from_yaml_str` the hot-reload path needs. Cargo fetches the
+# crate's nested `protobuf` submodule automatically. `opentelemetry` satisfies
+# method signatures (Option<&opentelemetry::Context>); we only ever pass None.
+# `prost-reflect` decodes streamed proto bytes for human-readable progress.
+jobworkerp-client = { git = "https://github.com/jobworkerp-rs/jobworkerp-client-rs", branch = "main" }
+opentelemetry = "0.31"
+prost-reflect = { version = "0.16", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Default to "custom-protocol" feature for production
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+# Platform-specific keyring backend. The `apple-native` backend only builds on
+# macOS; Linux needs the Secret Service backend (D-Bus, requires libdbus-1-dev
+# at build time and a Secret Service provider at runtime). `crypto-rust` avoids
+# an OpenSSL build dependency for the session encryption the backend uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }

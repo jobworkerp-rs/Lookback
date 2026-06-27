@@ -1,0 +1,92 @@
+/* Design tokens lifted verbatim from specs/tauri-mvp-mock.html so the
+ * production app preserves the same Apple HIG semantic palette. Keep the
+ * two in sync when the mock changes. */
+
+:root {
+  --window-bg: #ececec;
+  --sidebar-bg: rgba(246, 246, 246, 0.78);
+  --sidebar-bg-solid: #f5f5f7;
+  --content-bg: #ffffff;
+  --secondary-bg: #f5f5f7;
+  --tertiary-bg: #fafafa;
+  --elevated: #ffffff;
+
+  --label: rgba(0, 0, 0, 0.85);
+  --label-secondary: rgba(60, 60, 67, 0.6);
+  --label-tertiary: rgba(60, 60, 67, 0.3);
+  --label-quaternary: rgba(60, 60, 67, 0.18);
+
+  --separator: rgba(0, 0, 0, 0.08);
+  --separator-opaque: #d1d1d6;
+  --fill: rgba(120, 120, 128, 0.12);
+  --fill-secondary: rgba(120, 120, 128, 0.08);
+
+  --accent: #007aff;
+  --accent-hover: #0066d9;
+  --accent-soft: rgba(0, 122, 255, 0.12);
+  --success: #34c759;
+  --warning: #ff9500;
+  --danger: #ff3b30;
+  --indigo: #5856d6;
+  --teal: #5ac8fa;
+  --yellow: #ffcc00;
+
+  --source-claude: rgba(0, 0, 0, 0.85);
+  --source-codex: #5856d6;
+
+  --highlight: rgba(255, 204, 0, 0.38);
+
+  --shadow-1: 0 0 0 0.5px rgba(0, 0, 0, 0.06), 0 1px 1px rgba(0, 0, 0, 0.04);
+  --shadow-2: 0 0 0 0.5px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(0, 0, 0, 0.08);
+  --shadow-modal: 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 24px 60px rgba(0, 0, 0, 0.22);
+
+  --radius-sm: 5px;
+  --radius: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Hiragino Sans",
+    "Hiragino Kaku Gothic ProN", "Helvetica Neue", sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Hiragino Sans", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+}
+
+[data-theme="dark"] {
+  --window-bg: #1e1e1e;
+  --sidebar-bg: rgba(40, 40, 40, 0.72);
+  --sidebar-bg-solid: #2a2a2a;
+  --content-bg: #1e1e1e;
+  --secondary-bg: #2c2c2e;
+  --tertiary-bg: #3a3a3c;
+  --elevated: #2c2c2e;
+
+  --label: rgba(255, 255, 255, 0.92);
+  --label-secondary: rgba(235, 235, 245, 0.6);
+  --label-tertiary: rgba(235, 235, 245, 0.3);
+  --label-quaternary: rgba(235, 235, 245, 0.16);
+
+  --separator: rgba(255, 255, 255, 0.08);
+  --separator-opaque: #3a3a3c;
+  --fill: rgba(120, 120, 128, 0.24);
+  --fill-secondary: rgba(120, 120, 128, 0.16);
+
+  --accent: #0a84ff;
+  --accent-hover: #339cff;
+  --accent-soft: rgba(10, 132, 255, 0.18);
+  --success: #30d158;
+  --warning: #ff9f0a;
+  --danger: #ff453a;
+  --indigo: #5e5ce6;
+  --teal: #64d2ff;
+  --yellow: #ffd60a;
+
+  --source-claude: rgba(255, 255, 255, 0.92);
+  --source-codex: #5e5ce6;
+
+  --highlight: rgba(255, 214, 10, 0.28);
+
+  --shadow-1: 0 0 0 0.5px rgba(0, 0, 0, 0.4), 0 1px 1px rgba(0, 0, 0, 0.2);
+  --shadow-2: 0 0 0 0.5px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 0 0 0.5px rgba(0, 0, 0, 0.5), 0 24px 60px rgba(0, 0, 0, 0.6);
+}

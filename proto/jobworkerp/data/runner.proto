@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package jobworkerp.data;
+
+import "jobworkerp/data/common.proto";
+
+// # Output Type
+// Defines the streaming capability of the runner
+enum StreamingOutputType {
+  NON_STREAMING = 0; // Runner only supports non-streaming output
+  STREAMING = 1;     // Runner only supports streaming output
+  BOTH = 2;          // Runner supports both streaming and non-streaming outputs
+}
+
+message RunnerData {
+  // # Runner Name
+  // Unique key and proto message prefix (e.g. name: "command",
+  // runner_settings_proto: "CommandRunnerSettings", job_args_proto:
+  // "CommandArg")
+  string name = 1;
+  // # Runner Description
+  // Description of runner implementation
+  string description = 2;
+  // # Runner Type
+  // Defines the category of runner implementation
+  jobworkerp.data.RunnerType runner_type = 3;
+  // # Runner Settings Definition
+  // Proto file definition for runner configuration
+  string runner_settings_proto = 4;
+  // Fields 5-7 reserved to prevent reuse
+  reserved 5, 6, 7;
+  reserved "job_args_proto", "result_output_proto", "output_type";
+  // # definition
+  // runner definition
+  // mcp: mcp_server toml
+  // plugin: plugin filepath
+  string definition = 8;
+  // # Method Proto Map (REQUIRED)
+  // All runners must provide method-level schema definitions
+  // - Single-method runners: use default method name "run"
+  // - Multi-method runners: use method-specific names (e.g., "fetch_html", "exec")
+  // Maps method name to its input/output protobuf schema definitions
+  MethodProtoMap method_proto_map = 10;
+}
+
+// # Method Proto Map
+// Mapping of method names to their Protobuf schema definitions
+message MethodProtoMap {
+  // # Schemas Map
+  // Key: using name (e.g., "fetch_html", "fetch")
+  // Value: MethodSchema containing input and optional output schemas
+  //
+  // When schemas has only one entry, using can be omitted in job execution
+  // (auto-selected to the single available method)
+  map<string, MethodSchema> schemas = 1;
+}
+
+// # Method Schema
+// Input and output Protobuf schema definitions for a single method
+message MethodSchema {
+  // # Input Arguments Schema
+  // Protobuf schema definition for method arguments
+  // - Message name follows convention: {ServerName}{ToolName}Args
+  // - Example for fetch server's fetch_html tool:
+  //   "syntax = \"proto3\";\nmessage FetchFetchHtmlArgs { string url = 1; optional int32 timeout_ms = 2; }"
+  string args_proto = 1;
+
+  // # Output Result Schema (REQUIRED - proto3 constraint)
+  // Protobuf schema definition for method result
+  //
+  // - **REQUIRED**: This field MUST always be set by application layer
+  // - **Proto3 limitation**: Cannot use `required` keyword (proto3 spec)
+  // - **Empty string ALLOWED**: For unstructured/binary output
+  //
+  // Details: See docs/runner-proto-unification-spec.md Section 7.1
+  string result_proto = 2;
+
+  // # Method Description (Optional)
+  // Human-readable description of what this method does
+  // - Used by LLM for tool selection
+  // - Example: "Fetches HTML content from a URL"
+  optional string description = 3;
+
+  // # Output Type Configuration
+  // Specifies the streaming capability of this specific method
+  // Allows different methods within the same runner to have different streaming support
+  // - NON_STREAMING: Method only supports non-streaming output
+  // - STREAMING: Method only supports streaming output
+  // - BOTH: Method supports both streaming and non-streaming outputs
+  StreamingOutputType output_type = 4;
+
+  // # Client Streaming Support Flag
+  // Whether this method requires client streaming input during execution.
+  // When true, this method MUST be invoked via EnqueueWithClientStream.
+  // When false, this method can be invoked via Enqueue or EnqueueForStream.
+  bool require_client_stream = 5;
+
+  // # Client Streaming Data Proto Definition (Optional)
+  // Protobuf schema definition for client streaming data.
+  // If empty, streaming data is treated as opaque bytes.
+  optional string client_stream_data_proto = 6;
+}
+
+// # Method JSON Schema Map
+// Mapping of method names to their JSON Schema definitions
+// This is generated from MethodProtoMap and cached in RunnerWithSchema
+// to avoid repeated Protobuf → JSON Schema conversions
+message MethodJsonSchemaMap {
+  // # Schemas Map
+  // Key: method name (e.g., "run", "fetch_html", "get_current_time")
+  // Value: MethodJsonSchema containing input/output JSON schemas
+  map<string, MethodJsonSchema> schemas = 1;
+}
+
+// # Method JSON Schema
+// JSON Schema definition for a single method
+// Replaces the deprecated arguments_schema/output_schema/tools fields in RunnerWithSchema
+//
+// NOTE: description is NOT cached here - retrieve from MethodSchema.description instead
+// Reason: description is not converted (just copied), so caching it is redundant
+message MethodJsonSchema {
+  // # Arguments JSON Schema (REQUIRED)
+  // JSON Schema for method arguments
+  // - Generated from MethodSchema.args_proto
+  // - Example: {"type": "object", "properties": {"url": {"type": "string"}}}
+  string args_schema = 1;
+
+  // # Result JSON Schema (Optional)
+  // JSON Schema for method result
+  // - Generated from MethodSchema.result_proto
+  // - None for unstructured output (empty result_proto)
+  optional string result_schema = 2;
+
+  // Field 3 reserved (was description, removed as redundant)
+  reserved 3;
+  reserved "description";
+
+  // # Client Streaming Data JSON Schema (Optional)
+  // JSON Schema for client streaming data, generated from MethodSchema.client_stream_data_proto
+  // None when client_stream_data_proto is empty or require_client_stream is false
+  optional string client_stream_data_schema = 4;
+}
+
+message RunnerId { int64 value = 1; }
+
+message Runner {
+  RunnerId id = 1;
+  RunnerData data = 2;
+}
+
+// # Runner Sort Field
+// Defines the fields available for sorting runners in queries
+enum RunnerSortField {
+  RUNNER_SORT_FIELD_UNSPECIFIED = 0;
+  RUNNER_SORT_FIELD_ID = 1;
+  RUNNER_SORT_FIELD_NAME = 2;
+  RUNNER_SORT_FIELD_RUNNER_TYPE = 3;
+  RUNNER_SORT_FIELD_CREATED_AT = 4;
+}

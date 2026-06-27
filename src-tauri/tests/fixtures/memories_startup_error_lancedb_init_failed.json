@@ -1,0 +1,1 @@
+{"timestamp":"2026-06-05T07:50:50.976570Z","level":"ERROR","fields":{"code":"lancedb_init_failed","uri":"/Users/x/Library/Application Support/lookback/lancedb/memories.lancedb","message":"Permission denied (os error 13)"},"target":"app::startup_error"}

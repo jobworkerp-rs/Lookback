@@ -1,0 +1,316 @@
+syntax = "proto3";
+
+package jobworkerp.data;
+
+// # Empty Message
+// Represents an empty message with no fields, used as a placeholder
+message Empty {}
+
+// # Trailer
+message Trailer {
+  // # metadata
+  // Additional metadata information
+  map<string, string> metadata = 1;
+}
+
+// # Storage Type
+// Defines the storage backend type used for job queue and result storage
+enum StorageType {
+  // # Standalone Mode
+  // Uses memory channel and SQLite for job queue and result storage
+  // Suitable for single-node deployments
+  STANDALONE = 0;
+
+  // # Scalable Mode
+  // Uses Redis and MySQL for job queue and result storage
+  // Suitable for distributed deployments
+  SCALABLE = 1;
+}
+
+// # Runner Type
+// Defines the built-in runner implementation types
+enum RunnerType {
+  // # Plugin Runner
+  // Executes jobs through custom plugin modules
+  PLUGIN = 0;
+
+  // # Command Runner
+  // Executes shell commands
+  COMMAND = 1;
+
+  // # HTTP Request Runner
+  // Makes HTTP requests to specified endpoints
+  HTTP_REQUEST = 2;
+
+  // # gRPC Unary Runner [DEPRECATED]
+  // Deprecated: Use GRPC runner with 'unary' method instead
+  // Makes unary gRPC calls to specified services
+  GRPC_UNARY = 3;
+
+  // # Docker Runner
+  // Executes commands inside Docker containers
+  DOCKER = 4;
+
+  // # Slack Message Runner
+  // Posts messages to Slack channels
+  SLACK_POST_MESSAGE = 5;
+
+  // # Python Command Runner
+  // Executes Python scripts as commands
+  PYTHON_COMMAND = 6;
+
+  // # Mcp Server Runner
+  // Executes tools of MCP servers
+  MCP_SERVER = 7;
+
+  // # FunctionSet Selector Runner
+  // Lists available FunctionSets with tool summaries for LLM tool selection.
+  // Used as a meta-tool to help LLM discover and select appropriate FunctionSets.
+  FUNCTION_SET_SELECTOR = 8;
+
+  // ============================================================
+  // Multi-method Runners (32768+)
+  // These runners support multiple methods via 'using' parameter
+  // ============================================================
+
+  // # LLM Runner (Multi-method)
+  // Unified LLM runner with 'completion' and 'chat' methods
+  // - completion: Text completion using LLM (prompt-based)
+  // - chat: Chat conversation with message history
+  // Requires 'using' parameter to specify method
+  LLM = 32768;
+
+  // # Workflow Runner (Multi-method)
+  // Unified workflow runner with 'run' and 'create' methods
+  // - run: Execute workflow with pre-configured definition (default)
+  // - create: Create new workflow worker from definition
+  // 'using' defaults to 'run' if not specified
+  WORKFLOW = 32769;
+
+  // # GRPC Runner (Multi-method)
+  // Unified gRPC runner with 'unary' and 'streaming' methods
+  // - unary: gRPC unary call (default)
+  // - streaming: gRPC server streaming call
+  // 'using' defaults to 'unary' if not specified
+  GRPC = 32770;
+
+  // Prevent reuse of removed enum values/names
+  reserved -1, 65532, 65533, 65534, 65535;
+  reserved "LLM_CHAT", "LLM_COMPLETION", "INLINE_WORKFLOW", "REUSABLE_WORKFLOW", "CREATE_WORKFLOW";
+}
+
+// # Priority Level
+// Defines the execution priority of a job
+enum Priority {
+  // # Medium Priority (Default)
+  // Standard priority level for most jobs
+  PRIORITY_MEDIUM = 0;
+
+  // # Low Priority
+  // Lower priority, executed after medium priority jobs
+  PRIORITY_LOW = -1;
+
+  // # High Priority
+  // Higher priority, executed before medium priority jobs
+  PRIORITY_HIGH = 1;
+}
+
+// # Retry Type
+// Defines the algorithm used for retry intervals
+enum RetryType {
+  // # No Retry
+  // Failed jobs will not be retried
+  NONE = 0;
+
+  // # Exponential Backoff
+  // Retry interval increases exponentially with each attempt
+  // Formula: interval * basis ^ (retry_count - 1)
+  EXPONENTIAL = 1;
+
+  // # Linear Backoff
+  // Retry interval increases linearly with each attempt
+  // Formula: interval * retry_count
+  LINEAR = 2;
+
+  // # Constant Interval
+  // Same retry interval is used for all retry attempts
+  CONSTANT = 3;
+}
+
+// # Retry Policy
+// Configuration for how failed jobs should be retried
+message RetryPolicy {
+  // # Retry Type
+  // Algorithm used for calculating retry intervals
+  RetryType type = 1;
+
+  // # Base Interval
+  // Basic retry interval in milliseconds
+  uint32 interval = 2;
+
+  // # Maximum Interval
+  // Maximum retry interval in milliseconds
+  uint32 max_interval = 3;
+
+  // # Maximum Retry Count
+  // Maximum number of retry attempts (0: unlimited)
+  uint32 max_retry = 4;
+
+  // # Exponential Basis
+  // Base for exponential backoff calculation
+  // Formula: interval * basis ^ (retry_count - 1)
+  float basis = 5;
+}
+
+// # Response Type
+// Defines how job results should be returned to the client
+enum ResponseType {
+  // # No Result
+  // Returns job ID immediately, but no result
+  // Results may be available in database if stored by worker settings
+  // If broadcasting is enabled (worker.broadcast_result=true),
+  // the result will be broadcasted to all subscribers (use
+  // JobResultService/Listen)
+  NO_RESULT = 0;
+
+  // # Direct Response
+  // Gets result in the same response
+  // May involve long wait (long polling with gRPC unary)
+  DIRECT = 1;
+}
+
+// # Result Status
+// Defines the execution outcome of a job
+enum ResultStatus {
+  // # Success
+  // Job completed successfully
+  SUCCESS = 0;
+
+  // # Error with Retry
+  // Job failed but will be retried
+  ERROR_AND_RETRY = 1;
+
+  // # Fatal Error
+  // Job failed with a fatal error (cannot retry)
+  FATAL_ERROR = 2;
+
+  // # Aborted
+  // Job was manually aborted (cannot retry)
+  ABORT = 3;
+
+  // # Maximum Retries Reached
+  // Job failed and reached maximum retry count (cannot retry further)
+  MAX_RETRY = 4;
+
+  // # Other Error
+  // Unexpected system error occurred (cannot retry)
+  OTHER_ERROR = 5;
+
+  // # Cancelled
+  // Job was cancelled by user request (cannot retry)
+  CANCELLED = 6;
+}
+
+// # Job Processing Status
+// Defines the current processing state of a job (temporary state during execution)
+// This is different from ResultStatus which represents permanent job outcomes
+enum JobProcessingStatus {
+  // # Unknown
+  // Job status is unknown or corrupted (default value)
+  UNKNOWN = 0;
+
+  // # Pending
+  // Job is waiting to be processed
+  PENDING = 1;
+
+  // # Running
+  // Job is currently being executed
+  RUNNING = 2;
+
+  // # Waiting for Result
+  // Job has completed execution and is waiting for result processing
+  WAIT_RESULT = 3;
+
+  // # Cancelling
+  // Job is being cancelled (temporary state before final cancellation)
+  CANCELLING = 4;
+}
+
+// # Queue Type
+// Defines how jobs are queued and persisted
+enum QueueType {
+  // # Normal Queue
+  // Standard in-memory queue with no persistence
+  NORMAL = 0;
+
+  // # Queue with Backup
+  // In-memory queue with database backup for recovery (slower)
+  WITH_BACKUP = 1;
+
+  // # Database-Only Queue
+  // Forces all jobs to be stored in database (slowest)
+  DB_ONLY = 2;
+}
+
+// # Streaming Type
+// Defines how streaming is handled for job execution
+// Note: Values are chosen for backward compatibility with request_streaming bool field:
+//   - 0 (false) = NONE, 1 (true) = RESPONSE
+enum StreamingType {
+  // # No Streaming
+  // Job execution is non-streaming. Runner's run() method is used.
+  // This is the default behavior.
+  // Compatible with request_streaming=false
+  STREAMING_TYPE_NONE = 0;
+
+  // # Response Streaming
+  // Full streaming mode. Runner uses run_stream() and results are
+  // streamed back to the client via pub/sub.
+  // Client receives ResultOutputItem stream.
+  // Compatible with request_streaming=true
+  STREAMING_TYPE_RESPONSE = 1;
+
+  // # Internal Streaming
+  // Runner internally uses streaming (run_stream()) but the result is
+  // collected using collect_stream() and returned as a single JobResult.
+  // Useful for workflow tasks that need the final result but want to use
+  // streaming-capable runners internally for better resource management.
+  //
+  // Key behavior differences from STREAMING_TYPE_RESPONSE:
+  // - Even with ResponseType::Direct workers, enqueue returns immediately
+  //   (does not wait for job completion) to allow stream subscription
+  //   before data is published
+  // - The caller is responsible for subscribing to the stream and collecting
+  //   results using RunnerSpec::collect_stream()
+  // - Final collected result is sent as ResultOutputItem::final_collected
+  STREAMING_TYPE_INTERNAL = 2;
+}
+
+// # Result Output Item
+// Individual item in a streaming result output
+message ResultOutputItem {
+  oneof item {
+    // # Data Chunk
+    // A piece of result data in a stream
+    bytes data = 1;
+
+    // # End of Stream
+    // Marker indicating the end of the stream
+    Trailer end = 2;
+
+    // # Final Collected Result
+    // Contains the final collected result for STREAMING_TYPE_INTERNAL mode.
+    // This is sent as the last item in the stream after all data chunks,
+    // containing the aggregated result from collect_stream().
+    // Workflow consumers should use this as the task output.
+    bytes final_collected = 3;
+  }
+}
+
+// # Result Output
+// Collection of result data items for non-streaming output
+message ResultOutput {
+  // # Result Items
+  // List of binary data chunks representing the result
+  bytes items = 1;
+}

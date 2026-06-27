@@ -1,0 +1,1 @@
+{"timestamp":"2026-06-05T07:50:50.976570Z","level":"ERROR","fields":{"code":"config_load_failed","component":"VectorDBConfig","message":"missing field `MEMORY_VECTOR_SIZE`"},"target":"app::startup_error"}
