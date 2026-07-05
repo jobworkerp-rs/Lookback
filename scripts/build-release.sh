@@ -41,7 +41,7 @@ WORKDIR="${AGENT_APP}/.build-deps"
 SKIP_CLONE=0
 SKIP_FRONTEND=0
 ONLY_REPOS=""
-LINDERA=cli
+LINDERA=release
 LINDERA_ONLY=0
 JOBS=""
 NO_SUBMODULE=0
@@ -62,7 +62,8 @@ Options:
   --skip-clone             Reuse existing clones, do not fetch/pull
   --skip-frontend          Build/stage backend only, skip pnpm tauri build
   --only <repos>           Comma list: jobworkerp,memory-store,conductor,llama,mm
-  --lindera cli|skip       Dictionary strategy (default: cli)
+  --lindera release|cli|skip
+                           Dictionary strategy (default: release; cli is a legacy alias)
   --lindera-only           Generate only the lindera dictionary, then exit
                            (useful for `pnpm tauri:dev` without a full build)
   --jobs N                 Parallel cargo jobs (sets CARGO_BUILD_JOBS)
@@ -276,7 +277,7 @@ main() {
   if [[ "${LINDERA_ONLY}" == "1" ]]; then
     [[ "${DRY_RUN:-0}" == "1" ]] || require_cmd curl unzip tar
     run mkdir -p "${WORKDIR}"
-    stage_lindera cli
+    stage_lindera release
     return 0
   fi
 

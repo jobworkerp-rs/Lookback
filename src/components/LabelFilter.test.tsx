@@ -1,17 +1,18 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
+import { renderWithProviders } from "@/test-utils";
 import type { LabelWithCount } from "@/types/api";
 import { LabelFilter } from "./LabelFilter";
 
 const labels: LabelWithCount[] = [
-  // Category (no prefix) — pinned first
+  // Category (no prefix) — pinned first by LABEL_PREFIX_PRIORITY
   { label: "summary", thread_count: 20 },
   { label: "coding_agent", thread_count: 8 },
-  // dir prefix — most labels → second
+  // branch precedes dir in the fixed priority regardless of label count
+  { label: "branch:main", thread_count: 7 },
   { label: "dir:/foo", thread_count: 5 },
   { label: "dir:/bar", thread_count: 3 },
-  // branch prefix — one label
-  { label: "branch:main", thread_count: 7 },
 ];
 
 function noop() {}
@@ -29,6 +30,27 @@ describe("LabelFilter", () => {
       />,
     );
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("orders sections by the fixed prefix priority, not by label count", () => {
+    i18n.changeLanguage("ja");
+    // agent has the fewest labels but the priority pins it right after the
+    // category section; branch precedes dir even though dir has more labels.
+    const { container } = renderWithProviders(
+      <LabelFilter
+        labels={[...labels, { label: "agent:codex", thread_count: 1 }]}
+        selected={["summary"]} // open the fold
+        match="any"
+        onToggle={noop}
+        onToggleMany={noop}
+        onSetMatch={noop}
+      />,
+    );
+    const prefixes = [...container.querySelectorAll(".label-filter-section-prefix")].map(
+      (el) => el.textContent,
+    );
+    // Category heading is translated; the rest are raw prefixes in priority order.
+    expect(prefixes).toEqual(["カテゴリ", "agent", "branch", "dir"]);
   });
 
   it("starts collapsed when nothing is selected", () => {

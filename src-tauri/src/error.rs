@@ -49,6 +49,20 @@ pub enum AppError {
     #[error("jobworkerp: {0}")]
     Jobworkerp(String),
 
+    /// The local vector store (LanceDB) could not be opened at the
+    /// configured embedding dimension, so the sidecar was restarted in a
+    /// degraded mode with vector features disabled. Embedding-dependent
+    /// commands (semantic / hybrid / intent search, import, generation)
+    /// refuse to run in this state and surface this error; the fix is to
+    /// switch the embedding model back to the matching dimension in
+    /// Settings. Only raised in local connection mode — remote mode routes
+    /// embedding to the remote sidecar, which is unaffected.
+    #[error(
+        "ローカルのベクトルストアが次元不一致で無効化されています（期待 {expected_dim} 次元 / 実際 {actual_dim} 次元）。\
+         設定で embedding モデルを一致する次元に変更してください"
+    )]
+    VectorStoreDegraded { expected_dim: u32, actual_dim: u32 },
+
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

@@ -18,7 +18,10 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use super::connection::{MemoriesCallback, ResolvedTargets};
-use super::{AppState, StepStatus, cancel_dispatch_inner, emit_event};
+use super::{
+    AppState, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner, emit_event,
+    emit_generated_refresh, thread_summary_single_completed,
+};
 use crate::error::{AppError, AppResult};
 use crate::jobworkerp::{JobworkerpHandle, StreamEvent, run_cancellable_named_stream};
 
@@ -159,7 +162,7 @@ pub struct ImportStepUpdate {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImportStep {
     ThreadImport,
@@ -282,6 +285,11 @@ pub async fn start_import(
     // Validate up front so a half-spawned set of children can't be left
     // behind when an invalid source slips into the middle of the list.
     validate_plain(&req)?;
+
+    // Import writes memory embeddings into the local LanceDB; refuse when it
+    // is degraded (local mode only — a remote import writes to the remote
+    // vector store, which is unaffected).
+    state.ensure_local_embedding_available()?;
 
     // Honor the connection override (FR-CONFIG-1): import targets the same
     // memories / jobworkerp the browse clients use — local sidecar by default,
@@ -1511,6 +1519,14 @@ async fn run_cancellable_step(
                 StreamEvent::Active(msg) => {
                     if let Some(raw) = msg {
                         tracing::debug!(target: "import", step = ?step, "{raw}");
+                        if step == ImportStep::ThreadSummary && thread_summary_single_completed(raw)
+                        {
+                            emit_generated_refresh(
+                                app,
+                                job_id,
+                                vec![GeneratedRefreshScope::ThreadSummary],
+                            );
+                        }
                     }
                     let digest = msg.map(|raw| {
                         let (d, p) = summarize_workflow_chunk(raw, last_progress);

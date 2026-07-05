@@ -141,6 +141,51 @@ pub(crate) fn emit_event<P: Serialize + Clone>(app: &AppHandle, event: &str, pay
     }
 }
 
+pub(super) const GENERATED_REFRESH_EVENT: &str = "generated://refresh";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum GeneratedRefreshScope {
+    ThreadSummary,
+    DailySummary,
+    WeeklySummary,
+    MonthlySummary,
+    Personality,
+    Reflection,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct GeneratedRefreshUpdate {
+    pub job_id: String,
+    pub scopes: Vec<GeneratedRefreshScope>,
+}
+
+pub(super) fn emit_generated_refresh(
+    app: &AppHandle,
+    job_id: &str,
+    scopes: Vec<GeneratedRefreshScope>,
+) {
+    if scopes.is_empty() {
+        return;
+    }
+    emit_event(
+        app,
+        GENERATED_REFRESH_EVENT,
+        GeneratedRefreshUpdate {
+            job_id: job_id.to_string(),
+            scopes,
+        },
+    );
+}
+
+pub(super) fn thread_summary_single_completed(raw: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let position = v.get("position").and_then(|p| p.as_str()).unwrap_or("");
+    position.contains("summarizeEach") && position.contains("recordSuccess")
+}
+
 /// Status of a single step in a streaming dispatch (import pipeline,
 /// reflection generation). Shared between `commands::import` and
 /// `commands::reflection_dispatch` so the frontend gets a single
@@ -247,6 +292,34 @@ impl AppState {
         let cfg = connection::load_connection_config(&self.data.connection_config_path());
         let local = self.sidecars.current_endpoints();
         connection::resolve_targets(&cfg, local.as_ref())
+    }
+
+    /// The active connection mode (local live sidecars / remote configured
+    /// URLs). Read on every call, same read-on-dispatch pattern as
+    /// `resolve_targets()`, so a `set_connection_config` takes effect on the
+    /// next command without a restart.
+    pub(super) fn connection_mode(&self) -> connection::ConnectionMode {
+        connection::load_connection_config(&self.data.connection_config_path()).mode
+    }
+
+    /// Refuse an embedding-dependent dispatch when the local vector store is
+    /// degraded (a dimension mismatch forced the memories child to restart
+    /// with vectors disabled). Only gates in **local** connection mode:
+    /// remote mode routes embedding query generation and index writes to the
+    /// remote sidecar (`resolve_targets()` follows the config), which is
+    /// unaffected by the local LanceDB. Used by both the embed-dependent
+    /// search commands and the generation / import / write paths (their gate
+    /// scope collapses to the same "local + degraded" rule).
+    pub(super) fn ensure_local_embedding_available(&self) -> AppResult<()> {
+        if self.connection_mode() == connection::ConnectionMode::Local
+            && let Some(info) = self.sidecars.degraded()
+        {
+            return Err(AppError::VectorStoreDegraded {
+                expected_dim: info.expected_dim,
+                actual_dim: info.actual_dim,
+            });
+        }
+        Ok(())
     }
 
     /// Snapshot of `llm-settings.json`. Read on every call (same
@@ -474,6 +547,98 @@ mod tests {
             env_file: None,
         }));
         AppState::new(sidecars, data)
+    }
+
+    /// AppState rooted at a caller-controlled temp dir so the connection
+    /// config file can be written per-test (the shared `dummy_state` uses a
+    /// fixed path and can't isolate connection mode).
+    fn state_in(root: &std::path::Path) -> AppState {
+        let data = DataPaths::with_root(root.to_path_buf());
+        let lance_home = data.lance_language_model_home();
+        let sidecars = Arc::new(Sidecars::new(SidecarConfig {
+            jobworkerp_bin: std::path::PathBuf::from("/bin/true"),
+            memories_bin: std::path::PathBuf::from("/bin/true"),
+            conductor_bin: std::path::PathBuf::from("/bin/true"),
+            data: data.clone(),
+            worker_yaml_paths: Vec::new(),
+            function_set_yaml_paths: Vec::new(),
+            reflection_dispatch_enabled: false,
+            auto_embedding_enabled: false,
+            workflows_dir: None,
+            lance_language_model_home: lance_home,
+            lindera_dict_staged: false,
+            llm_model: None,
+            llm_hf_repo: None,
+            llm_ctx_size: None,
+            llm_kv_cache_type: None,
+            env_file: None,
+        }));
+        AppState::new(sidecars, data)
+    }
+
+    fn set_mode(state: &AppState, mode: connection::ConnectionMode) {
+        let (remote_jobworkerp_url, remote_memories_url) = match mode {
+            connection::ConnectionMode::Remote => (
+                Some("http://h:9000".to_string()),
+                Some("http://h:9010".to_string()),
+            ),
+            connection::ConnectionMode::Local => (None, None),
+        };
+        connection::save_connection_config(
+            &state.data.connection_config_path(),
+            &connection::ConnectionConfig {
+                mode,
+                remote_jobworkerp_url,
+                remote_memories_url,
+            },
+        )
+        .unwrap();
+    }
+
+    fn degraded_info() -> crate::sidecar::lifecycle::DegradedInfo {
+        crate::sidecar::lifecycle::DegradedInfo {
+            reason: "embedding_dimension_mismatch",
+            expected_dim: 2048,
+            actual_dim: 768,
+        }
+    }
+
+    #[test]
+    fn ensure_local_embedding_available_ok_when_not_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state_in(tmp.path());
+        set_mode(&state, connection::ConnectionMode::Local);
+        // No degraded flag set → available even in local mode.
+        assert!(state.ensure_local_embedding_available().is_ok());
+    }
+
+    #[test]
+    fn ensure_local_embedding_available_errors_local_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state_in(tmp.path());
+        set_mode(&state, connection::ConnectionMode::Local);
+        state.sidecars.set_degraded_for_test(Some(degraded_info()));
+        let err = state.ensure_local_embedding_available().unwrap_err();
+        match err {
+            AppError::VectorStoreDegraded {
+                expected_dim,
+                actual_dim,
+            } => {
+                assert_eq!((expected_dim, actual_dim), (2048, 768));
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_local_embedding_available_ok_remote_even_when_degraded() {
+        // Remote mode routes embedding to the remote sidecar, so a degraded
+        // LOCAL vector store must NOT gate remote-targeted dispatches.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state_in(tmp.path());
+        set_mode(&state, connection::ConnectionMode::Remote);
+        state.sidecars.set_degraded_for_test(Some(degraded_info()));
+        assert!(state.ensure_local_embedding_available().is_ok());
     }
 
     #[tokio::test]

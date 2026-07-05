@@ -103,6 +103,20 @@ export interface MemoryThreadPosition extends MemoryPosition {
  *  daily/weekly/monthly are the periodic work-summary rollups. Kept in
  *  manual correspondence with the Rust `SummaryKind` (kebab-case serde). */
 export type SummaryKind = "per-thread" | "daily" | "weekly" | "monthly";
+
+export type GeneratedRefreshScope =
+  | "thread_summary"
+  | "daily_summary"
+  | "weekly_summary"
+  | "monthly_summary"
+  | "personality"
+  | "reflection";
+
+export interface GeneratedRefreshEvent {
+  job_id: string;
+  scopes: GeneratedRefreshScope[];
+}
+
 export type PeriodicTaskKind = "regular" | "weekly" | "monthly";
 
 export interface PeriodicTaskArgs {
@@ -317,7 +331,19 @@ export interface SidecarEndpoints {
  * `sidecar://ready` so the UI can disable LLM-tagged flows when the
  * underlying runner registration failed.
  */
-export type SidecarWarningKind = "worker_apply_failed" | "plugins_stage_failed";
+export type SidecarWarningKind =
+  | "worker_apply_failed"
+  | "plugins_stage_failed"
+  /**
+   * The local LanceDB could not be opened at the configured embedding
+   * dimension, so the memories sidecar was restarted with the vector store
+   * disabled (degraded mode). Startup is allowed; embedding-dependent
+   * features (semantic / hybrid / intent search, import, generation) are
+   * unavailable until the user switches the embedding model back to the
+   * matching dimension. `SidecarWarning.detail` carries a JSON blob with
+   * `reason` / `expected_dim` / `actual_dim` (see `isVectorDegraded`).
+   */
+  | "vector_store_degraded";
 
 export interface SidecarWarning {
   kind: SidecarWarningKind;

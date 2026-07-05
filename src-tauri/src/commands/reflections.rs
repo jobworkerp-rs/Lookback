@@ -146,6 +146,10 @@ pub async fn search_reflections_by_intent(
     state: State<'_, AppState>,
     req: SearchReflectionsByIntentRequest,
 ) -> AppResult<Vec<ReflectionEntry>> {
+    // Server-side intent-text embedding against the reflection-intent vector
+    // index; unavailable when the local vector store is degraded (local
+    // mode only). Structured `search_reflections` stays available.
+    state.ensure_local_embedding_available()?;
     let request = build_intent_request(&req)?;
     let mut client = ReflectionServiceClient::new(state.memories_channel().await?);
     let stream = client

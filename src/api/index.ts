@@ -86,6 +86,13 @@ export async function listThreads(req: ListThreadsRequest): Promise<ThreadSummar
   return invoke<ThreadSummary[]>("list_threads", { req });
 }
 
+/** Fetch a single thread row by id; `null` if it no longer exists. Used to
+ *  hydrate ThreadDetail's header when opened from a cross-tab jump that only
+ *  had the thread id (the synthesized ThreadSummary has empty channel/labels). */
+export async function findThread(thread_id: string): Promise<ThreadSummary | null> {
+  return invoke<ThreadSummary | null>("find_thread", { req: { thread_id } });
+}
+
 export async function findDistinctLabels(
   req: FindDistinctLabelsRequest = {},
 ): Promise<LabelWithCount[]> {

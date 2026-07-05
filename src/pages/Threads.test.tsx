@@ -1,5 +1,6 @@
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SidecarStatus } from "@/hooks/useSidecarStatus";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
 import type {
@@ -9,6 +10,9 @@ import type {
   ThreadSummary,
 } from "@/types/api";
 import { Threads } from "./Threads";
+
+// A healthy (non-degraded) sidecar so embedding search modes stay enabled.
+const readySidecar: SidecarStatus = { phase: "ready", warnings: [] };
 
 const listThreads = vi.fn();
 const findDistinctLabels = vi.fn();
@@ -91,7 +95,7 @@ describe("Threads page label filter", () => {
     listThreads.mockResolvedValue([thread("1", [])]);
     findDistinctLabels.mockResolvedValue(labels);
 
-    renderWithProviders(<Threads onOpenImport={() => {}} />);
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
 
     await openLabelBar();
     await waitFor(() => barChip("lookback", 5));
@@ -128,7 +132,7 @@ describe("Threads page label filter", () => {
     findDistinctLabels.mockResolvedValue(labels);
     searchMemoriesKeyword.mockResolvedValue([]);
 
-    renderWithProviders(<Threads onOpenImport={() => {}} />);
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
 
     await openLabelBar();
     await waitFor(() => barChip("lookback", 5));
@@ -148,7 +152,7 @@ describe("Threads page label filter", () => {
     findDistinctLabels.mockResolvedValue(labels);
     searchMemoriesKeyword.mockResolvedValue([]);
 
-    renderWithProviders(<Threads onOpenImport={() => {}} />);
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Keyword" }));
     const queryInput = screen.getByPlaceholderText("検索クエリ");
@@ -168,7 +172,7 @@ describe("Threads page label filter", () => {
     findDistinctLabels.mockResolvedValue(labels);
     findCoOccurringLabels.mockResolvedValue([]);
 
-    renderWithProviders(<Threads onOpenImport={() => {}} />);
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
 
     // Wait for the thread card to render.
     await screen.findByText("Card with labels");
@@ -198,7 +202,7 @@ describe("Threads page label filter", () => {
     findDistinctLabels.mockResolvedValue(labels);
     findCoOccurringLabels.mockResolvedValue([{ label: "review", thread_count: 3 }]);
 
-    renderWithProviders(<Threads onOpenImport={() => {}} />);
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
 
     await openLabelBar();
     await waitFor(() => barChip("lookback", 5));
@@ -237,7 +241,7 @@ describe("Threads page label filter", () => {
       return Promise.resolve([]);
     });
 
-    renderWithProviders(<Threads onOpenImport={() => {}} />);
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Semantic" }));
     fireEvent.change(screen.getByPlaceholderText("検索クエリ"), { target: { value: "a" } });
@@ -252,7 +256,7 @@ describe("Threads page label filter", () => {
     findDistinctLabels.mockResolvedValue(labels);
     searchMemoriesSemantic.mockRejectedValue(new Error("embedding worker unavailable"));
 
-    renderWithProviders(<Threads onOpenImport={() => {}} />);
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Semantic" }));
     fireEvent.change(screen.getByPlaceholderText("検索クエリ"), {
@@ -268,7 +272,7 @@ describe("Threads page label filter", () => {
     findDistinctLabels.mockResolvedValue(labels);
     searchMemoriesKeyword.mockRejectedValue(new Error("keyword search failed"));
 
-    renderWithProviders(<Threads onOpenImport={() => {}} />);
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Keyword" }));
     fireEvent.change(screen.getByPlaceholderText("検索クエリ"), { target: { value: "hello" } });
@@ -276,5 +280,64 @@ describe("Threads page label filter", () => {
     await screen.findByText("keyword search failed");
     expect(screen.queryByText(/検索語をもう少し長く/)).toBeNull();
     expect(screen.queryByText(/embedding モデルまたは worker/)).toBeNull();
+  });
+});
+
+describe("Threads page vector-degraded gating", () => {
+  const degradedSidecar: SidecarStatus = {
+    phase: "ready",
+    warnings: [
+      {
+        kind: "vector_store_degraded",
+        message: "degraded",
+        detail: JSON.stringify({
+          reason: "embedding_dimension_mismatch",
+          expected_dim: 2048,
+          actual_dim: 768,
+        }),
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    i18n.changeLanguage("ja");
+    listThreads.mockReset();
+    findDistinctLabels.mockReset();
+    listThreads.mockResolvedValue([]);
+    findDistinctLabels.mockResolvedValue([]);
+  });
+
+  it("disables semantic and hybrid but keeps keyword/browse when degraded", async () => {
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={degradedSidecar} />);
+    await screen.findByRole("button", { name: "一覧" });
+    expect(screen.getByRole("button", { name: "Semantic" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Hybrid" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "一覧" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Keyword" })).not.toBeDisabled();
+  });
+
+  it("keeps every mode enabled on a healthy sidecar", async () => {
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
+    await screen.findByRole("button", { name: "一覧" });
+    expect(screen.getByRole("button", { name: "Semantic" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Hybrid" })).not.toBeDisabled();
+  });
+
+  it("keeps embedding modes enabled in remote mode even when the local sidecar is degraded", async () => {
+    renderWithProviders(
+      <Threads onOpenImport={() => {}} sidecar={degradedSidecar} connectionMode="remote" />,
+    );
+    await screen.findByRole("button", { name: "一覧" });
+    expect(screen.getByRole("button", { name: "Semantic" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Hybrid" })).not.toBeDisabled();
+  });
+
+  it("does not apply local degraded gating before the connection mode is known", async () => {
+    renderWithProviders(
+      <Threads onOpenImport={() => {}} sidecar={degradedSidecar} connectionMode={null} />,
+    );
+    await screen.findByRole("button", { name: "一覧" });
+    expect(screen.getByRole("button", { name: "Semantic" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Hybrid" })).not.toBeDisabled();
   });
 });

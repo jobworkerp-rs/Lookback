@@ -35,7 +35,14 @@
     },
     "warning": {
       "worker_apply_failed": "worker registration failed",
-      "plugins_stage_failed": "plugin staging failed"
+      "plugins_stage_failed": "plugin staging failed",
+      "vector_store_degraded": "vector store disabled"
+    },
+    "degraded": {
+      "title": "Vector search is disabled",
+      "bodyWithDims": "The local embedding dimension does not match the stored index (expected {{expectedDim}} / actual {{actualDim}}). Semantic / hybrid / intent search, import, generation, and scheduled tasks are unavailable. Switch the embedding model back to the matching dimension in Settings.",
+      "body": "The local embedding dimension does not match the stored index. Semantic / hybrid / intent search, import, generation, and scheduled tasks are unavailable. Switch the embedding model back to the matching dimension in Settings.",
+      "cta": "Open embedding settings"
     }
   },
   "common": {
@@ -102,8 +109,10 @@
     },
     "errorHint": {
       "shortQuery": "Try a longer search term, or combine several words. To search with short terms only, use Keyword search.",
-      "embeddingWorker": "Could not run {{mode}} search. Check the embedding model or worker readiness in Settings."
+      "embeddingWorker": "Could not run {{mode}} search. Check the embedding model or worker readiness in Settings.",
+      "vectorDegraded": "Vector search is disabled. In Settings, switch the embedding model to the dimension matching the stored index. Keyword search remains available."
     },
+    "modeDisabled": "Unavailable while the vector store is disabled (fix the embedding model dimension in Settings)",
     "searching": "Searching…",
     "enterQuery": "Enter a query"
   },
@@ -528,10 +537,11 @@
     "embedding": {
       "title": "Embedding model",
       "desc": "The model used to embed Memory / Reflection. If the model or vector dimension changes, the existing index is reset (re-generation required). Changing only dtype / max sequence length / tokenizer keeps the index.",
+      "remoteDesc": "The query embedding model used for Semantic / Hybrid search while connected to a Remote server. Changing it does not reset the local embedding index or request article embedding re-generation.",
       "modelPurpose": "embedding for search (Semantic / Hybrid / natural language)",
       "resetBanner": "⚠ Because the embedding model/dimension changes, all existing embeddings will be reset (moved aside/deleted) and must be re-generated (tens of minutes to hours).",
       "noResetNote": "This change does not alter the model/dimension, so the existing vectordb is kept (no re-generation needed). Saving restarts the sidecar.",
-      "remoteDisabled": "Embedding settings can't be changed while connected remotely. The remote memories keeps its own vectordb, so a local switch has no effect.",
+      "remoteCaution": "While connected remotely, local article embeddings are not generated. For Semantic / Hybrid search, keep the query embedding model and dimension aligned with the remote server embeddings. Local embedding re-generation is not required after this change.",
       "currentSettings": "Current settings",
       "preset": "Preset",
       "presetOption": "{{name}} (≈ {{ram}}GB)",

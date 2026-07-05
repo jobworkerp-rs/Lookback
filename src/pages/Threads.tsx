@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { type KeyboardEvent, useMemo, useState } from "react";
+import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { deleteThread, findCoOccurringLabels, findDistinctLabels, listThreads } from "@/api";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -10,16 +10,20 @@ import { Toolbar } from "@/components/Toolbar";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useDeleteAction } from "@/hooks/useDeleteAction";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
+import { isVectorDegraded, type SidecarStatus } from "@/hooks/useSidecarStatus";
 import { localDateToEpochMs } from "@/lib/dateInput";
+import { sortLabelsByPrefixPriority } from "@/lib/labelPrefix";
 import { formatDateTime } from "@/lib/localeFormat";
-import { resolveSearchErrorHint, SEARCH_MODES } from "@/lib/searchModes";
+import { PERSONALITY_QUERY_KEY } from "@/lib/queryKeys";
+import { isEmbeddingSearchMode, resolveSearchErrorHint, SEARCH_MODES } from "@/lib/searchModes";
 import { parseThreadDescription } from "@/lib/threadDescription";
 import { synthesizeThreadSummary } from "@/lib/threadSummary";
-import { PERSONALITY_QUERY_KEY } from "@/pages/Personality";
-import type { LabelMatch, SearchMode, ThreadHit, ThreadSummary } from "@/types/api";
+import type { ConnectionMode, LabelMatch, SearchMode, ThreadHit, ThreadSummary } from "@/types/api";
 
 export interface ThreadsPageProps {
   onOpenImport: () => void;
+  sidecar: SidecarStatus;
+  connectionMode?: ConnectionMode | null;
 }
 
 type Mode = "browse" | SearchMode;
@@ -30,11 +34,24 @@ interface Selection {
   highlight?: ThreadHighlight;
 }
 
-export function Threads({ onOpenImport }: ThreadsPageProps) {
+export function Threads({ onOpenImport, sidecar, connectionMode = "local" }: ThreadsPageProps) {
   const { t } = useTranslation();
+  // Semantic / hybrid embed the query, so they're unavailable while the local
+  // vector store is degraded. Keyword (FTS) and browse stay usable.
+  const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
   const [selected, setSelected] = useState<Selection | null>(null);
   const [filter, setFilter] = useState("");
   const [mode, setMode] = useState<Mode>("browse");
+  // If the vector store degrades while an embedding mode is active, fall back
+  // to keyword so the search panel doesn't sit on a disabled mode. Only the
+  // degrade transition should trigger this — depending on `mode` too would
+  // loop on the reset it performs.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional; see comment
+  useEffect(() => {
+    if (vectorDisabled && mode !== "browse" && isEmbeddingSearchMode(mode)) {
+      setMode("keyword");
+    }
+  }, [vectorDisabled]);
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 300);
   const [createdAfter, setCreatedAfter] = useState("");
@@ -206,7 +223,8 @@ export function Threads({ onOpenImport }: ThreadsPageProps) {
               type="button"
               className={`segment-btn ${mode === "semantic" ? "active" : ""}`}
               onClick={() => setMode("semantic")}
-              title={t("search.modeTitle.semantic")}
+              disabled={vectorDisabled}
+              title={vectorDisabled ? t("search.modeDisabled") : t("search.modeTitle.semantic")}
             >
               {t("search.mode.semantic")}
             </button>
@@ -214,7 +232,8 @@ export function Threads({ onOpenImport }: ThreadsPageProps) {
               type="button"
               className={`segment-btn ${mode === "hybrid" ? "active" : ""}`}
               onClick={() => setMode("hybrid")}
-              title={t("search.modeTitle.hybrid")}
+              disabled={vectorDisabled}
+              title={vectorDisabled ? t("search.modeDisabled") : t("search.modeTitle.hybrid")}
             >
               {t("search.mode.hybrid")}
             </button>
@@ -329,6 +348,13 @@ function BrowseList({
   const { t } = useTranslation();
   const locale = useLocaleTag();
   const selectedSet = useMemo(() => new Set(selectedLabels), [selectedLabels]);
+  // Sort each thread's chips once per data load, not on every re-render (a
+  // label toggle re-renders the whole list but leaves `data` — and thus every
+  // label order — unchanged).
+  const sortedLabelsById = useMemo(
+    () => new Map(data.map((t) => [t.id, sortLabelsByPrefixPriority(t.labels)])),
+    [data],
+  );
   return (
     <>
       {isLoading && <div className="empty-desc">{t("common.loading")}</div>}
@@ -360,7 +386,7 @@ function BrowseList({
               }
             </div>
             <div className="thread-card-foot">
-              {thread.labels.map((l) => (
+              {(sortedLabelsById.get(thread.id) ?? thread.labels).map((l) => (
                 <ClickableLabelPill
                   key={l}
                   label={l}

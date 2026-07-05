@@ -24,16 +24,16 @@ import { Toolbar } from "@/components/Toolbar";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useDeleteAction } from "@/hooks/useDeleteAction";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
-import type { SidecarStatus } from "@/hooks/useSidecarStatus";
+import { isVectorDegraded, type SidecarStatus } from "@/hooks/useSidecarStatus";
 import type { StepStreamProgressHandle } from "@/hooks/useStepStreamProgress";
 import { dayRangeToEpochMs, localDateToEpochMs } from "@/lib/dateInput";
 import { formatDateTime } from "@/lib/localeFormat";
-import { resolveSearchErrorHint, SEARCH_MODES } from "@/lib/searchModes";
+import { isEmbeddingSearchMode, resolveSearchErrorHint, SEARCH_MODES } from "@/lib/searchModes";
 import { KIND_LABEL_KEYS } from "@/lib/summaryKind";
 import { dayKey, monthKeyToYearMonth, yearMonthToKey } from "@/lib/summaryPeriod";
 import { resolveSummaryRefNavigation } from "@/lib/summaryRefNav";
 import { synthesizeThreadSummary } from "@/lib/threadSummary";
-import type { SearchMode, SummaryEntry, SummaryKind, ThreadHit } from "@/types/api";
+import type { ConnectionMode, SearchMode, SummaryEntry, SummaryKind, ThreadHit } from "@/types/api";
 
 // Synthetic owner of all summaries (Rust SUMMARY_USER_ID); summary search
 // scopes to this owner so it never returns raw conversation memories.
@@ -67,11 +67,13 @@ export interface SummariesFocus {
 export function Summaries({
   summaryProgress,
   sidecar,
+  connectionMode = "local",
   focus,
   onFocusConsumed,
 }: {
   summaryProgress: StepStreamProgressHandle;
   sidecar: SidecarStatus;
+  connectionMode?: ConnectionMode | null;
   /** One-shot focus seed: applied once on mount or whenever a new value
    *  arrives, then `onFocusConsumed` clears it so navigating around the
    *  tab freely doesn't keep snapping back. */
@@ -86,6 +88,13 @@ export function Summaries({
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 300);
   const [mode, setMode] = useState<SearchMode>("keyword");
+  // Semantic / hybrid embed the query, so they're gated while the local vector
+  // store is degraded; keyword (FTS) stays available.
+  const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: only the degrade transition should reset the mode; depending on `mode` would loop
+  useEffect(() => {
+    if (vectorDisabled && isEmbeddingSearchMode(mode)) setMode("keyword");
+  }, [vectorDisabled]);
   const [month, setMonth] = useState(() => {
     if (focus) return focus.month;
     const d = new Date();
@@ -326,17 +335,21 @@ export function Summaries({
           {effectiveView === "search" && (
             <>
               <div className="segment">
-                {(Object.keys(SEARCH_MODES) as SearchMode[]).map((m) => (
-                  <button
-                    type="button"
-                    key={m}
-                    className={`segment-btn ${mode === m ? "active" : ""}`}
-                    onClick={() => setMode(m)}
-                    title={t(`search.modeTitle.${m}`)}
-                  >
-                    {t(`search.mode.${m}`)}
-                  </button>
-                ))}
+                {(Object.keys(SEARCH_MODES) as SearchMode[]).map((m) => {
+                  const disabled = vectorDisabled && isEmbeddingSearchMode(m);
+                  return (
+                    <button
+                      type="button"
+                      key={m}
+                      className={`segment-btn ${mode === m ? "active" : ""}`}
+                      onClick={() => setMode(m)}
+                      disabled={disabled}
+                      title={disabled ? t("search.modeDisabled") : t(`search.modeTitle.${m}`)}
+                    >
+                      {t(`search.mode.${m}`)}
+                    </button>
+                  );
+                })}
               </div>
               <input
                 type="text"

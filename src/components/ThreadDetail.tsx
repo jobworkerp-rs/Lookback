@@ -1,8 +1,9 @@
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { findMemoriesByThreadId } from "@/api";
+import { findMemoriesByThreadId, findThread } from "@/api";
 import { visibleConversationMemories } from "@/lib/codexMemoryVisibility";
+import { sortLabelsByPrefixPriority } from "@/lib/labelPrefix";
 import { parseThreadDescription } from "@/lib/threadDescription";
 import {
   flattenMemories,
@@ -82,6 +83,22 @@ export function ThreadDetail({
     getPreviousPageParam: (_first, _all, firstParam) => prevOffset(firstParam),
   });
   const memories = useMemo(() => flattenMemories(query.data?.pages ?? []), [query.data?.pages]);
+
+  // A cross-tab jump (RAG source / personality / summary ref / reflection /
+  // search-cache miss) opens the modal with a synthesized ThreadSummary that
+  // has no channel and no labels. Fetch the real row to hydrate the header;
+  // skip it entirely when the prop already carries them (the browse path).
+  const needsHydration = thread.channel == null && thread.labels.length === 0;
+  const threadRow = useQuery({
+    queryKey: ["thread-row", thread.id],
+    queryFn: () => findThread(thread.id),
+    enabled: needsHydration,
+  });
+  const headerThread = threadRow.data ?? thread;
+  const sortedLabels = useMemo(
+    () => sortLabelsByPrefixPriority(headerThread.labels),
+    [headerThread.labels],
+  );
 
   const [summaryOpen, setSummaryOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -199,8 +216,8 @@ export function ThreadDetail({
       <div className="modal-head">
         <div className="thread-detail-meta-row">
           <span>
-            {thread.channel ?? t("threadDetail.noChannel")} ·{" "}
-            {thread.labels.join(", ") || t("threadDetail.noLabels")}
+            {headerThread.channel ?? t("threadDetail.noChannel")} ·{" "}
+            {sortedLabels.join(", ") || t("threadDetail.noLabels")}
           </span>
           <fieldset className="thread-role-filter">
             <legend className="visually-hidden">{t("threadDetail.roleFilter")}</legend>

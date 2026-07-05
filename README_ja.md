@@ -115,9 +115,9 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
 
 2. ランナープラグイン（`libjobworkerp_llama_cpp_plugin` と `libmm_embedding_runner`）を対象 OS
    向けにビルドし、共有ライブラリを `plugins/` に配置します。
-3. `memory-store` の `front` を Lindera FTS 対応でビルドする場合は、検索用辞書（lindera 0.44.1
-   形式）を `dict/lindera/ipadic` に配置します。Lookback はこのディレクトリをパッケージに含めて
-   `memory-store` 用に配置しますが、辞書を直接読み込んで解析するわけではありません。
+3. `memory-store` の `front` を Lindera FTS 対応でビルドする場合は、検索用辞書（`metadata.json`
+   を含む lindera 3.x 形式）を `dict/lindera/ipadic` に配置します。Lookback はこのディレクトリを
+   パッケージに含めて `memory-store` 用に配置しますが、辞書を直接読み込んで解析するわけではありません。
 
 開発時の起動コマンドやパスの上書きは [docs/developer-guide_ja.md](docs/developer-guide_ja.md) を参照してください。
 
@@ -131,6 +131,7 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
    - 埋め込みモデルを選びます。
    - バックエンドとモデル準備状態の検査結果を確認します。
 3. プロバイダー、モデルパス、キャッシュパス、言語、MCP 公開設定を変更したい場合は、後から **設定** を開きます。
+   - Connection を **Remote server** にする場合でも **Embedding model** は変更できます。Semantic / Hybrid 検索を使う場合は、ローカルで各記事の embedding は生成されないため、リモートサーバ側の embedding モデル・ベクトル次元と同じ設定に揃えます。Remote server 接続中の変更では、ローカル embedding インデックスのリセットや再生成は行いません。
 4. **スレッド** を開き、**インポート** から Claude Code または Codex のセッションログを取り込みます。ディレクトリ内のプレーンテキストを取り込む場合は、**プレーンテキスト (ディレクトリ)** をチェックし、対象ディレクトリを選択して、スレッド分割方法を選びます。
    - **ファイルごと**: 1 ファイル = 1 スレッド。
    - **ディレクトリごと**: 同じディレクトリ内のファイルを 1 スレッドにまとめる。

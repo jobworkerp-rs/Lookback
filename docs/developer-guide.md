@@ -56,7 +56,7 @@ Rust tests are run with one test thread because several tests share backend-like
    Local LLM execution supports only Qwen 3.5-family and Gemma 4-family models.
 
    The current macOS bundle path uses `.dylib` files. Linux builds should use the corresponding shared library extension and resource mapping.
-3. If the `memory-store` `front` binary is built with Lindera FTS support, place a compatible IPADIC search dictionary at `dict/lindera/ipadic`, or set `LOOKBACK_LINDERA_SRC` to that directory. Lookback only stages the files and sets `LANCE_LANGUAGE_MODEL_HOME` for `memory-store`; it does not load the dictionary directly.
+3. If the `memory-store` `front` binary is built with Lindera FTS support, place a compatible lindera 3.x IPADIC search dictionary at `dict/lindera/ipadic`, or set `LOOKBACK_LINDERA_SRC` to that directory. Lookback only stages the files and sets `LANCE_LANGUAGE_MODEL_HOME` for `memory-store`; it does not load the dictionary directly.
 4. Start the app with explicit paths when the binaries are not available from the repository fallback locations:
 
 ```bash
@@ -150,10 +150,10 @@ The release build must package backend binaries and resources before running Tau
 4. Build runner plugin shared libraries from [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner) and [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner) for the target OS, then place them under `plugins/` at the repository root.
 5. If the packaged `memory-store` `front` build needs Lindera FTS, populate `dict/lindera/ipadic`
    with the IPADIC search dictionary. Nothing under `dict/` is committed — generate it with
-   `scripts/build-release.sh --lindera-only` (lindera 0.44.1 CLI), which also stages the matching
-   `COPYING` license from the IPADIC source so the license always corresponds to the built
-   dictionary. This is also useful before `pnpm tauri:dev` if you want morphological FTS in
-   development (otherwise the sidecar falls back to the ngram tokenizer).
+   `scripts/build-release.sh --lindera-only`, which downloads the lindera 3.0.7 release dictionary
+   and stages the IPADIC `COPYING` license beside it. This is also useful before `pnpm tauri:dev`
+   if you want morphological FTS in development (otherwise the sidecar falls back to the ngram
+   tokenizer).
 6. Run `pnpm tauri:build`.
 
 ### Linux AppImage Post-Processing
@@ -263,10 +263,14 @@ configured jobworkerp and memories gRPC endpoints.
 If remote memories pages or searches look empty:
 
 1. Click `Test connection` and confirm both jobworkerp and memories are reachable.
-2. On failure, check the on-screen error or `<data-root>/log/lookback.log`. Dial failures are logged as
+2. For Semantic / Hybrid search, set Settings > Embedding model to the same embedding model and vector
+   dimension as the remote server. Remote server mode does not generate local article embeddings; only
+   query embedding depends on this local setting. This change does not reset or regenerate the local
+   embedding index.
+3. On failure, check the on-screen error or `<data-root>/log/lookback.log`. Dial failures are logged as
    `jobworkerp connection failed (<url>)` or `memories connection failed (<url>)`.
-3. For more detail, launch with `LOOKBACK_RUST_LOG=debug` and repeat the operation.
-4. If the connection test succeeds but the list is still empty, the connection worked. Check that the
+4. For more detail, launch with `LOOKBACK_RUST_LOG=debug` and repeat the operation.
+5. If the connection test succeeds but the list is still empty, the connection worked. Check that the
    remote memories instance has data for the `user_id` Lookback is querying.
 
 ## Environment Variables

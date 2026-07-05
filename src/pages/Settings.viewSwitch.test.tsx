@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { I18nextProvider } from "react-i18next";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
-import { Settings } from "./Settings";
+import { type EmbeddingFocus, Settings } from "./Settings";
 
 // Settings renders every card, so the whole @/api surface is mocked. The
 // view-switch tests only care about which cards are visible and the
@@ -149,12 +150,12 @@ const SETTINGS_SNAPSHOT = {
   memories_url: "http://127.0.0.1:9010",
 };
 
-function renderSettings() {
+function renderSettings(props?: Parameters<typeof Settings>[0]) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <I18nextProvider i18n={i18n}>
       <QueryClientProvider client={client}>
-        <Settings />
+        <Settings {...props} />
       </QueryClientProvider>
     </I18nextProvider>,
   );
@@ -490,5 +491,130 @@ describe("Settings view switching", () => {
     // New mode is Local ⇒ restart copy.
     expect(screen.getByText("保存して適用 (再起動)")).toBeInTheDocument();
     expect(screen.queryByText("保存して適用")).toBeNull();
+  });
+
+  it("opens the advanced view and scrolls the embedding card into view on focus", async () => {
+    // The banner CTA deep-links here via an `embeddingFocus` seed: the page
+    // must flip to the advanced view (where the embedding model card lives)
+    // and scroll it into view, then consume the seed exactly once.
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    const onConsumed = vi.fn();
+    renderSettings({ embeddingFocus: { nonce: 1 }, onEmbeddingFocusConsumed: onConsumed });
+
+    // Advanced-only "Embedding model" card becomes visible.
+    await screen.findByText("Embedding model");
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    expect(onConsumed).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the scheduled embedding-card scroll after consuming the focus seed", async () => {
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    let nextFrameId = 1;
+    const frames = new Map<number, FrameRequestCallback>();
+    const rafSpy = vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((cb) => {
+      const id = nextFrameId++;
+      frames.set(id, cb);
+      return id;
+    });
+    const cancelSpy = vi.spyOn(globalThis, "cancelAnimationFrame").mockImplementation((id) => {
+      frames.delete(id);
+    });
+
+    function FocusHost() {
+      const [focus, setFocus] = useState<EmbeddingFocus | null>({
+        nonce: 1,
+      });
+      return <Settings embeddingFocus={focus} onEmbeddingFocusConsumed={() => setFocus(null)} />;
+    }
+
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={client}>
+            <FocusHost />
+          </QueryClientProvider>
+        </I18nextProvider>,
+      );
+      await screen.findByText("Embedding model");
+      expect(frames.size).toBe(1);
+
+      act(() => {
+        for (const cb of Array.from(frames.values())) cb(performance.now());
+        frames.clear();
+      });
+
+      expect(scrollSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+    }
+  });
+
+  it("keeps the embedding-card focus seed while the dirty-view confirmation is pending", async () => {
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    let nextFrameId = 1;
+    const frames = new Map<number, FrameRequestCallback>();
+    const rafSpy = vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((cb) => {
+      const id = nextFrameId++;
+      frames.set(id, cb);
+      return id;
+    });
+    const cancelSpy = vi.spyOn(globalThis, "cancelAnimationFrame").mockImplementation((id) => {
+      frames.delete(id);
+    });
+
+    function FocusHost() {
+      const [focus, setFocus] = useState<EmbeddingFocus | null>(null);
+      return (
+        <>
+          <button type="button" onClick={() => setFocus({ nonce: 1 })}>
+            focus embedding
+          </button>
+          <Settings embeddingFocus={focus} onEmbeddingFocusConsumed={() => setFocus(null)} />
+        </>
+      );
+    }
+
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={client}>
+            <FocusHost />
+          </QueryClientProvider>
+        </I18nextProvider>,
+      );
+
+      await screen.findByText("LLM Provider");
+      await screen.findByDisplayValue("/hf");
+      fireEvent.click(screen.getByText("App data dir 配下"));
+      await screen.findByText(/未保存の変更があります/);
+
+      fireEvent.click(screen.getByText("focus embedding"));
+      expect(screen.getByText("保存していない変更があります")).toBeInTheDocument();
+
+      act(() => {
+        for (const cb of Array.from(frames.values())) cb(performance.now());
+        frames.clear();
+      });
+      expect(scrollSpy).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByText("破棄して移動"));
+      await screen.findByText("Embedding model");
+      expect(frames.size).toBe(1);
+
+      act(() => {
+        for (const cb of Array.from(frames.values())) cb(performance.now());
+        frames.clear();
+      });
+      expect(scrollSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+    }
   });
 });

@@ -22,7 +22,10 @@ use super::connection::MemoriesCallback;
 use super::import::{
     REFLECTION_PROMPT_VERSION, summarize_workflow_chunk, summarize_workflow_error,
 };
-use super::{AppState, StepStatus, cancel_dispatch_inner, emit_event};
+use super::{
+    AppState, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner, emit_event,
+    emit_generated_refresh,
+};
 
 const REFLECTION_WORKER_NAME: &str = "memories-reflection-batch";
 const REFLECTION_EVENT: &str = "reflection://step";
@@ -61,6 +64,9 @@ pub async fn enqueue_reflection_job(
     state: State<'_, AppState>,
     req: EnqueueReflectionJobRequest,
 ) -> AppResult<EnqueueReflectionJobResponse> {
+    // Reflection generation writes intent embeddings into the local vector
+    // store; refuse when it is degraded (local mode only).
+    state.ensure_local_embedding_available()?;
     let callback = state.resolve_targets()?.memories_callback()?;
     // Presence guard: the `memories-reflection-batch` worker is registered from
     // this bundled YAML (llm-workers.yaml `$file:`), so a missing bundle means
@@ -123,6 +129,11 @@ pub async fn enqueue_reflection_job(
                         (StepStatus::Active, digest)
                     }
                     StreamEvent::Done(msg) => {
+                        emit_generated_refresh(
+                            &app_for_emit,
+                            &job_id_for_emit,
+                            vec![GeneratedRefreshScope::Reflection],
+                        );
                         let digest = msg.map(|raw| summarize_workflow_chunk(raw, last_progress).0);
                         (StepStatus::Done, digest)
                     }

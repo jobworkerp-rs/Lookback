@@ -38,6 +38,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             commands::threads::list_threads,
+            commands::threads::find_thread,
             commands::threads::find_distinct_labels,
             commands::threads::find_co_occurring_labels,
             commands::threads::find_memories_by_thread_id,

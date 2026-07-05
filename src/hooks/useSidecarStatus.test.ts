@@ -4,6 +4,7 @@ import {
   applySnapshot,
   errorStatusFrom,
   hasLlmInitFailure,
+  isVectorDegraded,
   readyStatusFrom,
   type SidecarStatus,
 } from "./useSidecarStatus";
@@ -39,6 +40,59 @@ describe("readyStatusFrom", () => {
     });
     expect(status.warnings).toHaveLength(1);
     expect(hasLlmInitFailure(status)).toBe(true);
+  });
+});
+
+describe("isVectorDegraded", () => {
+  const withWarnings = (warnings: SidecarStatus["warnings"]): SidecarStatus => ({
+    phase: "ready",
+    warnings,
+  });
+
+  it("returns null when there is no degraded warning", () => {
+    expect(isVectorDegraded(withWarnings([]))).toBeNull();
+    expect(
+      isVectorDegraded(withWarnings([{ kind: "worker_apply_failed", message: "x", detail: null }])),
+    ).toBeNull();
+  });
+
+  it("parses expected/actual dims out of the detail JSON", () => {
+    const status = withWarnings([
+      {
+        kind: "vector_store_degraded",
+        message: "degraded",
+        detail: JSON.stringify({
+          reason: "embedding_dimension_mismatch",
+          expected_dim: 2048,
+          actual_dim: 768,
+        }),
+      },
+    ]);
+    expect(isVectorDegraded(status)).toEqual({ expectedDim: 2048, actualDim: 768 });
+  });
+
+  it("returns an empty object (still degraded) when detail is missing or unparsable", () => {
+    expect(
+      isVectorDegraded(
+        withWarnings([{ kind: "vector_store_degraded", message: "d", detail: null }]),
+      ),
+    ).toEqual({});
+    expect(
+      isVectorDegraded(
+        withWarnings([{ kind: "vector_store_degraded", message: "d", detail: "{not json" }]),
+      ),
+    ).toEqual({});
+  });
+
+  it("ignores local degraded warnings while the active connection is remote", () => {
+    const status = withWarnings([{ kind: "vector_store_degraded", message: "d", detail: null }]);
+    expect(isVectorDegraded(status, "remote")).toBeNull();
+    expect(isVectorDegraded(status, "local")).toEqual({});
+  });
+
+  it("does not assume local degraded while the connection mode is still unknown", () => {
+    const status = withWarnings([{ kind: "vector_store_degraded", message: "d", detail: null }]);
+    expect(isVectorDegraded(status, null)).toBeNull();
   });
 });
 

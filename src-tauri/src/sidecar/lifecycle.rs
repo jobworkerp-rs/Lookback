@@ -8,7 +8,7 @@
 //! succeeds (poor man's health check; gRPC `tonic_health` Check is the
 //! follow-up once we know what services are registered).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +106,15 @@ pub enum SidecarWarningKind {
     /// `plugins::stage_plugins` couldn't resolve a source directory or
     /// failed to copy. Same downstream impact as `WorkerApplyFailed`.
     PluginsStageFailed,
+    /// The local LanceDB could not be opened at the configured embedding
+    /// dimension, so the memories sidecar was restarted with the vector
+    /// store disabled (degraded mode). Startup is allowed to proceed —
+    /// browse / FTS keep working — but embedding-dependent features
+    /// (semantic / hybrid / intent search, import, generation) are
+    /// unavailable until the user switches the embedding model back to the
+    /// matching dimension in Settings. `SidecarWarning.detail` carries a
+    /// JSON blob (`DegradedInfo`) with `expected_dim` / `actual_dim`.
+    VectorStoreDegraded,
 }
 
 /// Non-fatal startup condition that the UI should surface to the user.
@@ -126,6 +135,105 @@ pub struct SidecarStartReport {
     #[serde(flatten)]
     pub endpoints: SidecarEndpoints,
     pub warnings: Vec<SidecarWarning>,
+}
+
+/// Diagnostics for a degraded (vector-store-disabled) startup. Recorded on
+/// `Sidecars::degraded` and serialized into the `SidecarWarning.detail` of
+/// the `VectorStoreDegraded` warning so the frontend can render the
+/// dimension mismatch. `reason` mirrors the originating `StartupFailure`
+/// code (`lancedb_schema_mismatch` / `embedding_dimension_mismatch`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DegradedInfo {
+    pub reason: &'static str,
+    pub expected_dim: u32,
+    pub actual_dim: u32,
+}
+
+impl DegradedInfo {
+    /// Build the `VectorStoreDegraded` warning for this diagnostic. The
+    /// human-readable `message` is a fallback; the frontend renders its own
+    /// i18n copy off the JSON `detail` (dims). Keeping the construction on
+    /// the type keeps the presentation out of `start_inner`.
+    fn into_warning(self) -> SidecarWarning {
+        let message = format!(
+            "ローカルのベクトルストアが次元不一致（期待 {} / 実際 {}）で無効化されました",
+            self.expected_dim, self.actual_dim
+        );
+        let detail = serde_json::to_string(&self).ok();
+        SidecarWarning {
+            kind: SidecarWarningKind::VectorStoreDegraded,
+            message,
+            detail,
+        }
+    }
+}
+
+/// Decide whether a memories startup failure is a local vector-dimension
+/// mismatch that should trigger a degraded (vector-disabled) restart, or a
+/// genuinely fatal error that must surface to BootError. Pure so the policy
+/// is unit-tested without spinning up a real sidecar.
+///
+/// Only the two dimension-mismatch codes are recoverable this way:
+/// disabling the vector store sidesteps the LanceDB open that produced them.
+/// Every other `StartupFailure` (RDB pool, env var, media conflict, LanceDB
+/// init IO error, …) is left fatal — restarting with vectors off would not
+/// fix them and would silently hide the real problem.
+pub(crate) fn plan_degraded_retry(err: &AppError) -> Option<DegradedInfo> {
+    use crate::sidecar::startup_error::StartupFailure;
+    let AppError::SidecarStartupFailed(failure) = err else {
+        return None;
+    };
+    match failure {
+        StartupFailure::LancedbSchemaMismatch {
+            expected_dim,
+            actual_dim,
+            ..
+        } => Some(DegradedInfo {
+            reason: "lancedb_schema_mismatch",
+            expected_dim: *expected_dim,
+            actual_dim: *actual_dim,
+        }),
+        StartupFailure::EmbeddingDimensionMismatch {
+            expected_dim,
+            actual_dim,
+            ..
+        } => Some(DegradedInfo {
+            reason: "embedding_dimension_mismatch",
+            expected_dim: *expected_dim,
+            actual_dim: *actual_dim,
+        }),
+        _ => None,
+    }
+}
+
+fn apply_memories_vector_env(
+    cmd: &mut Command,
+    vector_on: bool,
+    vector_size: u32,
+    memory_lancedb_uri: &Path,
+) {
+    if vector_on {
+        cmd.env("MEMORY_VECTOR_ENABLED", "true")
+            .env("MEMORY_VECTOR_SIZE", vector_size.to_string())
+            .env(
+                "MEMORY_LANCEDB_URI",
+                memory_lancedb_uri.to_string_lossy().as_ref(),
+            )
+            // Opt-in ON TOP OF MEMORY_VECTOR_ENABLED: creates the
+            // reflection_intent LanceDB table at startup. Without it
+            // `FindSimilarByIntentText` / `FindSimilarTrajectories` return
+            // Unimplemented (memories dot.env §Reflection).
+            .env("REFLECTION_INTENT_VECTOR_ENABLED", "true");
+    } else {
+        // Degraded restart must win over env_file / inherited env; otherwise a
+        // template with vectors enabled reopens the mismatched LanceDB.
+        cmd.env("MEMORY_VECTOR_ENABLED", "false")
+            .env("REFLECTION_INTENT_VECTOR_ENABLED", "false")
+            .env_remove("MEMORY_VECTOR_SIZE")
+            .env_remove("MEMORY_LANCEDB_URI")
+            .env_remove("REFLECTION_VECTOR_SIZE")
+            .env_remove("REFLECTION_LANCEDB_URI");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -390,6 +498,15 @@ pub struct Sidecars {
     /// it is stashed here so `get_mcp_settings` / `get_sidecar_status` can
     /// hand the UI the connection URL. Cleared on stop.
     active_mcp_port: Arc<Mutex<Option<u16>>>,
+    /// `Some` when the last `start_inner` had to restart the memories child
+    /// with the vector store disabled because the local LanceDB could not
+    /// be opened at the configured embedding dimension (degraded mode).
+    /// Read by the command-layer gate (`ensure_local_embedding_available`)
+    /// to refuse embedding-dependent dispatches, and surfaced to the UI via
+    /// the `VectorStoreDegraded` warning. Reset to `None` at the top of
+    /// every `start_inner` (so a subsequent clean start clears it) and on
+    /// `stop` / `stop_blocking`.
+    degraded: Arc<Mutex<Option<DegradedInfo>>>,
 }
 
 impl Sidecars {
@@ -406,7 +523,24 @@ impl Sidecars {
             startup_failure: Arc::new(Mutex::new(None)),
             spawned_external_key_env: Arc::new(Mutex::new(None)),
             active_mcp_port: Arc::new(Mutex::new(None)),
+            degraded: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Degraded-mode diagnostics from the last start, or `None` when the
+    /// vector store came up normally. `Some` means the memories child is
+    /// running with `MEMORY_VECTOR_ENABLED=false` because the local
+    /// LanceDB dimension did not match the configured embedding model.
+    pub fn degraded(&self) -> Option<DegradedInfo> {
+        self.degraded.lock().clone()
+    }
+
+    /// Test-only: seed the degraded flag so command-layer gate tests can
+    /// simulate a vector-disabled restart without spinning up a real
+    /// dimension-mismatched sidecar.
+    #[cfg(test)]
+    pub(crate) fn set_degraded_for_test(&self, info: Option<DegradedInfo>) {
+        *self.degraded.lock() = info;
     }
 
     /// MCP HTTP server bind port the running jobworkerp child is listening
@@ -536,6 +670,12 @@ impl Sidecars {
         // of `None` here (other writes come from `pipe_lines` on the
         // memories child's stdout).
         *self.startup_failure.lock() = None;
+        // Clear any degraded flag from a previous start: a clean start (or
+        // the restart the user triggers after fixing the embedding
+        // dimension in Settings) must return to full functionality. Only
+        // set again below if the memories child still can't open the
+        // LanceDB at the configured dimension.
+        *self.degraded.lock() = None;
 
         self.config.data.ensure()?;
 
@@ -864,23 +1004,14 @@ impl Sidecars {
         )
         .await;
 
-        let mem_child = self.spawn_memories(
+        self.spawn_and_register_memories(
             mem_port,
             jw_port,
             &rust_log,
             &embedding_runtime,
             staged_embedding_workers_yaml.as_deref(),
+            None,
         )?;
-        {
-            let mut guard = self.state.lock();
-            if let Some(procs) = guard.as_mut() {
-                procs.push(Process {
-                    name: "memories",
-                    child: mem_child,
-                    port: mem_port,
-                });
-            }
-        }
 
         if let Err(e) = wait_for_tcp_or_failure(
             ("127.0.0.1", mem_port),
@@ -889,8 +1020,54 @@ impl Sidecars {
         )
         .await
         {
-            self.stop_blocking();
-            return Err(e);
+            // A dimension-mismatch on the local LanceDB (the memories child
+            // `exit(1)`s via `StartupError::*Mismatch::fatal()`) is NOT
+            // fatal to the whole app: retry the memories child once with the
+            // vector store disabled (degraded mode) so browse / FTS keep
+            // working and only embedding-dependent features are gated. Any
+            // other startup failure stays fatal → BootError.
+            let Some(info) = plan_degraded_retry(&e) else {
+                self.stop_blocking();
+                return Err(e);
+            };
+            warn!(
+                expected_dim = info.expected_dim,
+                actual_dim = info.actual_dim,
+                reason = info.reason,
+                "memories vector dimension mismatch; restarting with vector store disabled (degraded)"
+            );
+            // Kill the dead memories child (jobworkerp stays up — its workers
+            // are already registered) and clear the structured-failure slot:
+            // otherwise the re-spawn's TCP wait would short-circuit on the
+            // stale failure.
+            self.kill_memories_child();
+            *self.startup_failure.lock() = None;
+
+            self.spawn_and_register_memories(
+                mem_port,
+                jw_port,
+                &rust_log,
+                &embedding_runtime,
+                staged_embedding_workers_yaml.as_deref(),
+                Some(false),
+            )?;
+
+            // Second wait: with vector disabled the LanceDB is never opened,
+            // so a mismatch can't recur. A failure here is a genuine problem
+            // → fatal.
+            if let Err(e2) = wait_for_tcp_or_failure(
+                ("127.0.0.1", mem_port),
+                MEMORIES_START_TIMEOUT,
+                Some(&self.startup_failure),
+            )
+            .await
+            {
+                self.stop_blocking();
+                return Err(e2);
+            }
+
+            *self.degraded.lock() = Some(info.clone());
+            warnings.push(info.into_warning());
         }
 
         let conductor_child = self.spawn_conductor(conductor_port, &rust_log)?;
@@ -1013,6 +1190,9 @@ impl Sidecars {
         // No live child ⇒ no MCP server listening; `get_mcp_settings` must
         // report `active_port: None` after a stop.
         *self.active_mcp_port.lock() = None;
+        // No live child ⇒ the degraded gate must not keep refusing
+        // dispatches after a stop / purge.
+        *self.degraded.lock() = None;
         let Some(mut procs) = self.state.lock().take() else {
             // Nothing was running; still release the lock/PID record in case a
             // prior partial start left them behind.
@@ -1030,6 +1210,26 @@ impl Sidecars {
         }
         self.release_instance_lock();
         Ok(())
+    }
+
+    /// SIGKILL and remove only the `memories` child from the process list,
+    /// leaving jobworkerp (and its already-registered workers) running.
+    /// Used by the degraded-restart path so a dimension-mismatched memories
+    /// child can be replaced without tearing the whole sidecar set down.
+    /// Best-effort: `start_kill` just sends SIGKILL on Unix.
+    fn kill_memories_child(&self) {
+        let mut guard = self.state.lock();
+        let Some(procs) = guard.as_mut() else {
+            return;
+        };
+        procs.retain_mut(|proc| {
+            if proc.name == "memories" {
+                let _ = proc.child.start_kill();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Drop the crash-recovery PID record and the per-instance advisory lock.
@@ -1077,6 +1277,8 @@ impl Sidecars {
         *self.spawned_external_key_env.lock() = None;
         // No live child ⇒ no MCP server listening; mirror `stop`.
         *self.active_mcp_port.lock() = None;
+        // Mirror `stop`: clear the degraded gate.
+        *self.degraded.lock() = None;
         let Some(mut procs) = self.state.lock().take() else {
             self.release_instance_lock();
             return;
@@ -1342,6 +1544,11 @@ impl Sidecars {
         Ok(child)
     }
 
+    /// Spawn the memories gRPC front. `auto_embedding_override` forces the
+    /// `MEMORY_AUTO_EMBEDDING_ENABLED` / vector-store env on (`Some(true)`)
+    /// or off (`Some(false)`) regardless of `config.auto_embedding_enabled`;
+    /// `None` uses the config value. The degraded-restart path passes
+    /// `Some(false)` so a dimension-mismatched LanceDB is never opened.
     fn spawn_memories(
         &self,
         port: u16,
@@ -1349,7 +1556,10 @@ impl Sidecars {
         rust_log: &str,
         embedding_runtime: &crate::commands::embedding_settings::EmbeddingRuntime,
         staged_embedding_workers_yaml: Option<&std::path::Path>,
+        auto_embedding_override: Option<bool>,
     ) -> AppResult<Child> {
+        let auto_embedding_on =
+            auto_embedding_override.unwrap_or(self.config.auto_embedding_enabled);
         // memories' gRPC frontend reads `GRPC_ADDR` as its *listen* address.
         // `MEMORY_GRPC_HOST` / `MEMORY_GRPC_PORT` are a SEPARATE concern: the
         // callback address the auto-embedding / reflection-intent workflows
@@ -1361,11 +1571,7 @@ impl Sidecars {
             &self.config.data.memories_data_dir(),
             rust_log,
         );
-        let auto_embedding = if self.config.auto_embedding_enabled {
-            "true"
-        } else {
-            "false"
-        };
+        let auto_embedding = if auto_embedding_on { "true" } else { "false" };
         cmd.env("GRPC_ADDR", format!("127.0.0.1:{port}"))
             .env("MEMORY_AUTO_EMBEDDING_ENABLED", auto_embedding)
             .env("MEMORY_GRPC_HOST", "127.0.0.1")
@@ -1405,33 +1611,18 @@ impl Sidecars {
         // root. `REFLECTION_LANCEDB_URI` defaults to
         // `${MEMORY_LANCEDB_URI}/reflection_intent`, so it needs no explicit
         // value. `REFLECTION_VECTOR_SIZE` falls back to `MEMORY_VECTOR_SIZE`.
-        if self.config.auto_embedding_enabled {
-            cmd.env("MEMORY_VECTOR_ENABLED", "true")
-                .env(
-                    "MEMORY_VECTOR_SIZE",
-                    embedding_runtime.vector_size.to_string(),
-                )
-                .env(
-                    "MEMORY_LANCEDB_URI",
-                    self.config
-                        .data
-                        .lancedb_dir()
-                        .join("memories.lancedb")
-                        .to_string_lossy()
-                        .as_ref(),
-                )
-                // Opt-in ON TOP OF MEMORY_VECTOR_ENABLED: creates the
-                // reflection_intent LanceDB table at startup. Without it
-                // `FindSimilarByIntentText` / `FindSimilarTrajectories` return
-                // Unimplemented (memories dot.env §Reflection).
-                .env("REFLECTION_INTENT_VECTOR_ENABLED", "true");
-            // NOTE: `LOOKBACK_EMBEDDING_*` env vars are NOT injected into the
-            // memories child — memories itself does not read them. They are
-            // applied to the Tauri process env (`apply_embedding_env`) so the
-            // jobworkerp YAML loader's `expand_env` can substitute the
-            // committed `auto-embedding-workers.yaml` placeholders. The staged
-            // YAML (when present) bakes the values in directly.
-        }
+        apply_memories_vector_env(
+            &mut cmd,
+            auto_embedding_on,
+            embedding_runtime.vector_size,
+            &self.config.data.lancedb_dir().join("memories.lancedb"),
+        );
+        // NOTE: `LOOKBACK_EMBEDDING_*` env vars are NOT injected into the
+        // memories child — memories itself does not read them. They are
+        // applied to the Tauri process env (`apply_embedding_env`) so the
+        // jobworkerp YAML loader's `expand_env` can substitute the committed
+        // `auto-embedding-workers.yaml` placeholders. The staged YAML (when
+        // present) bakes the values in directly.
 
         // Point the embedding dispatchers at the agent-app's bundled YAMLs
         // (Metal device + unified `memories-mm-embedding` names) instead of
@@ -1488,6 +1679,36 @@ impl Sidecars {
             Some(self.startup_failure.clone()),
         );
         Ok(child)
+    }
+
+    /// Spawn the memories child and register it in the process list. Wraps
+    /// `spawn_memories` + the `state` push so the initial start and the
+    /// degraded restart don't duplicate the lock/push boilerplate.
+    fn spawn_and_register_memories(
+        &self,
+        mem_port: u16,
+        jw_port: u16,
+        rust_log: &str,
+        embedding_runtime: &crate::commands::embedding_settings::EmbeddingRuntime,
+        staged_embedding_workers_yaml: Option<&std::path::Path>,
+        auto_embedding_override: Option<bool>,
+    ) -> AppResult<()> {
+        let child = self.spawn_memories(
+            mem_port,
+            jw_port,
+            rust_log,
+            embedding_runtime,
+            staged_embedding_workers_yaml,
+            auto_embedding_override,
+        )?;
+        if let Some(procs) = self.state.lock().as_mut() {
+            procs.push(Process {
+                name: "memories",
+                child,
+                port: mem_port,
+            });
+        }
+        Ok(())
     }
 
     fn spawn_conductor(&self, port: u16, rust_log: &str) -> AppResult<Child> {
@@ -2270,6 +2491,118 @@ mod tests {
         // post-purge get_model_status doesn't keep reporting `failed`.
         sidecars.stop().await.unwrap();
         assert!(sidecars.last_start_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_clears_degraded_flag() {
+        // A degraded start records `DegradedInfo`; a subsequent stop (or the
+        // restart the user triggers after fixing the embedding dimension)
+        // must clear it so the command-layer gate stops refusing dispatches.
+        let sidecars = test_sidecars();
+        *sidecars.degraded.lock() = Some(DegradedInfo {
+            reason: "embedding_dimension_mismatch",
+            expected_dim: 2048,
+            actual_dim: 768,
+        });
+        assert!(sidecars.degraded().is_some());
+        sidecars.stop().await.unwrap();
+        assert!(sidecars.degraded().is_none());
+    }
+
+    #[test]
+    fn plan_degraded_retry_recovers_dimension_mismatches() {
+        use crate::sidecar::startup_error::StartupFailure;
+        // The two dimension-mismatch codes are recoverable via a
+        // vector-disabled restart; the info carries the dims through.
+        let schema = AppError::SidecarStartupFailed(StartupFailure::LancedbSchemaMismatch {
+            table: "memories".into(),
+            uri: "/x".into(),
+            expected_dim: 2048,
+            actual_dim: 768,
+            expected_fingerprint: String::new(),
+            actual_fingerprint: String::new(),
+        });
+        let got = plan_degraded_retry(&schema).expect("schema mismatch is recoverable");
+        assert_eq!(got.reason, "lancedb_schema_mismatch");
+        assert_eq!((got.expected_dim, got.actual_dim), (2048, 768));
+
+        let dim = AppError::SidecarStartupFailed(StartupFailure::EmbeddingDimensionMismatch {
+            expected_dim: 1024,
+            actual_dim: 512,
+            runner_name: "memories-mm-embedding".into(),
+        });
+        let got = plan_degraded_retry(&dim).expect("embedding dim mismatch is recoverable");
+        assert_eq!(got.reason, "embedding_dimension_mismatch");
+        assert_eq!((got.expected_dim, got.actual_dim), (1024, 512));
+    }
+
+    #[test]
+    fn plan_degraded_retry_leaves_other_failures_fatal() {
+        use crate::sidecar::startup_error::StartupFailure;
+        // Everything that is NOT a dimension mismatch stays fatal: a
+        // vector-disabled restart would not fix these and would hide the
+        // real problem behind a degraded banner.
+        let fatal = [
+            AppError::SidecarStartupFailed(StartupFailure::LancedbInitFailed {
+                uri: "/x".into(),
+                message: "permission denied".into(),
+            }),
+            AppError::SidecarStartupFailed(StartupFailure::RdbPoolInitFailed {
+                url_sanitized: "sqlite:".into(),
+                message: "unable to open".into(),
+            }),
+            AppError::SidecarStartupFailed(StartupFailure::EnvVarInvalid {
+                name: "GRPC_ADDR".into(),
+                message: "bad".into(),
+            }),
+            AppError::SidecarStartupFailed(StartupFailure::MediaConfigConflict {
+                backend: "inline".into(),
+                image_search_mode: "clip".into(),
+            }),
+            AppError::SidecarStartupFailed(StartupFailure::ConfigLoadFailed {
+                component: "VectorDBConfig".into(),
+                message: "x".into(),
+            }),
+            AppError::SidecarStartupFailed(StartupFailure::Other {
+                component: "front".into(),
+                message: "x".into(),
+            }),
+            // A non-startup error must also stay fatal.
+            AppError::SidecarNotReady("nope".into()),
+        ];
+        for e in &fatal {
+            assert!(
+                plan_degraded_retry(e).is_none(),
+                "must not degrade for {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn degraded_vector_env_overrides_env_file_enabling_vectors() {
+        let mut cmd = Command::new("/bin/true");
+        cmd.env("MEMORY_VECTOR_ENABLED", "true")
+            .env("REFLECTION_INTENT_VECTOR_ENABLED", "true")
+            .env("MEMORY_VECTOR_SIZE", "2048");
+
+        apply_memories_vector_env(&mut cmd, false, 768, Path::new("/tmp/memories.lancedb"));
+
+        let env = cmd
+            .as_std()
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("MEMORY_VECTOR_ENABLED")),
+            Some(&Some(std::ffi::OsStr::new("false")))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("REFLECTION_INTENT_VECTOR_ENABLED")),
+            Some(&Some(std::ffi::OsStr::new("false")))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("MEMORY_VECTOR_SIZE")),
+            Some(&None)
+        );
     }
 
     #[tokio::test]

@@ -1520,6 +1520,22 @@ input[type="date"]:not(.has-value)::-webkit-datetime-edit {
   font-size: 11px;
 }
 
+.warning-banner-cta {
+  margin-top: 8px;
+  border: 1px solid var(--warning);
+  background: transparent;
+  color: var(--warning);
+  border-radius: 5px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.warning-banner-cta:hover {
+  background: rgba(255, 159, 10, 0.12);
+}
+
 /* ===== Reflections / Personality / Markdown messages ===== */
 
 .message {

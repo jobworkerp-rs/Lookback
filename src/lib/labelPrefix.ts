@@ -16,11 +16,36 @@ export function splitLabelPrefix(label: string): { prefix: string | null; value:
   return { prefix: label.slice(0, idx), value: label.slice(idx + 1) };
 }
 
-/** No-prefix labels are surfaced first as a single category section so
- *  curated labels (`summary`, `coding_agent`, ...) don't get buried under
- *  prefix-dumped lists. Remaining prefixes follow by descending label
- *  count — a `dir` group with many distinct paths is a more useful
- *  filter axis than a one-off prefix. */
+/** The single source of truth for the *prefix* order, shared by the filter
+ *  bar sections (`groupByPrefix`) and a thread's own chips
+ *  (`sortLabelsByPrefixPriority`): curated category labels first, then the
+ *  location/tooling axes agent → provider → vault → branch → dir → path. Any
+ *  prefix not listed here sorts after these, by prefix name ascending.
+ *  `CATEGORY_GROUP_KEY` stands in for prefix-less labels (see
+ *  `splitLabelPrefix`). Only the prefix order is shared — each consumer orders
+ *  labels *within* a prefix its own way (see each function's doc). */
+export const LABEL_PREFIX_PRIORITY = [
+  CATEGORY_GROUP_KEY,
+  "agent",
+  "provider",
+  "vault",
+  "branch",
+  "dir",
+  "path",
+] as const;
+
+/** Rank a prefix by `LABEL_PREFIX_PRIORITY`; unknown prefixes share the same
+ *  (largest) rank so they land after every known prefix, then break ties on
+ *  the prefix name at the call site. */
+function prefixRank(prefix: string | null): number {
+  const key = prefix ?? CATEGORY_GROUP_KEY;
+  const idx = (LABEL_PREFIX_PRIORITY as readonly string[]).indexOf(key);
+  return idx < 0 ? LABEL_PREFIX_PRIORITY.length : idx;
+}
+
+/** Bucket the aggregate distinct-label list into per-prefix sections for the
+ *  filter bar. Sections follow `LABEL_PREFIX_PRIORITY`; within a section labels
+ *  are sorted by name, so the display stays stable regardless of usage. */
 export function groupByPrefix(labels: LabelWithCount[]): LabelGroup[] {
   const buckets = new Map<string, LabelWithCount[]>();
   for (const l of labels) {
@@ -31,12 +56,29 @@ export function groupByPrefix(labels: LabelWithCount[]): LabelGroup[] {
     else buckets.set(key, [l]);
   }
   for (const list of buckets.values()) {
-    list.sort((a, b) => b.thread_count - a.thread_count || a.label.localeCompare(b.label));
+    list.sort((a, b) => a.label.localeCompare(b.label));
   }
-  const category = buckets.get(CATEGORY_GROUP_KEY);
-  const rest = [...buckets]
-    .filter(([k]) => k !== CATEGORY_GROUP_KEY)
+  return [...buckets]
     .map(([prefix, labels]) => ({ prefix, labels }))
-    .sort((a, b) => b.labels.length - a.labels.length || a.prefix.localeCompare(b.prefix));
-  return category ? [{ prefix: CATEGORY_GROUP_KEY, labels: category }, ...rest] : rest;
+    .sort(
+      (a, b) => prefixRank(a.prefix) - prefixRank(b.prefix) || a.prefix.localeCompare(b.prefix),
+    );
+}
+
+/**
+ * Order a single thread's chips by `LABEL_PREFIX_PRIORITY`, returning a flat
+ * `string[]` (unlike `groupByPrefix`, which returns per-prefix sections from
+ * the aggregate list). Within one prefix, input order is preserved via the
+ * stable sort — no name sort here, so same-prefix chips keep their given
+ * order.
+ */
+export function sortLabelsByPrefixPriority(labels: string[]): string[] {
+  // The localeCompare only ever splits distinct unknown prefixes; known
+  // prefixes never share a rank, and same-rank category labels keep input
+  // order (stable sort), so no explicit index tiebreak is needed.
+  return [...labels].sort((a, b) => {
+    const pa = splitLabelPrefix(a).prefix;
+    const pb = splitLabelPrefix(b).prefix;
+    return prefixRank(pa) - prefixRank(pb) || (pa ?? "").localeCompare(pb ?? "");
+  });
 }

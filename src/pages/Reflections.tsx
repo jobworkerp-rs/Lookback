@@ -15,6 +15,7 @@ import { Toolbar } from "@/components/Toolbar";
 import { useDeleteAction } from "@/hooks/useDeleteAction";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
 import type { ReflectionProgressHandle } from "@/hooks/useReflectionProgress";
+import { isVectorDegraded, type SidecarStatus } from "@/hooks/useSidecarStatus";
 import { localDateToEpochMs } from "@/lib/dateInput";
 import { formatDateTime } from "@/lib/localeFormat";
 import {
@@ -24,17 +25,25 @@ import {
   taskCategoryLabel,
 } from "@/lib/searchTaxonomy";
 import { synthesizeThreadSummary } from "@/lib/threadSummary";
-import type { ReflectionEntry, ThreadSummary } from "@/types/api";
+import type { ConnectionMode, ReflectionEntry, ThreadSummary } from "@/types/api";
 
 export function Reflections({
   reflectionProgress,
+  sidecar,
+  connectionMode = "local",
 }: {
   reflectionProgress: ReflectionProgressHandle;
+  sidecar: SidecarStatus;
+  connectionMode?: ConnectionMode | null;
 }) {
   const { t } = useTranslation();
   const [selectedOutcomes, setSelectedOutcomes] = useState<number[]>([]);
   const [createdAfter, setCreatedAfter] = useState<string>("");
   const [intentQuery, setIntentQuery] = useState<string>("");
+  // Intent search embeds the query against the reflection-intent vector index,
+  // so it's gated while the local vector store is degraded. Structured filters
+  // (outcomes / date) stay available via ReflectionService.Search.
+  const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
   const [enqueueError, setEnqueueError] = useState<string | null>(null);
   const [enqueueBusy, setEnqueueBusy] = useState(false);
   // Origin thread opened from a reflection card's link, shown as a modal
@@ -45,7 +54,7 @@ export function Reflections({
   // Non-empty intent text routes to FindSimilarByIntentText (server-side
   // embed of the query against stored intent vectors); empty falls back to
   // the filter-only listing via ReflectionService.Search.
-  const intent = intentQuery.trim();
+  const intent = vectorDisabled ? "" : intentQuery.trim();
   const reflections = useQuery({
     queryKey: ["reflections", selectedOutcomes, createdAfter, intent],
     queryFn: () =>
@@ -126,10 +135,13 @@ export function Reflections({
           <input
             type="text"
             className="text-input"
-            placeholder={t("reflections.intentPlaceholder")}
-            value={intentQuery}
+            placeholder={
+              vectorDisabled ? t("search.modeDisabled") : t("reflections.intentPlaceholder")
+            }
+            value={vectorDisabled ? "" : intentQuery}
             onChange={(e) => setIntentQuery(e.target.value)}
-            title={t("reflections.intentTitle")}
+            title={vectorDisabled ? t("search.modeDisabled") : t("reflections.intentTitle")}
+            disabled={vectorDisabled}
             style={{ flex: 1, minWidth: 240 }}
           />
           <DateInput

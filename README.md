@@ -98,8 +98,8 @@ If you build the backend components yourself, place the outputs as follows and r
 2. Build the runner plugins (`libjobworkerp_llama_cpp_plugin` and `libmm_embedding_runner`) for
    your target OS and place the shared libraries under `plugins/`.
 3. If your `memory-store` `front` build uses Lindera FTS, place the search dictionary under
-   `dict/lindera/ipadic` (lindera 0.44.1 format). Lookback packages and stages this directory for
-   `memory-store`; it does not load the dictionary directly.
+   `dict/lindera/ipadic` (lindera 3.x format with `metadata.json`). Lookback packages and stages
+   this directory for `memory-store`; it does not load the dictionary directly.
 
 For development launch commands and path overrides, see [docs/developer-guide.md](docs/developer-guide.md).
 
@@ -113,6 +113,7 @@ For development launch commands and path overrides, see [docs/developer-guide.md
    - Choose the embedding model.
    - Confirm the backend and model readiness checks.
 3. Open **Settings** later if you need to change providers, model paths, cache paths, language, or MCP exposure.
+   - **Embedding model** remains editable when Connection is **Remote server**. For semantic or hybrid search, local article embeddings are not generated, so match the local query embedding model and vector dimension to the remote server embeddings. Remote-server changes do not reset or regenerate the local embedding index.
 4. Open **Threads** and click **Import** to import Claude Code or Codex session logs. To import a directory of plain text instead, check **Plain text (directory)**, choose the target directory, and pick a thread split strategy:
    - **Per file**: one thread per file.
    - **Per directory**: files in the same directory become one thread.

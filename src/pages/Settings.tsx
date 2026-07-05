@@ -49,7 +49,22 @@ import type {
 import { CUSTOM_EMBEDDING_PRESET_ID, CUSTOM_LLM_PRESET_ID } from "@/types/api";
 import { SettingsSaveBar } from "./SettingsSaveBar";
 
-export function Settings({ dirty }: { dirty?: SettingsDirtyControl } = {}) {
+/** One-shot deep-link seed to open the embedding model card. `nonce` makes
+ * every request distinct so re-triggering (e.g. clicking the banner CTA
+ * twice) re-runs the focus effect. */
+export interface EmbeddingFocus {
+  nonce: number;
+}
+
+export function Settings({
+  dirty,
+  embeddingFocus,
+  onEmbeddingFocusConsumed,
+}: {
+  dirty?: SettingsDirtyControl;
+  embeddingFocus?: EmbeddingFocus | null;
+  onEmbeddingFocusConsumed?: () => void;
+} = {}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { data, refetch } = useQuery({
@@ -147,6 +162,30 @@ export function Settings({ dirty }: { dirty?: SettingsDirtyControl } = {}) {
     // `scrollTo` is absent in jsdom; `scrollTop = 0` works everywhere.
     el.scrollTop = 0;
   }, [view]);
+
+  // Deep-link into the embedding model card (banner CTA): switch to the
+  // advanced view via `requestView` (so the leave-guard is honored, not
+  // bypassed) then scroll the card into view once it has mounted. One-shot —
+  // `onEmbeddingFocusConsumed` clears the seed in the parent so a later view
+  // toggle doesn't re-scroll.
+  const embeddingCardRef = useRef<HTMLDivElement>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `embeddingFocus` is the trigger; requestView is stable enough for a one-shot
+  useEffect(() => {
+    if (!embeddingFocus) return;
+    requestView("advanced");
+  }, [embeddingFocus]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `embeddingFocus` and `view` are the only triggers; consume is stable enough for a one-shot
+  useEffect(() => {
+    if (!embeddingFocus || view !== "advanced") return;
+    // Defer the scroll to the next frame so the advanced view (and the card)
+    // has rendered. `scrollIntoView` is a no-op in jsdom but safe to call.
+    const id = requestAnimationFrame(() => {
+      embeddingCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      onEmbeddingFocusConsumed?.();
+    });
+    return () => cancelAnimationFrame(id);
+  }, [embeddingFocus, view]);
 
   // Save-bar counts are split per view and key off the applicable PAYLOAD
   // (an invalid form is not saveable, so it doesn't add to the count). The
@@ -377,14 +416,16 @@ export function Settings({ dirty }: { dirty?: SettingsDirtyControl } = {}) {
               onEditedChange={reportConnEdited}
             />
 
-            <EmbeddingProviderCard
-              retrying={retrying}
-              status={modelStatus.data?.embedding}
-              onRetry={handleRetry}
-              onDirtyChange={reportEmb}
-              onResetsVectordbChange={reportEmbResets}
-              resetSignal={resetSignal}
-            />
+            <div ref={embeddingCardRef}>
+              <EmbeddingProviderCard
+                retrying={retrying}
+                status={modelStatus.data?.embedding}
+                onRetry={handleRetry}
+                onDirtyChange={reportEmb}
+                onResetsVectordbChange={reportEmbResets}
+                resetSignal={resetSignal}
+              />
+            </div>
 
             <McpServerCard onDirtyChange={reportMcp} resetSignal={resetSignal} />
 
@@ -1615,8 +1656,9 @@ function LogsCard() {
  * checkbox so a user comfortable with the previous behaviour can opt
  * out.
  *
- * Disabled entirely when `connection.mode === "remote"` — the swap would
- * not affect the remote memories that the rest of the app is talking to.
+ * Still editable when `connection.mode === "remote"`: local article embeddings
+ * are not regenerated then, but semantic query embedding must match the remote
+ * memories vector space.
  */
 export function EmbeddingProviderCard({
   retrying,
@@ -1713,7 +1755,7 @@ export function EmbeddingProviderCard({
   const isCustom = presetId === CUSTOM_EMBEDDING_PRESET_ID;
   const effective = data?.effective;
 
-  const disabled = remote || retrying || isLoading;
+  const disabled = retrying || isLoading;
 
   // Custom requires BOTH model id and vector size. Vector size has no
   // safe default because the active preset dim can mismatch the model's
@@ -1723,9 +1765,9 @@ export function EmbeddingProviderCard({
     !isCustom || (customModel.trim() !== "" && Number.parseInt(customVectorSize, 10) > 0);
 
   // Build the save payload, or null when the card is clean / cannot be
-  // applied (remote, still loading, or an incomplete custom row).
+  // applied (still loading or an incomplete custom row).
   const buildPayload = useCallback((): SetEmbeddingSettingsRequest | null => {
-    if (!data || remote) return null;
+    if (!data) return null;
     const customOk =
       !isCustom || (customModel.trim() !== "" && Number.parseInt(customVectorSize, 10) > 0);
     if (!customOk) return null;
@@ -1755,7 +1797,6 @@ export function EmbeddingProviderCard({
     return clean ? null : payload;
   }, [
     data,
-    remote,
     isCustom,
     presetId,
     customModel,
@@ -1770,10 +1811,9 @@ export function EmbeddingProviderCard({
 
   // Whether the form differs from the persisted value, IGNORING the
   // custom-incomplete gate (so a half-typed custom row still guards
-  // navigation). `remote` is treated as not-edited: the card is disabled,
-  // so there is nothing to lose. Mirrors buildPayload's clean comparison.
+  // navigation). Mirrors buildPayload's clean comparison.
   const edited = useMemo(() => {
-    if (!data || remote) return false;
+    if (!data) return false;
     return !(
       (presetId === "" ? null : presetId) === (data.preset_id ?? presetList[0]?.id ?? null) &&
       (isCustom ? customModel.trim() || null : null) === (data.custom_model_id ?? null) &&
@@ -1788,7 +1828,6 @@ export function EmbeddingProviderCard({
     );
   }, [
     data,
-    remote,
     isCustom,
     presetId,
     customModel,
@@ -1814,13 +1853,14 @@ export function EmbeddingProviderCard({
   // prediction is preset/custom-only, which matches the production (no-env)
   // path the warning targets.
   const resetsVectordb = useMemo(() => {
+    if (remote) return false;
     if (!edited || !effective) return false;
     const nextModelId = isCustom ? customModel.trim() : (selectedPreset?.hf_repo ?? "");
     const nextVectorSize = isCustom
       ? Number.parseInt(customVectorSize, 10) || 0
       : (selectedPreset?.vector_size ?? 0);
     return nextModelId !== effective.model_id || nextVectorSize !== effective.vector_size;
-  }, [edited, effective, isCustom, customModel, customVectorSize, selectedPreset]);
+  }, [remote, edited, effective, isCustom, customModel, customVectorSize, selectedPreset]);
   useEffect(() => {
     onResetsVectordbChange?.(resetsVectordb);
   }, [resetsVectordb, onResetsVectordbChange]);
@@ -1828,7 +1868,9 @@ export function EmbeddingProviderCard({
   return (
     <div className="settings-card">
       <div className="settings-card-title">{t("settings.embedding.title")}</div>
-      <div className="settings-card-desc">{t("settings.embedding.desc")}</div>
+      <div className="settings-card-desc">
+        {t(remote ? "settings.embedding.remoteDesc" : "settings.embedding.desc")}
+      </div>
       <ModelStatusSection
         purpose={t("settings.embedding.modelPurpose")}
         status={status}
@@ -1844,6 +1886,7 @@ export function EmbeddingProviderCard({
         <div className="settings-destructive-banner">{t("settings.embedding.resetBanner")}</div>
       ) : (
         buildPayload() !== null &&
+        !remote &&
         !suppressResetWarning && (
           <div style={{ color: "var(--label-tertiary)", fontSize: 11, marginBottom: 8 }}>
             {t("settings.embedding.noResetNote")}
@@ -1853,7 +1896,7 @@ export function EmbeddingProviderCard({
       {remote && (
         <div
           style={{
-            color: "var(--danger)",
+            color: "var(--warning)",
             fontSize: 11,
             background: "var(--bg-secondary)",
             padding: 8,
@@ -1861,7 +1904,7 @@ export function EmbeddingProviderCard({
             marginBottom: 8,
           }}
         >
-          {t("settings.embedding.remoteDisabled")}
+          {t("settings.embedding.remoteCaution")}
         </div>
       )}
       {effective && (

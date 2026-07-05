@@ -7,6 +7,8 @@
 //! consumed in a detached task that emits `summary://step` /
 //! `personality://step` events `{ job_id, status, message }`.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
@@ -17,7 +19,10 @@ use super::import::{
     BatchDispatch, GenerateSummariesRequest, PeriodKind, PeriodRange, summarize_workflow_chunk,
     summarize_workflow_error,
 };
-use super::{AppState, DispatchCancelEntry, StepStatus, cancel_dispatch_inner, emit_event};
+use super::{
+    AppState, DispatchCancelEntry, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner,
+    emit_event, emit_generated_refresh, thread_summary_single_completed,
+};
 
 // Worker names must match what the import pipeline dispatches
 // (import.rs success path). Kept as constants here and guarded by a
@@ -106,12 +111,21 @@ pub struct AnalysisStepUpdate {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum RefreshMode {
+    Terminal(Vec<GeneratedRefreshScope>),
+    SummariesPipeline,
+}
+
 #[tauri::command]
 pub async fn enqueue_summary_job(
     app: AppHandle,
     state: State<'_, AppState>,
     req: EnqueueSummaryJobRequest,
 ) -> AppResult<EnqueueAnalysisJobResponse> {
+    // Generation writes summary / personality embeddings into the local
+    // LanceDB; refuse when it is degraded (local mode only).
+    state.ensure_local_embedding_available()?;
     let callback = state.resolve_targets()?.memories_callback()?;
     let user_id = req.user_id.unwrap_or(1);
     let dispatch = BatchDispatch::resolve_with_window(
@@ -135,6 +149,7 @@ pub async fn enqueue_summary_job(
         &job_id,
         SUMMARY_EVENT,
         entry,
+        RefreshMode::Terminal(vec![GeneratedRefreshScope::ThreadSummary]),
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -148,6 +163,9 @@ pub async fn enqueue_personality_job(
     state: State<'_, AppState>,
     req: EnqueuePersonalityJobRequest,
 ) -> AppResult<EnqueueAnalysisJobResponse> {
+    // Generation writes summary / personality embeddings into the local
+    // LanceDB; refuse when it is degraded (local mode only).
+    state.ensure_local_embedding_available()?;
     let callback = state.resolve_targets()?.memories_callback()?;
     let user_id = req.user_id.unwrap_or(1);
     let dispatch = BatchDispatch::resolve(
@@ -172,6 +190,7 @@ pub async fn enqueue_personality_job(
         &job_id,
         PERSONALITY_EVENT,
         entry,
+        RefreshMode::Terminal(vec![GeneratedRefreshScope::Personality]),
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -194,6 +213,9 @@ pub async fn enqueue_personality_merge_job(
     state: State<'_, AppState>,
     req: EnqueuePersonalityMergeJobRequest,
 ) -> AppResult<EnqueueAnalysisJobResponse> {
+    // Generation writes summary / personality embeddings into the local
+    // LanceDB; refuse when it is degraded (local mode only).
+    state.ensure_local_embedding_available()?;
     let callback = state.resolve_targets()?.memories_callback()?;
     let user_id = req.user_id.unwrap_or(1);
     let output_language = state.active_output_language();
@@ -223,6 +245,7 @@ pub async fn enqueue_personality_merge_job(
         &job_id,
         PERSONALITY_EVENT,
         entry,
+        RefreshMode::Terminal(vec![GeneratedRefreshScope::Personality]),
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -244,6 +267,9 @@ pub async fn enqueue_period_summary_job(
     state: State<'_, AppState>,
     req: EnqueuePeriodSummaryJobRequest,
 ) -> AppResult<EnqueueAnalysisJobResponse> {
+    // Generation writes summary / personality embeddings into the local
+    // LanceDB; refuse when it is degraded (local mode only).
+    state.ensure_local_embedding_available()?;
     let callback = state.resolve_targets()?.memories_callback()?;
     // Period summaries always operate on the synthetic owner; the importing
     // user_id is irrelevant here, so resolve with a placeholder.
@@ -268,6 +294,7 @@ pub async fn enqueue_period_summary_job(
         &job_id,
         SUMMARY_EVENT,
         entry,
+        RefreshMode::Terminal(vec![period_refresh_scope(req.kind)]),
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -284,6 +311,9 @@ pub async fn generate_summaries(
     state: State<'_, AppState>,
     req: GenerateSummariesRequest,
 ) -> AppResult<EnqueueAnalysisJobResponse> {
+    // Generation writes summary / personality embeddings into the local
+    // LanceDB; refuse when it is degraded (local mode only).
+    state.ensure_local_embedding_available()?;
     let callback = state.resolve_targets()?.memories_callback()?;
     let user_id = req.user_id.unwrap_or(1);
     // The per-thread epoch bounds ride on the request (forwarded by
@@ -308,6 +338,7 @@ pub async fn generate_summaries(
         &job_id,
         SUMMARY_EVENT,
         entry,
+        RefreshMode::SummariesPipeline,
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -350,6 +381,10 @@ fn resolve_dispatch_id(supplied: Option<&str>, prefix: &str) -> String {
 ///      `"中断"` message when the cancel token fires, and
 ///   3. clears its own AppState entry via `dispatch_take` on exit
 ///      regardless of how it terminated.
+// Each argument is a distinct dispatch concern (worker / args / job id /
+// event name / cancel entry / refresh mode); bundling them into a struct
+// would only move the arity to the call site without improving clarity.
+#[allow(clippy::too_many_arguments)]
 fn spawn_step_stream(
     app: AppHandle,
     handle: JobworkerpHandle,
@@ -360,6 +395,7 @@ fn spawn_step_stream(
     job_id: &str,
     event_name: &'static str,
     entry: DispatchCancelEntry,
+    refresh_mode: RefreshMode,
 ) {
     let job_id = job_id.to_string();
     tokio::spawn(async move {
@@ -380,6 +416,7 @@ fn spawn_step_stream(
         // same rationale.
         let park_job_id = current_job_id.clone();
         let cancel_for_emit = cancel.clone();
+        let mut emitted_refresh_scopes: HashSet<GeneratedRefreshScope> = HashSet::new();
         run_cancellable_named_stream(
             &handle,
             &worker_name,
@@ -398,6 +435,21 @@ fn spawn_step_stream(
                 let (status, message) = match ev {
                     StreamEvent::Active(msg) => {
                         let digest = msg.map(|raw| {
+                            if matches!(refresh_mode, RefreshMode::SummariesPipeline) {
+                                emit_new_refresh_scopes(
+                                    &app_for_emit,
+                                    &job_id_for_emit,
+                                    &mut emitted_refresh_scopes,
+                                    pipeline_refresh_scopes(raw),
+                                );
+                            }
+                            if thread_summary_single_completed(raw) {
+                                emit_generated_refresh(
+                                    &app_for_emit,
+                                    &job_id_for_emit,
+                                    vec![GeneratedRefreshScope::ThreadSummary],
+                                );
+                            }
                             let (d, p) = summarize_workflow_chunk(raw, last_progress);
                             last_progress = p;
                             d
@@ -405,7 +457,26 @@ fn spawn_step_stream(
                         (StepStatus::Active, digest)
                     }
                     StreamEvent::Done(msg) => {
-                        let digest = msg.map(|raw| summarize_workflow_chunk(raw, last_progress).0);
+                        if let RefreshMode::Terminal(scopes) = &refresh_mode {
+                            emit_new_refresh_scopes(
+                                &app_for_emit,
+                                &job_id_for_emit,
+                                &mut emitted_refresh_scopes,
+                                scopes.clone(),
+                            );
+                        }
+                        let digest = msg.map(|raw| {
+                            match &refresh_mode {
+                                RefreshMode::SummariesPipeline => emit_new_refresh_scopes(
+                                    &app_for_emit,
+                                    &job_id_for_emit,
+                                    &mut emitted_refresh_scopes,
+                                    pipeline_refresh_scopes(raw),
+                                ),
+                                RefreshMode::Terminal(_) => {}
+                            }
+                            summarize_workflow_chunk(raw, last_progress).0
+                        });
                         (StepStatus::Done, digest)
                     }
                     StreamEvent::Failed(msg) => {
@@ -446,9 +517,93 @@ fn spawn_step_stream(
     });
 }
 
+fn emit_new_refresh_scopes(
+    app: &AppHandle,
+    job_id: &str,
+    emitted: &mut HashSet<GeneratedRefreshScope>,
+    scopes: Vec<GeneratedRefreshScope>,
+) {
+    let fresh: Vec<GeneratedRefreshScope> = scopes
+        .into_iter()
+        .filter(|scope| emitted.insert(*scope))
+        .collect();
+    emit_generated_refresh(app, job_id, fresh);
+}
+
+fn pipeline_refresh_scopes(raw: &str) -> Vec<GeneratedRefreshScope> {
+    let Some(output) = pipeline_output_value(raw) else {
+        return Vec::new();
+    };
+
+    [
+        ("per_thread_result", GeneratedRefreshScope::ThreadSummary),
+        ("per_thread", GeneratedRefreshScope::ThreadSummary),
+        ("daily_result", GeneratedRefreshScope::DailySummary),
+        ("daily", GeneratedRefreshScope::DailySummary),
+        ("weekly_result", GeneratedRefreshScope::WeeklySummary),
+        ("weekly", GeneratedRefreshScope::WeeklySummary),
+        ("monthly_result", GeneratedRefreshScope::MonthlySummary),
+        ("monthly", GeneratedRefreshScope::MonthlySummary),
+    ]
+    .into_iter()
+    .filter_map(|(key, scope)| pipeline_stage_result_present(&output, key).then_some(scope))
+    .fold(Vec::new(), |mut acc, scope| {
+        if !acc.contains(&scope) {
+            acc.push(scope);
+        }
+        acc
+    })
+}
+
+fn pipeline_output_value(raw: &str) -> Option<serde_json::Value> {
+    let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if pipeline_has_stage_keys(&v) {
+        return Some(v);
+    }
+    match v.get("output") {
+        Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s).ok(),
+        Some(output @ serde_json::Value::Object(_)) => Some(output.clone()),
+        _ => v
+            .as_str()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+    }
+}
+
+fn pipeline_has_stage_keys(v: &serde_json::Value) -> bool {
+    [
+        "per_thread_result",
+        "per_thread",
+        "daily_result",
+        "daily",
+        "weekly_result",
+        "weekly",
+        "monthly_result",
+        "monthly",
+    ]
+    .into_iter()
+    .any(|key| v.get(key).is_some())
+}
+
+fn pipeline_stage_result_present(output: &serde_json::Value, key: &str) -> bool {
+    match output.get(key) {
+        Some(serde_json::Value::Null) | None => false,
+        Some(serde_json::Value::Object(map)) => !map.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn period_refresh_scope(kind: PeriodKind) -> GeneratedRefreshScope {
+    match kind {
+        PeriodKind::Daily => GeneratedRefreshScope::DailySummary,
+        PeriodKind::Weekly => GeneratedRefreshScope::WeeklySummary,
+        PeriodKind::Monthly => GeneratedRefreshScope::MonthlySummary,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::GeneratedRefreshUpdate;
 
     #[test]
     fn personality_request_deserializes_force_reextract() {
@@ -628,6 +783,142 @@ mod tests {
         // The period dispatch intentionally emits on the shared summary
         // event so the existing progress hook/invalidation covers it.
         assert_eq!(SUMMARY_EVENT, "summary://step");
+    }
+
+    #[test]
+    fn period_refresh_scope_matches_kind() {
+        assert_eq!(
+            period_refresh_scope(PeriodKind::Daily),
+            GeneratedRefreshScope::DailySummary
+        );
+        assert_eq!(
+            period_refresh_scope(PeriodKind::Weekly),
+            GeneratedRefreshScope::WeeklySummary
+        );
+        assert_eq!(
+            period_refresh_scope(PeriodKind::Monthly),
+            GeneratedRefreshScope::MonthlySummary
+        );
+    }
+
+    #[test]
+    fn generated_refresh_scope_serializes_for_frontend() {
+        let s = serde_json::to_string(&GeneratedRefreshUpdate {
+            job_id: "job-1".into(),
+            scopes: vec![
+                GeneratedRefreshScope::ThreadSummary,
+                GeneratedRefreshScope::DailySummary,
+                GeneratedRefreshScope::Personality,
+            ],
+        })
+        .unwrap();
+        assert_eq!(
+            s,
+            r#"{"job_id":"job-1","scopes":["thread_summary","daily_summary","personality"]}"#
+        );
+    }
+
+    #[test]
+    fn pipeline_refresh_scopes_reads_stage_results_from_running_context() {
+        let chunk = serde_json::json!({
+            "status": "Running",
+            "output": serde_json::json!({
+                "per_thread_result": { "processed_threads": 3, "succeeded_count": 3 },
+                "daily_result": null,
+                "weekly_result": {},
+                "monthly_result": null
+            }).to_string()
+        })
+        .to_string();
+
+        assert_eq!(
+            pipeline_refresh_scopes(&chunk),
+            vec![GeneratedRefreshScope::ThreadSummary]
+        );
+    }
+
+    #[test]
+    fn pipeline_refresh_scopes_reads_terminal_pipeline_output() {
+        let chunk = serde_json::json!({
+            "status": "Completed",
+            "output": serde_json::json!({
+                "completed": true,
+                "per_thread": { "processed_threads": 3, "succeeded_count": 3 },
+                "daily": { "processed_dates": 1, "succeeded_count": 1 },
+                "weekly": null,
+                "monthly": { "processed_months": 1, "succeeded_count": 1 }
+            }).to_string()
+        })
+        .to_string();
+
+        assert_eq!(
+            pipeline_refresh_scopes(&chunk),
+            vec![
+                GeneratedRefreshScope::ThreadSummary,
+                GeneratedRefreshScope::DailySummary,
+                GeneratedRefreshScope::MonthlySummary,
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_refresh_scopes_reads_direct_terminal_output() {
+        let raw = serde_json::json!({
+            "completed": true,
+            "per_thread": { "processed_threads": 2, "succeeded_count": 2 },
+            "daily": null,
+            "weekly": null,
+            "monthly": null
+        })
+        .to_string();
+
+        assert_eq!(
+            pipeline_refresh_scopes(&raw),
+            vec![GeneratedRefreshScope::ThreadSummary]
+        );
+    }
+
+    #[test]
+    fn pipeline_refresh_scopes_reads_json_string_terminal_output() {
+        let output = serde_json::json!({
+            "completed": true,
+            "per_thread": { "processed_threads": 2, "succeeded_count": 2 },
+            "daily": { "processed_dates": 1, "succeeded_count": 1 }
+        })
+        .to_string();
+        let raw = serde_json::Value::String(output).to_string();
+
+        assert_eq!(
+            pipeline_refresh_scopes(&raw),
+            vec![
+                GeneratedRefreshScope::ThreadSummary,
+                GeneratedRefreshScope::DailySummary,
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_summary_single_completed_detects_record_success_chunk() {
+        let chunk = serde_json::json!({
+            "status": "Running",
+            "position": "/ROOT/do/4/summarizeEach/for/do/1/invokeSingleWithRetry/try/do/1/recordSuccess",
+            "output": "{}"
+        })
+        .to_string();
+
+        assert!(thread_summary_single_completed(&chunk));
+    }
+
+    #[test]
+    fn thread_summary_single_completed_ignores_progress_chunk() {
+        let chunk = serde_json::json!({
+            "status": "Running",
+            "position": "/ROOT/do/4/summarizeEach/for/do/0/reportProgress",
+            "output": "{}"
+        })
+        .to_string();
+
+        assert!(!thread_summary_single_completed(&chunk));
     }
 
     #[test]

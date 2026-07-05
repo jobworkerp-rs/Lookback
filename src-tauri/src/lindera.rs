@@ -2,10 +2,10 @@
 //! the memories `front` sidecar (built with `--features lindera`) can find
 //! it at `LANCE_LANGUAGE_MODEL_HOME/lindera/ipadic/config.yml`.
 //!
-//! Lindera reads a multi-megabyte IPADIC dictionary (0.44.1 binary format)
+//! Lindera reads a multi-megabyte IPADIC dictionary (3.x binary format)
 //! at runtime. The binary dictionary files are NOT committed; they are
-//! generated into `agent-app/dict/lindera/ipadic` at build time by
-//! `scripts/build-release.sh` (lindera 0.44.1 CLI) and bundled as a Tauri
+//! staged into `agent-app/dict/lindera/ipadic` at build time by
+//! `scripts/build-release.sh` (lindera 3.0.7 release dictionary) and bundled as a Tauri
 //! resource. This code copies them into
 //! `<data>/lance_language_models/lindera/ipadic` on first launch, and
 //! (re)generates `config.yml` each run with the absolute staged path so it
@@ -29,9 +29,9 @@ use tracing::{debug, info, warn};
 use crate::data::fsutil::{copy_atomic, file_matches};
 use crate::error::{AppError, AppResult};
 
-/// The 0.44.1 IPADIC binary files lance-index's Lindera loader expects.
-/// `metadata.json` (v1.0.0+ format) is intentionally absent. `config.yml`
-/// is generated, not copied.
+/// The 3.x IPADIC binary files lance-index's Lindera loader expects.
+/// `metadata.json` is required by this format. `config.yml` is generated,
+/// not copied.
 const DICT_FILES: &[&str] = &[
     "char_def.bin",
     "dict.da",
@@ -39,6 +39,7 @@ const DICT_FILES: &[&str] = &[
     "dict.words",
     "dict.wordsidx",
     "matrix.mtx",
+    "metadata.json",
     "unk.bin",
 ];
 
@@ -207,6 +208,15 @@ mod tests {
         let src = tempdir().unwrap();
         // Only one of the required files present.
         write_file(src.path(), "char_def.bin", b"x");
+        let dst = tempdir().unwrap();
+        let err = stage_lindera_from(src.path(), &dst.path().join("ipadic")).unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+    }
+
+    #[test]
+    fn stage_requires_lindera_3_metadata() {
+        let src = full_dict_source();
+        std::fs::remove_file(src.path().join("metadata.json")).unwrap();
         let dst = tempdir().unwrap();
         let err = stage_lindera_from(src.path(), &dst.path().join("ipadic")).unwrap_err();
         assert!(matches!(err, AppError::Config(_)));

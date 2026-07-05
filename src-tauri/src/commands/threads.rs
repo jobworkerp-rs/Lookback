@@ -18,7 +18,7 @@ use super::AppState;
 /// Mirrors `llm_memory.data.Thread` but flattens optional nested ids to
 /// plain numbers so the TS side doesn't need to handle protobuf wrapper
 /// types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThreadSummary {
     #[serde(with = "crate::serde_id")]
     pub id: i64,
@@ -410,6 +410,32 @@ pub async fn delete_thread(state: State<'_, AppState>, req: DeleteThreadRequest)
     Ok(())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct FindThreadRequest {
+    #[serde(with = "crate::serde_id")]
+    pub thread_id: i64,
+}
+
+/// Fetch a single thread row by id (`/llm_memory.service.ThreadService/Find`).
+/// ThreadDetail uses this to hydrate the header's channel/labels when it was
+/// opened from a cross-tab jump that only had the thread id in hand (the
+/// synthesized ThreadSummary carries empty channel/labels). Returns `None`
+/// when the thread no longer exists.
+#[tauri::command]
+pub async fn find_thread(
+    state: State<'_, AppState>,
+    req: FindThreadRequest,
+) -> AppResult<Option<ThreadSummary>> {
+    let mut client = ThreadServiceClient::new(state.memories_channel().await?);
+    let resp = client
+        .find(mem_data::ThreadId {
+            value: req.thread_id,
+        })
+        .await?
+        .into_inner();
+    Ok(resp.data.and_then(thread_to_summary))
+}
+
 fn thread_to_summary(t: mem_data::Thread) -> Option<ThreadSummary> {
     let data = t.data?;
     Some(ThreadSummary {
@@ -447,6 +473,44 @@ mod tests {
         let req: DeleteThreadRequest =
             serde_json::from_str(r#"{"thread_id":"9007199254740993"}"#).unwrap();
         assert_eq!(req.thread_id, 9_007_199_254_740_993);
+    }
+
+    #[test]
+    fn find_thread_request_deserializes_id_from_json_string() {
+        let req: FindThreadRequest =
+            serde_json::from_str(r#"{"thread_id":"9007199254740993"}"#).unwrap();
+        assert_eq!(req.thread_id, 9_007_199_254_740_993);
+    }
+
+    #[test]
+    fn thread_to_summary_maps_channel_and_labels() {
+        let thread = mem_data::Thread {
+            id: Some(mem_data::ThreadId { value: 42 }),
+            data: Some(mem_data::ThreadData {
+                user_id: Some(mem_data::UserId { value: 1 }),
+                description: Some("desc".to_string()),
+                channel: Some("codex".to_string()),
+                labels: vec!["dir:/a".to_string(), "agent:codex".to_string()],
+                created_at: 100,
+                updated_at: 200,
+                ..Default::default()
+            }),
+        };
+        let summary = thread_to_summary(thread).unwrap();
+        assert_eq!(summary.id, 42);
+        assert_eq!(summary.channel.as_deref(), Some("codex"));
+        assert_eq!(summary.labels, vec!["dir:/a", "agent:codex"]);
+    }
+
+    #[test]
+    fn thread_to_summary_returns_none_without_data() {
+        // The Find RPC's OptionalThreadResponse carries a Thread with no `data`
+        // for a missing row; map that to None so find_thread yields None.
+        let thread = mem_data::Thread {
+            id: Some(mem_data::ThreadId { value: 42 }),
+            data: None,
+        };
+        assert_eq!(thread_to_summary(thread), None);
     }
 
     #[test]

@@ -168,7 +168,7 @@ fn persist_batch_to_disk(
     // custom LLM .gguf name aborts — the next launch would pick up the
     // orphaned embedding change). Validate all present requests first.
     if let Some(emb_req) = req.embedding.as_ref() {
-        validate_embedding_request(data, emb_req)?;
+        validate_embedding_request(emb_req)?;
     }
     if let Some(llm_req) = req.llm.as_ref() {
         validate_llm_request(llm_req)?;
@@ -807,10 +807,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_embedding_rejection_does_not_persist_llm() {
+    fn remote_embedding_and_llm_batch_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let data = data_in(tmp.path());
-        // Mark the connection remote so the embedding apply is rejected.
+        // Remote browse mode still allows local embedding settings because
+        // semantic searches need the query model to match the remote vectors.
         crate::commands::connection::save_connection_config(
             &data.connection_config_path(),
             &ConnectionConfig {
@@ -820,23 +821,30 @@ mod tests {
             },
         )
         .unwrap();
-        // The batch carries BOTH an LLM change and a (to-be-rejected)
-        // embedding change. Because embedding is processed first, the whole
-        // batch must abort and the LLM file must NOT be written.
-        let res = persist_batch_to_disk(
+        let out = persist_batch_to_disk(
             &data,
             ApplySettingsRequest {
                 llm: Some(external_llm("gpt-4o")),
-                embedding: Some(embedding_preset("qwen3-embedding-0-6b")),
+                embedding: Some(embedding_preset("qwen3-vl-embedding-2b")),
                 hf_home: None,
                 mcp: None,
             },
             None,
-        );
-        assert!(res.is_err(), "remote embedding must reject the batch");
+        )
+        .unwrap();
+        assert!(out.embedding_changed);
+        assert!(out.llm_changed);
         assert!(
-            !data.llm_settings_path().exists(),
-            "LLM must not be persisted when the embedding step rejects the batch"
+            !out.needs_vectordb_reset,
+            "remote embedding changes must not request local vectordb reset"
+        );
+        assert!(data.llm_settings_path().exists());
+        let saved_embedding = crate::commands::embedding_settings::load_embedding_settings(
+            &data.embedding_settings_path(),
+        );
+        assert_eq!(
+            saved_embedding.preset_id.as_deref(),
+            Some("qwen3-vl-embedding-2b")
         );
     }
 

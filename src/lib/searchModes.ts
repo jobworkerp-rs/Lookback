@@ -17,6 +17,13 @@ export const SEARCH_MODES: Record<
   hybrid: { fn: searchMemoriesHybrid, hintKey: "search.hint.hybrid" },
 };
 
+/** Modes that embed the query, so they're unavailable while the local vector
+ *  store is degraded. Keyword (BM25/FTS) is dimension-independent and stays on.
+ *  Single source of truth for the search-panel disable logic. */
+export function isEmbeddingSearchMode(mode: SearchMode): boolean {
+  return mode === "semantic" || mode === "hybrid";
+}
+
 const SHORT_QUERY_ERROR_RE = /\b(short|too few|min(?:imum)?|token|empty|invalid argument)\b/i;
 const EMBEDDING_WORKER_ERROR_RE =
   /\b(embedding|multimodalembeddingrunner|runner|worker|model|metal)\b/i;

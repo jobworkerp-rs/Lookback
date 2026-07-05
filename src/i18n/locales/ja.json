@@ -35,7 +35,14 @@
     },
     "warning": {
       "worker_apply_failed": "worker 登録失敗",
-      "plugins_stage_failed": "plugin 配備失敗"
+      "plugins_stage_failed": "plugin 配備失敗",
+      "vector_store_degraded": "ベクトルストア無効"
+    },
+    "degraded": {
+      "title": "ベクトル検索が無効化されています",
+      "bodyWithDims": "ローカルの埋め込み次元が保存済みインデックスと一致しません（期待 {{expectedDim}} 次元 / 実際 {{actualDim}} 次元）。セマンティック / ハイブリッド / 意図検索・import・各種生成・定期実行は無効です。設定で embedding モデルを一致する次元に変更してください。",
+      "body": "ローカルの埋め込み次元が保存済みインデックスと一致しません。セマンティック / ハイブリッド / 意図検索・import・各種生成・定期実行は無効です。設定で embedding モデルを一致する次元に変更してください。",
+      "cta": "embedding 設定を開く"
     }
   },
   "common": {
@@ -102,8 +109,10 @@
     },
     "errorHint": {
       "shortQuery": "検索語をもう少し長くするか、複数の語句で検索してください。短い語句だけで探す場合は Keyword 検索を試してください。",
-      "embeddingWorker": "{{mode}} 検索を実行できませんでした。Settings で embedding モデルまたは worker の準備状態を確認してください。"
+      "embeddingWorker": "{{mode}} 検索を実行できませんでした。Settings で embedding モデルまたは worker の準備状態を確認してください。",
+      "vectorDegraded": "ベクトル検索が無効化されています。Settings で embedding モデルを保存済みインデックスと一致する次元に変更してください。Keyword 検索は利用できます。"
     },
+    "modeDisabled": "ベクトルストアが無効のため利用できません（設定で embedding モデルの次元を修正してください）",
     "searching": "検索中…",
     "enterQuery": "クエリを入力してください"
   },
@@ -522,10 +531,11 @@
     "embedding": {
       "title": "Embedding model",
       "desc": "Memory / Reflection の埋め込みに使うモデル。モデルまたはベクトル次元が変わる場合は既存のインデックスがリセットされます (再生成が必要)。dtype / 最大シーケンス長 / tokenizer のみの変更ではインデックスは保持されます。",
+      "remoteDesc": "Remote server 接続中の Semantic / Hybrid 検索で使うクエリ embedding モデル。モデルを変更してもローカルの embedding インデックスはリセットせず、各記事の embedding 再生成もリクエストしません。",
       "modelPurpose": "検索 (Semantic / Hybrid / 自然言語) の埋め込み",
       "resetBanner": "⚠ embedding のモデル/次元が変わるため、既存の全 embedding が リセット (退避/削除) され、再生成が必要になります (数十分〜数時間)。",
       "noResetNote": "この変更ではモデル/次元が変わらないため、既存の vectordb は保持されます（再生成は不要）。保存時に sidecar が再起動されます。",
-      "remoteDisabled": "リモート接続中は embedding 設定を変更できません。リモート memories が独自の vectordb を保持しているため、ローカル側の切替は反映されません。",
+      "remoteCaution": "リモート接続中はローカルで各記事の embedding は生成されません。Semantic / Hybrid 検索ではクエリ embedding をリモートサーバ側の embedding と同じモデル・次元に揃えてください。変更してもローカル embedding の再生成は不要です。",
       "currentSettings": "現在の設定",
       "preset": "プリセット",
       "presetOption": "{{name}} (≈ {{ram}}GB)",

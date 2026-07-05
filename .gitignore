@@ -48,7 +48,7 @@ log/
 # license is sourced with the dictionary so it always matches the built kind.
 /dict/lindera/
 /dict
-
+/ops/*
 
 
 /specs

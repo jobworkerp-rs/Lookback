@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getSidecarStatus } from "@/api";
 import type {
+  ConnectionMode,
   SidecarEndpoints,
   SidecarErrorPayload,
   SidecarStartReport,
@@ -108,4 +109,38 @@ export function useSidecarStatus(): SidecarStatus {
 export function hasLlmInitFailure(status: SidecarStatus): boolean {
   const blocking: SidecarWarningKind[] = ["worker_apply_failed", "plugins_stage_failed"];
   return status.warnings.some((w) => blocking.includes(w.kind));
+}
+
+/** Dimension-mismatch diagnostics for a degraded (vector-disabled) start. */
+export interface VectorDegradedInfo {
+  expectedDim?: number;
+  actualDim?: number;
+}
+
+/**
+ * When the sidecar reported a `vector_store_degraded` warning, return the
+ * mismatch dimensions (parsed from `SidecarWarning.detail`, a JSON blob
+ * mirroring Rust's `DegradedInfo`); otherwise `null`. A present-but-unparsable
+ * detail still returns `{}` — degraded is true, we just can't show the dims.
+ * Mirror of `hasLlmInitFailure`: pages read this to disable embedding-dependent
+ * search modes and App renders the degraded banner off it.
+ */
+export function isVectorDegraded(
+  status: SidecarStatus,
+  connectionMode: ConnectionMode | null = "local",
+): VectorDegradedInfo | null {
+  if (connectionMode == null) return null;
+  if (connectionMode === "remote") return null;
+  const warning = status.warnings.find((w) => w.kind === "vector_store_degraded");
+  if (!warning) return null;
+  if (!warning.detail) return {};
+  try {
+    const parsed = JSON.parse(warning.detail) as {
+      expected_dim?: number;
+      actual_dim?: number;
+    };
+    return { expectedDim: parsed.expected_dim, actualDim: parsed.actual_dim };
+  } catch {
+    return {};
+  }
 }

@@ -1,8 +1,25 @@
-import { screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { I18nextProvider } from "react-i18next";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReflectionProgressHandle } from "@/hooks/useReflectionProgress";
+import type { SidecarStatus } from "@/hooks/useSidecarStatus";
+import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
 import type { ReflectionEntry } from "@/types/api";
-import { ReflectionCard } from "./Reflections";
+import { ReflectionCard, Reflections } from "./Reflections";
+
+const searchReflections = vi.fn();
+const searchReflectionsByIntent = vi.fn();
+const deleteReflection = vi.fn();
+const enqueueReflectionJob = vi.fn();
+
+vi.mock("@/api", () => ({
+  searchReflections: (req: unknown) => searchReflections(req),
+  searchReflectionsByIntent: (req: unknown) => searchReflectionsByIntent(req),
+  deleteReflection: (id: unknown) => deleteReflection(id),
+  enqueueReflectionJob: (req: unknown) => enqueueReflectionJob(req),
+}));
 
 function entry(over: Partial<ReflectionEntry> = {}): ReflectionEntry {
   return {
@@ -35,6 +52,63 @@ function renderCard(e: ReflectionEntry) {
     <ReflectionCard entry={e} onOpenThread={() => {}} onDelete={() => {}} />,
   );
 }
+
+const readySidecar: SidecarStatus = { phase: "ready", warnings: [] };
+const degradedSidecar: SidecarStatus = {
+  phase: "ready",
+  warnings: [{ kind: "vector_store_degraded", message: "degraded", detail: null }],
+};
+
+const reflectionProgress: ReflectionProgressHandle = {
+  progress: null,
+  start: vi.fn(),
+  cancel: vi.fn(),
+  clear: vi.fn(),
+};
+
+function renderReflections(sidecar: SidecarStatus) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const ui = (nextSidecar: SidecarStatus) => (
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <Reflections reflectionProgress={reflectionProgress} sidecar={nextSidecar} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  );
+  const result = render(ui(sidecar));
+  return {
+    ...result,
+    rerenderWithSidecar: (nextSidecar: SidecarStatus) => result.rerender(ui(nextSidecar)),
+  };
+}
+
+beforeEach(() => {
+  i18n.changeLanguage("ja");
+  searchReflections.mockReset();
+  searchReflectionsByIntent.mockReset();
+  deleteReflection.mockReset();
+  enqueueReflectionJob.mockReset();
+  searchReflections.mockResolvedValue([]);
+  searchReflectionsByIntent.mockResolvedValue([]);
+});
+
+describe("Reflections vector-degraded gating", () => {
+  it("falls back to structured search instead of reusing stale intent text when degraded", async () => {
+    const view = renderReflections(readySidecar);
+    await waitFor(() => expect(searchReflections).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByPlaceholderText(/意図テキスト/), {
+      target: { value: "フレーキーなテスト" },
+    });
+    await waitFor(() => expect(searchReflectionsByIntent).toHaveBeenCalledTimes(1));
+
+    view.rerenderWithSidecar(degradedSidecar);
+
+    await waitFor(() => expect(screen.getByPlaceholderText(/ベクトルストア/)).toBeDisabled());
+    await waitFor(() => expect(searchReflections).toHaveBeenCalledTimes(2));
+    expect(searchReflectionsByIntent).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("ReflectionCard markdown rendering", () => {
   it("renders summary markdown as HTML (heading, bold, code)", () => {

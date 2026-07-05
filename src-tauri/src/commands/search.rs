@@ -100,6 +100,9 @@ pub async fn search_memories_semantic(
     state: State<'_, AppState>,
     req: SearchThreadsRequest,
 ) -> AppResult<Vec<ThreadHit>> {
+    // Server-side embedding of the query; unavailable when the local vector
+    // store is degraded (local mode only — remote embeds on the remote side).
+    state.ensure_local_embedding_available()?;
     let mut client = MemoryVectorServiceClient::new(state.memories_channel().await?);
     let options = Some(build_search_options(&req));
     let request = mem_svc::SemanticTextSearchRequest {
@@ -120,7 +123,9 @@ pub async fn search_memories_hybrid(
     req: SearchThreadsRequest,
 ) -> AppResult<Vec<ThreadHit>> {
     // Client-side embed: hybrid needs `query_vectors` (the server fuses the
-    // vector hits with its own BM25 pass over `query_text`).
+    // vector hits with its own BM25 pass over `query_text`). Gated when the
+    // local vector store is degraded (local mode only).
+    state.ensure_local_embedding_available()?;
     let handle = state.jobworkerp().await?;
     let vector = crate::jobworkerp::embedding::embed_query(&handle, &req.query_text).await?;
 

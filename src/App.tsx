@@ -2,7 +2,13 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { countSummaries, getPersonality, getSetupStatus, setOutputLanguage } from "@/api";
+import {
+  countSummaries,
+  getConnectionConfig,
+  getPersonality,
+  getSetupStatus,
+  setOutputLanguage,
+} from "@/api";
 import { BootError } from "@/components/BootError";
 import { BootScreen } from "@/components/BootScreen";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -11,19 +17,23 @@ import { ImportDialog } from "@/components/ImportDialog";
 import { ImportToast } from "@/components/ImportToast";
 import { SetupWizard } from "@/components/SetupWizard";
 import { type Route, Sidebar } from "@/components/Sidebar";
+import { VectorDegradedBanner } from "@/components/VectorDegradedBanner";
+import { useGeneratedRefresh } from "@/hooks/useGeneratedRefresh";
 import { useImportProgress } from "@/hooks/useImportProgress";
+import { useImportRefresh } from "@/hooks/useImportRefresh";
 import { useLocale } from "@/hooks/useLocale";
 import { useRagChat } from "@/hooks/useRagChat";
 import { useReflectionProgress } from "@/hooks/useReflectionProgress";
 import { useSettingsDirty } from "@/hooks/useSettingsDirty";
-import { useSidecarStatus } from "@/hooks/useSidecarStatus";
+import { isVectorDegraded, useSidecarStatus } from "@/hooks/useSidecarStatus";
 import { usePersonalityProgress, useSummaryProgress } from "@/hooks/useStepStreamProgress";
 import { useTheme } from "@/hooks/useTheme";
+import { PERSONALITY_QUERY_KEY } from "@/lib/queryKeys";
 import { Chat } from "@/pages/Chat";
 import { PeriodicTasks } from "@/pages/PeriodicTasks";
-import { PERSONALITY_QUERY_KEY, Personality } from "@/pages/Personality";
+import { Personality } from "@/pages/Personality";
 import { Reflections } from "@/pages/Reflections";
-import { Settings } from "@/pages/Settings";
+import { type EmbeddingFocus, Settings } from "@/pages/Settings";
 import { Summaries, type SummariesFocus } from "@/pages/Summaries";
 import { Threads } from "@/pages/Threads";
 
@@ -54,13 +64,30 @@ export function App() {
   // source pill so the user lands on the cited calendar entry instead of
   // the top-level tab. `Summaries` clears it via `onFocusConsumed`.
   const [summariesFocus, setSummariesFocus] = useState<SummariesFocus | null>(null);
+  // Deep-link seed for the Settings tab's embedding card — set by the
+  // vector-degraded banner's CTA so the user lands directly on the embedding
+  // model settings (advanced view + scrolled into view). `Settings` clears it
+  // via `onEmbeddingFocusConsumed`.
+  const [embeddingFocus, setEmbeddingFocus] = useState<EmbeddingFocus | null>(null);
   const queryClient = useQueryClient();
+  useGeneratedRefresh(queryClient);
+  useImportRefresh(queryClient, importProgress.snapshot);
   const setupStatus = useQuery({
     queryKey: ["setup-status"],
     queryFn: getSetupStatus,
     enabled: sidecar.phase === "ready",
     staleTime: Number.POSITIVE_INFINITY,
   });
+  const connectionConfig = useQuery({
+    queryKey: ["connection-config"],
+    queryFn: getConnectionConfig,
+    enabled: sidecar.phase === "ready",
+  });
+  // Vector-store degraded diagnostics (null unless the sidecar restarted with
+  // vectors disabled). It only gates local connection mode; remote targets own
+  // their vector store state independently from the local sidecar warning.
+  const connectionMode = connectionConfig.data?.mode ?? null;
+  const degraded = isVectorDegraded(sidecar, connectionMode);
 
   // Mirror the resolved UI locale into the backend's `app-settings.json` so
   // headless generation (conductor periodic runs, which never touch the
@@ -88,42 +115,6 @@ export function App() {
       setRoute(next);
     }
   };
-
-  // Invalidate the affected listings when a batch reports done. Owned here
-  // (not in each page) because the page unmounts on tab switch — a batch that
-  // finishes while the user is elsewhere would otherwise never refresh its
-  // listing. A re-run flips status active→done again, so the boolean retriggers.
-  const summaryDone = summaryProgress.progress?.status === "done";
-  useEffect(() => {
-    if (!summaryDone) return;
-    void queryClient.invalidateQueries({ queryKey: ["summaries"] });
-    void queryClient.invalidateQueries({ queryKey: ["count-summaries"] });
-    void queryClient.invalidateQueries({ queryKey: ["summary-period-keys"] });
-    void queryClient.invalidateQueries({ queryKey: ["summary-search"] });
-  }, [summaryDone, queryClient]);
-
-  const personalityDone = personalityProgress.progress?.status === "done";
-  useEffect(() => {
-    if (!personalityDone) return;
-    void queryClient.invalidateQueries({ queryKey: PERSONALITY_QUERY_KEY });
-    void queryClient.invalidateQueries({ queryKey: ["personality-signals", 1] });
-  }, [personalityDone, queryClient]);
-
-  const reflectionDone = reflectionProgress.progress?.status === "done";
-  useEffect(() => {
-    if (!reflectionDone) return;
-    void queryClient.invalidateQueries({ queryKey: ["reflections"] });
-  }, [reflectionDone, queryClient]);
-
-  // Label aggregates have `staleTime: Infinity` on the Threads tab; if we
-  // invalidated them at import START they'd refetch the still-old data and
-  // never update. Watch the thread-import step instead.
-  const threadImportDone = importProgress.snapshot?.steps["thread-import"].status === "done";
-  useEffect(() => {
-    if (!threadImportDone) return;
-    void queryClient.invalidateQueries({ queryKey: ["distinct-labels"] });
-    void queryClient.invalidateQueries({ queryKey: ["co-occurring-labels"] });
-  }, [threadImportDone, queryClient]);
 
   // Sidebar's thread count piggybacks on the Personality query —
   // `get_personality` already returns `thread_count` (derived server-side
@@ -213,20 +204,45 @@ export function App() {
         locale={locale}
       />
       <main className="main">
+        {/* Non-fatal degraded banner: the sidecar came up but the local
+            vector store is disabled (dimension mismatch). Shown above every
+            tab with a shortcut into the embedding settings card. */}
+        {degraded && (
+          <VectorDegradedBanner
+            info={degraded}
+            onOpenEmbeddingSettings={() => {
+              setEmbeddingFocus({ nonce: Date.now() });
+              guardedSetRoute("settings");
+            }}
+          />
+        )}
         {/* Keyed by route so a crash in one tab shows a fallback while the
             sidebar stays usable, and switching tabs remounts the boundary
             (clearing the error). */}
         <ErrorBoundary key={route}>
-          {route === "threads" && <Threads onOpenImport={() => setImportOpen(true)} />}
+          {route === "threads" && (
+            <Threads
+              onOpenImport={() => setImportOpen(true)}
+              sidecar={sidecar}
+              connectionMode={connectionMode}
+            />
+          )}
           {route === "summaries" && (
             <Summaries
               summaryProgress={summaryProgress}
               sidecar={sidecar}
+              connectionMode={connectionMode}
               focus={summariesFocus}
               onFocusConsumed={() => setSummariesFocus(null)}
             />
           )}
-          {route === "reflections" && <Reflections reflectionProgress={reflectionProgress} />}
+          {route === "reflections" && (
+            <Reflections
+              reflectionProgress={reflectionProgress}
+              sidecar={sidecar}
+              connectionMode={connectionMode}
+            />
+          )}
           {route === "personality" && (
             <Personality personalityProgress={personalityProgress} onNavigate={setRoute} />
           )}
@@ -241,7 +257,13 @@ export function App() {
             />
           )}
           {route === "periodic" && <PeriodicTasks />}
-          {route === "settings" && <Settings dirty={settingsDirty} />}
+          {route === "settings" && (
+            <Settings
+              dirty={settingsDirty}
+              embeddingFocus={embeddingFocus}
+              onEmbeddingFocusConsumed={() => setEmbeddingFocus(null)}
+            />
+          )}
         </ErrorBoundary>
       </main>
 

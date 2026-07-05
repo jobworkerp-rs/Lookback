@@ -215,6 +215,11 @@ pub async fn chat_ask(
     state: State<'_, AppState>,
     req: ChatAskRequest,
 ) -> AppResult<ChatAskResponse> {
+    // The RAG chat's only tool (`lookback_recall`) embeds the query and runs
+    // a HybridSearch, so it can't function while the local vector store is
+    // degraded. MVP gates the whole turn (local mode only); a recall-skip
+    // fallback that still answers from the LLM is tracked as a follow-up.
+    state.ensure_local_embedding_available()?;
     let handle = state.jobworkerp().await?;
     // One read of `llm-settings.json` for the three values the dispatch
     // needs (worker name + external flag + chat-only generation overrides).

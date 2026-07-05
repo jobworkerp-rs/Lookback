@@ -131,19 +131,28 @@ describe("EmbeddingProviderCard", () => {
     listEmbeddingPresets.mockResolvedValue(PRESETS);
   });
 
-  it("renders the disabled banner when connection is remote", async () => {
+  it("keeps embedding editable without reset warning when connection is remote", async () => {
     getEmbeddingSettings.mockResolvedValue({
       ...DEFAULT_LOCAL_SETTINGS,
       connection_remote: true,
     });
-    renderCard();
+    const { onDirtyChange: onDirty, onResetsVectordbChange } = renderCard();
     await waitFor(() =>
       expect(
-        screen.getByText(/リモート接続中は embedding 設定を変更できません/),
+        screen.getByText(/リモート接続中はローカルで各記事の embedding は生成されません/),
       ).toBeInTheDocument(),
     );
+    expect(screen.getByText(/各記事の embedding 再生成もリクエストしません/)).toBeInTheDocument();
     const select = screen.getByRole("combobox") as HTMLSelectElement;
-    expect(select.disabled).toBe(true);
+    expect(select.disabled).toBe(false);
+    fireEvent.change(select, { target: { value: "qwen3-vl-embedding-2b" } });
+    await waitFor(() =>
+      expect(lastPayload(onDirty)).toMatchObject({ preset_id: "qwen3-vl-embedding-2b" }),
+    );
+    await waitFor(() => expect(lastResets(onResetsVectordbChange)).toBe(false));
+    expect(screen.queryByText(/既存の全 embedding が/)).toBeNull();
+    expect(screen.queryByText(/再生成が必要/)).toBeNull();
+    expect(screen.queryByText(/退避する \(チェックを外すと削除\)/)).toBeNull();
   });
 
   it("loads presets and shows the current effective model", async () => {

@@ -3,10 +3,12 @@ import type { ThreadSummary } from "@/types/api";
 /**
  * Build a minimal ThreadSummary for opening ThreadDetail when the full row
  * isn't in hand (a search hit, a personality signal, a chat source pill).
- * ThreadDetail only needs `id` to fetch memories; description/labels fill
- * in from the modal's own fetch. `user_id` is the app-wide default tenant
- * ("1"). `createdAtMs` / `updatedAtMs` default to `Date.now()` when the
- * caller has no better timestamp to offer.
+ * ThreadDetail only needs `id` to fetch its memories, and it hydrates the
+ * header's channel/labels from a `find_thread` call (triggered precisely
+ * because the placeholders below are empty), so leaving them blank here is
+ * intentional. `user_id` is the app-wide default tenant ("1"). `createdAtMs`
+ * / `updatedAtMs` default to `Date.now()` when the caller has no better
+ * timestamp to offer.
  */
 export function synthesizeThreadSummary(args: {
   id: string;

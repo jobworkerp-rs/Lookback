@@ -546,44 +546,34 @@ pub struct EmbeddingApplyOutcome {
     pub old_settings: EmbeddingSettings,
 }
 
-/// Reject remote mode, validate, and persist `embedding-settings.json` —
-/// WITHOUT evacuating the vectordb or restarting the sidecar. The caller
+/// Validate an embedding request WITHOUT persisting. Split out so the unified
+/// `apply_settings` can validate the whole batch up front (a later card's
+/// failure must not leave embedding-settings.json half-saved).
+pub fn validate_embedding_request(req: &SetEmbeddingSettingsRequest) -> AppResult<()> {
+    validate_set_request(req).map_err(AppError::Config)?;
+    Ok(())
+}
+
+/// Validate and persist `embedding-settings.json` WITHOUT evacuating the
+/// vectordb or restarting the sidecar. The caller
 /// (the individual command or the unified `apply_settings`) owns the
 /// stop → evacuate → restart → rollback sequence so several settings can
 /// share a single restart.
 ///
 /// When `changed == false` the file is left untouched (it equals the old
 /// value anyway) and the caller should not restart.
-/// Reject remote mode and validate an embedding request WITHOUT persisting.
-/// Split out so the unified `apply_settings` can validate the whole batch
-/// up front (a later card's failure must not leave embedding-settings.json
-/// half-saved).
-pub fn validate_embedding_request(
-    data: &DataPaths,
-    req: &SetEmbeddingSettingsRequest,
-) -> AppResult<()> {
-    // Reject remote mode early so a user can't accidentally swap the
-    // sidecar embedding model while the app is actually talking to a
-    // remote memories. The remote side owns its own vectordb and would
-    // not be affected by anything we do here.
-    let connection = super::connection::load_connection_config(&data.connection_config_path());
-    if matches!(connection.mode, super::connection::ConnectionMode::Remote) {
-        return Err(AppError::Config(
-            "リモート接続中は embedding 設定を変更できません".into(),
-        ));
-    }
-    validate_set_request(req).map_err(AppError::Config)?;
-    Ok(())
-}
-
 pub fn apply_embedding_settings_to_disk(
     data: &DataPaths,
     req: &SetEmbeddingSettingsRequest,
 ) -> AppResult<EmbeddingApplyOutcome> {
-    validate_embedding_request(data, req)?;
+    validate_embedding_request(req)?;
 
     let path = data.embedding_settings_path();
     let old_settings = load_embedding_settings(&path);
+    let connection_remote = matches!(
+        super::connection::load_connection_config(&data.connection_config_path()).mode,
+        super::connection::ConnectionMode::Remote
+    );
     // Resolve OLD and NEW runtimes with the same env-aware projection
     // the sidecar lifecycle uses. Without this, a dev shell override
     // (e.g. `LOOKBACK_EMBEDDING_VECTOR_SIZE=2048`) makes the sidecar
@@ -619,7 +609,7 @@ pub fn apply_embedding_settings_to_disk(
 
     save_embedding_settings(&path, &new_settings)?;
 
-    let needs_reset = needs_vectordb_reset(&old_runtime, &new_runtime);
+    let needs_reset = !connection_remote && needs_vectordb_reset(&old_runtime, &new_runtime);
     Ok(EmbeddingApplyOutcome {
         new_runtime,
         changed: true,
@@ -1348,11 +1338,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_embedding_to_disk_rejects_remote_without_writing() {
+    fn apply_embedding_to_disk_allows_remote_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let data = data_paths_in(tmp.path());
-        // Mark the connection remote; the disk apply must refuse and leave
-        // embedding-settings.json untouched.
+        // Remote browse mode still needs the local embedding model setting so
+        // semantic query vectors can match the remote memories vector space.
         super::super::connection::save_connection_config(
             &data.connection_config_path(),
             &super::super::connection::ConnectionConfig {
@@ -1362,11 +1352,14 @@ mod tests {
             },
         )
         .unwrap();
-        let err = apply_embedding_settings_to_disk(&data, &preset_req("qwen3-embedding-0-6b"));
-        assert!(err.is_err(), "remote mode must be rejected");
+        let outcome =
+            apply_embedding_settings_to_disk(&data, &preset_req("qwen3-vl-embedding-2b")).unwrap();
+        assert!(outcome.changed);
         assert!(
-            !data.embedding_settings_path().exists(),
-            "no settings file may be written on remote rejection"
+            !outcome.needs_vectordb_reset,
+            "remote mode must not reset the local vectordb"
         );
+        let saved = load_embedding_settings(&data.embedding_settings_path());
+        assert_eq!(saved.preset_id.as_deref(), Some("qwen3-vl-embedding-2b"));
     }
 }

@@ -32,12 +32,9 @@ import {
   type SignalCategoryView,
 } from "@/lib/personalitySignal";
 import { buildPersonaStats, PERSONA_CATEGORIES } from "@/lib/personaStats";
+import { PERSONALITY_QUERY_KEY } from "@/lib/queryKeys";
 import { synthesizeThreadSummary } from "@/lib/threadSummary";
 import type { PersonalityProfileContent, PersonalitySignal, ThreadSummary } from "@/types/api";
-
-/// Shared with App.tsx so the sidebar's thread count and the Personality
-/// tab dedupe their `get_personality` fetch under React Query.
-export const PERSONALITY_QUERY_KEY = ["personality", 1] as const;
 
 export function Personality({
   personalityProgress,

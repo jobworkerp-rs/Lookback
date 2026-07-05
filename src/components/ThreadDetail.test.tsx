@@ -7,8 +7,10 @@ import { memoryDomId } from "./MarkdownMessage";
 import { ThreadDetail } from "./ThreadDetail";
 
 const findMemoriesByThreadId = vi.fn();
+const findThread = vi.fn();
 vi.mock("@/api", () => ({
   findMemoriesByThreadId: (req: unknown) => findMemoriesByThreadId(req),
+  findThread: (id: string) => findThread(id),
 }));
 
 // jsdom lacks both APIs the component relies on.
@@ -51,6 +53,11 @@ const thread: ThreadSummary = {
 describe("ThreadDetail", () => {
   beforeEach(() => {
     i18n.changeLanguage("ja");
+    findThread.mockReset();
+    // Default: the synthesized-summary hydration finds nothing, so the header
+    // falls back to the prop (matches the pre-hydration behaviour these tests
+    // were written against).
+    findThread.mockResolvedValue(null);
   });
 
   it("renders the first page of memories", async () => {
@@ -212,5 +219,38 @@ describe("ThreadDetail", () => {
 
     expect(await screen.findByText("システムメッセージ")).toBeInTheDocument();
     expect(container.querySelector("details.system-fold")).not.toBeNull();
+  });
+
+  it("hydrates channel/labels from find_thread when opened with a synthesized summary", async () => {
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hi")]);
+    // Cross-tab entry: prop has empty channel/labels; the fetched row fills them.
+    findThread.mockResolvedValueOnce({
+      ...thread,
+      channel: "codex",
+      // Deliberately out of priority order to prove the header sorts them.
+      labels: ["dir:/proj", "agent:codex"],
+    });
+
+    renderWithProviders(<ThreadDetail thread={thread} onClose={() => {}} />);
+
+    await screen.findByText("hi");
+    expect(findThread).toHaveBeenCalledWith("10");
+    // sortLabelsByPrefixPriority puts agent before dir.
+    expect(
+      await screen.findByText((_, el) => el?.textContent === "codex · agent:codex, dir:/proj"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not fetch the thread row when the prop already carries channel/labels", async () => {
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hi")]);
+    const full: ThreadSummary = { ...thread, channel: "codex", labels: ["agent:codex"] };
+
+    renderWithProviders(<ThreadDetail thread={full} onClose={() => {}} />);
+
+    await screen.findByText("hi");
+    expect(findThread).not.toHaveBeenCalled();
+    expect(
+      screen.getByText((_, el) => el?.textContent === "codex · agent:codex"),
+    ).toBeInTheDocument();
   });
 });
