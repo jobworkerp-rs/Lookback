@@ -3,8 +3,8 @@ name: Release
 # Triggered by the tag that scripts/sync-public.sh (run on the private gitea
 # source) forwards to this public repository. Builds the signed macOS DMG first,
 # then the Linux CPU bundles, and attaches them to the GitHub Release for the
-# tag. The CUDA bundles are built and uploaded separately from the gitea side
-# (build-cuda workflow).
+# tag. The Linux CUDA AppImage is built on the self-hosted GPU runner and
+# attached to the same GitHub Release with a `-cuda` suffix.
 on:
   push:
     tags:
@@ -31,7 +31,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test:
     name: Lint & unit test
-    runs-on: ubuntu-latest
+    runs-on: lookback-linux-cuda
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -106,7 +106,7 @@ jobs:
   build-macos:
     name: Build macOS DMG
     needs: test
-    runs-on: macos-15
+    runs-on: [self-hosted, macOS, lookback-macos]
     timeout-minutes: 180
     steps:
       - name: Checkout
@@ -243,12 +243,104 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ---------------------------------------------------------------------------
-  # Stage 3: full CPU release build (deb + AppImage) and attach to the Release.
+  # Stage 3: Linux CUDA AppImage build on the self-hosted GPU runner.
+  # ---------------------------------------------------------------------------
+  build-cuda:
+    name: Build Linux AppImage (cuda)
+    needs: test
+    runs-on: lookback-linux-cuda
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      PUBLIC_REPO: jobworkerp-rs/Lookback
+      RUSTFLAGS: "-C relocation-model=pic"
+      CFLAGS: "-fPIC"
+      CXXFLAGS: "-fPIC"
+      CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: github-cuda
+          cache-on-failure: true
+          workspaces: |
+            .
+            .build-deps/jobworkerp-rs
+            .build-deps/memory-store
+            .build-deps/jobworkerp-conductor
+            .build-deps/llama-cpp-runner
+            .build-deps/mm-embedding-runner
+
+      - name: Cache lindera artifacts
+        uses: actions/cache@v4
+        with:
+          path: .build-deps/.lindera-cache
+          key: lindera-linux-x86_64-v0.44.1
+
+      - name: Pin CUDA compute capability
+        if: vars.CUDA_COMPUTE_CAP != ''
+        run: echo "CUDA_COMPUTE_CAP=${{ vars.CUDA_COMPUTE_CAP }}" >> "$GITHUB_ENV"
+
+      - name: Disable NCCL detection for CUDA build
+        run: |
+          set -e
+          for header in $(find /usr /opt/cuda /usr/local/cuda -name 'nccl.h' 2>/dev/null); do
+            echo "Hiding NCCL header: $header"
+            sudo mv "$header" "${header}.disabled-for-build"
+          done
+          for lib in $(find /usr /opt/cuda /usr/local/cuda -name 'libnccl*' 2>/dev/null); do
+            echo "Hiding NCCL library: $lib"
+            sudo mv "$lib" "${lib}.disabled-for-build"
+          done
+
+      - name: Build release AppImage (cuda)
+        run: bash scripts/build-release.sh --profile linux-cuda --bundle appimage
+
+      - name: Rename artifacts with -cuda suffix
+        run: |
+          set -euo pipefail
+          out=target/release/bundle
+          shopt -s nullglob
+          for f in "$out"/appimage/*.AppImage; do
+            mv "$f" "${f%.AppImage}-cuda.AppImage"
+          done
+          appimages=("$out"/appimage/*-cuda.AppImage)
+          [ ${#appimages[@]} -gt 0 ] || { echo "no -cuda .AppImage produced" >&2; exit 1; }
+
+      - name: Upload CUDA bundles to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          out=target/release/bundle
+          gh release view "${TAG}" -R "${PUBLIC_REPO}" >/dev/null 2>&1 \
+            || gh release create "${TAG}" -R "${PUBLIC_REPO}" \
+                 --title "${TAG}" --notes "Release ${TAG}" \
+                 $([ "${TAG#*-}" != "${TAG}" ] && echo --prerelease)
+          gh release upload "${TAG}" -R "${PUBLIC_REPO}" --clobber \
+            "$out"/appimage/*-cuda.AppImage
+
+  # ---------------------------------------------------------------------------
+  # Stage 4: Linux CPU release build after CUDA on the same self-hosted runner pool.
   # ---------------------------------------------------------------------------
   build:
     name: Build Linux bundles (cpu)
-    needs: [test, build-macos]
-    runs-on: ubuntu-latest
+    needs: [test, build-cuda]
+    runs-on: lookback-linux-cuda
     timeout-minutes: 120
     steps:
       - name: Checkout
