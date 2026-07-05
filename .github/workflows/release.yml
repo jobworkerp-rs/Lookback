@@ -259,6 +259,7 @@ jobs:
       CFLAGS: "-fPIC"
       CXXFLAGS: "-fPIC"
       CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+      CUDA_COMPUTE_CAP: "89"
       APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
       - name: Checkout
