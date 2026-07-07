@@ -218,6 +218,43 @@ CUDA_RUNTIME_SONAME_GLOBS=(
   'libcurand.so.*'
 )
 
+find_cuda_driver_stub() {
+  local search_dirs=()
+  [[ -n "${CUDA_DRIVER_STUB_DIR:-}" ]] && search_dirs+=("${CUDA_DRIVER_STUB_DIR}")
+  search_dirs+=(
+    /usr/local/cuda/lib64/stubs
+    /usr/local/cuda/targets/x86_64-linux/lib/stubs
+    /opt/cuda/lib64/stubs
+    /usr/lib/x86_64-linux-gnu/stubs
+  )
+
+  local dir match
+  for dir in "${search_dirs[@]}"; do
+    [[ -d "${dir}" ]] || continue
+    match=$(find -L "${dir}" -maxdepth 1 -type f -name 'libcuda.so' -print -quit 2>/dev/null || true)
+    if [[ -n "${match}" ]]; then
+      printf '%s\n' "${match}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+prepare_cuda_driver_stub_dir() {
+  [[ "${GPU}" == "cuda" && "${PLATFORM}" == "linux" && ",${BUNDLE}," == *",appimage,"* ]] || return 0
+  if ldconfig -p 2>/dev/null | grep -q 'libcuda\.so\.1'; then
+    return 0
+  fi
+
+  local stub tmp
+  stub=$(find_cuda_driver_stub) \
+    || die "libcuda.so.1 is not available and no CUDA driver stub was found; set CUDA_DRIVER_STUB_DIR for AppImage bundling"
+  tmp=$(mktemp -d)
+  ln -sf "${stub}" "${tmp}/libcuda.so.1"
+  log "use CUDA driver stub for linuxdeploy dependency scan: ${stub}"
+  printf '%s\n' "${tmp}"
+}
+
 # stage_cuda_runtime: copy the CUDA toolkit runtime libs into PLUGINS_DIR so the
 # plugins' `$ORIGIN` RUNPATH resolves them WITHOUT relying on linuxdeploy's
 # ldd-walk (which would also drag in the driver). Searches the standard CUDA
@@ -280,8 +317,9 @@ stage_plugins() {
   want_repo mm    && install_file "${mm}/target/release/libmm_embedding_runner.${LIBEXT}"            "${PLUGINS_DIR}/libmm_embedding_runner.${LIBEXT}"
   stage_cuda_runtime
   # On Linux, surface unresolved shared-library deps early (warn, non-fatal).
-  # libcuda.so.1 staying unresolved here is EXPECTED and correct: it is the
-  # host driver, provided at runtime, never bundled.
+  # libcuda.so.1 is the host driver and must not ship. linuxdeploy still needs
+  # it resolvable during AppImage dependency scanning, so build-release.sh adds
+  # a CUDA stub via LD_LIBRARY_PATH for that phase only.
   if [[ "${LIBEXT}" == "so" && "${DRY_RUN:-0}" != "1" ]]; then
     local f
     for f in "${PLUGINS_DIR}"/*.so; do

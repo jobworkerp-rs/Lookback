@@ -340,8 +340,8 @@
     "generateTitle": "memories-reflection-batch を jobworkerp に dispatch します",
     "generate": "自省を生成",
     "enqueuing": "投入中…",
-    "intentPlaceholder": "意図テキストで自然言語検索 (例: フレーキーなテストの直し方)",
-    "intentTitle": "intent_embedding に対する意味検索 (GPU embedding worker 必須)",
+    "searchPlaceholder": "自省を検索 (例: フレーキーなテスト)",
+    "searchTitle": "自省本文・意図・教訓などを通常検索します",
     "createdAfterTitle": "作成日下限",
     "progress": {
       "done": "生成完了",
@@ -352,6 +352,10 @@
     "empty": {
       "title": "自省がまだありません",
       "desc": "Import で自動生成されるか、上の「自省を生成」ボタンから単発実行できます"
+    },
+    "noHits": {
+      "title": "一致する自省がありません",
+      "desc": "検索語、作成日、結果フィルタを変更してください"
     },
     "delete": {
       "title": "自省を削除しますか?",

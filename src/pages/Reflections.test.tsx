@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { I18nextProvider } from "react-i18next";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReflectionProgressHandle } from "@/hooks/useReflectionProgress";
 import type { SidecarStatus } from "@/hooks/useSidecarStatus";
 import i18n from "@/i18n";
@@ -10,12 +10,14 @@ import type { ReflectionEntry } from "@/types/api";
 import { ReflectionCard, Reflections } from "./Reflections";
 
 const searchReflections = vi.fn();
+const searchReflectionsHybrid = vi.fn();
 const searchReflectionsByIntent = vi.fn();
 const deleteReflection = vi.fn();
 const enqueueReflectionJob = vi.fn();
 
 vi.mock("@/api", () => ({
   searchReflections: (req: unknown) => searchReflections(req),
+  searchReflectionsHybrid: (req: unknown) => searchReflectionsHybrid(req),
   searchReflectionsByIntent: (req: unknown) => searchReflectionsByIntent(req),
   deleteReflection: (id: unknown) => deleteReflection(id),
   enqueueReflectionJob: (req: unknown) => enqueueReflectionJob(req),
@@ -53,12 +55,6 @@ function renderCard(e: ReflectionEntry) {
   );
 }
 
-const readySidecar: SidecarStatus = { phase: "ready", warnings: [] };
-const degradedSidecar: SidecarStatus = {
-  phase: "ready",
-  warnings: [{ kind: "vector_store_degraded", message: "degraded", detail: null }],
-};
-
 const reflectionProgress: ReflectionProgressHandle = {
   progress: null,
   start: vi.fn(),
@@ -66,47 +62,208 @@ const reflectionProgress: ReflectionProgressHandle = {
   clear: vi.fn(),
 };
 
-function renderReflections(sidecar: SidecarStatus) {
+const readySidecar: SidecarStatus = { phase: "ready", warnings: [] };
+const degradedSidecar: SidecarStatus = {
+  phase: "ready",
+  warnings: [{ kind: "vector_store_degraded", message: "degraded", detail: null }],
+};
+
+function renderReflections(sidecar: SidecarStatus = readySidecar) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const ui = (nextSidecar: SidecarStatus) => (
+  return render(
     <I18nextProvider i18n={i18n}>
       <QueryClientProvider client={client}>
-        <Reflections reflectionProgress={reflectionProgress} sidecar={nextSidecar} />
+        <Reflections reflectionProgress={reflectionProgress} sidecar={sidecar} />
       </QueryClientProvider>
-    </I18nextProvider>
+    </I18nextProvider>,
   );
-  const result = render(ui(sidecar));
-  return {
-    ...result,
-    rerenderWithSidecar: (nextSidecar: SidecarStatus) => result.rerender(ui(nextSidecar)),
-  };
 }
 
 beforeEach(() => {
   i18n.changeLanguage("ja");
   searchReflections.mockReset();
+  searchReflectionsHybrid.mockReset();
   searchReflectionsByIntent.mockReset();
   deleteReflection.mockReset();
   enqueueReflectionJob.mockReset();
   searchReflections.mockResolvedValue([]);
+  searchReflectionsHybrid.mockResolvedValue([]);
   searchReflectionsByIntent.mockResolvedValue([]);
 });
 
-describe("Reflections vector-degraded gating", () => {
-  it("falls back to structured search instead of reusing stale intent text when degraded", async () => {
-    const view = renderReflections(readySidecar);
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("Reflections search", () => {
+  it("loads the initial filter-only list through regular reflection search", async () => {
+    renderReflections();
+
     await waitFor(() => expect(searchReflections).toHaveBeenCalled());
-
-    fireEvent.change(screen.getByPlaceholderText(/意図テキスト/), {
-      target: { value: "フレーキーなテスト" },
+    expect(searchReflections.mock.calls[0]?.[0]).toEqual({
+      outcomes: [],
+      created_after_ms: undefined,
+      limit: 200,
     });
-    await waitFor(() => expect(searchReflectionsByIntent).toHaveBeenCalledTimes(1));
+    expect(searchReflectionsByIntent).not.toHaveBeenCalled();
+  });
 
-    view.rerenderWithSidecar(degradedSidecar);
+  it("searches reflections with memory hybrid search when query is present", async () => {
+    searchReflections.mockResolvedValue([
+      entry({
+        id: "1",
+        summary: "フレーキーなテストを修正した",
+        lessons: ["CI の再試行条件を見直す"],
+      }),
+      entry({
+        id: "2",
+        summary: "設定画面の保存処理を整理した",
+        key_decisions: ["dirty state を分離する"],
+      }),
+    ]);
+    searchReflectionsHybrid.mockResolvedValue([
+      entry({
+        id: "1",
+        summary: "フレーキーなテストを修正した",
+        lessons: ["CI の再試行条件を見直す"],
+      }),
+    ]);
+    renderReflections();
+    await waitFor(() => expect(searchReflections).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/フレーキーなテスト/)).toBeInTheDocument();
+    expect(screen.getByText(/設定画面/)).toBeInTheDocument();
 
-    await waitFor(() => expect(screen.getByPlaceholderText(/ベクトルストア/)).toBeDisabled());
-    await waitFor(() => expect(searchReflections).toHaveBeenCalledTimes(2));
-    expect(searchReflectionsByIntent).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByPlaceholderText(/自省を検索/), {
+      target: { value: "  フレーキーなテスト  " },
+    });
+
+    act(() => vi.advanceTimersByTime(300));
+    vi.useRealTimers();
+    await waitFor(() => expect(screen.queryByText(/設定画面/)).toBeNull());
+    expect(await screen.findByText(/フレーキーなテスト/)).toBeInTheDocument();
+    expect(searchReflections).toHaveBeenCalledTimes(1);
+    expect(searchReflectionsHybrid).toHaveBeenCalledWith({
+      query_text: "フレーキーなテスト",
+      outcomes: [],
+      created_after_ms: undefined,
+      limit: 50,
+    });
+    expect(searchReflectionsByIntent).not.toHaveBeenCalled();
+  });
+
+  it("falls back to local multi-word filtering when vector search is degraded", async () => {
+    searchReflections.mockResolvedValue([
+      entry({
+        id: "1",
+        summary: "フレーキーなテストを修正した",
+        lessons: ["CI の再試行条件を見直す"],
+      }),
+      entry({
+        id: "2",
+        summary: "フレーキーな設定だけを整理した",
+        lessons: ["保存処理を見直す"],
+      }),
+    ]);
+    renderReflections(degradedSidecar);
+    await waitFor(() => expect(searchReflections).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/フレーキーなテスト/)).toBeInTheDocument();
+    expect(screen.getByText(/フレーキーな設定/)).toBeInTheDocument();
+
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByPlaceholderText(/自省を検索/), {
+      target: { value: "フレーキー CI" },
+    });
+
+    act(() => vi.advanceTimersByTime(300));
+    vi.useRealTimers();
+    await waitFor(() => expect(screen.queryByText(/フレーキーな設定/)).toBeNull());
+    expect(screen.getByText(/フレーキーなテスト/)).toBeInTheDocument();
+    expect(searchReflections).toHaveBeenCalledTimes(1);
+    expect(searchReflectionsHybrid).not.toHaveBeenCalled();
+  });
+
+  it("debounces rapid query edits before searching with hybrid", async () => {
+    searchReflections.mockResolvedValue([
+      entry({ id: "1", summary: "フレーキーなテストを修正した" }),
+      entry({ id: "2", summary: "設定画面の保存処理を整理した" }),
+    ]);
+    searchReflectionsHybrid.mockResolvedValue([
+      entry({ id: "1", summary: "フレーキーなテストを修正した" }),
+    ]);
+    renderReflections();
+    await waitFor(() => expect(searchReflections).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/設定画面/)).toBeInTheDocument();
+
+    vi.useFakeTimers();
+    const input = screen.getByPlaceholderText(/自省を検索/);
+    fireEvent.change(input, { target: { value: "フ" } });
+    fireEvent.change(input, { target: { value: "フレーキー" } });
+    fireEvent.change(input, { target: { value: "フレーキーなテスト" } });
+
+    act(() => vi.advanceTimersByTime(299));
+    expect(searchReflections).toHaveBeenCalledTimes(1);
+    expect(searchReflectionsHybrid).not.toHaveBeenCalled();
+    expect(screen.getByText(/設定画面/)).toBeInTheDocument();
+
+    act(() => vi.advanceTimersByTime(1));
+    vi.useRealTimers();
+    await waitFor(() => expect(screen.queryByText(/設定画面/)).toBeNull());
+    expect(await screen.findByText(/フレーキーなテスト/)).toBeInTheDocument();
+    expect(searchReflections).toHaveBeenCalledTimes(1);
+    expect(searchReflectionsHybrid).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to local filtering when hybrid search returns no hits", async () => {
+    searchReflections.mockResolvedValue([
+      entry({
+        id: "1",
+        summary: "フレーキーなテストを修正した",
+        lessons: ["CI の再試行条件を見直す"],
+      }),
+      entry({
+        id: "2",
+        summary: "設定画面の保存処理を整理した",
+        lessons: ["dirty state を分離する"],
+      }),
+    ]);
+    searchReflectionsHybrid.mockResolvedValue([]);
+    renderReflections();
+    await waitFor(() => expect(searchReflections).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/フレーキーなテスト/)).toBeInTheDocument();
+
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByPlaceholderText(/自省を検索/), {
+      target: { value: "フレーキー" },
+    });
+
+    act(() => vi.advanceTimersByTime(300));
+    vi.useRealTimers();
+    await waitFor(() => expect(searchReflectionsHybrid).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/フレーキーなテスト/)).toBeInTheDocument();
+    expect(screen.queryByText(/設定画面/)).toBeNull();
+    expect(screen.queryByText("一致する自省がありません")).toBeNull();
+  });
+
+  it("shows the generated-empty copy when no filters are active", async () => {
+    renderReflections();
+
+    expect(await screen.findByText("自省がまだありません")).toBeInTheDocument();
+  });
+
+  it("shows the no-hit copy when search filters are active", async () => {
+    renderReflections();
+    await screen.findByText("自省がまだありません");
+
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByPlaceholderText(/自省を検索/), {
+      target: { value: "存在しない単語" },
+    });
+
+    act(() => vi.advanceTimersByTime(300));
+    vi.useRealTimers();
+    await waitFor(() => expect(searchReflectionsHybrid).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("一致する自省がありません")).toBeInTheDocument();
   });
 });
 

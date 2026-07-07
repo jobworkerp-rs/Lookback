@@ -13,10 +13,16 @@ use tokio_stream::StreamExt;
 use crate::error::{AppError, AppResult};
 use crate::grpc::proto::llm_memory::data as mem_data;
 use crate::grpc::proto::llm_memory::service as mem_svc;
+use crate::grpc::proto::llm_memory::service::memory_vector_service_client::MemoryVectorServiceClient;
 use crate::grpc::proto::llm_memory::service::reflection_service_client::ReflectionServiceClient;
 use crate::grpc::proto::llm_memory::service::reflection_vector_service_client::ReflectionVectorServiceClient;
 
 use super::AppState;
+use super::search::{
+    SearchMode, SearchThreadsRequest, build_hybrid_request as build_thread_hybrid_request,
+};
+
+const REFLECTION_MEMORY_USER_ID: i64 = 300_000;
 
 /// Projected reflection record. Reflection proto has ~40 fields, of which
 /// only the ones used by the Reflections tab are forwarded. Frontend maps
@@ -107,6 +113,58 @@ pub async fn search_reflections(
     let request = build_search_request(&req);
     let stream = client.search(request).await?.into_inner();
     collect_reflection_entries(stream).await
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SearchReflectionsHybridRequest {
+    /// Natural-language query searched against reflection backing memories.
+    pub query_text: String,
+    /// Backing memory owner, not origin_user_id. Defaults to reflection_user_id.
+    pub user_id: Option<i64>,
+    /// Outcome OR-list. Applied after ReflectionService hydration because
+    /// MemoryVectorService cannot filter reflection-specific columns.
+    #[serde(default)]
+    pub outcomes: Vec<i32>,
+    pub created_after_ms: Option<i64>,
+    pub created_before_ms: Option<i64>,
+    pub limit: Option<u32>,
+}
+
+#[tauri::command]
+pub async fn search_reflections_hybrid(
+    state: State<'_, AppState>,
+    req: SearchReflectionsHybridRequest,
+) -> AppResult<Vec<ReflectionEntry>> {
+    state.ensure_local_embedding_available()?;
+    let handle = state.jobworkerp().await?;
+    let vector = crate::jobworkerp::embedding::embed_query(&handle, &req.query_text).await?;
+    let request = build_hybrid_search_request(&req, vector);
+
+    let mut memory_client = MemoryVectorServiceClient::new(state.memories_channel().await?);
+    let mut stream = memory_client.hybrid_search(request).await?.into_inner();
+    let mut hits = Vec::new();
+    while let Some(item) = stream.next().await {
+        hits.push(item?);
+    }
+
+    let ids = reflection_memory_ids_from_hits(hits);
+    let mut reflection_client = ReflectionServiceClient::new(state.memories_channel().await?);
+    let mut out = Vec::new();
+    for id in ids {
+        let resp = reflection_client
+            .find(mem_svc::FindReflectionRequest {
+                id: Some(mem_data::ReflectionId { value: id }),
+            })
+            .await?
+            .into_inner();
+        if let Some(refl) = resp.reflection
+            && let Some(entry) = entry_from_proto(refl)
+            && (req.outcomes.is_empty() || req.outcomes.contains(&entry.outcome))
+        {
+            out.push(entry);
+        }
+    }
+    Ok(out)
 }
 
 /// Drain a `ReflectionSearchResult` stream into UI DTOs. Both `Search` and
@@ -356,6 +414,39 @@ fn build_search_request(req: &SearchReflectionsRequest) -> mem_svc::SearchReflec
     }
 }
 
+fn build_hybrid_search_request(
+    req: &SearchReflectionsHybridRequest,
+    vector: Vec<f32>,
+) -> mem_svc::HybridSearchRequest {
+    let thread_req = SearchThreadsRequest {
+        query_text: req.query_text.clone(),
+        mode: SearchMode::Hybrid,
+        user_id: Some(req.user_id.unwrap_or(REFLECTION_MEMORY_USER_ID)),
+        created_after_ms: req.created_after_ms,
+        created_before_ms: req.created_before_ms,
+        labels_any: vec![],
+        label_match: None,
+        limit: req.limit,
+    };
+    build_thread_hybrid_request(&thread_req, vector)
+}
+
+fn reflection_memory_ids_from_hits(hits: Vec<mem_svc::MemorySearchResult>) -> Vec<i64> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for hit in hits {
+        let Some(memory_id) = hit.memory.and_then(|m| m.id).map(|id| id.value) else {
+            continue;
+        };
+        if seen.insert(memory_id) {
+            ids.push(memory_id);
+        }
+    }
+    ids
+}
+
 /// Convert a proto `Reflection` to the trimmed UI DTO.
 ///
 /// Returns `None` when:
@@ -430,6 +521,20 @@ mod tests {
                 updated_at: 1_700_000_000_001,
                 ..Default::default()
             }),
+        }
+    }
+
+    fn memory_hit(memory_id: i64) -> mem_svc::MemorySearchResult {
+        mem_svc::MemorySearchResult {
+            memory: Some(mem_data::Memory {
+                id: Some(mem_data::MemoryId { value: memory_id }),
+                data: Some(mem_data::MemoryData {
+                    content: "reflection summary".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 
@@ -513,6 +618,55 @@ mod tests {
             build_search_request(&req).query_text,
             Some("rust ownership".into())
         );
+    }
+
+    #[test]
+    fn build_hybrid_search_request_targets_reflection_memory_owner() {
+        let req = SearchReflectionsHybridRequest {
+            query_text: "flaky test recovery".into(),
+            created_after_ms: Some(1_000),
+            created_before_ms: Some(2_000),
+            limit: Some(25),
+            ..Default::default()
+        };
+        let r = build_hybrid_search_request(&req, vec![0.1, 0.2, 0.3]);
+        assert_eq!(r.query_text, "flaky test recovery");
+        assert_eq!(r.query_vectors.len(), 1);
+        assert_eq!(r.query_vectors[0].values, vec![0.1, 0.2, 0.3]);
+        assert!(r.hybrid_options.is_none());
+        assert!(r.fts_options.is_none());
+        let opts = r.options.expect("options always set");
+        assert_eq!(opts.limit, 25);
+        assert_eq!(opts.include_content, Some(true));
+        let filter = opts.filter.expect("filter always set");
+        assert_eq!(filter.user_id, Some(300_000));
+        assert_eq!(filter.created_after, Some(1_000));
+        assert_eq!(filter.created_before, Some(2_000));
+        assert!(filter.thread_filter.is_none());
+    }
+
+    #[test]
+    fn build_hybrid_search_request_overrides_reflection_memory_owner() {
+        let req = SearchReflectionsHybridRequest {
+            query_text: "owned search".into(),
+            user_id: Some(300_123),
+            ..Default::default()
+        };
+        let r = build_hybrid_search_request(&req, vec![0.1]);
+        let filter = r.options.unwrap().filter.unwrap();
+        assert_eq!(filter.user_id, Some(300_123));
+    }
+
+    #[test]
+    fn reflection_memory_ids_preserve_order_and_dedupe() {
+        let ids = reflection_memory_ids_from_hits(vec![
+            memory_hit(10),
+            memory_hit(20),
+            memory_hit(10),
+            mem_svc::MemorySearchResult::default(),
+            memory_hit(30),
+        ]);
+        assert_eq!(ids, vec![10, 20, 30]);
     }
 
     #[test]

@@ -64,6 +64,7 @@ import type {
   ResolvedSummaryMemoryRef,
   SavePeriodicTaskRequest,
   SearchReflectionsByIntentRequest,
+  SearchReflectionsHybridRequest,
   SearchReflectionsRequest,
   SearchThreadsRequest,
   SetEmbeddingSettingsRequest,
@@ -205,6 +206,12 @@ export async function listReflectionsByThread(
 
 export async function searchReflections(req: SearchReflectionsRequest): Promise<ReflectionEntry[]> {
   return invoke<ReflectionEntry[]>("search_reflections", { req });
+}
+
+export async function searchReflectionsHybrid(
+  req: SearchReflectionsHybridRequest,
+): Promise<ReflectionEntry[]> {
+  return invoke<ReflectionEntry[]>("search_reflections_hybrid", { req });
 }
 
 /** Delete a single reflection by its id. */
