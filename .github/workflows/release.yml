@@ -23,6 +23,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
   CARGO_INCREMENTAL: '0'
+  LOOKBACK_RELEASE_VERSION: ${{ github.ref_name }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -270,6 +271,7 @@ jobs:
       CMAKE_POSITION_INDEPENDENT_CODE: "ON"
       CUDA_COMPUTE_CAP: "89"
       APPIMAGE_EXTRACT_AND_RUN: "1"
+      LOOKBACK_TAURI_VERBOSE: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -331,6 +333,16 @@ jobs:
               -print0 2>/dev/null
           )
 
+      - name: Install / verify AppImage bundling dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            desktop-file-utils file fuse libfuse2 patchelf
+          command -v appimagetool >/dev/null || { echo "appimagetool missing" >&2; exit 1; }
+          command -v patchelf >/dev/null || { echo "patchelf missing" >&2; exit 1; }
+          command -v desktop-file-validate >/dev/null || { echo "desktop-file-utils missing" >&2; exit 1; }
+
       - name: Build release AppImage (cuda)
         run: bash scripts/build-release.sh --profile linux-cuda --bundle appimage
 
@@ -388,7 +400,7 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev \
-            fuse libfuse2 file desktop-file-utils
+            fuse libfuse2 file desktop-file-utils patchelf
           # build-release.sh patches the generated AppImage runtime hook and
           # repackages it, so appimagetool is required even for CPU builds.
           sudo curl -fsSL -o /usr/local/bin/appimagetool \

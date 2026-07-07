@@ -5,13 +5,14 @@ import {
   deleteReflection,
   enqueueReflectionJob,
   searchReflections,
-  searchReflectionsByIntent,
+  searchReflectionsHybrid,
 } from "@/api";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DateInput } from "@/components/DateInput";
 import { MarkdownBody } from "@/components/MarkdownMessage";
 import { ThreadDetail } from "@/components/ThreadDetail";
 import { Toolbar } from "@/components/Toolbar";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useDeleteAction } from "@/hooks/useDeleteAction";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
 import type { ReflectionProgressHandle } from "@/hooks/useReflectionProgress";
@@ -41,13 +42,10 @@ export function Reflections({
   // Date filter anchored to midnight in the display timezone (matches the
   // rendered card timestamps; see Threads for the boundary rationale).
   const timezone = useTimezone();
+  const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
   const [selectedOutcomes, setSelectedOutcomes] = useState<number[]>([]);
   const [createdAfter, setCreatedAfter] = useState<string>("");
-  const [intentQuery, setIntentQuery] = useState<string>("");
-  // Intent search embeds the query against the reflection-intent vector index,
-  // so it's gated while the local vector store is degraded. Structured filters
-  // (outcomes / date) stay available via ReflectionService.Search.
-  const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
+  const [queryText, setQueryText] = useState<string>("");
   const [enqueueError, setEnqueueError] = useState<string | null>(null);
   const [enqueueBusy, setEnqueueBusy] = useState(false);
   // Origin thread opened from a reflection card's link, shown as a modal
@@ -55,26 +53,37 @@ export function Reflections({
   const [openThread, setOpenThread] = useState<ThreadSummary | null>(null);
   const del = useDeleteAction(deleteReflection, [["reflections"]]);
 
-  // Non-empty intent text routes to FindSimilarByIntentText (server-side
-  // embed of the query against stored intent vectors); empty falls back to
-  // the filter-only listing via ReflectionService.Search.
-  const intent = vectorDisabled ? "" : intentQuery.trim();
+  const debouncedQueryText = useDebouncedValue(queryText, 300);
+  const query = debouncedQueryText.trim();
+  const createdAfterMs = localDateToEpochMs(createdAfter, timezone);
+  const hasActiveFilter =
+    query.length > 0 || selectedOutcomes.length > 0 || createdAfter.trim().length > 0;
   const reflections = useQuery({
-    queryKey: ["reflections", selectedOutcomes, createdAfter, intent, timezone],
+    queryKey: ["reflections", selectedOutcomes, createdAfter, timezone],
     queryFn: () =>
-      intent.length > 0
-        ? searchReflectionsByIntent({
-            intent_text: intent,
-            outcomes: selectedOutcomes,
-            created_after_ms: localDateToEpochMs(createdAfter, timezone),
-            top_k: 50,
-          })
-        : searchReflections({
-            outcomes: selectedOutcomes,
-            created_after_ms: localDateToEpochMs(createdAfter, timezone),
-            limit: 200,
-          }),
+      searchReflections({
+        outcomes: selectedOutcomes,
+        created_after_ms: createdAfterMs,
+        limit: 200,
+      }),
   });
+  const hybridSearch = useQuery({
+    queryKey: ["reflection-hybrid-search", selectedOutcomes, createdAfter, query, timezone],
+    enabled: query.length > 0 && !vectorDisabled,
+    queryFn: () =>
+      searchReflectionsHybrid({
+        query_text: query,
+        outcomes: selectedOutcomes,
+        created_after_ms: createdAfterMs,
+        limit: 50,
+      }),
+  });
+  const visibleReflections = useMemo(() => {
+    if (query.length === 0) return reflections.data ?? [];
+    if (!vectorDisabled && !hybridSearch.isSuccess) return [];
+    if (!vectorDisabled && (hybridSearch.data?.length ?? 0) > 0) return hybridSearch.data ?? [];
+    return (reflections.data ?? []).filter((entry) => reflectionMatchesQuery(entry, query));
+  }, [hybridSearch.data, hybridSearch.isSuccess, reflections.data, query, vectorDisabled]);
 
   async function handleEnqueue() {
     setEnqueueError(null);
@@ -90,11 +99,11 @@ export function Reflections({
     }
   }
 
-  const total = reflections.data?.length ?? 0;
+  const total = visibleReflections.length;
   const subtitle = useMemo(() => {
-    if (reflections.isLoading) return t("common.loading");
+    if (reflections.isLoading || hybridSearch.isLoading) return t("common.loading");
     return t("reflections.subtitleCount", { count: total });
-  }, [reflections.isLoading, total, t]);
+  }, [hybridSearch.isLoading, reflections.isLoading, total, t]);
 
   return (
     <>
@@ -139,13 +148,10 @@ export function Reflections({
           <input
             type="text"
             className="text-input"
-            placeholder={
-              vectorDisabled ? t("search.modeDisabled") : t("reflections.intentPlaceholder")
-            }
-            value={vectorDisabled ? "" : intentQuery}
-            onChange={(e) => setIntentQuery(e.target.value)}
-            title={vectorDisabled ? t("search.modeDisabled") : t("reflections.intentTitle")}
-            disabled={vectorDisabled}
+            placeholder={t("reflections.searchPlaceholder")}
+            value={queryText}
+            onChange={(e) => setQueryText(e.target.value)}
+            title={t("reflections.searchTitle")}
             style={{ flex: 1, minWidth: 240 }}
           />
           <DateInput
@@ -226,13 +232,13 @@ export function Reflections({
           </div>
         )}
 
-        {reflections.error && (
+        {(reflections.error || hybridSearch.error) && (
           <div style={{ color: "var(--danger)", fontSize: 12 }}>
-            {(reflections.error as Error).message}
+            {((reflections.error ?? hybridSearch.error) as Error).message}
           </div>
         )}
 
-        {reflections.data?.map((r) => (
+        {visibleReflections.map((r) => (
           <ReflectionCard
             key={r.id}
             entry={r}
@@ -249,12 +255,20 @@ export function Reflections({
           />
         ))}
 
-        {!reflections.isLoading && !reflections.error && total === 0 && (
-          <div className="empty-state">
-            <div className="empty-title">{t("reflections.empty.title")}</div>
-            <div className="empty-desc">{t("reflections.empty.desc")}</div>
-          </div>
-        )}
+        {!reflections.isLoading &&
+          !hybridSearch.isLoading &&
+          !reflections.error &&
+          !hybridSearch.error &&
+          total === 0 && (
+            <div className="empty-state">
+              <div className="empty-title">
+                {hasActiveFilter ? t("reflections.noHits.title") : t("reflections.empty.title")}
+              </div>
+              <div className="empty-desc">
+                {hasActiveFilter ? t("reflections.noHits.desc") : t("reflections.empty.desc")}
+              </div>
+            </div>
+          )}
       </div>
 
       {openThread && <ThreadDetail thread={openThread} onClose={() => setOpenThread(null)} />}
@@ -271,6 +285,25 @@ export function Reflections({
       )}
     </>
   );
+}
+
+function reflectionMatchesQuery(entry: ReflectionEntry, query: string): boolean {
+  const haystack = [
+    entry.summary,
+    entry.task_intent,
+    entry.mitigation_hint ?? "",
+    ...entry.lessons,
+    ...entry.key_decisions,
+    ...entry.success_factors,
+  ]
+    .join("\n")
+    .toLocaleLowerCase();
+  const tokens = query
+    .toLocaleLowerCase()
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  return tokens.every((token) => haystack.includes(token));
 }
 
 export function ReflectionCard({

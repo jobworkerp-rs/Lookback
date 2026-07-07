@@ -143,7 +143,7 @@ pub async fn search_memories_hybrid(
 /// query vector. The embedding worker may return multiple chunks, but
 /// hybrid search expects exactly one vector — `embed_query` already returns
 /// only the first chunk, so we wrap it as a single `EmbeddingVector`.
-fn build_hybrid_request(
+pub(crate) fn build_hybrid_request(
     req: &SearchThreadsRequest,
     vector: Vec<f32>,
 ) -> mem_svc::HybridSearchRequest {

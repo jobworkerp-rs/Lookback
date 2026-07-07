@@ -13,6 +13,11 @@
 # Environment:
 #   DRY_RUN=1   Print every side-effecting command without running it.
 #   VERBOSE=1   (reserved)
+#   LOOKBACK_RELEASE_VERSION
+#                 Optional git tag (for example v0.0.3) used as the Tauri
+#                 bundle version after stripping the leading v.
+#   LOOKBACK_TAURI_VERBOSE=1
+#                 Pass -v to the Tauri CLI so linuxdeploy stderr is surfaced.
 #
 # Run with -h for the full option list.
 
@@ -156,8 +161,7 @@ preflight() {
   if [[ "${PLATFORM}" == linux && ",${BUNDLE}," == *",appimage,"* ]]; then
     # appimagetool repackages Linux AppImages after runtime hook and driver-lib
     # cleanup. Only required when building one.
-    command -v appimagetool >/dev/null 2>&1 \
-      || die "appimagetool required to patch the generated AppImage"
+    require_cmd appimagetool patchelf
   fi
   if [[ "${GPU}" == cuda ]]; then
     command -v nvcc >/dev/null 2>&1 || die "CUDA toolkit (nvcc) required for --gpu cuda"
@@ -186,6 +190,32 @@ verify_tauri_conf() {
   fi
 }
 
+dump_appimage_diagnostics() {
+  [[ "${PLATFORM}" == linux && ",${BUNDLE}," == *",appimage,"* ]] || return 0
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+
+  warn "AppImage bundling failed; dumping diagnostic context"
+  local bundle_dir="${AGENT_APP}/target/release/bundle"
+  local path
+  for path in "${bundle_dir}/appimage" "${bundle_dir}/appimage_deb" "${PLUGINS_DIR}"; do
+    if [[ -e "${path}" ]]; then
+      log "diagnostic tree: ${path}"
+      find "${path}" -maxdepth 4 -printf '%M %s %p -> %l\n' 2>/dev/null | sort >&2 || true
+    else
+      warn "diagnostic path missing: ${path}"
+    fi
+  done
+
+  if command -v ldd >/dev/null 2>&1; then
+    local so
+    for so in "${PLUGINS_DIR}"/*.so "${PLUGINS_DIR}"/*.so.*; do
+      [[ -e "${so}" && ! -L "${so}" ]] || continue
+      log "ldd: ${so}"
+      ldd "${so}" >&2 || true
+    done
+  fi
+}
+
 # Frontend build -----------------------------------------------------------
 build_frontend() {
   [[ "${SKIP_FRONTEND}" == "1" ]] && { log "skip frontend (--skip-frontend)"; return 0; }
@@ -196,7 +226,38 @@ build_frontend() {
   run mkdir -p "${AGENT_APP}/dict"
   log "frontend: pnpm install + tauri build (${BUNDLE})"
   run sh -c 'cd "$1" && pnpm install --frozen-lockfile' _ "${AGENT_APP}"
-  run sh -c 'cd "$1" && exec pnpm tauri build --bundles "$2"' _ "${AGENT_APP}" "${BUNDLE}"
+  if [[ -n "${LOOKBACK_RELEASE_VERSION:-}" ]]; then
+    run node "${SCRIPT_DIR}/ci-apply-release-version.mjs" \
+      "${LOOKBACK_RELEASE_VERSION}" \
+      "${AGENT_APP}/src-tauri/tauri.conf.json"
+  fi
+  local tauri_verbose_display=""
+  if [[ "${LOOKBACK_TAURI_VERBOSE:-0}" == "1" ]]; then
+    tauri_verbose_display=" -v"
+  fi
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    log "   $ cd ${AGENT_APP} && pnpm tauri build${tauri_verbose_display} --bundles ${BUNDLE}"
+  else
+    log "   $ pnpm tauri build${tauri_verbose_display} --bundles ${BUNDLE}"
+    local cuda_stub_dir="" status=0
+    cuda_stub_dir=$(prepare_cuda_driver_stub_dir)
+    if [[ "${LOOKBACK_TAURI_VERBOSE:-0}" == "1" ]]; then
+      if [[ -n "${cuda_stub_dir}" ]]; then
+        (cd "${AGENT_APP}" && LD_LIBRARY_PATH="${cuda_stub_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" pnpm tauri build -v --bundles "${BUNDLE}") || status=$?
+      else
+        (cd "${AGENT_APP}" && pnpm tauri build -v --bundles "${BUNDLE}") || status=$?
+      fi
+    elif [[ -n "${cuda_stub_dir}" ]]; then
+      (cd "${AGENT_APP}" && LD_LIBRARY_PATH="${cuda_stub_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" pnpm tauri build --bundles "${BUNDLE}") || status=$?
+    else
+      (cd "${AGENT_APP}" && pnpm tauri build --bundles "${BUNDLE}") || status=$?
+    fi
+    [[ -n "${cuda_stub_dir}" ]] && rm -rf "${cuda_stub_dir}"
+    if [[ "${status}" != "0" ]]; then
+      dump_appimage_diagnostics
+      return "${status}"
+    fi
+  fi
 }
 
 # NVIDIA user-mode DRIVER libraries that must NEVER ship inside the bundle:

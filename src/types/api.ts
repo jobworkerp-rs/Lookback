@@ -847,6 +847,16 @@ export interface SearchReflectionsRequest {
   limit?: number;
 }
 
+export interface SearchReflectionsHybridRequest {
+  query_text: string;
+  /** Backing reflection memory owner. Defaults to reflection_user_id=300000. */
+  user_id?: number;
+  outcomes?: number[];
+  created_after_ms?: number;
+  created_before_ms?: number;
+  limit?: number;
+}
+
 /** Natural-language intent search over reflections (FindSimilarByIntentText).
  *  The server embeds `intent_text` itself — no client vector required. */
 export interface SearchReflectionsByIntentRequest {

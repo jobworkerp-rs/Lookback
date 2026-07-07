@@ -32,6 +32,7 @@ import {
   retryModelSetup,
   searchMemoriesHybrid,
   searchReflectionsByIntent,
+  searchReflectionsHybrid,
   setConnectionConfig,
   setEnabledPeriodicTask,
   setMcpSettings,
@@ -123,6 +124,12 @@ describe("command wrappers", () => {
     const req = { intent_text: "fix flaky tests", top_k: 50 };
     await searchReflectionsByIntent(req);
     expect(invokeMock).toHaveBeenCalledWith("search_reflections_by_intent", { req });
+  });
+
+  it("searchReflectionsHybrid invokes search_reflections_hybrid", async () => {
+    const req = { query_text: "fix flaky tests", limit: 50 };
+    await searchReflectionsHybrid(req);
+    expect(invokeMock).toHaveBeenCalledWith("search_reflections_hybrid", { req });
   });
 
   it("getReflectionIntentIndexStats invokes get_reflection_intent_index_stats", async () => {

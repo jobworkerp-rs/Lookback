@@ -159,6 +159,11 @@ The release build must package backend binaries and resources before running Tau
    tokenizer).
 6. Run `pnpm tauri:build`.
 
+When `LOOKBACK_RELEASE_VERSION` is set, `scripts/build-release.sh` applies that tag to
+`src-tauri/tauri.conf.json` before Tauri packaging. Tags may use the normal `v` prefix, so
+`v0.0.3` produces bundle assets with version `0.0.3` instead of the development default in the
+checked-in Tauri config.
+
 ### Linux AppImage Post-Processing
 
 `scripts/build-release.sh` extracts each generated Linux AppImage, patches the GTK runtime hook
@@ -184,6 +189,16 @@ The CUDA GitHub Actions job temporarily renames `nccl.h` / `libnccl*` before bui
 build scripts do not auto-enable NCCL. The step restores those paths with an `EXIT` trap and skips
 previous `*.disabled-for-build` names, so reruns on a self-hosted runner do not accumulate hidden
 NCCL files.
+The CUDA runner image must provide `appimagetool`, `patchelf`, and `desktop-file-utils` before Tauri
+runs linuxdeploy. The workflow checks these tools explicitly so a missing runner-image dependency
+fails before the long release build reaches AppImage bundling.
+CUDA plugins link to the host-provided NVIDIA driver (`libcuda.so.1`), which must not be bundled.
+When the build container has no real driver library in `ldconfig`, `scripts/build-release.sh` points
+linuxdeploy at the CUDA toolkit stub through a temporary `LD_LIBRARY_PATH`. The existing AppImage
+post-processing still removes any `libcuda.so*` copy before publishing.
+The CUDA AppImage job sets `LOOKBACK_TAURI_VERBOSE=1` so linuxdeploy stderr is visible in GitHub
+Actions logs. If bundling fails, `scripts/build-release.sh` also dumps the AppDir tree and staged
+plugin `ldd` output.
 
 ### CUDA Release Asset Limit
 

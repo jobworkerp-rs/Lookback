@@ -345,8 +345,8 @@
     "generateTitle": "Dispatch memories-reflection-batch to jobworkerp",
     "generate": "Generate reflection",
     "enqueuing": "Enqueuing…",
-    "intentPlaceholder": "Natural-language search by intent (e.g. how to fix flaky tests)",
-    "intentTitle": "Semantic search over intent_embedding (requires GPU embedding worker)",
+    "searchPlaceholder": "Search reflections (e.g. flaky tests)",
+    "searchTitle": "Search reflection text, intent, lessons, and related fields",
     "createdAfterTitle": "Created after",
     "progress": {
       "done": "Generation complete",
@@ -357,6 +357,10 @@
     "empty": {
       "title": "No reflections yet",
       "desc": "Generated automatically on import, or run once from the \"Generate reflection\" button above"
+    },
+    "noHits": {
+      "title": "No matching reflections",
+      "desc": "Adjust the query, created date, or outcome filters"
     },
     "delete": {
       "title": "Delete this reflection?",

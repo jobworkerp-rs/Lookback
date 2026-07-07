@@ -62,6 +62,7 @@ pub fn run() {
             commands::logs::read_sidecar_log,
             commands::reflections::list_reflections_by_thread,
             commands::reflections::search_reflections,
+            commands::reflections::search_reflections_hybrid,
             commands::reflections::search_reflections_by_intent,
             commands::reflections::get_reflection_intent_index_stats,
             commands::reflections::redispatch_reflection_embeddings,
