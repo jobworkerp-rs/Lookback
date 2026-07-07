@@ -180,6 +180,11 @@ changing AppImage hook handling, run:
 bash scripts/test-appimage-hooks.sh
 ```
 
+The CUDA GitHub Actions job temporarily renames `nccl.h` / `libnccl*` before building so dependency
+build scripts do not auto-enable NCCL. The step restores those paths with an `EXIT` trap and skips
+previous `*.disabled-for-build` names, so reruns on a self-hosted runner do not accumulate hidden
+NCCL files.
+
 ### CUDA Release Asset Limit
 
 The gitea CUDA Linux workflow builds and uploads only the CUDA AppImage. The

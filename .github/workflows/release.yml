@@ -307,14 +307,29 @@ jobs:
       - name: Disable NCCL detection for CUDA build
         run: |
           set -euo pipefail
-          while IFS= read -r -d '' header; do
-            echo "Hiding NCCL header: $header"
-            sudo mv "$header" "${header}.disabled-for-build"
-          done < <(find /usr /opt/cuda /usr/local/cuda -name 'nccl.h' -print0 2>/dev/null)
-          while IFS= read -r -d '' lib; do
-            echo "Hiding NCCL library: $lib"
-            sudo mv "$lib" "${lib}.disabled-for-build"
-          done < <(find /usr /opt/cuda /usr/local/cuda -name 'libnccl*' -print0 2>/dev/null)
+          hidden_paths=()
+          restore_nccl_paths() {
+            local disabled original
+            for disabled in "${hidden_paths[@]}"; do
+              original="${disabled%.disabled-for-build}"
+              if [ -e "$disabled" ] && [ ! -e "$original" ]; then
+                echo "Restoring NCCL path: $original"
+                sudo mv "$disabled" "$original" || true
+              fi
+            done
+          }
+          trap restore_nccl_paths EXIT
+          while IFS= read -r -d '' path; do
+            disabled="${path}.disabled-for-build"
+            echo "Hiding NCCL path: $path"
+            sudo mv "$path" "$disabled"
+            hidden_paths+=("$disabled")
+          done < <(
+            find /usr /opt/cuda /usr/local/cuda \
+              \( -name 'nccl.h' -o -name 'libnccl*' \) \
+              ! -name '*.disabled-for-build' \
+              -print0 2>/dev/null
+          )
 
       - name: Build release AppImage (cuda)
         run: bash scripts/build-release.sh --profile linux-cuda --bundle appimage
