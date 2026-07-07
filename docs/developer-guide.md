@@ -214,16 +214,18 @@ To investigate disk pressure:
 ### GitHub Actions Signed macOS Release
 
 The public repository's `.github/workflows/release.yml` runs on tag pushes in this order: `test`,
-`build-macos`, then the Linux CPU `build`. `build-macos` uses a `macos-15` runner to execute
-`scripts/build-release.sh --profile mac` and uploads the generated DMG to the same GitHub Release.
+`build-macos`, `build-cuda`, then the Linux CPU `build`. `build-macos` uses the `self-hosted`,
+`macOS`, `lookback-macos` runner labels to execute `scripts/build-release.sh --profile mac` and
+uploads the generated DMG to the same GitHub Release.
 For the macOS profile, the script explicitly signs `src-tauri/plugins/*.dylib` with
 `APPLE_SIGNING_IDENTITY` before Tauri packaging. This path is macOS-only and does not affect Linux
-`.so` plugins or CUDA runtime staging. The workflow imports the `.p12` into the keychain with
-`apple-actions/import-codesign-certs`, verifies the signing identity in the keychain, and verifies
-notarization credentials with `notarytool history` before running `scripts/build-release.sh --profile
-mac`; without these checks, explicit plugin signing can fail with `The specified item could not be
-found in the keychain`, or invalid Apple ID / Team ID / app-specific password values can fail only
-after a long build.
+`.so` plugins or CUDA runtime staging. Before importing the certificate, the workflow deletes stale
+`signing_temp*.keychain-db` files left by earlier self-hosted runner attempts, then imports the
+`.p12` into a run-scoped keychain with `apple-actions/import-codesign-certs`. It verifies the signing
+identity in the keychain and verifies notarization credentials with `notarytool history` before
+running `scripts/build-release.sh --profile mac`; without these checks, explicit plugin signing can
+fail with `The specified item could not be found in the keychain`, or invalid Apple ID / Team ID /
+app-specific password values can fail only after a long build.
 After Tauri build, the workflow explicitly runs `notarytool submit --wait` and `stapler staple` on the
 DMG, then validates the stapled ticket and Gatekeeper assessment before uploading the release asset.
 

@@ -148,9 +148,18 @@ jobs:
           path: .build-deps/.lindera-cache
           key: lindera-${{ runner.os }}-x86_64-v0.44.1
 
+      - name: Clean stale Apple signing keychains
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for keychain in "${HOME}/Library/Keychains"/signing_temp*.keychain-db; do
+            security delete-keychain "$keychain" || true
+          done
+
       - name: Import Apple signing certificate
         uses: apple-actions/import-codesign-certs@v3
         with:
+          keychain: signing_temp_${{ github.run_id }}_${{ github.run_attempt }}
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
@@ -297,15 +306,15 @@ jobs:
 
       - name: Disable NCCL detection for CUDA build
         run: |
-          set -e
-          for header in $(find /usr /opt/cuda /usr/local/cuda -name 'nccl.h' 2>/dev/null); do
+          set -euo pipefail
+          while IFS= read -r -d '' header; do
             echo "Hiding NCCL header: $header"
             sudo mv "$header" "${header}.disabled-for-build"
-          done
-          for lib in $(find /usr /opt/cuda /usr/local/cuda -name 'libnccl*' 2>/dev/null); do
+          done < <(find /usr /opt/cuda /usr/local/cuda -name 'nccl.h' -print0 2>/dev/null)
+          while IFS= read -r -d '' lib; do
             echo "Hiding NCCL library: $lib"
             sudo mv "$lib" "${lib}.disabled-for-build"
-          done
+          done < <(find /usr /opt/cuda /usr/local/cuda -name 'libnccl*' -print0 2>/dev/null)
 
       - name: Build release AppImage (cuda)
         run: bash scripts/build-release.sh --profile linux-cuda --bundle appimage
@@ -328,10 +337,14 @@ jobs:
         run: |
           set -euo pipefail
           out=target/release/bundle
+          create_args=()
+          if [ "${TAG#*-}" != "${TAG}" ]; then
+            create_args+=(--prerelease)
+          fi
           gh release view "${TAG}" -R "${PUBLIC_REPO}" >/dev/null 2>&1 \
             || gh release create "${TAG}" -R "${PUBLIC_REPO}" \
                  --title "${TAG}" --notes "Release ${TAG}" \
-                 $([ "${TAG#*-}" != "${TAG}" ] && echo --prerelease)
+                 "${create_args[@]}"
           gh release upload "${TAG}" -R "${PUBLIC_REPO}" --clobber \
             "$out"/appimage/*-cuda.AppImage
 
