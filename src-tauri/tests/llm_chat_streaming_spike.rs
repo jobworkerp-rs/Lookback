@@ -93,7 +93,7 @@ async fn llm_chat_emits_per_token_chunks() {
         lance_language_model_home: lance_home,
         lindera_dict_staged: lindera_staged,
         // Allow CI / local override; otherwise we use whatever the YAML
-        // defaults to (Qwen3.6-27B-UD-Q4_K_XL — large; first run downloads).
+        // Defaults to non-MTP Gemma 4 E2B IT; MTP presets may download a draft GGUF too.
         llm_model: std::env::var("LOOKBACK_LLM_MODEL").ok(),
         llm_hf_repo: std::env::var("LOOKBACK_LLM_HF_REPO").ok(),
         llm_ctx_size: std::env::var("LOOKBACK_LLM_CTX_SIZE")

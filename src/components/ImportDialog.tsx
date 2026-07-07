@@ -1,8 +1,9 @@
 import { open as openDirectoryDialog } from "@tauri-apps/plugin-dialog";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { startImport } from "@/api";
 import { hasLlmInitFailure, type SidecarStatus } from "@/hooks/useSidecarStatus";
+import { useTimezone } from "@/hooks/useTimezone";
 import { localDateToIsoUtc, localTodayMinusDays } from "@/lib/dateInput";
 import {
   isValidPlainSourceName,
@@ -40,6 +41,9 @@ export function ImportDialog({
   sidecar,
 }: ImportDialogProps) {
   const { t } = useTranslation();
+  // Import `--since` is anchored to midnight in the display timezone so the
+  // cutoff matches what the user sees elsewhere (see Threads for the rationale).
+  const timezone = useTimezone();
   const [claude, setClaude] = useState(true);
   const [codex, setCodex] = useState(true);
   // Plain source is off by default (it needs an explicit directory). The
@@ -51,7 +55,8 @@ export function ImportDialog({
     loadPlainThreadStrategy(),
   );
   const [sinceMode, setSinceMode] = useState<"all" | "from">("from");
-  const [sinceDate, setSinceDate] = useState(() => localTodayMinusDays(1));
+  const [sinceDate, setSinceDate] = useState(() => localTodayMinusDays(1, timezone));
+  const sinceDateEdited = useRef(false);
   const [labels, setLabels] = useState("");
   const [dryRun, setDryRun] = useState(false);
   // Post-import generation toggles default to on so the dialog reproduces
@@ -68,6 +73,12 @@ export function ImportDialog({
   // Effective checkbox value: masked off while generation is disabled so the
   // visual state and the wire value can't diverge.
   const effective = (v: boolean) => v && !genDisabled;
+
+  useEffect(() => {
+    if (open && !sinceDateEdited.current) {
+      setSinceDate(localTodayMinusDays(1, timezone));
+    }
+  }, [open, timezone]);
 
   if (!open) return null;
 
@@ -113,7 +124,7 @@ export function ImportDialog({
 
     let since: string | undefined;
     if (sinceMode === "from") {
-      since = localDateToIsoUtc(sinceDate);
+      since = localDateToIsoUtc(sinceDate, timezone);
       // Guard the from-mode regression: a cleared/invalid date must not
       // silently fall through to a full (all-history) import.
       if (since === undefined) {
@@ -246,7 +257,10 @@ export function ImportDialog({
             </label>
             <DateInput
               value={sinceDate}
-              onChange={setSinceDate}
+              onChange={(value) => {
+                sinceDateEdited.current = true;
+                setSinceDate(value);
+              }}
               disabled={sinceMode === "all"}
               className="" // sits inside a radio-row, not styled as a standalone .text-input
             />

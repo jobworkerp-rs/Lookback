@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
+import { useTimezone } from "@/hooks/useTimezone";
 import { isCodexInjectedUserMessage } from "@/lib/codexMemoryVisibility";
 import { formatDateTime, formatNumber } from "@/lib/localeFormat";
 import { claudeCodeDisplayHints, isTagOnlyMessage } from "@/lib/systemMessage";
@@ -88,6 +89,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
 }: MarkdownMessageProps) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   const tone = ROLE_TONE[role] ?? "other";
   // Computed once per (role, content, metadata) tuple so each row's metadata
   // JSON is parsed at most once across the fold/command/markdown branches —
@@ -104,7 +106,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
   const header = (
     <div className="message-head">
       <span className={`role-badge role-${tone}`}>{MESSAGE_ROLE_LABEL[role] ?? "?"}</span>
-      <span className="message-time">{formatDateTime(createdAtMs, locale)}</span>
+      <span className="message-time">{formatDateTime(createdAtMs, locale, timezone)}</span>
     </div>
   );
   if (mode.kind === "tool") {

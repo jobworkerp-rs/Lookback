@@ -1,4 +1,4 @@
-# LLM worker definitions for Lookback Tauri MVP (Phase C / IMPL-1).
+# LLM worker definitions for Lookback Tauri.
 #
 # Registered at sidecar startup via `jobworkerp-client worker apply`
 # (see agent-app/src-tauri/src/workers/mod.rs). The thread-summary /
@@ -54,18 +54,15 @@ workers:
     # Do NOT wrap in a `llama_cpp:` sub-block — that would be encoded as
     # an unrecognized field and apply would fail.
     settings:
-      # Default to Qwen3.6-27B (Unsloth GGUF, Q4_K_XL). Override via env
+      # Default to Gemma 4 E2B non-MTP (Unsloth GGUF, Q4_K_XL). Override via env
       # (e.g. LOOKBACK_LLM_MODEL / LOOKBACK_LLM_HF_REPO) when the Tauri
       # side resolves a different runtime selection.
-      model: "%{LOOKBACK_LLM_MODEL:-Qwen3.6-27B-UD-Q4_K_XL.gguf}"
-      hf_repo: "%{LOOKBACK_LLM_HF_REPO:-unsloth/Qwen3.6-27B-GGUF}"
-      # Qwen3.6-27B native context = 262144 tokens (HF model card). The
-      # reflection workflow's `context_limit_tokens: 222000` is the hard
-      # upper bound we have to cover, plus a few thousand for the
-      # model-side `max_tokens` output budget. Set just below the
-      # native limit so KV-cache RAM stays bounded; users on memory-tight
-      # machines can shrink via LOOKBACK_LLM_CTX_SIZE.
-      ctx_size: "%{LOOKBACK_LLM_CTX_SIZE:-262144}"
+      model: "%{LOOKBACK_LLM_MODEL:-gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf}"
+      hf_repo: "%{LOOKBACK_LLM_HF_REPO:-unsloth/gemma-4-E2B-it-qat-GGUF}"
+      # Gemma 4 E2B native context = 131072 tokens. Reflection defaults cap
+      # input at 110000 and reserve 20000 output tokens, keeping the bundled
+      # default workflow inside this runner context.
+      ctx_size: "%{LOOKBACK_LLM_CTX_SIZE:-131072}"
       # --- KV cache optimization ---
       # The chat path now runs a 2-hop agent loop (model hop → tool →
       # model hop). Without these, each hop re-evaluates the full
@@ -87,6 +84,16 @@ workers:
       use_flash_attention: true
       type_k: %{LOOKBACK_LLM_KV_CACHE_TYPE:-KV_CACHE_TYPE_Q4_0}
       type_v: %{LOOKBACK_LLM_KV_CACHE_TYPE:-KV_CACHE_TYPE_Q4_0}
+      # --- MTP speculative decoding ---
+      # Enabled by curated MTP presets. Gemma 4 MTP repos ship a separate
+      # draft GGUF, while Qwen MTP repos use same-file MTP and leave
+      # `draft_model` as null.
+      mtp:
+        enabled: %{LOOKBACK_LLM_MTP_ENABLED:-false}
+        # Long-context summarization/reflection workloads tend to be more
+        # stable with a conservative MTP lookahead than the plugin default 3.
+        n_max: %{LOOKBACK_LLM_MTP_N_MAX:-2}
+        draft_model: %{LOOKBACK_LLM_MTP_DRAFT_MODEL:-null}
       # Quote-less: `%{...}` is string-substituted into the raw YAML
       # BEFORE parsing (both by jobworkerp's apply path and by the
       # Settings UI loader, which now also runs `expand_env`). Quoting
@@ -275,4 +282,4 @@ workers:
 # per-token chunks (only `execute_workflow_with_events` emits raw
 # `StreamingData`, and it isn't exposed over gRPC). Instead the Tauri
 # `chat_ask` command dispatches `memories-llm` directly with
-# `using: chat` + `function_options` per ARCH-CHAT-1 / DECIDE-CHAT-2.
+# `using: chat` + `function_options` expose the RAG tool set to chat.

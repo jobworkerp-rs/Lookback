@@ -5,9 +5,9 @@ import en from "./locales/en.json";
 import ja from "./locales/ja.json";
 
 // Dictionaries are bundled (synchronous load) and the language is resolved before
-// first paint so there is no FOUC on switch (NFR-I18N-4). The initial language is
+// first paint so there is no FOUC on switch. The initial language is
 // the saved preference resolved against navigator.language; "en" is the fallback
-// for any missing key (FR-I18N-6). React already escapes interpolated values, so
+// for any missing key. React already escapes interpolated values, so
 // i18next's own escaping is disabled.
 i18next.use(initReactI18next).init({
   resources: {

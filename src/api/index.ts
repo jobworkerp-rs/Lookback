@@ -344,7 +344,7 @@ export async function getModelStatus(): Promise<ModelStatusReport> {
   return invoke<ModelStatusReport>("get_model_status");
 }
 
-/** FR-CONFIG-5 retry: restart sidecars to recover model setup. Resolves
+/** Restart sidecars to recover model setup. Resolves
  *  once the restart settles (the Rust command emits sidecar://ready|error). */
 export async function retryModelSetup(): Promise<void> {
   return invoke<void>("retry_model_setup");
@@ -415,12 +415,12 @@ export async function chatCancel(jobId: string): Promise<void> {
   return invoke<void>("chat_cancel", { jobId });
 }
 
-/** FR-CONFIG-1: read the persisted connection-target override. */
+/** Read the persisted connection-target override. */
 export async function getConnectionConfig(): Promise<ConnectionConfig> {
   return invoke<ConnectionConfig>("get_connection_config");
 }
 
-/** FR-CONFIG-1: persist the connection override and invalidate cached gRPC
+/** Persist the connection override and invalidate cached gRPC
  *  clients so the next command reconnects to the new target. */
 export async function setConnectionConfig(cfg: ConnectionConfig): Promise<void> {
   return invoke<void>("set_connection_config", { cfg });
@@ -446,6 +446,12 @@ export async function setLlmSettings(req: SetLlmSettingsRequest): Promise<void> 
  *  resolved paths the running sidecar / next launch will use. */
 export async function getAppSettings(): Promise<AppSettingsResponse> {
   return invoke<AppSettingsResponse>("get_app_settings");
+}
+
+/** List the selectable IANA timezone names from the host tz database. Empty
+ *  when the host has no zoneinfo dir (the UI then offers Auto + free text). */
+export async function listTimezones(): Promise<string[]> {
+  return invoke<string[]>("list_timezones");
 }
 
 /** Persist the data-root override to `bootstrap.json`. Takes effect on the
@@ -534,7 +540,7 @@ export async function restartForSetup(): Promise<void> {
   return invoke("restart_for_setup");
 }
 
-/** NFR-6: read the tail of a sidecar log file (default 64 KiB). */
+/** Read the tail of a sidecar log file (default 64 KiB). */
 export async function readSidecarLog(
   source: LogSource,
   stream: LogStream,

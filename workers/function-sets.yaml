@@ -34,7 +34,7 @@ function_sets:
         # on that default for code we don't own.
         using: run
 
-  # MCP-exposed retrieval tools (FR-MCP-1). Surfaced to EXTERNAL MCP clients
+  # MCP-exposed retrieval tools. Surfaced to EXTERNAL MCP clients
   # (e.g. Claude Desktop) when the user enables the MCP server in Settings —
   # the sidecar is then spawned with `MCP_SET_NAME=lookback-mcp-rag`, which
   # narrows jobworkerp's MCP tool surface to exactly this set. Kept SEPARATE

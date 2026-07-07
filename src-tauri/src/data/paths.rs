@@ -8,7 +8,7 @@ use crate::error::{AppError, AppResult};
 /// Single application data root.
 ///
 /// All persistent state — sqlite, LanceDB, plugin dylibs, llama.cpp model
-/// cache, sidecar logs — lives under this directory. NFR-5 / AC-9 / ARCH-4:
+/// cache, sidecar logs — lives under this directory:
 /// "delete everything" maps to `rm -rf` of this single path.
 #[derive(Debug, Clone)]
 pub struct DataPaths {
@@ -117,7 +117,7 @@ impl DataPaths {
     ///        official `huggingface_hub` default).
     ///
     /// Used by BOTH `Sidecars::spawn_jobworkerp` (to inject `HF_HOME` into
-    /// the child) AND `get_model_status` (the FR-CONFIG-5 readiness scanner),
+    /// the child) AND `get_model_status` (the readiness scanner),
     /// so the readiness check follows the same cache the sidecar is actually
     /// populating.
     pub fn effective_hf_home(
@@ -197,9 +197,9 @@ impl DataPaths {
         self.root.join("app-settings.json")
     }
 
-    /// FR-CONFIG-1: where the connection-target override (local vs remote
+    /// Where the connection-target override (local vs remote
     /// server) is persisted. Lives *inside* the data root on purpose, so
-    /// "delete all data" (AC-9 / NFR-5) wipes it too — a purge is meant to
+    /// "delete all data" wipes it too — a purge is meant to
     /// leave no trace, and resetting back to the local default afterwards is
     /// the safe fallback (the user can't get stranded pointing at an
     /// unreachable remote).
@@ -289,7 +289,7 @@ impl DataPaths {
 #[serde(rename_all = "snake_case")]
 pub enum HfHomeMode {
     /// Lookback-owned cache under `<data>/models`. Pick this to keep all
-    /// models inside the single delete target (ARCH-4).
+    /// models inside the single delete target.
     DataRoot,
     /// User's OS-wide HuggingFace cache: shell env `HF_HOME` first, then
     /// `~/.cache/huggingface`. Default because typical models run 10–30 GB
@@ -324,6 +324,15 @@ pub struct AppSettings {
     /// dispatch commands also pass an explicit value that takes precedence.
     #[serde(default)]
     pub output_language: Option<String>,
+    /// Explicit IANA timezone (e.g. `"Asia/Tokyo"`, `"America/New_York"`) for
+    /// the agent-chat summary / import workflows' day/week/month boundary jq
+    /// (read via `env.TZ` in the jobworkerp worker). `None` = "Auto": fall back
+    /// to the process `TZ` env → `/etc/localtime` → `Asia/Tokyo`, preserving the
+    /// historical OS-following behaviour. `Some(_)` takes precedence over the
+    /// env so a GUI selection is honoured deterministically even under a DMG
+    /// launch. Resolved by `sidecar::lifecycle::resolve_timezone`.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 /// Bootstrap-time config: lives at a fixed path (`<os-default>/bootstrap.json`)
@@ -685,7 +694,7 @@ pub fn workers_bundle_dir() -> AppResult<PathBuf> {
 }
 
 /// `<workers>/llm-workers.yaml` — the YAML applied at sidecar startup to
-/// register the `memories-llm` named worker (IMPL-1).
+/// register the `memories-llm` named worker.
 pub fn llm_workers_yaml() -> AppResult<PathBuf> {
     Ok(workers_bundle_dir()?.join("llm-workers.yaml"))
 }
@@ -877,6 +886,7 @@ mod tests {
             hf_home_mode: HfHomeMode::DataRoot,
             hf_home_path: None,
             output_language: None,
+            timezone: None,
         };
         // Explicit `data_root` mode must beat the shell env — that's the
         // whole point of the user opting in to Lookback-owned storage.
@@ -895,6 +905,7 @@ mod tests {
             hf_home_mode: HfHomeMode::Global,
             hf_home_path: None,
             output_language: None,
+            timezone: None,
         };
         assert_eq!(
             paths.effective_hf_home(None, Some(&app)),
@@ -918,6 +929,7 @@ mod tests {
             hf_home_mode: HfHomeMode::Global,
             hf_home_path: None,
             output_language: None,
+            timezone: None,
         };
         let got = paths.effective_hf_home(None, Some(&app));
         let expected = dirs::home_dir().unwrap().join(".cache").join("huggingface");
@@ -942,6 +954,7 @@ mod tests {
             hf_home_mode: HfHomeMode::Global,
             hf_home_path: None,
             output_language: None,
+            timezone: None,
         };
         assert_eq!(
             paths.effective_hf_home(Some(&env_file), Some(&app)),
@@ -963,6 +976,7 @@ mod tests {
             hf_home_mode: HfHomeMode::Global,
             hf_home_path: None,
             output_language: None,
+            timezone: None,
         };
         let got = paths.effective_hf_home(None, Some(&app));
         assert_eq!(got, PathBuf::from("/tmp/xdg-cache-root/huggingface"));
@@ -977,6 +991,7 @@ mod tests {
             hf_home_mode: HfHomeMode::Custom,
             hf_home_path: Some(PathBuf::from("/Volumes/Ext/hf")),
             output_language: None,
+            timezone: None,
         };
         assert_eq!(
             paths.effective_hf_home(None, Some(&app)),
@@ -997,6 +1012,7 @@ mod tests {
             hf_home_mode: HfHomeMode::Custom,
             hf_home_path: None,
             output_language: None,
+            timezone: None,
         };
         let expected = dirs::home_dir().unwrap().join(".cache").join("huggingface");
         assert_eq!(paths.effective_hf_home(None, Some(&app)), expected);
@@ -1283,6 +1299,7 @@ mod tests {
             hf_home_mode: HfHomeMode::DataRoot,
             hf_home_path: None,
             output_language: None,
+            timezone: None,
         };
         assert_eq!(
             paths.effective_hf_home(None, Some(&explicit_data_root)),
@@ -1308,6 +1325,7 @@ mod tests {
             hf_home_mode: HfHomeMode::Custom,
             hf_home_path: Some(PathBuf::from("/Volumes/Ext/hf")),
             output_language: None,
+            timezone: None,
         };
         save_app_settings(&path, &cfg).unwrap();
         assert_eq!(load_app_settings(&path), cfg);
@@ -1336,6 +1354,7 @@ mod tests {
             hf_home_mode: HfHomeMode::Global,
             hf_home_path: None,
             output_language: Some("en".into()),
+            timezone: None,
         };
         save_app_settings(&path, &cfg).unwrap();
         assert_eq!(
@@ -1378,6 +1397,7 @@ mod tests {
                 hf_home_mode: mode,
                 hf_home_path: None,
                 output_language: None,
+                timezone: None,
             };
             let json = serde_json::to_value(&s).unwrap();
             assert_eq!(json["hf_home_mode"], wire);
@@ -1576,6 +1596,39 @@ mod tests {
         );
     }
 
+    /// The lang-worker single YAMLs (day/week/month summary) live outside
+    /// `workers/workflows/`, so `workflow_yamls_parse` never scans them —
+    /// yet they carry the same UTC/TZ jq boundary logic (memories 5e996f5,
+    /// `env.TZ`-vs-`timezone_offset_hours`). A stray quote in that jq would
+    /// only surface on the first summary dispatch. Reparse them here too.
+    #[test]
+    fn lang_worker_yamls_parse() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        let lang_workers_dir = workers_bundle_dir().unwrap().join("lang-workers");
+        let mut bad = Vec::new();
+        let mut count = 0usize;
+        for entry in walkdir(&lang_workers_dir) {
+            if entry.extension().and_then(|s| s.to_str()) != Some("yaml") {
+                continue;
+            }
+            count += 1;
+            let body = std::fs::read_to_string(&entry).unwrap();
+            let expanded = expand_env_defaults(&body);
+            if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&expanded) {
+                bad.push(format!(
+                    "{}: {e}",
+                    entry.strip_prefix(&lang_workers_dir).unwrap().display()
+                ));
+            }
+        }
+        assert!(count > 0, "no lang-worker YAMLs scanned (path wrong?)");
+        assert!(
+            bad.is_empty(),
+            "lang-worker YAML parse failures:\n  - {}",
+            bad.join("\n  - ")
+        );
+    }
+
     #[test]
     fn llm_worker_file_includes_exist_in_workers_bundle() {
         unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
@@ -1741,6 +1794,59 @@ mod tests {
             pipeline_body.contains("max_signals:\n          type: integer\n          default: 100"),
             "agent-chat-pipeline should default to 100 merge signals"
         );
+    }
+
+    #[test]
+    fn thread_reflection_context_budget_stays_below_default_llm_context_limit() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        const DEFAULT_LLM_CTX_TOKENS: u32 = 131_072;
+        const REFLECTION_MAX_OUTPUT_TOKENS: u32 = 20_000;
+        const DEFAULT_REFLECTION_INPUT_TOKENS: u32 = 110_000;
+        const DEFAULT_REFLECTION_THRESHOLD_TOKENS: u32 = 100_000;
+        const DEFAULT_REFLECTION_MERGE_TOKENS: u32 = 90_000;
+
+        const {
+            assert!(
+                DEFAULT_REFLECTION_INPUT_TOKENS + REFLECTION_MAX_OUTPUT_TOKENS
+                    <= DEFAULT_LLM_CTX_TOKENS,
+                "reflection input + output budget must fit the default local LLM ctx"
+            );
+        }
+
+        let batch_path = workers_bundle_dir()
+            .unwrap()
+            .join("workflows/thread-reflection/thread-reflection-batch.yaml");
+        let batch_body = std::fs::read_to_string(&batch_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", batch_path.display()));
+        let single_path = lang_workers_repo_root()
+            .unwrap()
+            .join("workers/thread-reflection/thread-reflection-single.yaml");
+        let single_body = std::fs::read_to_string(&single_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", single_path.display()));
+
+        for (name, body) in [
+            ("thread-reflection-batch", batch_body),
+            ("thread-reflection-single", single_body),
+        ] {
+            assert!(
+                body.contains(&format!(
+                    "context_limit_tokens: {{ type: integer, default: {DEFAULT_REFLECTION_INPUT_TOKENS} }}"
+                )),
+                "{name} should cap default reflection input below the default LLM ctx"
+            );
+            assert!(
+                body.contains(&format!(
+                    "single_pass_threshold_tokens: {{ type: integer, default: {DEFAULT_REFLECTION_THRESHOLD_TOKENS} }}"
+                )),
+                "{name} threshold should stay below the input cap"
+            );
+            assert!(
+                body.contains(&format!(
+                    "merge_max_input_tokens: {{ type: integer, default: {DEFAULT_REFLECTION_MERGE_TOKENS} }}"
+                )),
+                "{name} merge budget should stay below the input cap"
+            );
+        }
     }
 
     #[test]

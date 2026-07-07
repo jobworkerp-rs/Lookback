@@ -125,6 +125,8 @@ pub struct LocalRuntime {
     pub ctx_size: u32,
     pub kv_cache_type: KvCacheType,
     pub thinking_kwarg: llm_presets::ThinkingKwarg,
+    pub mtp_enabled: bool,
+    pub mtp_draft_model: Option<String>,
 }
 
 pub fn resolve_kv_cache_type(settings: &LlmSettings) -> KvCacheType {
@@ -167,13 +169,15 @@ pub fn resolve_local_runtime(settings: &LlmSettings) -> LocalRuntime {
             ctx_size: settings.local_ctx_size.unwrap_or(262_144),
             kv_cache_type: resolve_kv_cache_type(settings),
             thinking_kwarg: llm_presets::ThinkingKwarg::None,
+            mtp_enabled: false,
+            mtp_draft_model: None,
         };
     }
     // Unset and unknown preset ids both fall back to the default preset.
     let preset = settings
         .local_preset_id
         .as_deref()
-        .and_then(llm_presets::find_preset)
+        .and_then(llm_presets::find_preset_or_alias)
         .unwrap_or_else(llm_presets::default_preset);
     LocalRuntime {
         model_file: preset.gguf_file.into(),
@@ -183,6 +187,8 @@ pub fn resolve_local_runtime(settings: &LlmSettings) -> LocalRuntime {
             .unwrap_or(preset.recommended_ctx_size),
         kv_cache_type: resolve_kv_cache_type(settings),
         thinking_kwarg: preset.thinking_kwarg,
+        mtp_enabled: preset.mtp_enabled,
+        mtp_draft_model: preset.mtp_draft_model.map(str::to_string),
     }
 }
 
@@ -216,6 +222,54 @@ where
             .and_then(|v| v.parse().ok())
             .or(Some(runtime.ctx_size)),
     )
+}
+
+/// Resolves the MTP speculative-decoding runtime (`enabled` + optional
+/// draft GGUF) into env values, mirroring [`resolve_local_llm_env_triple`]'s
+/// precedence: a saved preset (`local_preset_id == Some(_)`) is
+/// authoritative; otherwise a `LOOKBACK_LLM_MTP_*` shell override wins, then
+/// the resolved runtime default.
+///
+/// Pass `|name| std::env::var(name).ok()` from production code; tests inject
+/// a closure to keep the resolver pure.
+pub fn resolve_local_llm_mtp_env<F>(
+    settings: &LlmSettings,
+    env_lookup: F,
+) -> (Option<bool>, Option<String>)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let runtime = resolve_local_runtime(settings);
+    if settings.local_preset_id.is_some() {
+        return (
+            Some(runtime.mtp_enabled),
+            mtp_draft_env_value(runtime.mtp_enabled, runtime.mtp_draft_model),
+        );
+    }
+    let enabled = env_lookup("LOOKBACK_LLM_MTP_ENABLED")
+        .and_then(|v| parse_bool_env(&v))
+        .unwrap_or(runtime.mtp_enabled);
+    let draft = env_lookup("LOOKBACK_LLM_MTP_DRAFT_MODEL")
+        .or_else(|| mtp_draft_env_value(enabled, runtime.mtp_draft_model));
+    (Some(enabled), draft)
+}
+
+/// Draft-GGUF env value for the `draft_model: %{LOOKBACK_LLM_MTP_DRAFT_MODEL:-null}`
+/// placeholder in `llm-workers.yaml`. Same-file MTP (e.g. Qwen) has no draft
+/// GGUF, so when MTP is enabled without one we emit the literal `"null"` — after
+/// `%{...}` substitution that yields a YAML null so the runner reads no draft.
+/// (When MTP is disabled the key is omitted entirely and the YAML `:-null`
+/// default applies.)
+fn mtp_draft_env_value(enabled: bool, draft_model: Option<String>) -> Option<String> {
+    draft_model.or_else(|| enabled.then(|| "null".to_string()))
+}
+
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// `chat_template_kwargs.enable_thinking` policy for the LLM the sidecar
@@ -320,7 +374,26 @@ pub fn load_llm_settings(path: &Path) -> LlmSettings {
     let Ok(bytes) = std::fs::read(path) else {
         return LlmSettings::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    serde_json::from_slice(&bytes)
+        .map(normalize_llm_settings)
+        .unwrap_or_default()
+}
+
+fn normalize_llm_settings(mut settings: LlmSettings) -> LlmSettings {
+    settings.local_preset_id = normalize_local_preset_id(settings.local_preset_id);
+    settings
+}
+
+fn normalize_local_preset_id(id: Option<String>) -> Option<String> {
+    id.map(|id| {
+        if id == llm_presets::CUSTOM_PRESET_ID {
+            id
+        } else {
+            llm_presets::canonical_preset_id(&id)
+                .unwrap_or(id.as_str())
+                .to_string()
+        }
+    })
 }
 
 pub fn save_llm_settings(path: &Path, settings: &LlmSettings) -> AppResult<()> {
@@ -625,7 +698,7 @@ pub fn validate_llm_request(req: &SetLlmSettingsRequest) -> AppResult<()> {
         if req.local_preset_id.as_deref() == Some(llm_presets::CUSTOM_PRESET_ID) {
             validate_custom_local_fields(req).map_err(AppError::Config)?;
         } else if let Some(id) = req.local_preset_id.as_deref()
-            && llm_presets::find_preset(id).is_none()
+            && llm_presets::canonical_preset_id(id).is_none()
         {
             return Err(AppError::Config(format!(
                 "unknown local_preset_id {id:?}: not in the curated preset list"
@@ -725,7 +798,7 @@ pub fn apply_llm_settings_to_disk(
         base_url: req.base_url,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
-        local_preset_id: req.local_preset_id,
+        local_preset_id: normalize_local_preset_id(req.local_preset_id),
         local_model_file: req.local_model_file,
         local_hf_repo: req.local_hf_repo,
         local_ctx_size: req.local_ctx_size,
@@ -793,6 +866,13 @@ fn llm_placeholder_vars(settings: &LlmSettings) -> std::collections::HashMap<Str
     }
     if let Some(c) = ctx_size {
         vars.insert("LOOKBACK_LLM_CTX_SIZE".to_string(), c.to_string());
+    }
+    let (mtp_enabled, mtp_draft_model) = resolve_local_llm_mtp_env(settings, |_| None);
+    if let Some(enabled) = mtp_enabled {
+        vars.insert("LOOKBACK_LLM_MTP_ENABLED".to_string(), enabled.to_string());
+    }
+    if let Some(draft) = mtp_draft_model.filter(|s| !s.is_empty()) {
+        vars.insert("LOOKBACK_LLM_MTP_DRAFT_MODEL".to_string(), draft);
     }
     vars.insert(
         "LOOKBACK_LLM_KV_CACHE_TYPE".to_string(),
@@ -1468,6 +1548,11 @@ mod tests {
         assert_eq!(rt.ctx_size, default_preset.recommended_ctx_size);
         assert_eq!(rt.thinking_kwarg, default_preset.thinking_kwarg);
         assert_eq!(rt.kv_cache_type, KvCacheType::Q4_0);
+        assert_eq!(rt.mtp_enabled, default_preset.mtp_enabled);
+        assert_eq!(
+            rt.mtp_draft_model.as_deref(),
+            default_preset.mtp_draft_model
+        );
     }
 
     #[test]
@@ -1483,6 +1568,8 @@ mod tests {
         assert_eq!(rt.ctx_size, preset.recommended_ctx_size);
         assert_eq!(rt.thinking_kwarg, llm_presets::ThinkingKwarg::Disable);
         assert_eq!(rt.kv_cache_type, KvCacheType::Q4_0);
+        assert!(!rt.mtp_enabled);
+        assert_eq!(rt.mtp_draft_model, None);
     }
 
     #[test]
@@ -1538,25 +1625,57 @@ mod tests {
     #[test]
     fn resolve_runtime_gemma4_e2b_preset_returns_artifact_values() {
         let s = LlmSettings {
-            local_preset_id: Some("gemma-4-e2b-it-ud-q4-k-xl".into()),
+            local_preset_id: Some("gemma-4-e2b-it-qat-ud-q4-k-xl".into()),
             ..Default::default()
         };
         let rt = resolve_local_runtime(&s);
-        assert_eq!(rt.model_file, "gemma-4-E2B-it-UD-Q4_K_XL.gguf");
-        assert_eq!(rt.hf_repo, "unsloth/gemma-4-E2B-it-GGUF");
+        assert_eq!(rt.model_file, "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf");
+        assert_eq!(rt.hf_repo, "unsloth/gemma-4-E2B-it-qat-GGUF");
         assert_eq!(rt.ctx_size, 131_072);
         assert_eq!(rt.thinking_kwarg, llm_presets::ThinkingKwarg::Enable);
+        assert!(!rt.mtp_enabled);
+        assert_eq!(rt.mtp_draft_model, None);
+    }
+
+    #[test]
+    fn resolve_runtime_gemma4_e2b_qat_mtp_preset_returns_draft_model() {
+        let s = LlmSettings {
+            local_preset_id: Some("gemma-4-e2b-it-qat-mtp-ud-q4-k-xl".into()),
+            ..Default::default()
+        };
+        let rt = resolve_local_runtime(&s);
+        assert_eq!(rt.model_file, "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf");
+        assert_eq!(rt.hf_repo, "unsloth/gemma-4-E2B-it-qat-GGUF");
+        assert!(rt.mtp_enabled);
+        assert_eq!(
+            rt.mtp_draft_model.as_deref(),
+            Some("mtp-gemma-4-E2B-it.gguf")
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_qwen_mtp_preset_enables_same_file_mtp() {
+        let s = LlmSettings {
+            local_preset_id: Some("qwen3-6-27b-mtp-ud-q4-k-xl".into()),
+            ..Default::default()
+        };
+        let rt = resolve_local_runtime(&s);
+        assert_eq!(rt.model_file, "Qwen3.6-27B-UD-Q4_K_XL.gguf");
+        assert_eq!(rt.hf_repo, "unsloth/Qwen3.6-27B-MTP-GGUF");
+        assert!(rt.mtp_enabled);
+        assert_eq!(rt.mtp_draft_model, None);
     }
 
     #[test]
     fn resolve_runtime_gemma4_e4b_uses_model_context_limit() {
         let s = LlmSettings {
-            local_preset_id: Some("gemma-4-e4b-it-ud-q4-k-xl".into()),
+            local_preset_id: Some("gemma-4-e4b-it-qat-ud-q4-k-xl".into()),
             ..Default::default()
         };
         let rt = resolve_local_runtime(&s);
         assert_eq!(rt.ctx_size, 131_072);
         assert_eq!(rt.thinking_kwarg, llm_presets::ThinkingKwarg::Enable);
+        assert!(!rt.mtp_enabled);
     }
 
     #[test]
@@ -1629,6 +1748,63 @@ mod tests {
     }
 
     #[test]
+    fn resolve_runtime_legacy_gemma_id_maps_to_qat_replacement() {
+        let s = LlmSettings {
+            local_preset_id: Some("gemma-4-e4b-it-ud-q4-k-xl".into()),
+            ..Default::default()
+        };
+        let rt = resolve_local_runtime(&s);
+        assert_eq!(rt.model_file, "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf");
+        assert_eq!(rt.hf_repo, "unsloth/gemma-4-E4B-it-qat-GGUF");
+        assert!(!rt.mtp_enabled);
+        assert_eq!(rt.mtp_draft_model, None);
+    }
+
+    #[test]
+    fn load_settings_migrates_legacy_gemma_preset_id_to_qat_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llm-settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "mode": "local",
+              "local_preset_id": "gemma-4-12b-it-ud-q4-k-xl"
+            }"#,
+        )
+        .unwrap();
+        let settings = load_llm_settings(&path);
+        assert_eq!(
+            settings.local_preset_id.as_deref(),
+            Some("gemma-4-12b-it-qat-ud-q4-k-xl")
+        );
+    }
+
+    #[test]
+    fn apply_llm_to_disk_accepts_and_saves_canonical_legacy_gemma_preset_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llm-settings.json");
+        let req = SetLlmSettingsRequest {
+            mode: LlmMode::Local,
+            provider_model: None,
+            api_key: None,
+            base_url: None,
+            max_tokens: None,
+            temperature: None,
+            local_preset_id: Some("gemma-4-e2b-it-ud-q4-k-xl".into()),
+            local_model_file: None,
+            local_hf_repo: None,
+            local_ctx_size: None,
+            local_kv_cache_type: None,
+        };
+        apply_llm_settings_to_disk(&path, req).unwrap();
+        let settings = load_llm_settings(&path);
+        assert_eq!(
+            settings.local_preset_id.as_deref(),
+            Some("gemma-4-e2b-it-qat-ud-q4-k-xl")
+        );
+    }
+
+    #[test]
     fn resolve_runtime_custom_returns_user_fields() {
         let s = LlmSettings {
             local_preset_id: Some(llm_presets::CUSTOM_PRESET_ID.into()),
@@ -1641,6 +1817,46 @@ mod tests {
         assert_eq!(rt.model_file, "my-model.gguf");
         assert_eq!(rt.hf_repo, "me/my-repo");
         assert_eq!(rt.ctx_size, 8192);
+        assert!(!rt.mtp_enabled);
+        assert_eq!(rt.mtp_draft_model, None);
+    }
+
+    #[test]
+    fn resolve_local_llm_mtp_env_uses_preset_when_user_selected() {
+        let s = LlmSettings {
+            local_preset_id: Some("gemma-4-e4b-it-qat-mtp-ud-q4-k-xl".into()),
+            ..Default::default()
+        };
+        let (enabled, draft) = resolve_local_llm_mtp_env(&s, |name| match name {
+            "LOOKBACK_LLM_MTP_ENABLED" => Some("false".into()),
+            "LOOKBACK_LLM_MTP_DRAFT_MODEL" => Some("stale-draft.gguf".into()),
+            _ => None,
+        });
+        assert_eq!(enabled, Some(true));
+        assert_eq!(draft.as_deref(), Some("mtp-gemma-4-E4B-it.gguf"));
+    }
+
+    #[test]
+    fn resolve_local_llm_mtp_env_uses_null_draft_for_same_file_mtp() {
+        let s = LlmSettings {
+            local_preset_id: Some("qwen3-6-27b-mtp-ud-q4-k-xl".into()),
+            ..Default::default()
+        };
+        let (enabled, draft) = resolve_local_llm_mtp_env(&s, |_| None);
+        assert_eq!(enabled, Some(true));
+        assert_eq!(draft.as_deref(), Some("null"));
+    }
+
+    #[test]
+    fn resolve_local_llm_mtp_env_honours_shell_env_when_user_has_not_picked() {
+        let s = LlmSettings::default();
+        let (enabled, draft) = resolve_local_llm_mtp_env(&s, |name| match name {
+            "LOOKBACK_LLM_MTP_ENABLED" => Some("false".into()),
+            "LOOKBACK_LLM_MTP_DRAFT_MODEL" => Some("dev-draft.gguf".into()),
+            _ => None,
+        });
+        assert_eq!(enabled, Some(false));
+        assert_eq!(draft.as_deref(), Some("dev-draft.gguf"));
     }
 
     #[test]
@@ -2170,6 +2386,11 @@ mod tests {
             vars.get("LOOKBACK_LLM_KV_CACHE_TYPE").map(String::as_str),
             Some("KV_CACHE_TYPE_Q4_0")
         );
+        assert_eq!(
+            vars.get("LOOKBACK_LLM_MTP_ENABLED").map(String::as_str),
+            Some("false")
+        );
+        assert!(!vars.contains_key("LOOKBACK_LLM_MTP_DRAFT_MODEL"));
         // No provider model ⇒ External keys absent ⇒ YAML default (gpt-4o) wins.
         assert!(!vars.contains_key("LOOKBACK_EXTERNAL_LLM_MODEL"));
         assert!(!vars.contains_key("LOOKBACK_EXTERNAL_LLM_BASE_URL"));
@@ -2282,8 +2503,15 @@ mod tests {
                 && !resolved.contains("%{LOOKBACK_LLM_HF_REPO")
                 && !resolved.contains("%{LOOKBACK_LLM_CTX_SIZE")
                 && !resolved.contains("%{LOOKBACK_LLM_KV_CACHE_TYPE")
+                && !resolved.contains("%{LOOKBACK_LLM_MTP_ENABLED")
+                && !resolved.contains("%{LOOKBACK_LLM_MTP_N_MAX")
+                && !resolved.contains("%{LOOKBACK_LLM_MTP_DRAFT_MODEL")
                 && !resolved.contains("%{LOOKBACK_EXTERNAL_LLM_MODEL"),
             "all LLM placeholders with defaults must be resolved env-free"
+        );
+        assert!(
+            resolved.contains("n_max: 2"),
+            "MTP n_max must default to the long-context tuned value"
         );
         // The preset's gguf must appear in the resolved text.
         let preset = llm_presets::find_preset("qwen3-5-9b-ud-q4-k-xl").unwrap();

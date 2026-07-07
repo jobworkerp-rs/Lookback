@@ -457,7 +457,7 @@ export interface PurgeReport {
   warnings: string[];
 }
 
-/** FR-CONFIG-5: model preparation state (3 states only). */
+/** Model preparation state (3 states only). */
 export type ModelState = "preparing" | "ready" | "failed";
 
 export interface ModelStatus {
@@ -540,6 +540,8 @@ export interface LlmPreset {
    *  resolve via `t()` so language switching is instant. */
   description: string;
   thinking_kwarg: ThinkingKwarg;
+  mtp_enabled: boolean;
+  mtp_draft_model: string | null;
 }
 
 /** Sentinel preset id for "free-text custom entry". Matches
@@ -672,12 +674,25 @@ export interface AppSettingsResponse {
   hf_home_path: string | null;
   /** `null` = use the OS default (current behaviour). */
   data_root_override: string | null;
+  /** Explicit IANA timezone the user picked, or `null` for "Auto" (follow the
+   *  env `TZ` / OS zone). Drives the Timezone card's select. */
+  timezone: string | null;
+  /** The zone the sidecar will inject as `TZ` right now (the resolved value of
+   *  `timezone`, or the env/OS fallback when it is `null`). Shown as the card's
+   *  "current effective" preview so an Auto selection still names a zone. */
+  effective_timezone: string;
   resolved: ResolvedAppPaths;
 }
 
 export interface SetHfHomeRequest {
   mode: HfHomeMode;
   path: string | null;
+}
+
+/** `timezone: null` (or empty) means "Auto" — clear the explicit selection and
+ *  follow the env `TZ` / OS zone. */
+export interface SetTimezoneRequest {
+  timezone: string | null;
 }
 
 // ====================================================================
@@ -692,6 +707,7 @@ export interface ApplySettingsRequest {
   embedding: SetEmbeddingSettingsRequest | null;
   hf_home: SetHfHomeRequest | null;
   mcp: SetMcpSettingsRequest | null;
+  timezone: SetTimezoneRequest | null;
 }
 
 export interface ApplySettingsResponse {
@@ -735,7 +751,7 @@ export interface DataRootValidation {
   message: string | null;
 }
 
-/** FR-CONFIG-1: connection-target override (local sidecar vs remote server). */
+/** Connection-target override (local sidecar vs remote server). */
 export type ConnectionMode = "local" | "remote";
 
 export interface ConnectionConfig {
@@ -749,7 +765,7 @@ export interface ConnectionTestReport {
   memories_url: string;
 }
 
-/** NFR-6: which log file to read. `app` is Lookback's own Rust-side log
+/** Which log file to read. `app` is Lookback's own Rust-side log
  * (carries the memories-import child output); the rest are sidecar logs. */
 export type LogSource = "jobworkerp" | "memories" | "app";
 export type LogStream = "stdout" | "stderr";
@@ -790,7 +806,7 @@ export type SummaryValue =
     };
 
 // ====================================================================
-// Reflections (FR-REF)
+// Reflections
 // ====================================================================
 
 /** Trimmed projection of `llm_memory.data.Reflection`. */
@@ -1000,7 +1016,7 @@ export interface EnqueueAnalysisJobResponse {
 export type AnalysisStepUpdate = ReflectionStepUpdate;
 
 // ====================================================================
-// Personality (FR-PER)
+// Personality
 // ====================================================================
 
 export interface PersonalityProfile {
@@ -1197,7 +1213,7 @@ export interface ProfileMetrics {
 }
 
 // ====================================================================
-// Search (FR-SEARCH)
+// Search
 // ====================================================================
 
 export type SearchMode = "keyword" | "semantic" | "hybrid";
@@ -1226,7 +1242,7 @@ export interface ThreadHit {
 }
 
 // ====================================================================
-// RAG chat (specs/rag-chat-spec.md FR-CHAT-1..9)
+// RAG chat
 //
 // Mirrors `src-tauri/src/commands/chat.rs`. Wire shape is hand-synced
 // with the Rust serde structs — same convention as the rest of this
@@ -1254,13 +1270,13 @@ export interface ChatAskResponse {
   job_id: string;
 }
 
-/** FR-CHAT-9 minimum-contract phases. Kebab-case mirrors the Rust
+/** Minimum-contract chat phases. Kebab-case mirrors the Rust
  *  `ChatPhase` serde rename. */
 export type ChatPhase = "start" | "searching" | "source" | "token" | "done" | "error";
 
 /** One citation entry. Discriminated by `source_kind`; the union
  *  enforces that only `period_summary` carries `period_key/scope_key`
- *  and only the other two carry `source_thread_id` (FR-CHAT-4b). */
+ *  and only the other two carry `source_thread_id`. */
 export type ChatSource =
   | {
       source_kind: "raw_memory";

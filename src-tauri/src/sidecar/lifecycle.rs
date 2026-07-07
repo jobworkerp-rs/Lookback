@@ -1,4 +1,4 @@
-//! ARCH-1 / ARCH-5 / ARCH-6 / ARCH-7: sidecar process lifecycle.
+//! Sidecar process lifecycle.
 //!
 //! Spawn jobworkerp `all-in-one` and memories `memories-front` as child
 //! processes when the Tauri app launches; stop them — via SIGTERM with a
@@ -296,7 +296,7 @@ pub struct SidecarConfig {
     /// FTS index creation looking for an absent dictionary (spec §3.R3).
     pub lindera_dict_staged: bool,
 
-    /// Override default LLM model settings (FR-CONFIG-1/2). When set, passed
+    /// Override default LLM model settings. When set, passed
     /// to the memories-llm Worker via env-var expansion in its YAML
     /// (`%{LOOKBACK_LLM_MODEL:-…}` / `%{LOOKBACK_LLM_HF_REPO:-…}` /
     /// `%{LOOKBACK_LLM_CTX_SIZE:-…}` /
@@ -329,8 +329,10 @@ fn jobworkerp_llm_env_vars(
     hf_repo: Option<&str>,
     ctx_size: Option<u32>,
     kv_cache_type: Option<&str>,
+    mtp_enabled: Option<bool>,
+    mtp_draft_model: Option<&str>,
 ) -> Vec<(&'static str, String)> {
-    let mut out = Vec::with_capacity(4);
+    let mut out = Vec::with_capacity(6);
     if let Some(model) = model.filter(|s| !s.is_empty()) {
         out.push(("LOOKBACK_LLM_MODEL", model.to_string()));
     }
@@ -342,6 +344,12 @@ fn jobworkerp_llm_env_vars(
     }
     if let Some(kv) = kv_cache_type.filter(|s| !s.is_empty()) {
         out.push(("LOOKBACK_LLM_KV_CACHE_TYPE", kv.to_string()));
+    }
+    if let Some(enabled) = mtp_enabled {
+        out.push(("LOOKBACK_LLM_MTP_ENABLED", enabled.to_string()));
+    }
+    if let Some(draft) = mtp_draft_model.filter(|s| !s.is_empty()) {
+        out.push(("LOOKBACK_LLM_MTP_DRAFT_MODEL", draft.to_string()));
     }
     out
 }
@@ -372,12 +380,63 @@ fn jobworkerp_channel_env_vars() -> [(&'static str, &'static str); 3] {
     ]
 }
 
+/// Read the host's IANA timezone name from the `/etc/localtime` symlink
+/// (`.../zoneinfo/<Area>/<Location>` → `<Area>/<Location>`). This is the
+/// canonical source on macOS and most Linux distros; a GUI launch inherits
+/// no shell `TZ`, so without this the sidecars would always fall back to the
+/// JST default even on a machine set to another zone. Returns `None` when
+/// `/etc/localtime` is absent or not a `zoneinfo` symlink (e.g. a bind mount)
+/// so the caller can fall back.
+/// Last-resort timezone when no explicit setting, `TZ` env, or host zone is
+/// available — preserves the fixtures' historical JST wall-clock semantics.
+/// Must stay in sync with the frontend's `resolveTimezoneOffsetHours` fallback
+/// (`dateInput.ts`, 9 = JST) and the workflow YAML `timezone_offset_hours` default.
+const DEFAULT_TIMEZONE: &str = "Asia/Tokyo";
+
+fn system_timezone_name() -> Option<String> {
+    let target = std::fs::read_link("/etc/localtime").ok()?;
+    let s = target.to_str()?;
+    // Split on the last "zoneinfo/" so nested paths like
+    // "/var/db/timezone/zoneinfo/America/New_York" still yield the IANA name.
+    let name = s.rsplit_once("zoneinfo/").map(|(_, rest)| rest)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// IANA timezone name forwarded to the sidecars' `TZ` env. The
+/// agent-chat summary / import workflows read `env.TZ` inside the
+/// jobworkerp worker's jq to make their day/week/month boundaries
+/// DST-aware (memories 5e996f5); a DMG/GUI launch inherits an
+/// essentially empty env, so the value must be resolved and injected
+/// explicitly rather than relying on an inherited shell `TZ`.
+///
+/// Resolution order: explicit `app-settings.json` `timezone` (a GUI
+/// selection — honoured over the env so the choice is deterministic even
+/// under a DMG launch) → `TZ` env (dev shell override / the "Auto" case)
+/// → the host's `/etc/localtime` zone (so a machine set to e.g.
+/// `America/New_York` gets DST-aware, west-of-UTC boundaries even under a
+/// GUI launch) → `Asia/Tokyo` as a last resort, preserving the historical
+/// JST wall-clock semantics of the fixtures. Pass `None` for `app_settings`
+/// to skip the persisted layer (env/OS only). Shared with
+/// `conductor_env_vars`, which additionally honours `CONDUCTOR_CRON_TIMEZONE`
+/// on top of this.
+pub(crate) fn resolve_timezone(app_settings: Option<&crate::data::paths::AppSettings>) -> String {
+    app_settings
+        .and_then(|s| s.timezone.clone())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("TZ").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(system_timezone_name)
+        .unwrap_or_else(|| DEFAULT_TIMEZONE.to_string())
+}
+
 fn conductor_env_vars(data: &DataPaths, port: u16) -> Vec<(&'static str, String)> {
+    let app_settings = crate::data::paths::load_app_settings(&data.app_settings_path());
     let timezone = std::env::var("CONDUCTOR_CRON_TIMEZONE")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| std::env::var("TZ").ok().filter(|s| !s.trim().is_empty()))
-        .unwrap_or_else(|| "Asia/Tokyo".to_string());
+        .unwrap_or_else(|| resolve_timezone(Some(&app_settings)));
     vec![
         ("GRPC_ADDR", format!("127.0.0.1:{port}")),
         (
@@ -453,7 +512,7 @@ pub struct Sidecars {
     /// check timeout). Unlike `last_report.warnings` (non-fatal), this is the
     /// fatal path where `start_with_warnings` returns `Err`. Kept so
     /// `get_model_status` can surface the `failed` state when the sidecars
-    /// never came up at all (FR-CONFIG-5). Cleared on a successful start and
+    /// never came up at all. Cleared on a successful start and
     /// on stop, mirroring `last_report`'s lifecycle.
     last_start_error: Arc<Mutex<Option<String>>>,
     /// Frontend-shaped snapshot of the last hard-startup failure. Same
@@ -756,6 +815,11 @@ impl Sidecars {
         )
         .runner_value()
         .to_string();
+        let (llm_mtp_enabled, llm_mtp_draft_model) =
+            crate::commands::llm_settings::resolve_local_llm_mtp_env(
+                &llm_settings,
+                crate::commands::process_env_lookup,
+            );
 
         // Same pattern for the embedding model: re-resolve from the JUST-
         // LOADED `embedding-settings.json` so a `set_embedding_settings`
@@ -830,6 +894,8 @@ impl Sidecars {
             llm_hf_repo.as_deref(),
             llm_ctx_size,
             Some(llm_kv_cache_type.as_str()),
+            llm_mtp_enabled,
+            llm_mtp_draft_model.as_deref(),
         )?;
         let mut processes = vec![Process {
             name: "jobworkerp",
@@ -902,16 +968,18 @@ impl Sidecars {
             // (llama-cpp) placeholders in `llm-workers.yaml`. The Tauri
             // process runs `expand_env` against ITS OWN env when applying
             // the worker YAMLs below; without mirroring here the
-            // `%{LOOKBACK_LLM_MODEL:-Qwen3.6-27B-…}` placeholder always
+            // `%{LOOKBACK_LLM_MODEL:-gemma-4-E2B-…}` placeholder always
             // falls back to its YAML default and the user-selected preset
             // never reaches the registered `memories-llm` worker — chat
-            // then runs against Qwen3.6-27B regardless of what Settings
+            // then runs against the YAML fallback regardless of what Settings
             // shows.
             apply_local_llm_env(
                 llm_model.as_deref(),
                 llm_hf_repo.as_deref(),
                 llm_ctx_size,
                 Some(llm_kv_cache_type.as_str()),
+                llm_mtp_enabled,
+                llm_mtp_draft_model.as_deref(),
             );
             // Mirror the embedding runtime into the process env so the
             // bundled (non-staged) `auto-embedding-workers.yaml`'s `%{...}`
@@ -1386,6 +1454,8 @@ impl Sidecars {
         llm_hf_repo: Option<&str>,
         llm_ctx_size: Option<u32>,
         llm_kv_cache_type: Option<&str>,
+        llm_mtp_enabled: Option<bool>,
+        llm_mtp_draft_model: Option<&str>,
     ) -> AppResult<Child> {
         // cwd is pinned to the per-app data dir so `dotenvy::dotenv()` in the
         // child cannot read a surprise `.env` from the parent workspace
@@ -1404,7 +1474,7 @@ impl Sidecars {
                 self.config.data.plugins_dir().to_string_lossy().as_ref(),
             );
 
-        // MCP server env (FR-MCP-1). When disabled this is just
+        // MCP server env. When disabled this is just
         // `MCP_ENABLED=false` (the long-standing default — jobworkerp boots
         // gRPC-only). When enabled it adds `MCP_SET_NAME=lookback-mcp-rag`
         // plus any advanced overrides the user set. `MCP_ADDR` is attached
@@ -1462,14 +1532,29 @@ impl Sidecars {
             // the bound port stable across an enable toggle.
             .env("MCP_ADDR", format!("127.0.0.1:{mcp_server_port}"));
 
+        // Timezone for the agent-chat summary / import workflows. Their jq
+        // reads `env.TZ` to make the day/week/month boundary DST-aware
+        // (memories 5e996f5); when unset it falls back to the fixed
+        // `timezone_offset_hours` input. A DMG/GUI launch inherits an
+        // essentially empty env, so `TZ` is resolved and injected explicitly
+        // here rather than relying on an inherited shell value — otherwise the
+        // DST-aware path never activates. `resolve_timezone` prefers the
+        // user's `app-settings.json` selection (re-read on every restart, like
+        // HF_HOME), then the env, then the OS zone, then `Asia/Tokyo` — which
+        // matches the workflows' `timezone_offset_hours` JST default, so the
+        // boundary is identical whether or not any of those was set.
+        let app_settings =
+            crate::data::paths::load_app_settings(&self.config.data.app_settings_path());
+        cmd.env("TZ", resolve_timezone(Some(&app_settings)));
+
         // Hugging Face cache root. Re-resolved on every `start_inner`
         // (app-settings.json → shell env → `.env` template →
         // `<data>/models` fallback) and forwarded verbatim — a user who
         // maintains a shared HF cache keeps their existing GGUFs, while
-        // a fresh install lands files under the ARCH-4 data root. The
+        // a fresh install lands files under the app data root. The
         // same value is surfaced to `get_model_status` so the readiness
         // scan walks the exact directory the sidecar is populating
-        // (FR-CONFIG-5).
+        // readiness scan.
         cmd.env("HF_HOME", self.effective_hf_home.lock().as_path());
 
         // Inject the LLM model/repo/ctx_size into env vars whose names match
@@ -1479,9 +1564,14 @@ impl Sidecars {
         // start-time re-resolved triple, NOT `self.config.llm_*`, so a
         // `set_llm_settings` restart picks up the new preset (the cached
         // config is frozen at app boot).
-        for (k, v) in
-            jobworkerp_llm_env_vars(llm_model, llm_hf_repo, llm_ctx_size, llm_kv_cache_type)
-        {
+        for (k, v) in jobworkerp_llm_env_vars(
+            llm_model,
+            llm_hf_repo,
+            llm_ctx_size,
+            llm_kv_cache_type,
+            llm_mtp_enabled,
+            llm_mtp_draft_model,
+        ) {
             cmd.env(k, v);
         }
 
@@ -1607,7 +1697,7 @@ impl Sidecars {
         // Vector store (LanceDB) wiring. Required for ALL vector search paths
         // — Semantic / Hybrid (memory_vector) and the reflection intent store.
         // memories reads `MEMORY_LANCEDB_URI` (NOT the unused `LANCEDB_PATH`),
-        // defaulting to a cwd-relative path; we pin it under the ARCH-4 data
+        // defaulting to a cwd-relative path; we pin it under the app data
         // root. `REFLECTION_LANCEDB_URI` defaults to
         // `${MEMORY_LANCEDB_URI}/reflection_intent`, so it needs no explicit
         // value. `REFLECTION_VECTOR_SIZE` falls back to `MEMORY_VECTOR_SIZE`.
@@ -1828,9 +1918,9 @@ unsafe fn apply_rag_memories_env(data: &DataPaths, mem_port: u16) {
 /// Mirror the Local-LLM runtime selection into THIS process's env so the
 /// `worker_yaml_paths` loader's `expand_env` can substitute it into the
 /// `llm-workers.yaml` placeholders
-/// (`%{LOOKBACK_LLM_MODEL:-Qwen3.6-27B-…}` /
-/// `%{LOOKBACK_LLM_HF_REPO:-unsloth/Qwen3.6-27B-GGUF}` /
-/// `%{LOOKBACK_LLM_CTX_SIZE:-262144}`).
+/// (`%{LOOKBACK_LLM_MODEL:-gemma-4-E2B-…}` /
+/// `%{LOOKBACK_LLM_HF_REPO:-unsloth/gemma-4-E2B-it-qat-GGUF}` /
+/// `%{LOOKBACK_LLM_CTX_SIZE:-131072}` / `%{LOOKBACK_LLM_MTP_*:-…}`).
 ///
 /// These values are already set on the jobworkerp CHILD's env in
 /// `spawn_jobworkerp`, but the YAML expansion (the call that ultimately
@@ -1838,7 +1928,7 @@ unsafe fn apply_rag_memories_env(data: &DataPaths, mem_port: u16) {
 /// Tauri process via `register_workers_from_yaml`. Without this mirror the
 /// placeholders always fall back to their YAML default and a user-selected
 /// preset never reaches the registered `memories-llm` worker — chat then
-/// runs against Qwen3.6-27B regardless of what Settings shows.
+/// runs against the YAML fallback regardless of what Settings shows.
 ///
 /// `None` / empty values clear the env var so a subsequent restart with a
 /// reverted (default) preset does not leave a stale model name behind.
@@ -1852,13 +1942,18 @@ pub(crate) unsafe fn apply_local_llm_env(
     hf_repo: Option<&str>,
     ctx_size: Option<u32>,
     kv_cache_type: Option<&str>,
+    mtp_enabled: Option<bool>,
+    mtp_draft_model: Option<&str>,
 ) {
     let ctx = ctx_size.map(|v| v.to_string());
+    let mtp_enabled = mtp_enabled.map(|v| v.to_string());
     unsafe {
         set_or_clear_env("LOOKBACK_LLM_MODEL", model);
         set_or_clear_env("LOOKBACK_LLM_HF_REPO", hf_repo);
         set_or_clear_env("LOOKBACK_LLM_CTX_SIZE", ctx.as_deref());
         set_or_clear_env("LOOKBACK_LLM_KV_CACHE_TYPE", kv_cache_type);
+        set_or_clear_env("LOOKBACK_LLM_MTP_ENABLED", mtp_enabled.as_deref());
+        set_or_clear_env("LOOKBACK_LLM_MTP_DRAFT_MODEL", mtp_draft_model);
     }
 }
 
@@ -2179,6 +2274,163 @@ mod tests {
                 !is_benign_sidecar_noise(line),
                 "must not be demoted: {line:?}"
             );
+        }
+    }
+
+    fn app_settings_with_tz(tz: Option<&str>) -> crate::data::paths::AppSettings {
+        crate::data::paths::AppSettings {
+            timezone: tz.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    // Env-touching: relies on `--test-threads=1` (repo-wide convention).
+    #[test]
+    fn resolve_timezone_auto_prefers_tz_env() {
+        // "Auto" case = no explicit app-settings timezone (None).
+        // SAFETY: single-threaded test run; `set_var`/`remove_var` are the
+        // documented env-mutation path the rest of this module uses.
+        unsafe {
+            std::env::set_var("TZ", "America/New_York");
+        }
+        assert_eq!(resolve_timezone(None), "America/New_York");
+        assert_eq!(
+            resolve_timezone(Some(&app_settings_with_tz(None))),
+            "America/New_York",
+            "a None app-settings timezone means Auto — env TZ is used"
+        );
+
+        // A blank TZ is treated as unset — the result then comes from the
+        // host zone / JST fallback, which are exercised separately below.
+        unsafe {
+            std::env::set_var("TZ", "   ");
+        }
+        assert_ne!(
+            resolve_timezone(None),
+            "   ",
+            "a blank TZ must not be forwarded verbatim"
+        );
+
+        unsafe {
+            std::env::remove_var("TZ");
+        }
+        // With TZ unset the resolver falls back to the host zone (if
+        // /etc/localtime is a zoneinfo symlink) or JST — either way a
+        // non-empty IANA-shaped name, never blank.
+        let resolved = resolve_timezone(None);
+        assert!(
+            !resolved.trim().is_empty(),
+            "resolve_timezone must never return blank, got {resolved:?}"
+        );
+    }
+
+    // Env-touching: relies on `--test-threads=1`.
+    #[test]
+    fn resolve_timezone_prefers_explicit_app_setting_over_env() {
+        // SAFETY: single-threaded test run.
+        unsafe {
+            std::env::set_var("TZ", "America/New_York");
+        }
+        // An explicit GUI selection must win over the env so a DMG launch
+        // honours the user's choice deterministically.
+        assert_eq!(
+            resolve_timezone(Some(&app_settings_with_tz(Some("Europe/Paris")))),
+            "Europe/Paris"
+        );
+        // A blank app-settings timezone is treated as Auto → env wins.
+        assert_eq!(
+            resolve_timezone(Some(&app_settings_with_tz(Some("   ")))),
+            "America/New_York",
+            "a blank app-settings timezone falls through to the env"
+        );
+        unsafe {
+            std::env::remove_var("TZ");
+        }
+    }
+
+    #[test]
+    fn system_timezone_name_is_none_or_iana_shaped() {
+        // On CI /etc/localtime may be absent (None) or a zoneinfo symlink
+        // (an "Area/Location" name). It must never surface the raw path or
+        // an empty string.
+        if let Some(name) = system_timezone_name() {
+            assert!(!name.is_empty());
+            assert!(
+                !name.contains("zoneinfo"),
+                "the zoneinfo prefix must be stripped, got {name:?}"
+            );
+        }
+    }
+
+    // Env-touching: relies on `--test-threads=1`.
+    #[test]
+    fn conductor_timezone_prefers_cron_var_over_tz() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path().to_path_buf());
+        // SAFETY: single-threaded test run.
+        unsafe {
+            std::env::set_var("CONDUCTOR_CRON_TIMEZONE", "Europe/Paris");
+            std::env::set_var("TZ", "America/New_York");
+        }
+        let vars = conductor_env_vars(&data, 1234);
+        let tz = vars
+            .iter()
+            .find(|(k, _)| *k == "CONDUCTOR_CRON_TIMEZONE")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            tz,
+            Some("Europe/Paris"),
+            "CONDUCTOR_CRON_TIMEZONE must win over TZ for the cron scheduler"
+        );
+
+        unsafe {
+            std::env::remove_var("CONDUCTOR_CRON_TIMEZONE");
+        }
+        let vars = conductor_env_vars(&data, 1234);
+        let tz = vars
+            .iter()
+            .find(|(k, _)| *k == "CONDUCTOR_CRON_TIMEZONE")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            tz,
+            Some("America/New_York"),
+            "without the cron var, conductor falls back to TZ via resolve_timezone"
+        );
+
+        unsafe {
+            std::env::remove_var("TZ");
+        }
+    }
+
+    // Env-touching: relies on `--test-threads=1`.
+    #[test]
+    fn conductor_timezone_honors_app_setting_when_no_cron_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(&data.root).unwrap();
+        // Persist an explicit GUI timezone selection.
+        crate::data::paths::save_app_settings(
+            &data.app_settings_path(),
+            &app_settings_with_tz(Some("Europe/Berlin")),
+        )
+        .unwrap();
+        // SAFETY: single-threaded test run.
+        unsafe {
+            std::env::remove_var("CONDUCTOR_CRON_TIMEZONE");
+            std::env::set_var("TZ", "America/New_York");
+        }
+        let vars = conductor_env_vars(&data, 1234);
+        let tz = vars
+            .iter()
+            .find(|(k, _)| *k == "CONDUCTOR_CRON_TIMEZONE")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            tz,
+            Some("Europe/Berlin"),
+            "without the cron var, the explicit app-settings timezone wins over env TZ"
+        );
+        unsafe {
+            std::env::remove_var("TZ");
         }
     }
 
@@ -2794,14 +3046,18 @@ mod tests {
         let saved_repo = std::env::var("LOOKBACK_LLM_HF_REPO").ok();
         let saved_ctx = std::env::var("LOOKBACK_LLM_CTX_SIZE").ok();
         let saved_kv = std::env::var("LOOKBACK_LLM_KV_CACHE_TYPE").ok();
+        let saved_mtp_enabled = std::env::var("LOOKBACK_LLM_MTP_ENABLED").ok();
+        let saved_mtp_draft = std::env::var("LOOKBACK_LLM_MTP_DRAFT_MODEL").ok();
 
-        // 1) Setting all four populates the env vars verbatim.
+        // 1) Setting all local LLM fields populates the env vars verbatim.
         unsafe {
             apply_local_llm_env(
                 Some("Qwen3.6-35B-A3B-UD-IQ4_NL.gguf"),
                 Some("unsloth/Qwen3.6-35B-A3B-GGUF"),
                 Some(262_144),
                 Some("KV_CACHE_TYPE_Q4_0"),
+                Some(true),
+                Some("mtp-draft.gguf"),
             )
         };
         assert_eq!(
@@ -2817,20 +3073,29 @@ mod tests {
             std::env::var("LOOKBACK_LLM_KV_CACHE_TYPE").unwrap(),
             "KV_CACHE_TYPE_Q4_0"
         );
+        assert_eq!(std::env::var("LOOKBACK_LLM_MTP_ENABLED").unwrap(), "true");
+        assert_eq!(
+            std::env::var("LOOKBACK_LLM_MTP_DRAFT_MODEL").unwrap(),
+            "mtp-draft.gguf"
+        );
 
         // 2) None / empty must REMOVE the var so a later restart with a
         //    reverted (default) selection does not see a stale model name.
-        unsafe { apply_local_llm_env(None, None, None, None) };
+        unsafe { apply_local_llm_env(None, None, None, None, None, None) };
         assert!(std::env::var("LOOKBACK_LLM_MODEL").is_err());
         assert!(std::env::var("LOOKBACK_LLM_HF_REPO").is_err());
         assert!(std::env::var("LOOKBACK_LLM_CTX_SIZE").is_err());
         assert!(std::env::var("LOOKBACK_LLM_KV_CACHE_TYPE").is_err());
+        assert!(std::env::var("LOOKBACK_LLM_MTP_ENABLED").is_err());
+        assert!(std::env::var("LOOKBACK_LLM_MTP_DRAFT_MODEL").is_err());
 
-        unsafe { apply_local_llm_env(Some(""), Some(""), None, Some("")) };
+        unsafe { apply_local_llm_env(Some(""), Some(""), None, Some(""), Some(false), Some("")) };
         assert!(std::env::var("LOOKBACK_LLM_MODEL").is_err());
         assert!(std::env::var("LOOKBACK_LLM_HF_REPO").is_err());
         assert!(std::env::var("LOOKBACK_LLM_CTX_SIZE").is_err());
         assert!(std::env::var("LOOKBACK_LLM_KV_CACHE_TYPE").is_err());
+        assert_eq!(std::env::var("LOOKBACK_LLM_MTP_ENABLED").unwrap(), "false");
+        assert!(std::env::var("LOOKBACK_LLM_MTP_DRAFT_MODEL").is_err());
 
         // Restore the original environment.
         unsafe {
@@ -2849,6 +3114,14 @@ mod tests {
             match saved_kv {
                 Some(v) => std::env::set_var("LOOKBACK_LLM_KV_CACHE_TYPE", v),
                 None => std::env::remove_var("LOOKBACK_LLM_KV_CACHE_TYPE"),
+            }
+            match saved_mtp_enabled {
+                Some(v) => std::env::set_var("LOOKBACK_LLM_MTP_ENABLED", v),
+                None => std::env::remove_var("LOOKBACK_LLM_MTP_ENABLED"),
+            }
+            match saved_mtp_draft {
+                Some(v) => std::env::set_var("LOOKBACK_LLM_MTP_DRAFT_MODEL", v),
+                None => std::env::remove_var("LOOKBACK_LLM_MTP_DRAFT_MODEL"),
             }
         }
     }
@@ -2982,6 +3255,8 @@ mod tests {
             Some("unsloth/Qwen3.5-9B-GGUF"),
             Some(32_768),
             Some("KV_CACHE_TYPE_Q4_0"),
+            Some(true),
+            Some("mtp-draft.gguf"),
         );
         let map: std::collections::HashMap<&str, String> = envs.into_iter().collect();
         assert_eq!(
@@ -3000,6 +3275,14 @@ mod tests {
             map.get("LOOKBACK_LLM_KV_CACHE_TYPE").map(String::as_str),
             Some("KV_CACHE_TYPE_Q4_0"),
         );
+        assert_eq!(
+            map.get("LOOKBACK_LLM_MTP_ENABLED").map(String::as_str),
+            Some("true"),
+        );
+        assert_eq!(
+            map.get("LOOKBACK_LLM_MTP_DRAFT_MODEL").map(String::as_str),
+            Some("mtp-draft.gguf"),
+        );
         // Names that shouldn't appear — defensive.
         assert!(!map.contains_key("MEMORIES_LLM_MODEL"));
         assert!(!map.contains_key("MEMORIES_LLM_HF_REPO"));
@@ -3011,7 +3294,7 @@ mod tests {
         // inject empty env vars (`LOOKBACK_LLM_MODEL=""` would override
         // the YAML's `:-default` with an empty string and the plugin
         // would fail to resolve any model).
-        let envs = jobworkerp_llm_env_vars(None, None, None, None);
+        let envs = jobworkerp_llm_env_vars(None, None, None, None, None, None);
         assert!(envs.is_empty());
     }
 
@@ -3020,7 +3303,7 @@ mod tests {
         // Empty string overrides come from a fat-fingered Settings save
         // before our validation gate ran. Treat them as "unset" so the
         // YAML's `:-default` survives instead of being clobbered.
-        let envs = jobworkerp_llm_env_vars(Some(""), Some(""), None, Some(""));
+        let envs = jobworkerp_llm_env_vars(Some(""), Some(""), None, Some(""), None, Some(""));
         assert!(envs.is_empty());
     }
 
@@ -3030,7 +3313,7 @@ mod tests {
         // `ctx_size: "%{...}"` placeholder; the proto-JSON coercion
         // accepts the decimal form but rejects hex / underscores /
         // floats.
-        let envs = jobworkerp_llm_env_vars(None, None, Some(262_144), None);
+        let envs = jobworkerp_llm_env_vars(None, None, Some(262_144), None, None, None);
         let v = envs
             .into_iter()
             .find(|(k, _)| *k == "LOOKBACK_LLM_CTX_SIZE")

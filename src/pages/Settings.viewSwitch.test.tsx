@@ -39,6 +39,7 @@ vi.mock("@/api", () => ({
   validateDataRoot: () => Promise.resolve(null),
   redispatchMemoryEmbeddings: () => Promise.resolve(null),
   retryModelSetup: () => Promise.resolve(),
+  listTimezones: () => Promise.resolve(["Asia/Tokyo", "America/New_York", "UTC"]),
   purgeAllData: () => Promise.resolve({ warnings: [] }),
   readSidecarLog: () =>
     Promise.resolve({ file_name: "", content: "", truncated: false, file_size: 0 }),
@@ -62,10 +63,10 @@ const LLM_SETTINGS = {
 
 const LLM_PRESETS = [
   {
-    id: "gemma-4-e2b-it-ud-q4-k-xl",
-    display_name: "Gemma 4 E2B IT",
-    hf_repo: "unsloth/gemma-4-E2B-it-GGUF",
-    gguf_file: "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
+    id: "gemma-4-e2b-it-qat-ud-q4-k-xl",
+    display_name: "Gemma 4 E2B IT QAT",
+    hf_repo: "unsloth/gemma-4-E2B-it-qat-GGUF",
+    gguf_file: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
     recommended_ctx_size: 131072,
     min_ctx_size: 2048,
     estimated_model_ram_gb: 3.5,
@@ -75,6 +76,8 @@ const LLM_PRESETS = [
     kv_embd_v_gqa: 256,
     description: "デフォルト",
     thinking_kwarg: "enable" as const,
+    mtp_enabled: false,
+    mtp_draft_model: null,
   },
   {
     id: "qwen3-5-9b-ud-q4-k-xl",
@@ -90,6 +93,8 @@ const LLM_PRESETS = [
     kv_embd_v_gqa: 1024,
     description: "軽量",
     thinking_kwarg: "disable" as const,
+    mtp_enabled: false,
+    mtp_draft_model: null,
   },
 ];
 
@@ -131,6 +136,8 @@ const APP_SETTINGS = {
   hf_home_mode: "global" as const,
   hf_home_path: null,
   data_root_override: null,
+  timezone: null,
+  effective_timezone: "Asia/Tokyo",
   resolved: {
     current_data_root: "/root",
     default_data_root: "/root",
@@ -214,6 +221,21 @@ describe("Settings view switching", () => {
     expect(screen.queryByText("Destructive")).toBeNull();
     // Entry button present.
     expect(screen.getByText("高度な設定を開く…")).toBeInTheDocument();
+  });
+
+  it("disables timezone edits when the saved connection mode is remote", async () => {
+    getConnectionConfig.mockResolvedValue({
+      mode: "remote",
+      remote_jobworkerp_url: "http://10.0.0.2:9000",
+      remote_memories_url: "http://10.0.0.2:9010",
+    });
+
+    renderSettings();
+
+    const help = await screen.findByText(i18n.t("settings.timezone.remoteDisabled"));
+    const card = help.closest(".settings-card");
+    const select = card?.querySelector("select");
+    expect(select).toBeDisabled();
   });
 
   it("switches to the advanced view and back", async () => {
@@ -417,7 +439,7 @@ describe("Settings view switching", () => {
       .closest(".settings-row")
       ?.querySelector("select") as HTMLSelectElement;
     await waitFor(() => expect(select.options.length).toBeGreaterThan(1));
-    await waitFor(() => expect(select.value).toBe("gemma-4-e2b-it-ud-q4-k-xl"));
+    await waitFor(() => expect(select.value).toBe("gemma-4-e2b-it-qat-ud-q4-k-xl"));
     // Switch to the second preset → dirty → basic save bar appears.
     fireEvent.change(select, { target: { value: "qwen3-5-9b-ud-q4-k-xl" } });
     await screen.findByText(/未保存の変更があります/);

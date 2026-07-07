@@ -203,6 +203,30 @@ describe("fallbackDayRange", () => {
     expect(fallbackDayRange("daily", -5, earlyUtc)?.fromDate).toBe("2026-05-22");
   });
 
+  it("resolves daily fallback in a west-of-UTC IANA display timezone", () => {
+    const earlyUtc = new Date(Date.UTC(2026, 4, 24, 2, 0, 0));
+    expect(fallbackDayRange("daily", 9, earlyUtc, "America/New_York")).toEqual({
+      fromDate: "2026-05-22",
+      toDate: "2026-05-22",
+    });
+  });
+
+  it("resolves weekly fallback in a west-of-UTC IANA display timezone", () => {
+    const earlyUtc = new Date(Date.UTC(2026, 4, 24, 2, 0, 0));
+    expect(fallbackDayRange("weekly", 9, earlyUtc, "America/New_York")).toEqual({
+      fromDate: "2026-05-11",
+      toDate: "2026-05-17",
+    });
+  });
+
+  it("resolves monthly fallback in a west-of-UTC IANA display timezone", () => {
+    const earlyUtc = new Date(Date.UTC(2026, 5, 1, 2, 0, 0));
+    expect(fallbackDayRange("monthly", 9, earlyUtc, "America/New_York")).toEqual({
+      fromDate: "2026-04-01",
+      toDate: "2026-04-30",
+    });
+  });
+
   it("returns null for per-thread (handled as unbounded elsewhere)", () => {
     expect(fallbackDayRange("per-thread", 9)).toBeNull();
   });

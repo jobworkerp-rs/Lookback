@@ -41,7 +41,7 @@ workers:
     channel: embedding
     settings:
       model_id: Qwen/Qwen3-VL-Embedding-2B
-      # IMPL-7 (Lookback Tauri MVP Phase C): switched from CUDA to Metal
+      # Lookback uses Metal for local macOS embedding.
       # so the Apple-Silicon sidecar build can run the multimodal
       # embedding runner on the platform GPU. The mm-embedding-runner
       # crate must be built with `--features metal` for this device

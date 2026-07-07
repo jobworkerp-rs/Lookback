@@ -36,6 +36,14 @@ pub struct AppSettingsResponse {
     /// `data_root_override` from `bootstrap.json` — i.e. the data root
     /// that will be used on the NEXT launch. `None` = OS default.
     pub data_root_override: Option<PathBuf>,
+    /// Explicit IANA timezone the user selected, or `None` for "Auto"
+    /// (follow env `TZ` / the OS zone). Drives the Settings card's select.
+    pub timezone: Option<String>,
+    /// The zone the sidecar will actually inject as `TZ` right now — the
+    /// resolved value of `timezone` (or, when `None`, the env/OS fallback).
+    /// Shown as the card's "current effective" preview so an Auto selection
+    /// still tells the user which zone is in force.
+    pub effective_timezone: String,
     /// Resolved paths for the UI preview.
     pub resolved: ResolvedAppPaths,
 }
@@ -77,6 +85,14 @@ pub struct SetHfHomeRequest {
     pub path: Option<PathBuf>,
 }
 
+/// Request to set the workflow timezone. `timezone: None` (or empty) means
+/// "Auto" — clear the explicit selection and follow env `TZ` / the OS zone.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetTimezoneRequest {
+    #[serde(default)]
+    pub timezone: Option<String>,
+}
+
 #[tauri::command]
 pub fn get_app_settings(state: tauri::State<'_, AppState>) -> AppResult<AppSettingsResponse> {
     let app_settings = paths::load_app_settings(&state.data.app_settings_path());
@@ -91,10 +107,17 @@ pub fn get_app_settings(state: tauri::State<'_, AppState>) -> AppResult<AppSetti
     // the override target. Same helper drives both paths so they can't
     // drift.
     let pending = paths::resolved_data_root(&default, data_root_override.as_deref());
+    let timezone = app_settings.timezone.clone();
+    // Preview of the zone the sidecar will inject NOW (honours an explicit
+    // selection, else the env/OS fallback) — the same resolver the sidecar
+    // spawn uses, so the card can never disagree with reality.
+    let effective_timezone = crate::sidecar::lifecycle::resolve_timezone(Some(&app_settings));
     Ok(AppSettingsResponse {
         hf_home_mode: app_settings.hf_home_mode,
         hf_home_path: app_settings.hf_home_path,
         data_root_override,
+        timezone,
+        effective_timezone,
         resolved: ResolvedAppPaths {
             current_data_root: state.data.root.clone(),
             default_data_root: default,
@@ -216,6 +239,178 @@ pub async fn set_hf_home(
     let data = state.data.clone();
     crate::stage_and_start_sidecars(&app, &sidecars, &data).await;
     Ok(())
+}
+
+// ── Timezone ──────────────────────────────────────────────────────────
+//
+// The workflow timezone is persisted into `app-settings.json` (same file as
+// HF_HOME / output_language) and injected as the jobworkerp worker's `TZ`
+// env on spawn — the DST-aware boundary source the summary/import workflow
+// jq reads. `TZ` is read at spawn time, so a change is applied via the
+// unified `apply_settings` single-restart pipeline (hot-reload impossible,
+// same category as HF_HOME / MCP). `validate_*` / `apply_*_to_disk` are split
+// so `apply_settings` can validate the whole batch before writing any file.
+
+/// The tz database directories, in preference order. macOS 10.13+ ships the
+/// real zoneinfo under `/var/db/timezone/zoneinfo` (a symlink target of
+/// `/etc/localtime`); most Linux distros use `/usr/share/zoneinfo`. The first
+/// existing one is the source of truth for BOTH the selectable list and the
+/// save-time validation, so a name that lists is always a name that validates.
+const ZONEINFO_DIRS: &[&str] = &["/var/db/timezone/zoneinfo", "/usr/share/zoneinfo"];
+
+/// Top-level tz areas we surface. Restricting to these drops the tzdb's
+/// aliases / special files (`posix`, `right`, `SystemV`, `Factory`, the
+/// `*.tab` indexes, bare abbreviations) so the UI list stays the canonical
+/// `Area/Location` zones plus `UTC`.
+const ZONEINFO_AREAS: &[&str] = &[
+    "Africa",
+    "America",
+    "Antarctica",
+    "Arctic",
+    "Asia",
+    "Atlantic",
+    "Australia",
+    "Europe",
+    "Indian",
+    "Pacific",
+];
+
+fn zoneinfo_root() -> Option<PathBuf> {
+    ZONEINFO_DIRS.iter().map(PathBuf::from).find(|p| p.is_dir())
+}
+
+/// Test-only accessor so sibling command modules can guard-skip zoneinfo-
+/// dependent assertions on hosts without a tz database.
+#[cfg(test)]
+pub(crate) fn zoneinfo_root_for_test() -> Option<PathBuf> {
+    zoneinfo_root()
+}
+
+/// True when `name` is a syntactically safe relative IANA name — rejects
+/// absolute paths, `..` traversal, and empty segments so `validate` can join
+/// it onto a zoneinfo root without escaping the directory.
+fn is_safe_zone_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && name
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// Validate WITHOUT persisting (split out so `apply_settings` can validate the
+/// whole batch first). `None`/empty ⇒ Ok (the "Auto" selection). A non-empty
+/// name must exist as a file under a zoneinfo root — the same tzdb the sidecar
+/// resolves `TZ` against, so a validated name can never dangle at spawn.
+pub fn validate_timezone_request(request: &SetTimezoneRequest) -> AppResult<()> {
+    let Some(name) = request
+        .timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(()); // Auto.
+    };
+    if !is_safe_zone_name(name) {
+        return Err(AppError::Config(format!("invalid timezone name `{name}`")));
+    }
+    // When no zoneinfo dir exists (unusual), accept the name rather than
+    // block the user — the sidecar's own tzdb is the final arbiter, and a
+    // wrong name there just falls back to UTC-as-if in the jq, not a crash.
+    let Some(root) = zoneinfo_root() else {
+        return Ok(());
+    };
+    if root.join(name).is_file() {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "unknown timezone `{name}` (not found in the tz database)"
+        )))
+    }
+}
+
+/// Validate + persist the timezone into `app-settings.json` WITHOUT restarting
+/// the sidecar. Returns whether the value actually changed (a no-op save skips
+/// the restart). Empty ⇒ `None` (Auto). `..old.clone()` preserves the
+/// unrelated `hf_home_*` / `output_language` fields sharing this file.
+pub fn apply_timezone_to_disk(data: &DataPaths, request: SetTimezoneRequest) -> AppResult<bool> {
+    validate_timezone_request(&request)?;
+    let normalized = request
+        .timezone
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let app_settings_path = data.app_settings_path();
+    let old = paths::load_app_settings(&app_settings_path);
+    let cfg = AppSettings {
+        timezone: normalized,
+        ..old.clone()
+    };
+    let changed = old.timezone != cfg.timezone;
+    paths::save_app_settings(&app_settings_path, &cfg)?;
+    Ok(changed)
+}
+
+/// List the selectable IANA timezone names from the host tz database. Walks
+/// the first existing zoneinfo root, keeps only the `Area/Location` zones
+/// under [`ZONEINFO_AREAS`] plus `UTC`, and returns them sorted. Empty when no
+/// zoneinfo dir exists — the frontend then offers only "Auto" + free text.
+#[tauri::command]
+pub fn list_timezones() -> AppResult<Vec<String>> {
+    let Some(root) = zoneinfo_root() else {
+        return Ok(Vec::new());
+    };
+    let mut zones = Vec::new();
+    // `UTC` is a top-level file, not under an area prefix.
+    if root.join("UTC").is_file() {
+        zones.push("UTC".to_string());
+    }
+    for area in ZONEINFO_AREAS {
+        collect_zone_names(&root.join(area), area, &mut zones);
+    }
+    zones.sort();
+    Ok(zones)
+}
+
+/// Recurse `dir`, appending `prefix/<file>` for each regular file (zones can
+/// nest, e.g. `America/Argentina/Buenos_Aires`).
+fn collect_zone_names(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let path = entry.path();
+        let child_prefix = format!("{prefix}/{name}");
+        if path.is_dir() {
+            collect_zone_names(&path, &child_prefix, out);
+        } else if path.is_file() {
+            out.push(child_prefix);
+        }
+    }
+}
+
+/// Set the workflow timezone. Thin wrapper that delegates to the unified
+/// `apply_settings` pipeline (single validate → persist → restart), mirroring
+/// `set_mcp_settings`. `TZ` is spawn-time env, so this always restarts.
+#[tauri::command]
+pub async fn set_timezone(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request: SetTimezoneRequest,
+) -> AppResult<super::apply_settings::ApplySettingsResponse> {
+    super::apply_settings::apply_settings(
+        app,
+        state,
+        super::apply_settings::ApplySettingsRequest {
+            llm: None,
+            embedding: None,
+            hf_home: None,
+            mcp: None,
+            timezone: Some(request),
+        },
+    )
+    .await
 }
 
 /// Pre-flight check for a candidate data-root path. Returns a structured
@@ -710,6 +905,131 @@ mod tests {
         assert_eq!(
             saved.data_root_override,
             Some(PathBuf::from("/tmp/lookback-next"))
+        );
+    }
+
+    // ── Timezone ──
+
+    fn tz_req(tz: Option<&str>) -> SetTimezoneRequest {
+        SetTimezoneRequest {
+            timezone: tz.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn validate_timezone_request_accepts_none_as_auto() {
+        assert!(validate_timezone_request(&tz_req(None)).is_ok());
+        assert!(validate_timezone_request(&tz_req(Some(""))).is_ok());
+        assert!(validate_timezone_request(&tz_req(Some("   "))).is_ok());
+    }
+
+    #[test]
+    fn validate_timezone_request_accepts_known_zone() {
+        // Guard-skip on hosts without a zoneinfo dir (unusual CI images):
+        // there the validator is permissive by design, so there is nothing
+        // to assert.
+        if zoneinfo_root().is_none() {
+            return;
+        }
+        assert!(validate_timezone_request(&tz_req(Some("Asia/Tokyo"))).is_ok());
+        assert!(validate_timezone_request(&tz_req(Some("America/New_York"))).is_ok());
+    }
+
+    #[test]
+    fn validate_timezone_request_rejects_unknown_zone() {
+        if zoneinfo_root().is_none() {
+            return;
+        }
+        assert!(validate_timezone_request(&tz_req(Some("Not/AZone"))).is_err());
+    }
+
+    #[test]
+    fn validate_timezone_request_rejects_path_traversal() {
+        // Rejected before any filesystem lookup, so this holds regardless of
+        // whether a zoneinfo dir exists.
+        assert!(validate_timezone_request(&tz_req(Some("../../etc/passwd"))).is_err());
+        assert!(validate_timezone_request(&tz_req(Some("/etc/passwd"))).is_err());
+        assert!(validate_timezone_request(&tz_req(Some("Asia/../../etc"))).is_err());
+    }
+
+    #[test]
+    fn apply_timezone_to_disk_persists_and_reports_change() {
+        let dir = tempdir();
+        let data = DataPaths::with_root(dir.path().to_path_buf());
+        // Use a name that validates when a zoneinfo dir exists; on a host
+        // without one the validator is permissive so it still persists.
+        let changed = apply_timezone_to_disk(&data, tz_req(Some("Asia/Tokyo"))).unwrap();
+        assert!(changed);
+        let saved = paths::load_app_settings(&data.app_settings_path());
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Tokyo"));
+    }
+
+    #[test]
+    fn apply_timezone_to_disk_noop_reports_no_change() {
+        let dir = tempdir();
+        let data = DataPaths::with_root(dir.path().to_path_buf());
+        apply_timezone_to_disk(&data, tz_req(Some("Asia/Tokyo"))).unwrap();
+        let changed = apply_timezone_to_disk(&data, tz_req(Some("Asia/Tokyo"))).unwrap();
+        assert!(!changed, "re-applying the same zone must be a no-op");
+    }
+
+    #[test]
+    fn apply_timezone_to_disk_normalizes_empty_to_auto() {
+        let dir = tempdir();
+        let data = DataPaths::with_root(dir.path().to_path_buf());
+        apply_timezone_to_disk(&data, tz_req(Some("Asia/Tokyo"))).unwrap();
+        // An empty selection clears back to Auto (None).
+        let changed = apply_timezone_to_disk(&data, tz_req(Some("  "))).unwrap();
+        assert!(changed);
+        let saved = paths::load_app_settings(&data.app_settings_path());
+        assert_eq!(saved.timezone, None);
+    }
+
+    #[test]
+    fn apply_timezone_to_disk_preserves_unrelated_fields() {
+        let dir = tempdir();
+        let data = DataPaths::with_root(dir.path().to_path_buf());
+        // Seed unrelated app-settings fields first.
+        let seed = AppSettings {
+            hf_home_mode: HfHomeMode::DataRoot,
+            output_language: Some("en".into()),
+            ..Default::default()
+        };
+        paths::save_app_settings(&data.app_settings_path(), &seed).unwrap();
+
+        apply_timezone_to_disk(&data, tz_req(Some("Asia/Tokyo"))).unwrap();
+
+        let saved = paths::load_app_settings(&data.app_settings_path());
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Tokyo"));
+        assert!(
+            matches!(saved.hf_home_mode, HfHomeMode::DataRoot),
+            "hf_home_mode must survive a timezone write"
+        );
+        assert_eq!(
+            saved.output_language.as_deref(),
+            Some("en"),
+            "output_language must survive a timezone write"
+        );
+    }
+
+    #[test]
+    fn list_timezones_returns_nonempty_and_contains_common_zone() {
+        if zoneinfo_root().is_none() {
+            return; // No tzdb on this host — the list is legitimately empty.
+        }
+        let zones = list_timezones().unwrap();
+        assert!(!zones.is_empty());
+        assert!(
+            zones.iter().any(|z| z == "Asia/Tokyo"),
+            "expected a common zone in the list"
+        );
+        // The list must be the canonical Area/Location zones, not raw tzdb
+        // index files.
+        assert!(
+            !zones
+                .iter()
+                .any(|z| z.ends_with(".tab") || z.contains("posix/")),
+            "index / alias files must be filtered out"
         );
     }
 }

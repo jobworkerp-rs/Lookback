@@ -1,4 +1,4 @@
-//! NFR-6: read sidecar logs from inside the app for troubleshooting.
+//! Read sidecar logs from inside the app for troubleshooting.
 //!
 //! The sidecars already append their stdout/stderr to four files under
 //! `<data>/log/` (see `sidecar::lifecycle::forward_output`). These can reach

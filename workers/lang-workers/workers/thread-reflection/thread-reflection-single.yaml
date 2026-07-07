@@ -64,11 +64,11 @@ input:
         # `context_limit_tokens` / `single_pass_threshold_tokens`. The
         # remaining knobs are accepted for API stability with the
         # sliding-window path that lands in a follow-up issue.
-        context_limit_tokens: { type: integer, default: 222000 }
-        single_pass_threshold_tokens: { type: integer, default: 170000 }
+        context_limit_tokens: { type: integer, default: 110000 }
+        single_pass_threshold_tokens: { type: integer, default: 100000 }
         window_size_turns: { type: integer, default: 80 }
         window_overlap_turns: { type: integer, default: 10 }
-        merge_max_input_tokens: { type: integer, default: 100000 }
+        merge_max_input_tokens: { type: integer, default: 90000 }
         estimated_tokens_per_turn: { type: integer, default: 1500 }
         experiment_id: { type: string }
         experiment_variant: { type: string }

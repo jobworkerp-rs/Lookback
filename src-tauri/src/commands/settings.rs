@@ -1,4 +1,4 @@
-//! Tauri commands backing the Settings page (FR-CONFIG-1/2/4 partial).
+//! Tauri commands backing the Settings page.
 
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ use super::AppState;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsSnapshot {
-    /// Application data root. ARCH-4: single delete target.
+    /// Application data root; the single delete target.
     pub data_root: PathBuf,
 
     pub sqlite_path: PathBuf,
@@ -83,7 +83,7 @@ fn restore_completed_bootstrap_after_purge(
     Ok(())
 }
 
-/// FR-CONFIG-4 / AC-9: stop sidecars and remove the entire data root.
+/// Stop sidecars and remove the entire data root.
 ///
 /// Also deletes the macOS Keychain entry for the External LLM API key.
 /// Keychain failures don't fail the whole command — by the time we reach

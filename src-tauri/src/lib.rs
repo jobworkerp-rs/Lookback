@@ -100,6 +100,8 @@ pub fn run() {
             commands::app_settings::set_data_root,
             commands::app_settings::set_hf_home,
             commands::app_settings::set_output_language,
+            commands::app_settings::set_timezone,
+            commands::app_settings::list_timezones,
             commands::app_settings::validate_data_root,
             commands::app_settings::create_data_root,
             commands::llm_presets::list_llm_presets,

@@ -79,14 +79,31 @@ do:
   # Month math runs in "year * 12 + month_index" ordinal space to
   # avoid DST/leap traps. See monthly-work-summary-single.yaml for
   # the strftime/mktime UTC-as-if rationale.
+  # `last_month_token` anchor: offset path shifts `now` by the fixed
+  # offset; TZ path renders this month's local 1st via strflocaltime,
+  # converts to a DST-aware UTC epoch with candidate offset re-evaluation,
+  # backs up one second into last month, and reformats.
   - resolveLastMonthToken:
       set:
         last_month_token: >-
-          ${ ((((now + ($workflow.input.timezone_offset_hours * 3600))
-                 | strftime("%Y-%m-01T00:00:00Z"))
-                | strptime("%Y-%m-%dT%H:%M:%SZ")
-                | mktime) - 1)
-             | strftime("%Y-%m") }
+          ${ if (env.TZ // "") != ""
+             then (((now | strflocaltime("%Y-%m-01T00:00:00"))
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                   | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                   | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                   | ($wall_epoch | strftime("%Y-%m-%d")) as $target_day
+                   | if ($candidate_epoch | strflocaltime("%Y-%m-%d")) == $target_day
+                     then (($candidate_epoch - 1) | strflocaltime("%Y-%m"))
+                     else (($candidate_epoch | localtime | mktime) as $candidate_local_epoch
+                           | (($wall_epoch - ($candidate_local_epoch - $candidate_epoch)) - 1
+                              | strflocaltime("%Y-%m")))
+                     end)
+             else (((((now + ($workflow.input.timezone_offset_hours * 3600))
+                      | strftime("%Y-%m-01T00:00:00Z"))
+                     | strptime("%Y-%m-%dT%H:%M:%SZ")
+                     | mktime) - 1)
+                   | strftime("%Y-%m"))
+             end }
 
   - resolveMonthRange:
       set:

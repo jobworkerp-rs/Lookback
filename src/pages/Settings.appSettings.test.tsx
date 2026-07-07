@@ -32,6 +32,8 @@ const APP_SETTINGS_DEFAULT: AppSettingsResponse = {
   hf_home_mode: "data_root",
   hf_home_path: null,
   data_root_override: null,
+  timezone: null,
+  effective_timezone: "Asia/Tokyo",
   resolved: {
     current_data_root: "/Users/u/Library/Application Support/lookback",
     default_data_root: "/Users/u/Library/Application Support/lookback",
@@ -44,6 +46,8 @@ const APP_SETTINGS_WITH_OVERRIDE: AppSettingsResponse = {
   hf_home_mode: "custom",
   hf_home_path: "/Volumes/Ext/hf",
   data_root_override: "/Volumes/Ext/lookback",
+  timezone: null,
+  effective_timezone: "Asia/Tokyo",
   resolved: {
     current_data_root: "/Users/u/Library/Application Support/lookback",
     default_data_root: "/Users/u/Library/Application Support/lookback",

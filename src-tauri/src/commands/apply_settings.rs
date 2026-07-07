@@ -1,4 +1,4 @@
-//! Unified settings save (FR-CONFIG: batch apply).
+//! Unified settings save.
 //!
 //! The individual `set_llm_settings` / `set_embedding_settings` /
 //! `set_hf_home` commands each persist their file AND restart the sidecar.
@@ -25,7 +25,10 @@ use tauri::Emitter;
 use crate::error::AppResult;
 
 use super::AppState;
-use super::app_settings::{SetHfHomeRequest, apply_hf_home_to_disk, validate_hf_home_request};
+use super::app_settings::{
+    SetHfHomeRequest, SetTimezoneRequest, apply_hf_home_to_disk, apply_timezone_to_disk,
+    validate_hf_home_request, validate_timezone_request,
+};
 use super::embedding_settings::{
     EmbeddingRuntime, EmbeddingSettings, EvacuateMode, SetEmbeddingSettingsRequest,
     apply_embedding_settings_to_disk, restore_vectordb_backup, save_embedding_settings,
@@ -53,6 +56,8 @@ pub struct ApplySettingsRequest {
     pub hf_home: Option<SetHfHomeRequest>,
     #[serde(default)]
     pub mcp: Option<SetMcpSettingsRequest>,
+    #[serde(default)]
+    pub timezone: Option<SetTimezoneRequest>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,9 +84,27 @@ struct RollbackState {
     /// means there was no stored key before (rollback deletes it).
     llm_api_key: Option<Option<String>>,
     embedding: Option<EmbeddingSettings>,
-    hf_home_changed: bool,
-    hf_home_old: Option<paths::AppSettings>,
+    /// Pre-batch snapshot of `app-settings.json`, captured ONCE before the
+    /// first writer touches it. Both HF_HOME and timezone persist into this
+    /// same file, so they share one rollback slot — restoring per-writer
+    /// snapshots would double-restore and clobber the co-changed field.
+    /// Restored once when `app_settings_changed`.
+    app_settings_changed: bool,
+    app_settings_old: Option<paths::AppSettings>,
     mcp: Option<McpSettings>,
+}
+
+impl RollbackState {
+    /// Snapshot `app-settings.json` exactly once — the first app-settings
+    /// writer (HF_HOME or timezone) in the batch owns the pre-batch state so
+    /// a later writer's snapshot (which would already contain the first
+    /// writer's change) never overwrites it.
+    fn snapshot_app_settings_once(&mut self, data: &crate::data::DataPaths) {
+        if !self.app_settings_changed {
+            self.app_settings_old = Some(paths::load_app_settings(&data.app_settings_path()));
+            self.app_settings_changed = true;
+        }
+    }
 }
 
 /// Result of persisting the batch to disk (Phase 1). Carries everything
@@ -104,6 +127,10 @@ struct PersistOutcome {
     /// there is no hot-reload path. Gates `is_llm_only_change` so a co-changed
     /// MCP toggle can never be split into the LLM-only in-place reload.
     mcp_changed: bool,
+    /// Workflow timezone changed. Like MCP, `TZ` is read at jobworkerp spawn
+    /// time (there is no hot-reload path), so a change always requires a full
+    /// sidecar restart. Gates `is_llm_only_change`.
+    tz_changed: bool,
     /// Whether the LLM change (if any) can be applied via an in-place worker
     /// hot-reload rather than a sidecar restart. False for an External-side
     /// edit (mode switch / API key / provider / base_url), whose effect only
@@ -128,6 +155,7 @@ impl PersistOutcome {
             && !self.embedding_changed
             && !self.hf_home_changed
             && !self.mcp_changed
+            && !self.tz_changed
     }
 }
 
@@ -160,6 +188,7 @@ fn persist_batch_to_disk(
     let mut embedding_changed = false;
     let mut hf_home_changed = false;
     let mut mcp_changed = false;
+    let mut tz_changed = false;
     let mut llm_new: Option<LlmSettings> = None;
 
     // ── Validate the WHOLE batch before writing anything ──
@@ -178,6 +207,9 @@ fn persist_batch_to_disk(
     }
     if let Some(mcp_req) = req.mcp.as_ref() {
         validate_mcp_request(mcp_req)?;
+    }
+    if let Some(tz_req) = req.timezone.as_ref() {
+        validate_timezone_request(tz_req)?;
     }
 
     // ── Persist (validation already passed for every request) ──
@@ -259,14 +291,15 @@ fn persist_batch_to_disk(
     }
 
     if let Some(hf_req) = req.hf_home {
-        let old = paths::load_app_settings(&data.app_settings_path());
+        // Snapshot app-settings.json BEFORE the first writer touches it, so
+        // a co-changed timezone (same file, persisted below) shares this one
+        // pre-batch snapshot rather than capturing the hf-mutated state.
+        rollback.snapshot_app_settings_once(data);
         match apply_hf_home_to_disk(data, hf_req) {
             Ok(changed) => {
                 if changed {
                     restart_needed = true;
                     hf_home_changed = true;
-                    rollback.hf_home_changed = true;
-                    rollback.hf_home_old = Some(old);
                 }
             }
             Err(e) => {
@@ -296,6 +329,27 @@ fn persist_batch_to_disk(
         }
     }
 
+    // Timezone shares `app-settings.json` with HF_HOME, so it must run AFTER
+    // hf_home and reuse the single pre-batch snapshot (see
+    // `snapshot_app_settings_once`) — otherwise a co-changed batch would
+    // double-restore and clobber one of the two fields on rollback.
+    if let Some(tz_req) = req.timezone {
+        rollback.snapshot_app_settings_once(data);
+        match apply_timezone_to_disk(data, tz_req) {
+            Ok(changed) => {
+                if changed {
+                    restart_needed = true;
+                    tz_changed = true;
+                }
+            }
+            Err(e) => {
+                // Undo the embedding + LLM + HF_HOME + MCP changes.
+                rollback_files_on(data, &rollback);
+                return Err(e);
+            }
+        }
+    }
+
     Ok(PersistOutcome {
         rollback,
         restart_needed,
@@ -307,6 +361,7 @@ fn persist_batch_to_disk(
         embedding_changed,
         hf_home_changed,
         mcp_changed,
+        tz_changed,
         llm_new,
     })
 }
@@ -501,8 +556,11 @@ fn rollback_files_on(data: &crate::data::DataPaths, rollback: &RollbackState) {
     if let Some(old) = &rollback.embedding {
         let _ = save_embedding_settings(&data.embedding_settings_path(), old);
     }
-    if rollback.hf_home_changed
-        && let Some(old) = &rollback.hf_home_old
+    // Single app-settings.json restore — HF_HOME and timezone both live here
+    // and share one pre-batch snapshot, so restoring it once undoes whichever
+    // (or both) the batch changed without a double-restore clobber.
+    if rollback.app_settings_changed
+        && let Some(old) = &rollback.app_settings_old
     {
         let _ = paths::save_app_settings(&data.app_settings_path(), old);
     }
@@ -531,7 +589,7 @@ mod tests {
     use crate::commands::connection::{ConnectionConfig, ConnectionMode};
     use crate::commands::llm_settings::LlmMode;
     use crate::data::DataPaths;
-    use crate::data::paths::HfHomeMode;
+    use crate::data::paths::{AppSettings, HfHomeMode};
 
     fn data_in(tmp: &std::path::Path) -> DataPaths {
         DataPaths::with_root(tmp.to_path_buf())
@@ -595,6 +653,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -616,6 +675,7 @@ mod tests {
                     path: None,
                 }),
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -651,6 +711,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -678,6 +739,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             Some("OPENAI_API_KEY"),
         )
@@ -706,6 +768,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -738,6 +801,7 @@ mod tests {
                     path: None,
                 }),
                 mcp: None,
+                timezone: None,
             },
             Some("OPENAI_API_KEY"),
         )
@@ -761,6 +825,7 @@ mod tests {
                 embedding: Some(embedding_preset("qwen3-vl-embedding-2b")),
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -787,6 +852,7 @@ mod tests {
                 )),
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -798,6 +864,7 @@ mod tests {
                 embedding: Some(embedding_preset("qwen3-vl-embedding-2b")),
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -828,6 +895,7 @@ mod tests {
                 embedding: Some(embedding_preset("qwen3-vl-embedding-2b")),
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -876,6 +944,7 @@ mod tests {
                 embedding: Some(embedding_preset("qwen3-embedding-0-6b")),
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         );
@@ -908,6 +977,7 @@ mod tests {
                 )),
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -934,6 +1004,7 @@ mod tests {
                 llm: Some(external_llm("gpt-4o")),
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         );
@@ -975,6 +1046,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: None,
+                timezone: None,
             },
             None,
         )
@@ -1001,6 +1073,7 @@ mod tests {
                     path: None,
                 }),
                 mcp: None,
+                timezone: None,
             },
             None,
         );
@@ -1035,6 +1108,7 @@ mod tests {
                     path: None, // custom without a path → invalid
                 }),
                 mcp: None,
+                timezone: None,
             },
             None,
         );
@@ -1074,6 +1148,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: Some(enable_mcp()),
+                timezone: None,
             },
             None,
         )
@@ -1104,6 +1179,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: Some(enable_mcp()),
+                timezone: None,
             },
             Some("OPENAI_API_KEY"),
         )
@@ -1126,6 +1202,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: Some(enable_mcp()),
+                timezone: None,
             },
             None,
         )
@@ -1137,6 +1214,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: Some(enable_mcp()),
+                timezone: None,
             },
             None,
         )
@@ -1168,6 +1246,7 @@ mod tests {
                 embedding: None,
                 hf_home: None,
                 mcp: Some(enable_mcp()),
+                timezone: None,
             },
             None,
         )
@@ -1210,6 +1289,248 @@ mod tests {
         assert!(
             !crate::commands::mcp_settings::load_mcp_settings(&data.mcp_settings_path()).enabled,
             "rollback must restore the MCP file to its pre-apply (disabled) value"
+        );
+    }
+
+    // ── Timezone ──
+
+    fn tz(name: &str) -> SetTimezoneRequest {
+        SetTimezoneRequest {
+            timezone: Some(name.to_string()),
+        }
+    }
+
+    #[test]
+    fn timezone_only_change_needs_restart_not_hot_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_in(tmp.path());
+        let out = persist_batch_to_disk(
+            &data,
+            ApplySettingsRequest {
+                llm: None,
+                embedding: None,
+                hf_home: None,
+                mcp: None,
+                timezone: Some(tz("America/New_York")),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(out.tz_changed);
+        assert!(out.restart_needed);
+        assert!(
+            !out.is_llm_only_change(),
+            "TZ is spawn-time env — never eligible for the LLM hot-reload"
+        );
+        assert_eq!(
+            paths::load_app_settings(&data.app_settings_path())
+                .timezone
+                .as_deref(),
+            Some("America/New_York")
+        );
+    }
+
+    #[test]
+    fn timezone_noop_when_unchanged_needs_no_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_in(tmp.path());
+        crate::commands::app_settings::apply_timezone_to_disk(&data, tz("America/New_York"))
+            .unwrap();
+        let out = persist_batch_to_disk(
+            &data,
+            ApplySettingsRequest {
+                llm: None,
+                embedding: None,
+                hf_home: None,
+                mcp: None,
+                timezone: Some(tz("America/New_York")),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!out.tz_changed);
+        assert!(!out.restart_needed);
+    }
+
+    #[test]
+    fn llm_plus_timezone_change_is_not_hot_reload_eligible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_in(tmp.path());
+        // External LLM whose key already matches (hot-reload-safe on its own),
+        // co-changed with a timezone — the TZ change forces a full restart.
+        let out = persist_batch_to_disk(
+            &data,
+            ApplySettingsRequest {
+                llm: Some(external_llm("gpt-4o")),
+                embedding: None,
+                hf_home: None,
+                mcp: None,
+                timezone: Some(tz("Europe/Paris")),
+            },
+            Some("OPENAI_API_KEY"),
+        )
+        .unwrap();
+        assert!(out.tz_changed);
+        assert!(
+            !out.is_llm_only_change(),
+            "a co-changed TZ must force the full restart path"
+        );
+    }
+
+    #[test]
+    fn timezone_persists_in_remote_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_in(tmp.path());
+        // TZ drives the LOCAL sidecar's summary/import workflows, which run
+        // regardless of browse mode — so it is not gated on remote (unlike
+        // embedding). Persisting must succeed in remote mode.
+        crate::commands::connection::save_connection_config(
+            &data.connection_config_path(),
+            &ConnectionConfig {
+                mode: ConnectionMode::Remote,
+                remote_jobworkerp_url: Some("http://h:9000".into()),
+                remote_memories_url: Some("http://h:9010".into()),
+            },
+        )
+        .unwrap();
+        let out = persist_batch_to_disk(
+            &data,
+            ApplySettingsRequest {
+                llm: None,
+                embedding: None,
+                hf_home: None,
+                mcp: None,
+                timezone: Some(tz("Asia/Tokyo")),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(out.tz_changed);
+        assert_eq!(
+            paths::load_app_settings(&data.app_settings_path())
+                .timezone
+                .as_deref(),
+            Some("Asia/Tokyo")
+        );
+    }
+
+    #[test]
+    fn hf_home_plus_timezone_batch_preserves_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_in(tmp.path());
+        // Both persist into app-settings.json in one batch; the final file
+        // must carry BOTH the new hf_home_mode AND the new timezone (pins the
+        // shared-file ordering / `..old.clone()` preservation).
+        let out = persist_batch_to_disk(
+            &data,
+            ApplySettingsRequest {
+                llm: None,
+                embedding: None,
+                hf_home: Some(SetHfHomeRequest {
+                    mode: HfHomeMode::DataRoot,
+                    path: None,
+                }),
+                mcp: None,
+                timezone: Some(tz("Europe/Berlin")),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(out.hf_home_changed);
+        assert!(out.tz_changed);
+        let saved = paths::load_app_settings(&data.app_settings_path());
+        assert!(matches!(saved.hf_home_mode, HfHomeMode::DataRoot));
+        assert_eq!(saved.timezone.as_deref(), Some("Europe/Berlin"));
+    }
+
+    #[test]
+    fn rollback_restores_timezone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_in(tmp.path());
+        // Seed a pre-batch app-settings state (explicit zone A).
+        crate::commands::app_settings::apply_timezone_to_disk(&data, tz("Asia/Tokyo")).unwrap();
+        let pre_batch = paths::load_app_settings(&data.app_settings_path());
+        // Apply zone B, then roll back using the pre-batch snapshot.
+        crate::commands::app_settings::apply_timezone_to_disk(&data, tz("Europe/Paris")).unwrap();
+        let rollback = RollbackState {
+            app_settings_changed: true,
+            app_settings_old: Some(pre_batch),
+            ..Default::default()
+        };
+        rollback_files_on(&data, &rollback);
+        assert_eq!(
+            paths::load_app_settings(&data.app_settings_path())
+                .timezone
+                .as_deref(),
+            Some("Asia/Tokyo"),
+            "rollback must restore the timezone to its pre-batch value"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_both_hf_home_and_timezone_from_one_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_in(tmp.path());
+        // Pre-batch: Global hf_home + zone A.
+        let pre_batch = AppSettings {
+            hf_home_mode: HfHomeMode::Global,
+            timezone: Some("Asia/Tokyo".into()),
+            ..Default::default()
+        };
+        paths::save_app_settings(&data.app_settings_path(), &pre_batch).unwrap();
+        // Mutate BOTH fields (as a co-changed batch would), then roll back
+        // from the single pre-batch snapshot.
+        crate::commands::app_settings::apply_hf_home_to_disk(
+            &data,
+            SetHfHomeRequest {
+                mode: HfHomeMode::DataRoot,
+                path: None,
+            },
+        )
+        .unwrap();
+        crate::commands::app_settings::apply_timezone_to_disk(&data, tz("Europe/Paris")).unwrap();
+        let rollback = RollbackState {
+            app_settings_changed: true,
+            app_settings_old: Some(pre_batch),
+            ..Default::default()
+        };
+        rollback_files_on(&data, &rollback);
+        let restored = paths::load_app_settings(&data.app_settings_path());
+        assert!(
+            matches!(restored.hf_home_mode, HfHomeMode::Global),
+            "the single snapshot must restore hf_home too"
+        );
+        assert_eq!(
+            restored.timezone.as_deref(),
+            Some("Asia/Tokyo"),
+            "the single snapshot must restore timezone too"
+        );
+    }
+
+    #[test]
+    fn invalid_timezone_in_batch_does_not_persist_embedding() {
+        // Guard-skip when there's no zoneinfo dir (the validator is permissive
+        // there, so an "invalid" name would actually be accepted).
+        if crate::commands::app_settings::zoneinfo_root_for_test().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_in(tmp.path());
+        let err = persist_batch_to_disk(
+            &data,
+            ApplySettingsRequest {
+                llm: None,
+                embedding: Some(embedding_preset("qwen3-vl-embedding-2b")),
+                hf_home: None,
+                mcp: None,
+                timezone: Some(tz("Not/AZone")),
+            },
+            None,
+        );
+        assert!(err.is_err(), "an invalid timezone must abort the batch");
+        assert!(
+            !data.embedding_settings_path().exists(),
+            "the up-front validation must abort before any file is written"
         );
     }
 }

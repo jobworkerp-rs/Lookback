@@ -208,7 +208,7 @@ pub enum StepStatus {
 ///
 /// The gRPC clients are cached behind `Mutex<Option<..>>` (not `OnceCell`)
 /// so a sidecar restart can invalidate them: ports are re-selected on each
-/// start (ARCH-7), and even an unchanged port gets a fresh TCP connection,
+/// start, and even an unchanged port gets a fresh TCP connection,
 /// so a cached client would otherwise keep pointing at the stopped sidecar.
 /// `retry_model_setup` calls `invalidate_clients()` around the restart.
 pub struct AppState {
@@ -282,7 +282,7 @@ impl AppState {
             .ok_or_else(|| AppError::SidecarNotReady("not started".into()))
     }
 
-    /// Resolve the gRPC targets honoring the connection override (FR-CONFIG-1).
+    /// Resolve the gRPC targets honoring the connection override.
     /// Local mode uses the live sidecar ports; remote mode uses the configured
     /// URLs. Read on every (re)connect so a `set_connection_config` +
     /// `invalidate_clients` takes effect on the next command. Exposed to the

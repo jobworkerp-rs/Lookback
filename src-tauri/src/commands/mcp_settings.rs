@@ -305,6 +305,7 @@ pub async fn set_mcp_settings(
             embedding: None,
             hf_home: None,
             mcp: Some(req),
+            timezone: None,
         },
     )
     .await

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   countSummaries,
+  getAppSettings,
   getConnectionConfig,
   getPersonality,
   getSetupStatus,
@@ -28,6 +29,7 @@ import { useSettingsDirty } from "@/hooks/useSettingsDirty";
 import { isVectorDegraded, useSidecarStatus } from "@/hooks/useSidecarStatus";
 import { usePersonalityProgress, useSummaryProgress } from "@/hooks/useStepStreamProgress";
 import { useTheme } from "@/hooks/useTheme";
+import { TimezoneContext } from "@/hooks/useTimezone";
 import { PERSONALITY_QUERY_KEY } from "@/lib/queryKeys";
 import { Chat } from "@/pages/Chat";
 import { PeriodicTasks } from "@/pages/PeriodicTasks";
@@ -43,6 +45,13 @@ export function App() {
   const theme = useTheme();
   const locale = useLocale();
   const settingsDirty = useSettingsDirty();
+  // App-wide display timezone, read once here and shared via TimezoneContext so
+  // every leaf timestamp view can render in the configured zone without each
+  // one needing its own `["app-settings"]` query. `effective_timezone` is the
+  // backend-resolved zone (explicit selection → env/OS fallback); the Settings
+  // save invalidates `["app-settings"]`, so a change re-renders all timestamps.
+  const appSettings = useQuery({ queryKey: ["app-settings"], queryFn: getAppSettings });
+  const timezone = appSettings.data?.effective_timezone;
   const [route, setRoute] = useState<Route>("threads");
   // Pending navigation parked while the leave-guard confirm is open.
   const [pendingRoute, setPendingRoute] = useState<Route | null>(null);
@@ -192,115 +201,117 @@ export function App() {
   }
 
   return (
-    <div className="app">
-      <Sidebar
-        current={route}
-        onChange={guardedSetRoute}
-        threadCount={personality.data?.thread_count ?? null}
-        threadCountTruncated={personality.data?.thread_count_truncated ?? false}
-        summaryCount={summaryCount.data ?? null}
-        sidecar={sidecar}
-        theme={theme}
-        locale={locale}
-      />
-      <main className="main">
-        {/* Non-fatal degraded banner: the sidecar came up but the local
+    <TimezoneContext.Provider value={timezone}>
+      <div className="app">
+        <Sidebar
+          current={route}
+          onChange={guardedSetRoute}
+          threadCount={personality.data?.thread_count ?? null}
+          threadCountTruncated={personality.data?.thread_count_truncated ?? false}
+          summaryCount={summaryCount.data ?? null}
+          sidecar={sidecar}
+          theme={theme}
+          locale={locale}
+        />
+        <main className="main">
+          {/* Non-fatal degraded banner: the sidecar came up but the local
             vector store is disabled (dimension mismatch). Shown above every
             tab with a shortcut into the embedding settings card. */}
-        {degraded && (
-          <VectorDegradedBanner
-            info={degraded}
-            onOpenEmbeddingSettings={() => {
-              setEmbeddingFocus({ nonce: Date.now() });
-              guardedSetRoute("settings");
-            }}
-          />
-        )}
-        {/* Keyed by route so a crash in one tab shows a fallback while the
-            sidebar stays usable, and switching tabs remounts the boundary
-            (clearing the error). */}
-        <ErrorBoundary key={route}>
-          {route === "threads" && (
-            <Threads
-              onOpenImport={() => setImportOpen(true)}
-              sidecar={sidecar}
-              connectionMode={connectionMode}
-            />
-          )}
-          {route === "summaries" && (
-            <Summaries
-              summaryProgress={summaryProgress}
-              sidecar={sidecar}
-              connectionMode={connectionMode}
-              focus={summariesFocus}
-              onFocusConsumed={() => setSummariesFocus(null)}
-            />
-          )}
-          {route === "reflections" && (
-            <Reflections
-              reflectionProgress={reflectionProgress}
-              sidecar={sidecar}
-              connectionMode={connectionMode}
-            />
-          )}
-          {route === "personality" && (
-            <Personality personalityProgress={personalityProgress} onNavigate={setRoute} />
-          )}
-          {route === "chat" && (
-            <Chat
-              onNavigate={setRoute}
-              rag={rag}
-              onNavigateSummariesFocus={(focus) => {
-                setSummariesFocus(focus);
-                setRoute("summaries");
+          {degraded && (
+            <VectorDegradedBanner
+              info={degraded}
+              onOpenEmbeddingSettings={() => {
+                setEmbeddingFocus({ nonce: Date.now() });
+                guardedSetRoute("settings");
               }}
             />
           )}
-          {route === "periodic" && <PeriodicTasks />}
-          {route === "settings" && (
-            <Settings
-              dirty={settingsDirty}
-              embeddingFocus={embeddingFocus}
-              onEmbeddingFocusConsumed={() => setEmbeddingFocus(null)}
-            />
-          )}
-        </ErrorBoundary>
-      </main>
+          {/* Keyed by route so a crash in one tab shows a fallback while the
+            sidebar stays usable, and switching tabs remounts the boundary
+            (clearing the error). */}
+          <ErrorBoundary key={route}>
+            {route === "threads" && (
+              <Threads
+                onOpenImport={() => setImportOpen(true)}
+                sidecar={sidecar}
+                connectionMode={connectionMode}
+              />
+            )}
+            {route === "summaries" && (
+              <Summaries
+                summaryProgress={summaryProgress}
+                sidecar={sidecar}
+                connectionMode={connectionMode}
+                focus={summariesFocus}
+                onFocusConsumed={() => setSummariesFocus(null)}
+              />
+            )}
+            {route === "reflections" && (
+              <Reflections
+                reflectionProgress={reflectionProgress}
+                sidecar={sidecar}
+                connectionMode={connectionMode}
+              />
+            )}
+            {route === "personality" && (
+              <Personality personalityProgress={personalityProgress} onNavigate={setRoute} />
+            )}
+            {route === "chat" && (
+              <Chat
+                onNavigate={setRoute}
+                rag={rag}
+                onNavigateSummariesFocus={(focus) => {
+                  setSummariesFocus(focus);
+                  setRoute("summaries");
+                }}
+              />
+            )}
+            {route === "periodic" && <PeriodicTasks />}
+            {route === "settings" && (
+              <Settings
+                dirty={settingsDirty}
+                embeddingFocus={embeddingFocus}
+                onEmbeddingFocusConsumed={() => setEmbeddingFocus(null)}
+              />
+            )}
+          </ErrorBoundary>
+        </main>
 
-      {pendingRoute && (
-        <ConfirmDialog
-          title={t("app.leaveGuard.title")}
-          message={t("app.leaveGuard.message")}
-          confirmLabel={t("app.leaveGuard.confirm")}
-          onConfirm={() => {
-            settingsDirty.setDirty(false);
-            setRoute(pendingRoute);
-            setPendingRoute(null);
+        {pendingRoute && (
+          <ConfirmDialog
+            title={t("app.leaveGuard.title")}
+            message={t("app.leaveGuard.message")}
+            confirmLabel={t("app.leaveGuard.confirm")}
+            onConfirm={() => {
+              settingsDirty.setDirty(false);
+              setRoute(pendingRoute);
+              setPendingRoute(null);
+            }}
+            onCancel={() => setPendingRoute(null)}
+          />
+        )}
+
+        <ImportDialog
+          open={importOpen}
+          onClose={() => setImportOpen(false)}
+          onStarted={(jobId) => {
+            importProgress.reset(jobId);
+            void queryClient.invalidateQueries({ queryKey: ["threads"] });
+            void queryClient.invalidateQueries({ queryKey: ["summaries"] });
           }}
-          onCancel={() => setPendingRoute(null)}
+          memoriesImportBin={importBin.data ?? ""}
+          resolveError={importBin.error ? String(importBin.error) : null}
+          sidecar={sidecar}
         />
-      )}
 
-      <ImportDialog
-        open={importOpen}
-        onClose={() => setImportOpen(false)}
-        onStarted={(jobId) => {
-          importProgress.reset(jobId);
-          void queryClient.invalidateQueries({ queryKey: ["threads"] });
-          void queryClient.invalidateQueries({ queryKey: ["summaries"] });
-        }}
-        memoriesImportBin={importBin.data ?? ""}
-        resolveError={importBin.error ? String(importBin.error) : null}
-        sidecar={sidecar}
-      />
-
-      {importProgress.snapshot && (
-        <ImportToast
-          snapshot={importProgress.snapshot}
-          onClose={importProgress.clear}
-          onCancel={importProgress.cancel}
-        />
-      )}
-    </div>
+        {importProgress.snapshot && (
+          <ImportToast
+            snapshot={importProgress.snapshot}
+            onClose={importProgress.clear}
+            onCancel={importProgress.cancel}
+          />
+        )}
+      </div>
+    </TimezoneContext.Provider>
   );
 }

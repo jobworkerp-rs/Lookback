@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { generateSummaries } from "@/api";
 import { DateInput } from "@/components/DateInput";
 import { hasLlmInitFailure, type SidecarStatus } from "@/hooks/useSidecarStatus";
+import { useTimezone } from "@/hooks/useTimezone";
 import { dayRangeToEpochMs, resolveTimezoneOffsetHours } from "@/lib/dateInput";
 import {
   applyDependency,
@@ -87,6 +88,7 @@ export function buildGenerateRequest(
   from: string,
   to: string,
   tzOffsetHours: number,
+  timeZone?: string,
 ): BuildResult {
   const top = topKind(selection);
   if (!top) return { request: null, error: null };
@@ -108,16 +110,16 @@ export function buildGenerateRequest(
     if (top === "per-thread") return { request: base, error: null };
     // Resolve the fallback in the workflow's tz so it matches each batch's own
     // `now_utc + offset` fallback (see fallbackDayRange).
-    const fb = fallbackDayRange(top, tzOffsetHours);
+    const fb = fallbackDayRange(top, tzOffsetHours, new Date(), timeZone);
     if (!fb) return { request: null, error: "invalid" };
-    return { request: applyDayRange(base, selection, top, fb), error: null };
+    return { request: applyDayRange(base, selection, top, fb, timeZone), error: null };
   }
 
   const span = expandToDayRange(top, from, to);
   if (!span) return { request: null, error: "invalid" };
   // String compare works for all three token formats once expanded to YYYY-MM-DD.
   if (span.fromDate > span.toDate) return { request: null, error: "reversed" };
-  return { request: applyDayRange(base, selection, top, span), error: null };
+  return { request: applyDayRange(base, selection, top, span, timeZone), error: null };
 }
 
 /** Derive every layer's input from the selected `periodSpan`.
@@ -133,6 +135,7 @@ function applyDayRange(
   selection: KindSelection,
   top: SummaryKind,
   periodSpan: DayRange,
+  timeZone?: string,
 ): GenerateSummariesRequest {
   const dailySpan =
     top === "weekly" || top === "monthly" ? extendStartToWeekStart(periodSpan) : periodSpan;
@@ -141,7 +144,7 @@ function applyDayRange(
     ...dayRangeToPeriodTokens(periodSpan, dailySpan),
   };
   if (selection["per-thread"]) {
-    const { after, before } = dayRangeToEpochMs(dailySpan.fromDate, dailySpan.toDate);
+    const { after, before } = dayRangeToEpochMs(dailySpan.fromDate, dailySpan.toDate, timeZone);
     if (after !== undefined) req.updated_after_ms = after;
     if (before !== undefined) req.updated_before_ms = before;
   }
@@ -173,11 +176,18 @@ export function SummaryGenerateDialog({
   const llmDown = hasLlmInitFailure(sidecar);
 
   const top = topKind(selection);
-  const tzOffsetHours = useMemo(() => resolveTimezoneOffsetHours(), []);
+  // Fallback "yesterday / last week / last month" and the per-thread window are
+  // resolved in the display timezone so a manual run with no explicit range
+  // targets the same day the workflow's own `env.TZ` boundary would.
+  const timezone = useTimezone();
+  const tzOffsetHours = useMemo(
+    () => resolveTimezoneOffsetHours(undefined, 9, timezone),
+    [timezone],
+  );
 
   const build = useMemo(
-    () => buildGenerateRequest(selection, from, to, tzOffsetHours),
-    [selection, from, to, tzOffsetHours],
+    () => buildGenerateRequest(selection, from, to, tzOffsetHours, timezone),
+    [selection, from, to, tzOffsetHours, timezone],
   );
 
   const toggle = (k: SummaryKind, next: boolean) => {

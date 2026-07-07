@@ -14,7 +14,7 @@ function stubNavigatorLanguage(lang: string) {
   vi.stubGlobal("navigator", { ...navigator, language: lang });
 }
 
-// TEST-I18N-5 — FR-I18N-2 / FR-I18N-5
+// Locale hook switching and document sync.
 describe("useLocale", () => {
   it("switches i18n language and <html lang> when an explicit pref is set", () => {
     const { result } = renderHook(() => useLocale());

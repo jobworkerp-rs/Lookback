@@ -21,7 +21,7 @@ Japanese documentation is available in [README_ja.md](README_ja.md). Developer-f
 
 Lookback targets Tauri-supported desktop platforms. The current repository is set up for macOS and Linux builds.
 
-Local LLM execution currently supports only Qwen 3.5-family and Gemma 4-family models. Use an external LLM provider for other model families.
+Local LLM execution currently supports only Qwen 3.5/3.6-family and Gemma 4-family models. The default local preset is the non-MTP Gemma 4 E2B IT QAT preset because Lookback summarizes before chat; MTP presets remain available for chat-focused use. Gemma 4 MTP initializes the runner with the QAT target GGUF plus a separate draft GGUF. Use an external LLM provider for other model families.
 
 ## Required Components
 
@@ -112,8 +112,9 @@ For development launch commands and path overrides, see [docs/developer-guide.md
      - External LLM API keys are stored in the OS credential store, such as Keychain.
    - Choose the embedding model.
    - Confirm the backend and model readiness checks.
-3. Open **Settings** later if you need to change providers, model paths, cache paths, language, or MCP exposure.
+3. Open **Settings** later if you need to change providers, model paths, cache paths, language, timezone, or MCP exposure.
    - **Embedding model** remains editable when Connection is **Remote server**. For semantic or hybrid search, local article embeddings are not generated, so match the local query embedding model and vector dimension to the remote server embeddings. Remote-server changes do not reset or regenerate the local embedding index.
+   - **Timezone** controls the wall-clock boundaries used by summaries, imports, and timestamp display. **Auto** follows the app environment / OS timezone; saving an explicit timezone restarts the sidecar because worker processes read `TZ` at startup. This setting is disabled while Connection is **Remote server** because the remote workflows use the remote server environment.
 4. Open **Threads** and click **Import** to import Claude Code or Codex session logs. To import a directory of plain text instead, check **Plain text (directory)**, choose the target directory, and pick a thread split strategy:
    - **Per file**: one thread per file.
    - **Per directory**: files in the same directory become one thread.

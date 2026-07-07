@@ -1,4 +1,5 @@
 import type { SummaryKind } from "@/types/api";
+import { datePartsInTimeZone } from "./timezoneMath";
 
 // Period summaries are keyed by an `external_id` period token:
 //   - daily:   "YYYY-MM-DD"
@@ -200,11 +201,9 @@ export function fallbackDayRange(
   topKind: SummaryKind,
   tzOffsetHours: number,
   now: Date = new Date(),
+  timeZone?: string,
 ): DayRange | null {
-  // Shift to the offset's wall clock, then read the shifted UTC fields back
-  // into a local Date so the y/m/d arithmetic below runs in the target zone.
-  const shifted = new Date(now.getTime() + tzOffsetHours * 3_600_000);
-  const wall = new Date(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
+  const wall = fallbackWallDate(now, tzOffsetHours, timeZone);
   switch (topKind) {
     case "daily": {
       wall.setDate(wall.getDate() - 1);
@@ -228,6 +227,17 @@ export function fallbackDayRange(
     default:
       return null;
   }
+}
+
+function fallbackWallDate(now: Date, tzOffsetHours: number, timeZone?: string): Date {
+  const parts = datePartsInTimeZone(now, timeZone);
+  if (parts) {
+    return new Date(parts.year, parts.month - 1, parts.day);
+  }
+  // Shift to the offset's wall clock, then read the shifted UTC fields back
+  // into a local Date so the y/m/d arithmetic below runs in the target zone.
+  const shifted = new Date(now.getTime() + tzOffsetHours * 3_600_000);
+  return new Date(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
 }
 
 /** Pull `fromDate` back to its ISO week's Monday, leaving `toDate` untouched.

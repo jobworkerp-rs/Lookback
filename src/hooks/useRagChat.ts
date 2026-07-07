@@ -4,7 +4,7 @@ import type { ChatMessage, ChatPhase, ChatSource, ChatStepUpdate } from "@/types
 import { useTauriEvent } from "./useTauriEvent";
 
 /** One turn of the in-screen conversation. Lives in React state only —
- *  per FR-CHAT-6 / NG-CHAT-1 nothing is persisted, so a tab switch or
+ *  Nothing is persisted, so a tab switch or
  *  app restart wipes the entire chat. */
 export interface ChatTurn {
   /** Correlation key chosen by `ask()` before dispatch and echoed
@@ -63,7 +63,7 @@ function applyEvent(turn: ChatTurn, ev: ChatStepUpdate): ChatTurn {
         message: ev.message ?? null,
       };
     case "source":
-      // Each Source event carries one tool-result batch (FR-CHAT-4a).
+      // Each Source event carries one tool-result batch.
       // Concatenate so multi-tool-call answers preserve every citation
       // observation in arrival order.
       return {
@@ -117,7 +117,7 @@ export interface UseRagChat {
   /** Submit a question. The history (last 5 turns) is prepended on the
    *  server-bound `messages` array automatically. */
   ask: (question: string) => Promise<void>;
-  /** Wipe the screen-only history (FR-CHAT-6 / NG-CHAT-1). */
+  /** Wipe the screen-only history. */
   reset: () => void;
   /** Cancel the in-flight turn (OPEN-CHAT-2). Resolves immediately; the
    *  actual terminal-state transition arrives over `chat://step` so the

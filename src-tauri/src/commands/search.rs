@@ -1,4 +1,4 @@
-//! Tauri commands backing the Threads-tab search panel (FR-SEARCH-1..4).
+//! Tauri commands backing the Threads-tab search panel.
 //!
 //! Three modes are exposed:
 //!   - `Keyword`  → `MemoryVectorService.SearchByText` (BM25 only).
@@ -10,7 +10,7 @@
 //!     embedding worker (`jobworkerp::embedding::embed_query`).
 //!
 //! Results come back at memory granularity and are aggregated into
-//! thread-keyed buckets per FR-SEARCH-4: max-score representative,
+//! thread-keyed buckets: max-score representative,
 //! ties broken by recency, hits without a representative thread
 //! (ROLE_SYSTEM rows) skipped.
 
@@ -160,11 +160,11 @@ fn build_hybrid_request(
 
 /// Build the `SearchOptions` proto from the Tauri request.
 ///
-/// FR-SEARCH-3 bounds map directly to LanceDB columns:
+/// Search bounds map directly to LanceDB columns:
 ///   * `created_after`  → strict (`>`)
 ///   * `created_before` → inclusive (`<=`)
 ///
-/// `user_id` defaults to 1 (single-user MVP isolation, FR-CONFIG-3).
+/// `user_id` defaults to 1 for single-user local isolation.
 /// Label filter lives inside `thread_filter` so it ANDs with the memory
 /// owner filter rather than overlapping it.
 ///
@@ -212,7 +212,7 @@ fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
     }
 }
 
-/// Collapse memory-level hits into thread cards per FR-SEARCH-4.
+/// Collapse memory-level hits into thread cards.
 ///
 /// Rules:
 ///   * Hits without `thread_id` (ROLE_SYSTEM cross-user rows) are
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn aggregate_breaks_score_ties_by_recency() {
         // Same score on thread 1: the later `created_at` becomes
-        // representative (FR-SEARCH-4 tie-break rule).
+        // representative.
         let hits = vec![
             hit_with_id(11, Some(1), 0.8, "older", 100, Some(1)),
             hit_with_id(12, Some(1), 0.8, "newer", 200, Some(5)),

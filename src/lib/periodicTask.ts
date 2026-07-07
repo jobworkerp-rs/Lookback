@@ -238,8 +238,13 @@ export function stableSchedulerIds(ids: string[]): string[] {
   return [...new Set(ids)].sort();
 }
 
-/** Epoch ms → local-timezone display string. `null` / non-positive → null. */
-export function formatExecutionTime(ms: number | null, locale?: string): string | null {
+/** Epoch ms → timezone display string. `null` / non-positive → null. `timeZone`
+ *  (an IANA name) renders in that zone; omit to follow the host zone. */
+export function formatExecutionTime(
+  ms: number | null,
+  locale?: string,
+  timeZone?: string,
+): string | null {
   if (ms === null || ms <= 0) return null;
-  return formatDateTime(ms, locale);
+  return formatDateTime(ms, locale, timeZone);
 }

@@ -1,7 +1,7 @@
-//! FR-CONFIG-5 / design IMPL-9: LLM model preparation status.
+//! LLM model preparation status.
 //!
 //! The LLMPromptRunner plugin downloads the configured model from Hugging
-//! Face on first use and caches it. We pin `HF_HOME` to the ARCH-4 data
+//! Face on first use and caches it. We pin `HF_HOME` to the app data
 //! root (`<data>/models`) at sidecar spawn, so a `*.gguf` appearing under
 //! that directory is the observable signal that the model is cached.
 //!
@@ -68,6 +68,10 @@ pub struct ModelStatusReport {
 pub struct ModelIdentity {
     pub name: Option<String>,
     pub repo: Option<String>,
+    /// Relative GGUF names that must exist before a local LLM is ready.
+    /// Empty means "any weight in the selected repo", preserving fallback
+    /// behaviour for identities that cannot name their concrete artifacts.
+    pub required_files: Vec<String>,
 }
 
 /// Decide the model state from observable signals. Pure so the readiness
@@ -119,13 +123,35 @@ fn llm_identity(data: &crate::data::DataPaths) -> ModelIdentity {
         let repo = name
             .as_deref()
             .map(|m| super::llm_settings::provider_display_name(m).to_string());
-        return ModelIdentity { name, repo };
+        return ModelIdentity {
+            name,
+            repo,
+            required_files: Vec::new(),
+        };
     }
     let rt = super::llm_settings::resolve_local_runtime(&settings);
+    let required_files = required_llm_files(&rt);
     ModelIdentity {
         name: (!rt.model_file.is_empty()).then_some(rt.model_file),
         repo: (!rt.hf_repo.is_empty()).then_some(rt.hf_repo),
+        required_files,
     }
+}
+
+fn required_llm_files(rt: &super::llm_settings::LocalRuntime) -> Vec<String> {
+    let mut files = Vec::new();
+    if !rt.model_file.is_empty() {
+        files.push(rt.model_file.clone());
+    }
+    if let Some(draft) = rt
+        .mtp_draft_model
+        .as_ref()
+        .filter(|draft| !draft.is_empty())
+        && !files.iter().any(|file| file == draft)
+    {
+        files.push(draft.clone());
+    }
+    files
 }
 
 /// Resolve the embedding model identity from `embedding-settings.json` (the
@@ -153,6 +179,7 @@ fn embedding_identity(data: &crate::data::DataPaths) -> ModelIdentity {
     ModelIdentity {
         name: model_id.clone(),
         repo: model_id,
+        required_files: Vec::new(),
     }
 }
 
@@ -203,6 +230,20 @@ fn filter_files_for_repo(files: Vec<PathBuf>, repo: Option<&str>) -> Vec<PathBuf
         .into_iter()
         .filter(|p| p.components().any(|c| c.as_os_str() == segment.as_os_str()))
         .collect()
+}
+
+fn filter_files_for_required_names(files: Vec<PathBuf>, required_files: &[String]) -> Vec<PathBuf> {
+    if required_files.is_empty() {
+        return files;
+    }
+    let all_required_present = required_files
+        .iter()
+        .all(|required| files.iter().any(|file| file.ends_with(Path::new(required))));
+    if all_required_present {
+        files
+    } else {
+        Vec::new()
+    }
 }
 
 fn collect_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>, depth: usize) {
@@ -313,7 +354,10 @@ pub async fn get_model_status(state: State<'_, AppState>) -> AppResult<ModelStat
         // GGUF still on disk) would make the Settings card report `ready`
         // against a newly-picked repo whose weights aren't downloaded.
         (
-            filter_files_for_repo(gguf, llm_id.repo.as_deref()),
+            filter_files_for_required_names(
+                filter_files_for_repo(gguf, llm_id.repo.as_deref()),
+                &llm_id.required_files,
+            ),
             sidecars_ready,
             last_error.clone(),
         )
@@ -330,7 +374,7 @@ pub async fn get_model_status(state: State<'_, AppState>) -> AppResult<ModelStat
     })
 }
 
-/// FR-CONFIG-5 retry: re-run the recovery path, not just re-read status.
+/// Retry by re-running the recovery path, not just re-reading status.
 ///
 /// The `stop()` is load-bearing: it releases the idempotent `start` guard
 /// AND forces jobworkerp to re-scan `PLUGINS_RUNNER_DIR` on the next boot
@@ -363,6 +407,7 @@ mod tests {
         ModelIdentity {
             name: Some(name.into()),
             repo: Some(format!("org/{name}")),
+            required_files: Vec::new(),
         }
     }
 
@@ -437,6 +482,28 @@ mod tests {
         let preset = crate::commands::llm_presets::find_preset("qwen3-5-9b-ud-q4-k-xl").unwrap();
         assert_eq!(id.name.as_deref(), Some(preset.gguf_file));
         assert_eq!(id.repo.as_deref(), Some(preset.hf_repo));
+    }
+
+    #[test]
+    fn llm_identity_includes_mtp_draft_when_preset_requires_one() {
+        unsafe { std::env::remove_var("LOOKBACK_LLM_MODEL") };
+        unsafe { std::env::remove_var("LOOKBACK_LLM_HF_REPO") };
+        let dir = tempfile::tempdir().unwrap();
+        let data = crate::data::DataPaths::with_root(dir.path().to_path_buf());
+        let settings = crate::commands::llm_settings::LlmSettings {
+            local_preset_id: Some("gemma-4-e2b-it-qat-mtp-ud-q4-k-xl".into()),
+            ..Default::default()
+        };
+        crate::commands::llm_settings::save_llm_settings(&data.llm_settings_path(), &settings)
+            .unwrap();
+        let id = llm_identity(&data);
+        assert_eq!(
+            id.required_files,
+            vec![
+                "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf".to_string(),
+                "mtp-gemma-4-E2B-it.gguf".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -675,6 +742,47 @@ mod tests {
         )];
         let kept = filter_files_for_repo(files, Some("Qwen/Qwen3-Embedding-0.6B"));
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn llm_required_files_keep_mtp_draft_missing_as_preparing() {
+        let files = vec![PathBuf::from(
+            "/cache/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/rev/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+        )];
+        let id = ModelIdentity {
+            name: Some("gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf".into()),
+            repo: Some("unsloth/gemma-4-E2B-it-qat-GGUF".into()),
+            required_files: vec![
+                "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf".into(),
+                "mtp-gemma-4-E2B-it.gguf".into(),
+            ],
+        };
+        let ready_files = filter_files_for_required_names(files, &id.required_files);
+        let status = classify_model_status(&ready_files, true, None, id);
+        assert_eq!(status.state, ModelState::Preparing);
+    }
+
+    #[test]
+    fn llm_required_files_ready_when_mtp_target_and_draft_exist() {
+        let files = vec![
+            PathBuf::from(
+                "/cache/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/rev/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+            ),
+            PathBuf::from(
+                "/cache/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/rev/mtp-gemma-4-E2B-it.gguf",
+            ),
+        ];
+        let id = ModelIdentity {
+            name: Some("gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf".into()),
+            repo: Some("unsloth/gemma-4-E2B-it-qat-GGUF".into()),
+            required_files: vec![
+                "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf".into(),
+                "mtp-gemma-4-E2B-it.gguf".into(),
+            ],
+        };
+        let ready_files = filter_files_for_required_names(files, &id.required_files);
+        let status = classify_model_status(&ready_files, true, None, id);
+        assert_eq!(status.state, ModelState::Ready);
     }
 
     #[test]

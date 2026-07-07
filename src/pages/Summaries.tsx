@@ -26,6 +26,7 @@ import { useDeleteAction } from "@/hooks/useDeleteAction";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
 import { isVectorDegraded, type SidecarStatus } from "@/hooks/useSidecarStatus";
 import type { StepStreamProgressHandle } from "@/hooks/useStepStreamProgress";
+import { useTimezone } from "@/hooks/useTimezone";
 import { dayRangeToEpochMs, localDateToEpochMs } from "@/lib/dateInput";
 import { formatDateTime } from "@/lib/localeFormat";
 import { isEmbeddingSearchMode, resolveSearchErrorHint, SEARCH_MODES } from "@/lib/searchModes";
@@ -81,6 +82,9 @@ export function Summaries({
   onFocusConsumed?: () => void;
 }) {
   const { t } = useTranslation();
+  // Date filters anchored to midnight in the display timezone so the range
+  // boundary matches the rendered timestamps (see Threads for the rationale).
+  const timezone = useTimezone();
   const [kind, setKind] = useState<SummaryKind>(focus?.kind ?? "per-thread");
   const [view, setView] = useState<View>(focus ? "calendar" : "list");
   const [updatedAfter, setUpdatedAfter] = useState("");
@@ -135,12 +139,16 @@ export function Summaries({
   // per-thread has no period_key, so the calendar view is meaningless there.
   const calendarKind: CalendarKind | null = kind === "per-thread" ? null : kind;
   const effectiveView: View = view === "calendar" && calendarKind == null ? "list" : view;
-  const monthWindow = useMemo(() => monthBounds(month), [month]);
+  const monthWindow = useMemo(() => monthBounds(month, timezone), [month, timezone]);
 
   const listQuery = useQuery({
-    queryKey: ["summaries", kind, updatedAfter, updatedBefore],
+    queryKey: ["summaries", kind, updatedAfter, updatedBefore, timezone],
     queryFn: () =>
-      fetchSummaries(kind, localDateToEpochMs(updatedAfter), localDateToEpochMs(updatedBefore)),
+      fetchSummaries(
+        kind,
+        localDateToEpochMs(updatedAfter, timezone),
+        localDateToEpochMs(updatedBefore, timezone),
+      ),
     enabled: effectiveView === "list",
   });
 
@@ -167,7 +175,7 @@ export function Summaries({
 
   const searchEnabled = effectiveView === "search" && debouncedQuery.trim().length > 0;
   const search = useQuery({
-    queryKey: ["summary-search", kind, mode, debouncedQuery, updatedAfter, updatedBefore],
+    queryKey: ["summary-search", kind, mode, debouncedQuery, updatedAfter, updatedBefore, timezone],
     enabled: searchEnabled,
     queryFn: () =>
       SEARCH_MODES[mode].fn({
@@ -175,8 +183,8 @@ export function Summaries({
         mode,
         user_id: SUMMARY_USER_ID,
         labels_any: [KIND_SEARCH_LABEL[kind]],
-        created_after_ms: localDateToEpochMs(updatedAfter),
-        created_before_ms: localDateToEpochMs(updatedBefore),
+        created_after_ms: localDateToEpochMs(updatedAfter, timezone),
+        created_before_ms: localDateToEpochMs(updatedBefore, timezone),
         limit: 50,
       }),
   });
@@ -527,6 +535,7 @@ function ListView({
 function SummaryCard({ entry, onDelete }: { entry: SummaryEntry; onDelete: () => void }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   const { onOpenThread } = useSummaryRefHandlers();
   const content = parseSummaryContent(entry);
   // `_all` is the default scope and adds no signal; only surface a named scope.
@@ -554,7 +563,9 @@ function SummaryCard({ entry, onDelete }: { entry: SummaryEntry; onDelete: () =>
           </span>
         )}
         {scopeBadge && <span className="label-pill">{scopeBadge}</span>}
-        <span style={{ marginLeft: "auto" }}>{formatDateTime(entry.updated_at_ms, locale)}</span>
+        <span style={{ marginLeft: "auto" }}>
+          {formatDateTime(entry.updated_at_ms, locale, timezone)}
+        </span>
         <button type="button" className="btn danger" onClick={onDelete}>
           {t("common.delete")}
         </button>
@@ -620,6 +631,7 @@ function SearchResults({
 function SearchHitCard({ hit }: { hit: ThreadHit }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   const [open, setOpen] = useState(false);
   const detail = useQuery({
     queryKey: ["summary-hit", hit.thread_id],
@@ -647,7 +659,7 @@ function SearchHitCard({ hit }: { hit: ThreadHit }) {
             count: hit.hit_count,
             score: hit.top_score.toFixed(3),
           })}{" "}
-          · {formatDateTime(hit.top_created_at_ms, locale)}
+          · {formatDateTime(hit.top_created_at_ms, locale, timezone)}
         </span>
       </div>
       <details onToggle={(e) => setOpen(e.currentTarget.open)}>
@@ -669,11 +681,14 @@ function SearchHitCard({ hit }: { hit: ThreadHit }) {
 /** Local-TZ epoch-ms bounds covering exactly the shown month. Delegates the
  *  ±1ms boundary nudging (strict-`>` after / inclusive-`<=` before) to the
  *  shared `dayRangeToEpochMs` so the rule lives in one place. */
-function monthBounds(monthKey: string): { after: number | undefined; before: number | undefined } {
+function monthBounds(
+  monthKey: string,
+  timeZone?: string,
+): { after: number | undefined; before: number | undefined } {
   const ym = monthKeyToYearMonth(monthKey);
   if (!ym) return { after: undefined, before: undefined };
   const firstDay = dayKey(new Date(ym.y, ym.m - 1, 1));
   // Day 0 of the next month is the last day of this month.
   const lastDay = dayKey(new Date(ym.y, ym.m, 0));
-  return dayRangeToEpochMs(firstDay, lastDay);
+  return dayRangeToEpochMs(firstDay, lastDay, timeZone);
 }

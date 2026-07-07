@@ -81,7 +81,7 @@ export function SetupWizard({
       }
       const response = await applySetup({
         data_root: dataRoot.trim() || null,
-        settings: { llm, embedding, hf_home: hfHome, mcp: null },
+        settings: { llm, embedding, hf_home: hfHome, mcp: null, timezone: null },
       });
       if (response.restart_required) {
         setRestartRequired(true);

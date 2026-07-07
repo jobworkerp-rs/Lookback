@@ -1,4 +1,4 @@
-//! Tauri commands backing the Personality tab (FR-PER-1..4).
+//! Tauri commands backing the Personality tab.
 //!
 //! The MVP surfaces both layers of the personality model:
 //! - layer 2: the merged profile stored as a memory owned by
@@ -60,7 +60,7 @@ pub struct PersonalityProfile {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PersonalityResponse {
-    /// FR-PER-3: `None` when no merged profile row exists yet.
+    /// `None` when no merged profile row exists yet.
     pub profile: Option<PersonalityProfile>,
     /// Persona-stats "Threads" count for the user.
     pub thread_count: i64,
@@ -127,7 +127,7 @@ pub async fn get_personality(
     })
 }
 
-/// FR-PER-4: list the layer-1 personality signals that back the merged
+/// List the layer-1 personality signals that back the merged
 /// profile. One `FindListByCondition` with an `external_id_prefix` plus a
 /// `personality_signal` thread_filter pulls every signal in a single RPC —
 /// the same shape the merge workflow and `list_summaries` use, avoiding the

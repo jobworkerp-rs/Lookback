@@ -53,7 +53,10 @@ Rust tests are run with one test thread because several tests share backend-like
    - [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner) for local LLM execution
    - [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner) for embedding generation
 
-   Local LLM execution supports only Qwen 3.5-family and Gemma 4-family models.
+   Local LLM execution supports only Qwen 3.5/3.6-family and Gemma 4-family models. The
+   default Local preset is the non-MTP Gemma 4 E2B IT QAT preset because Lookback summarizes before
+   chat; MTP presets are available for chat-focused use. Gemma 4 MTP presets keep the QAT target
+   GGUF as `model` and set `LlamaRunnerSettings.mtp.draft_model` to the draft GGUF.
 
    The current macOS bundle path uses `.dylib` files. Linux builds should use the corresponding shared library extension and resource mapping.
 3. If the `memory-store` `front` binary is built with Lindera FTS support, place a compatible lindera 3.x IPADIC search dictionary at `dict/lindera/ipadic`, or set `LOOKBACK_LINDERA_SRC` to that directory. Lookback only stages the files and sets `LANCE_LANGUAGE_MODEL_HOME` for `memory-store`; it does not load the dictionary directly.

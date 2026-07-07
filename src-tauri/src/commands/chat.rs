@@ -605,7 +605,7 @@ async fn run_chat_stream(
                             // it can apologise or retry on the next hop.
                             // `is_error=true` is the structured signal (see
                             // `specs/tool-result-message-content-spec.md`
-                            // FR-TRSP-8); pass the raw error text so the
+                            // Pass the raw error text so the
                             // provider-side rendering isn't double-wrapped.
                             let err_text = e.to_string();
                             emit_event(
@@ -1165,13 +1165,13 @@ fn assistant_tool_calls_proto(calls: &[ExtractedToolCall]) -> serde_json::Value 
 }
 
 /// Build a `ChatRole::TOOL` message carrying a client-executed tool result
-/// (`specs/tool-result-message-content-spec.md` FR-TRSP-1).
+/// (`specs/tool-result-message-content-spec.md`).
 ///
 /// We emit a single-element `tool_results.results` array per hop — the spec
 /// (§5) reserves multi-result batching for a future `parallel_tool_calls=true`
 /// rollout. `fn_name` is always supplied (drawn from the ASSISTANT ToolCall
 /// that triggered the hop) so the server-side reverse-scan fallback
-/// (FR-TRSP-7) never runs; Gemini in particular requires it on the wire.
+/// never runs; Gemini in particular requires it on the wire.
 fn tool_result_proto(
     call_id: &str,
     fn_name: &str,
@@ -1300,7 +1300,7 @@ fn parse_lookback_sources(result: &ExtractedToolResult) -> Vec<ChatSource> {
 
 /// Project the `sources` array of a `lookback_recall` result payload
 /// into typed `ChatSource` entries. Malformed rows are dropped silently
-/// — FR-CHAT-4 lets the frontend render zero hits as
+/// — lets the frontend render zero hits as
 /// "該当する記憶が見つかりませんでした".
 fn extract_lookback_sources(payload: &serde_json::Value) -> Vec<ChatSource> {
     payload
@@ -1632,7 +1632,7 @@ mod tests {
 
     #[test]
     fn build_chat_args_applies_overrides_from_settings() {
-        // FR-CONFIG-?: Settings UI's max_tokens / temperature flow into the
+        // Settings UI's max_tokens / temperature flow into the
         // chat dispatch. The bug fixed here was that build_chat_args
         // hard-coded 4000 / 0.3 and ignored the persisted overrides.
         let v = build_chat_args(
@@ -1822,7 +1822,7 @@ mod tests {
             "must expose limit_per_layer"
         );
         // The label-filter params must be visible so the LLM can narrow
-        // the summary layer by kind/period (FR-CHAT-RAG label filtering).
+        // the summary layer by kind/period.
         assert!(
             props.contains_key("summary_labels"),
             "must expose summary_labels so the LLM can filter by kind/period"
@@ -2088,7 +2088,7 @@ mod tests {
 
     #[test]
     fn chat_source_period_summary_omits_source_thread_id() {
-        // FR-CHAT-4b: period_summary deliberately has no
+        // period_summary deliberately has no
         // source_thread_id; the discriminated union enforces this at
         // the type level, but pin the serde shape too.
         let s = ChatSource::PeriodSummary {
@@ -2148,7 +2148,7 @@ mod tests {
 
     #[test]
     fn started_then_repeat_emits_searching_once() {
-        // FR-CHAT-9: Searching is the enter-edge for the tool call.
+        // Searching is the enter-edge for the tool call.
         // A long-running tool may surface tool_execution_started on
         // multiple chunks; we emit Searching only on the call_id
         // transition.
@@ -2586,7 +2586,7 @@ mod tests {
     #[test]
     fn tool_result_proto_uses_tool_results_oneof() {
         // Both the llama-cpp-plugin OAI converter and the genai adapter
-        // consume the `tool_results` oneof (spec FR-TRSP-3 / FR-TRSP-4).
+        // consume the `tool_results` oneof.
         // We emit a single-element results array per hop (spec §5).
         let v = tool_result_proto("c1", "lookback_recall", "{\"sources\":[]}", false);
         assert_eq!(v["role"], "TOOL");

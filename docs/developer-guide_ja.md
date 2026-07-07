@@ -53,7 +53,10 @@ Rust テストにはバックエンド相当のポートやデータディレク
    - [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner): ローカル LLM 実行用
    - [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner): 埋め込み生成用
 
-   ローカル LLM 実行は Qwen 3.5 系と Gemma 4 系のモデルのみに対応しています。
+   ローカル LLM 実行は Qwen 3.5/3.6 系と Gemma 4 系のモデルのみに対応しています。Lookback は
+   チャット前に要約を行うため、既定の Local preset は非MTPの Gemma 4 E2B IT QAT です。MTP preset は
+   チャット重視の用途向けに利用できます。Gemma 4 MTP preset では QAT 本体 GGUF を `model` に残し、
+   `LlamaRunnerSettings.mtp.draft_model` に draft GGUF を指定します。
 
    現行の macOS バンドルパスは `.dylib` ファイルを使います。Linux ビルドでは対応する共有ライブラリ拡張子とリソースマッピングを使ってください。
 3. `memory-store` の `front` バイナリを Lindera FTS 対応でビルドする場合は、互換 lindera 3.x

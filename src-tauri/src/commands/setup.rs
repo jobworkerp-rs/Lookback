@@ -218,6 +218,7 @@ mod tests {
             embedding: None,
             hf_home: None,
             mcp: None,
+            timezone: None,
         });
         assert!(settings.llm.is_some());
         assert_eq!(
@@ -241,6 +242,7 @@ mod tests {
             embedding: None,
             hf_home: Some(explicit),
             mcp: None,
+            timezone: None,
         });
         assert!(matches!(
             settings.hf_home.unwrap().mode,

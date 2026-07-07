@@ -184,7 +184,7 @@ do:
           summary_hits: ${ (.jsonBody // "[]") | fromjson }
 
   # Step 3: Raw-message layer. owner=user_id=1 (the human user; spec
-  # FR-CONFIG-3 fixes this).
+  # Lookback currently runs as a single local user.
   - searchRaw:
       run:
         function:
@@ -214,7 +214,7 @@ do:
   # Step 4: Project both layers into the compact { source_kind,
   # memory_id, source_thread_id, period_key, scope_key, snippet, score }
   # shape the chat command surfaces in `chat://step` Source events
-  # (FR-CHAT-4b). source_kind is derived from `externalId` — the
+  # source_kind is derived from `externalId` — the
   # summaries pipeline (thread-summary-single / daily / weekly /
   # monthly) always sets it on the memory it writes. Field names use
   # protobuf JSON's lowerCamelCase because the GRPC runner emits the

@@ -1,4 +1,4 @@
-//! Tauri commands backing the Summaries page (FR-SUM).
+//! Tauri commands backing the Summaries page.
 //!
 //! Summaries are stored as memories owned by the synthetic
 //! `summary_user_id=100000`. Their `external_id` encodes the summary kind:

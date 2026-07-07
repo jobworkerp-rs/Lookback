@@ -11,7 +11,7 @@ export interface LocaleControl {
 /**
  * Owns locale application. Call once (in App), mirroring useTheme. Re-applies on
  * preference change by switching the i18next language and reflecting the effective
- * locale onto <html lang> (FR-I18N-5). While on "system" it follows the OS via the
+ * locale onto <html lang>. While on "system" it follows the OS via the
  * `languagechange` event (the locale analogue of useTheme's matchMedia listener).
  */
 export function useLocale(): LocaleControl {

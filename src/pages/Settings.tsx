@@ -45,9 +45,11 @@ import type {
   SetHfHomeRequest,
   SetLlmSettingsRequest,
   SetMcpSettingsRequest,
+  SetTimezoneRequest,
 } from "@/types/api";
 import { CUSTOM_EMBEDDING_PRESET_ID, CUSTOM_LLM_PRESET_ID } from "@/types/api";
 import { SettingsSaveBar } from "./SettingsSaveBar";
+import { TimezoneCard } from "./TimezoneCard";
 
 /** One-shot deep-link seed to open the embedding model card. `nonce` makes
  * every request distinct so re-triggering (e.g. clicking the banner CTA
@@ -71,6 +73,10 @@ export function Settings({
     queryKey: ["settings"],
     queryFn: getSettings,
   });
+  const connectionConfig = useQuery({
+    queryKey: ["connection-config"],
+    queryFn: getConnectionConfig,
+  });
   const modelStatus = useQuery({
     queryKey: ["model-status"],
     queryFn: getModelStatus,
@@ -92,6 +98,7 @@ export function Settings({
   const [llmPayload, setLlmPayload] = useState<SetLlmSettingsRequest | null>(null);
   const [embPayload, setEmbPayload] = useState<SetEmbeddingSettingsRequest | null>(null);
   const [hfPayload, setHfPayload] = useState<SetHfHomeRequest | null>(null);
+  const [tzPayload, setTzPayload] = useState<SetTimezoneRequest | null>(null);
   const [mcpPayload, setMcpPayload] = useState<SetMcpSettingsRequest | null>(null);
   // "edited" tracks whether each card's form differs from the persisted
   // value regardless of validity. The leave-guard keys off this so an
@@ -100,6 +107,7 @@ export function Settings({
   const [llmEdited, setLlmEdited] = useState(false);
   const [embEdited, setEmbEdited] = useState(false);
   const [hfEdited, setHfEdited] = useState(false);
+  const [tzEdited, setTzEdited] = useState(false);
   const [mcpEdited, setMcpEdited] = useState(false);
   // Connection / Data location are self-contained cards (their own Save
   // button, NOT part of the unified save bar), but their in-progress edits
@@ -131,6 +139,10 @@ export function Settings({
   const reportHf = useCallback((p: SetHfHomeRequest | null, edited: boolean) => {
     setHfPayload(p);
     setHfEdited(edited);
+  }, []);
+  const reportTz = useCallback((p: SetTimezoneRequest | null, edited: boolean) => {
+    setTzPayload(p);
+    setTzEdited(edited);
   }, []);
   const reportMcp = useCallback((p: SetMcpSettingsRequest | null, edited: boolean) => {
     setMcpPayload(p);
@@ -191,7 +203,7 @@ export function Settings({
   // (an invalid form is not saveable, so it doesn't add to the count). The
   // leave-guards key off EDITED so an invalid-but-edited form still blocks
   // navigation. App-level tab leave-guard uses the combined `anyEdited`.
-  const basicDirtyCount = [llmPayload, hfPayload].filter(Boolean).length;
+  const basicDirtyCount = [llmPayload, hfPayload, tzPayload].filter(Boolean).length;
   const advancedDirtyCount = [embPayload, mcpPayload].filter(Boolean).length;
   // The destructive vectordb-reset warning must fire ONLY when the pending
   // embedding change actually changes the model id / vector dimension (what
@@ -208,7 +220,7 @@ export function Settings({
   // provider's key env, which the frontend can't see. Showing the restart copy
   // is therefore a harmless over-warning (the user may wait less than implied),
   // never a false "no restart". So no `hotReload` flag is passed below.
-  const basicEdited = llmEdited || hfEdited;
+  const basicEdited = llmEdited || hfEdited || tzEdited;
   // Advanced view holds Embedding (save bar) AND the self-contained
   // Connection / Data location cards — all three must arm the leave-guard.
   const advancedEdited = embEdited || mcpEdited || connEdited || dataRootEdited;
@@ -228,8 +240,10 @@ export function Settings({
   const discardBasic = () => {
     setLlmPayload(null);
     setHfPayload(null);
+    setTzPayload(null);
     setLlmEdited(false);
     setHfEdited(false);
+    setTzEdited(false);
     setApplyError(null);
     setResetSignal((n) => n + 1);
   };
@@ -258,6 +272,7 @@ export function Settings({
         embedding: scope === "advanced" ? embPayload : null,
         hf_home: scope === "basic" ? hfPayload : null,
         mcp: scope === "advanced" ? mcpPayload : null,
+        timezone: scope === "basic" ? tzPayload : null,
       });
       setBackupPath(res.backup_path);
       // Clear only the saved scope's payloads/edited; the other view's
@@ -265,8 +280,10 @@ export function Settings({
       if (scope === "basic") {
         setLlmPayload(null);
         setHfPayload(null);
+        setTzPayload(null);
         setLlmEdited(false);
         setHfEdited(false);
+        setTzEdited(false);
       } else {
         setEmbPayload(null);
         setEmbEdited(false);
@@ -372,6 +389,12 @@ export function Settings({
             <MemoryEmbeddingCard />
 
             <HfHomeCard onDirtyChange={reportHf} resetSignal={resetSignal} />
+
+            <TimezoneCard
+              onDirtyChange={reportTz}
+              resetSignal={resetSignal}
+              disabled={connectionConfig.data?.mode === "remote"}
+            />
 
             <LogsCard />
 
@@ -610,7 +633,7 @@ function ModelStatusBadge({ state, error }: { state?: ModelState; error: string 
 }
 
 /**
- * FR-CONFIG-5: a model's identity + preparation state, rendered INSIDE the
+ * A model's identity + preparation state, rendered INSIDE the
  * provider card (LLM / embedding) so "what model" and "is it ready" live in
  * one place instead of a separate read-only card. Both are HF models fetched
  * lazily on first use, so the "preparing = not downloaded yet, run Import to
@@ -739,7 +762,7 @@ function formatRamGb(value: number): string {
  * `resetSignal` is an incrementing counter that tells the card to re-seed
  * from the server data and clear its dirty state (the "破棄" action).
  */
-interface DirtyReporter<P> {
+export interface DirtyReporter<P> {
   onDirtyChange: (payload: P | null, edited: boolean) => void;
   resetSignal: number;
 }
@@ -1330,8 +1353,8 @@ const CONNECTION_MODES: { value: ConnectionMode; labelKey: string }[] = [
 ];
 
 /**
- * FR-CONFIG-1: connection-target override. Local mode shows the live sidecar
- * URLs read-only (the dynamic ports are never persisted — ARCH-7); remote mode
+ * Connection-target override. Local mode shows the live sidecar
+ * URLs read-only (the dynamic ports are never persisted); remote mode
  * exposes editable URL fields persisted via set_connection_config.
  */
 export function ConnectionCard({
@@ -1540,7 +1563,7 @@ const LOG_STREAMS: { value: LogStream; label: string }[] = [
 ];
 
 /**
- * NFR-6: view logs in-app for troubleshooting. Reads only the tail (the Rust
+ * View logs in-app for troubleshooting. Reads only the tail (the Rust
  * command caps at 1 MiB) so a multi-MB log can't freeze the UI; a manual
  * refresh button is enough for the MVP (no live streaming). `app` is Lookback's
  * own combined log (single file — the stream selector is hidden for it).
@@ -2052,7 +2075,7 @@ const MCP_TIMEOUT_SEC_MIN = 1;
 const MCP_TIMEOUT_SEC_MAX = 3600;
 
 /**
- * FR-MCP-1: expose Lookback's RAG retrieval (`lookback_recall`) as MCP tools
+ * Expose Lookback's RAG retrieval (`lookback_recall`) as MCP tools
  * so an external MCP client (e.g. Claude Desktop) can search the user's
  * memories. jobworkerp boots its in-process MCP HTTP server alongside the
  * gRPC front when `MCP_ENABLED=true`, narrowed to the `lookback-mcp-rag`

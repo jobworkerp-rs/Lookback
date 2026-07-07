@@ -40,6 +40,24 @@ vi.mock("@/api", () => ({
   // (it reports its payload via onDirtyChange), so setLlmSettings is gone.
   getModelStatus: () => Promise.resolve({ llm: null, embedding: null }),
   retryModelSetup: () => Promise.resolve(),
+  // HfHomeCard / TimezoneCard read app-settings; TimezoneCard also lists the
+  // host zones. Stub both so the Basic view mounts cleanly (these tests
+  // exercise the LLM card, not the timezone card).
+  getAppSettings: () =>
+    Promise.resolve({
+      hf_home_mode: "data_root",
+      hf_home_path: null,
+      data_root_override: null,
+      timezone: null,
+      effective_timezone: "Asia/Tokyo",
+      resolved: {
+        current_data_root: "/tmp/lookback",
+        default_data_root: "/tmp/lookback",
+        effective_hf_home: "/tmp/lookback/models",
+        pending_data_root: "/tmp/lookback",
+      },
+    }),
+  listTimezones: () => Promise.resolve(["Asia/Tokyo", "America/New_York", "UTC"]),
 }));
 
 // Default preset list used by the api_key tests below — they don't care
@@ -47,10 +65,10 @@ vi.mock("@/api", () => ({
 // from so `localPresetId` isn't blank when the user clicks Save.
 const DEFAULT_PRESETS_FIXTURE = [
   {
-    id: "gemma-4-e2b-it-ud-q4-k-xl",
-    display_name: "Gemma 4 E2B IT (Q4_K_XL / Unsloth)",
-    hf_repo: "unsloth/gemma-4-E2B-it-GGUF",
-    gguf_file: "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
+    id: "gemma-4-e2b-it-qat-ud-q4-k-xl",
+    display_name: "Gemma 4 E2B IT QAT (Q4_K_XL / Unsloth)",
+    hf_repo: "unsloth/gemma-4-E2B-it-qat-GGUF",
+    gguf_file: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
     recommended_ctx_size: 131072,
     min_ctx_size: 2048,
     estimated_model_ram_gb: 3.5,
@@ -60,6 +78,8 @@ const DEFAULT_PRESETS_FIXTURE = [
     kv_embd_v_gqa: 256,
     description: "デフォルト",
     thinking_kwarg: "enable" as const,
+    mtp_enabled: false,
+    mtp_draft_model: null,
   },
   {
     id: "qwen3-5-9b-ud-q4-k-xl",
@@ -75,6 +95,8 @@ const DEFAULT_PRESETS_FIXTURE = [
     kv_embd_v_gqa: 1024,
     description: "軽量",
     thinking_kwarg: "disable" as const,
+    mtp_enabled: false,
+    mtp_draft_model: null,
   },
 ];
 
@@ -474,7 +496,9 @@ describe("LlmProviderCard local LLM presets", () => {
     fireEvent.change(dropdown, { target: { value: "custom" } });
     expect(screen.getByPlaceholderText("unsloth/Qwen3.5-9B-GGUF")).toBeInTheDocument();
     expect(screen.getByPlaceholderText("Qwen3.5-9B-UD-Q4_K_XL.gguf")).toBeInTheDocument();
-    expect(screen.getByText(/サポート対象は Qwen3\.5 系と Gemma 4 系のみです/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/サポート対象は Qwen3\.5\/3\.6 系と Gemma 4 系のみです/),
+    ).toBeInTheDocument();
   });
 
   it("keeps the advanced section collapsed by default and shows ctx_size when expanded", async () => {
@@ -598,7 +622,7 @@ describe("LlmProviderCard local LLM presets", () => {
     getLlmSettings.mockResolvedValue({ ...LOCAL_PRE_FEATURE, temperature: 0.5 });
     const onDirty = renderLlmCard();
     const dropdown = await waitForPresetDropdownReady();
-    await waitFor(() => expect(dropdown.value).toBe("gemma-4-e2b-it-ud-q4-k-xl"));
+    await waitFor(() => expect(dropdown.value).toBe("gemma-4-e2b-it-qat-ud-q4-k-xl"));
     const tempInput = screen.getByDisplayValue("0.5") as HTMLInputElement;
     fireEvent.change(tempInput, { target: { value: "0.7" } });
     await waitFor(() => expect(llmPayload(onDirty)).toMatchObject({ temperature: 0.7 }));

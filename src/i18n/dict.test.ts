@@ -20,7 +20,7 @@ function flatten(obj: Dict, prefix = ""): Map<string, string> {
 
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/;
 
-/** Normalise plural variants to their base key (FR-I18N-8 / NFR-I18N-3). */
+/** Normalise plural variants to their base key. */
 function baseKeys(flat: Map<string, string>): Set<string> {
   const out = new Set<string>();
   for (const key of flat.keys()) out.add(key.replace(PLURAL_SUFFIX, ""));
@@ -41,7 +41,7 @@ describe("dictionary key parity", () => {
   });
 });
 
-// TEST-I18N-4 — FR-I18N-7
+// Interpolation keys stay aligned across locales.
 describe("interpolation placeholder parity", () => {
   it("matching keys carry the same set of {{placeholders}} in both languages", () => {
     const placeholders = (s: string) =>

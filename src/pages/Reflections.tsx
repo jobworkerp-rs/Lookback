@@ -16,6 +16,7 @@ import { useDeleteAction } from "@/hooks/useDeleteAction";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
 import type { ReflectionProgressHandle } from "@/hooks/useReflectionProgress";
 import { isVectorDegraded, type SidecarStatus } from "@/hooks/useSidecarStatus";
+import { useTimezone } from "@/hooks/useTimezone";
 import { localDateToEpochMs } from "@/lib/dateInput";
 import { formatDateTime } from "@/lib/localeFormat";
 import {
@@ -37,6 +38,9 @@ export function Reflections({
   connectionMode?: ConnectionMode | null;
 }) {
   const { t } = useTranslation();
+  // Date filter anchored to midnight in the display timezone (matches the
+  // rendered card timestamps; see Threads for the boundary rationale).
+  const timezone = useTimezone();
   const [selectedOutcomes, setSelectedOutcomes] = useState<number[]>([]);
   const [createdAfter, setCreatedAfter] = useState<string>("");
   const [intentQuery, setIntentQuery] = useState<string>("");
@@ -56,18 +60,18 @@ export function Reflections({
   // the filter-only listing via ReflectionService.Search.
   const intent = vectorDisabled ? "" : intentQuery.trim();
   const reflections = useQuery({
-    queryKey: ["reflections", selectedOutcomes, createdAfter, intent],
+    queryKey: ["reflections", selectedOutcomes, createdAfter, intent, timezone],
     queryFn: () =>
       intent.length > 0
         ? searchReflectionsByIntent({
             intent_text: intent,
             outcomes: selectedOutcomes,
-            created_after_ms: localDateToEpochMs(createdAfter),
+            created_after_ms: localDateToEpochMs(createdAfter, timezone),
             top_k: 50,
           })
         : searchReflections({
             outcomes: selectedOutcomes,
-            created_after_ms: localDateToEpochMs(createdAfter),
+            created_after_ms: localDateToEpochMs(createdAfter, timezone),
             limit: 200,
           }),
   });
@@ -280,6 +284,7 @@ export function ReflectionCard({
 }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   return (
     <div className="reflection-card">
       <div className="reflection-card-head">
@@ -288,7 +293,7 @@ export function ReflectionCard({
         <span className="reflection-tag">{reflectionAspectLabel(t, entry.reflection_aspect)}</span>
         <span style={{ marginLeft: "auto" }}>
           <span className="reflection-score">{entry.score.toFixed(2)}</span> ·{" "}
-          {formatDateTime(entry.created_at_ms, locale)}
+          {formatDateTime(entry.created_at_ms, locale, timezone)}
         </span>
       </div>
       {entry.task_intent && (

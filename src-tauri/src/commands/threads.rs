@@ -1,4 +1,4 @@
-//! Tauri commands backing the Threads page (FR-THREAD-1/2/3).
+//! Tauri commands backing the Threads page.
 
 use serde::{Deserialize, Serialize};
 use tauri::State;

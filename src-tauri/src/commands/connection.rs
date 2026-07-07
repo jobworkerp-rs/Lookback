@@ -1,7 +1,7 @@
-//! FR-CONFIG-1: connection-target override.
+//! Connection-target override.
 //!
 //! By default the app talks to the bundled local sidecars on their
-//! dynamically chosen ports (ARCH-7). The user can override this to point at
+//! dynamically chosen ports. The user can override this to point at
 //! an already-running remote memories / jobworkerp instead. The override is a
 //! small JSON file under the data root (see `DataPaths::connection_config_path`)
 //! — there is no general settings store in this app, and pulling in

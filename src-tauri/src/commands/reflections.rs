@@ -1,4 +1,4 @@
-//! Tauri commands backing the Reflections tab (FR-REF-1..4).
+//! Tauri commands backing the Reflections tab.
 //!
 //! Reflections live in a dedicated entity (not user_id-owned memories) so
 //! we route through `ReflectionService` instead of the `MemoryService`
@@ -43,7 +43,7 @@ pub struct ReflectionEntry {
     pub mitigation_hint: Option<String>,
     pub pinned: bool,
     pub prompt_version: String,
-    /// FR-REF-4 "active" judgment relies on `intent_embedding_status == OK`.
+    /// Active judgment relies on `intent_embedding_status == OK`.
     pub intent_embedding_status: i32,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -361,7 +361,7 @@ fn build_search_request(req: &SearchReflectionsRequest) -> mem_svc::SearchReflec
 /// Returns `None` when:
 ///   - id / data / origin_thread_id is missing (defensive — server should
 ///     always populate these).
-///   - summary is empty (FR-REF-2: surface only non-empty reflections).
+///   - summary is empty.
 fn entry_from_proto(refl: mem_data::Reflection) -> Option<ReflectionEntry> {
     let id = refl.id?.value;
     let data = refl.data?;
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn entry_from_proto_skips_empty_summary() {
-        // FR-REF-2: empty summaries are guarded out at this layer rather
+        // Empty summaries are guarded out at this layer rather
         // than relying on the frontend to filter.
         assert!(entry_from_proto(proto_with_summary("")).is_none());
         assert!(entry_from_proto(proto_with_summary("   \n  ")).is_none());

@@ -5,7 +5,7 @@ afterEach(() => {
   localStorage.clear();
 });
 
-// TEST-I18N-1 — FR-I18N-3
+// Locale resolution.
 describe("resolveLocale", () => {
   it("follows the system language when pref is system", () => {
     expect(resolveLocale("system", "ja-JP")).toBe("ja");
@@ -25,7 +25,7 @@ describe("resolveLocale", () => {
   });
 });
 
-// TEST-I18N-2 — FR-I18N-4
+// Locale persistence.
 describe("loadLocalePref / saveLocalePref", () => {
   it("defaults to system when unset", () => {
     expect(loadLocalePref()).toBe("system");

@@ -15,6 +15,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Modal } from "@/components/Modal";
 import { Toolbar } from "@/components/Toolbar";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
+import { useTimezone } from "@/hooks/useTimezone";
 import { errorMessage } from "@/lib/errorMessage";
 import {
   cronPreview,
@@ -263,6 +264,7 @@ function PeriodicStatusRow({
 }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   if (!summary) {
     // A missing summary means either the query is still loading OR it rejected
     // as a whole (e.g. conductor unreachable, so no per-scheduler element came
@@ -287,7 +289,7 @@ function PeriodicStatusRow({
     return <UnavailableRow error={summary.error} />;
   }
   const rt = summary.runtime;
-  const time = formatExecutionTime(rt.triggered_at_ms, locale);
+  const time = formatExecutionTime(rt.triggered_at_ms, locale, timezone);
   const detail = rt.detail ?? rt.enqueue_error ?? null;
   return (
     <div className="periodic-status-row">
@@ -435,7 +437,8 @@ function PeriodicHistoryRow({
 }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
-  const time = formatExecutionTime(entry.triggered_at_ms, locale);
+  const timezone = useTimezone();
+  const time = formatExecutionTime(entry.triggered_at_ms, locale, timezone);
   const detail = entry.detail ?? entry.enqueue_error ?? null;
   return (
     <div className="periodic-history-row">

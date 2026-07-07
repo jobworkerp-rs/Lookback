@@ -3,7 +3,7 @@ use std::net::{SocketAddr, TcpListener};
 use crate::error::{AppError, AppResult};
 
 /// Pick a port for a sidecar service. Try `preferred` first; if it's busy,
-/// fall back to OS-assigned (port 0). ARCH-7 dictates that the resolved
+/// fall back to OS-assigned (port 0). The resolved
 /// port is not persisted across launches.
 ///
 /// The returned port has been successfully bound and *released* — there is a

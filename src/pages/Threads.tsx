@@ -11,6 +11,7 @@ import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useDeleteAction } from "@/hooks/useDeleteAction";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
 import { isVectorDegraded, type SidecarStatus } from "@/hooks/useSidecarStatus";
+import { useTimezone } from "@/hooks/useTimezone";
 import { localDateToEpochMs } from "@/lib/dateInput";
 import { sortLabelsByPrefixPriority } from "@/lib/labelPrefix";
 import { formatDateTime } from "@/lib/localeFormat";
@@ -36,6 +37,11 @@ interface Selection {
 
 export function Threads({ onOpenImport, sidecar, connectionMode = "local" }: ThreadsPageProps) {
   const { t } = useTranslation();
+  // Date filters are anchored to midnight in the display timezone so the search
+  // boundary matches the timestamps the list renders (both go through the same
+  // zone); without this a thread shown as "4/30" could leak into a "5/1 onward"
+  // search when the OS zone differs from the configured one.
+  const timezone = useTimezone();
   // Semantic / hybrid embed the query, so they're unavailable while the local
   // vector store is degraded. Keyword (FTS) and browse stay usable.
   const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
@@ -138,6 +144,7 @@ export function Threads({ onOpenImport, sidecar, connectionMode = "local" }: Thr
       createdBefore,
       sortedLabels,
       effectiveMatch ?? "any",
+      timezone,
     ],
     enabled: searchEnabled,
     queryFn: () => {
@@ -147,8 +154,8 @@ export function Threads({ onOpenImport, sidecar, connectionMode = "local" }: Thr
         query_text: debouncedQuery.trim(),
         mode: m,
         user_id: 1,
-        created_after_ms: localDateToEpochMs(createdAfter),
-        created_before_ms: localDateToEpochMs(createdBefore),
+        created_after_ms: localDateToEpochMs(createdAfter, timezone),
+        created_before_ms: localDateToEpochMs(createdBefore, timezone),
         ...labelArgs,
         limit: 50,
       });
@@ -347,6 +354,7 @@ function BrowseList({
 }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   const selectedSet = useMemo(() => new Set(selectedLabels), [selectedLabels]);
   // Sort each thread's chips once per data load, not on every re-render (a
   // label toggle re-renders the whole list but leaves `data` — and thus every
@@ -373,7 +381,7 @@ function BrowseList({
               <span className={`thread-source ${thread.channel === "codex" ? "codex" : ""}`}>
                 {thread.channel ?? "?"}
               </span>
-              <span>{formatDateTime(thread.updated_at_ms, locale)}</span>
+              <span>{formatDateTime(thread.updated_at_ms, locale, timezone)}</span>
             </div>
             <div className="thread-title">
               {
@@ -431,6 +439,7 @@ function SearchResults({
 }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   if (!enabled) {
     return (
       <div className="empty-state">
@@ -488,7 +497,7 @@ function SearchResults({
                 count: hit.hit_count,
                 score: hit.top_score.toFixed(3),
               })}{" "}
-              · {formatDateTime(hit.top_created_at_ms, locale)}
+              · {formatDateTime(hit.top_created_at_ms, locale, timezone)}
             </span>
           </div>
           <div className="thread-hit-snippet">{hit.top_snippet}</div>

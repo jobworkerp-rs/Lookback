@@ -391,7 +391,7 @@
     },
     "list": {
       "emptyTitle": "要約はまだ生成されていません",
-      "emptyDesc": "Import 完了後、自動で生成されます (FR-IMPORT-6)"
+      "emptyDesc": "Import 完了後、自動で生成されます"
     },
     "card": {
       "openThreadTitle": "元スレッドを開く",
@@ -492,7 +492,7 @@
       "ggufFile": "GGUF ファイル",
       "customHintPre": "Hugging Face のリポジトリ",
       "customHintMid": "と、その中の",
-      "customHintPost": "ファイル名を指定します。サポート対象は Qwen3.5 系と Gemma 4 系のみです。形式チェックのみ行います (HF 上に実在するかは検証しません)。",
+      "customHintPost": "ファイル名を指定します。サポート対象は Qwen3.5/3.6 系と Gemma 4 系のみです。形式チェックのみ行います (HF 上に実在するかは検証しません)。",
       "advancedToggleOpen": "▼ 上級設定",
       "advancedToggleClosed": "▶ 上級設定",
       "ctxSizeHint": "空欄でプリセット推奨値 ({{value}}) を使用",
@@ -508,7 +508,7 @@
       "modeLocal": "Local sidecar",
       "modeRemote": "Remote server",
       "title": "Connection",
-      "desc": "既定では同梱 sidecar に接続します。実ポートは起動時に決定され、Local 選択時は読み取り専用で表示されます (ARCH-7)。Remote を選ぶと既存サーバの gRPC URL に接続先を上書きできます (http/https)。",
+      "desc": "既定では同梱 sidecar に接続します。実ポートは起動時に決定され、Local 選択時は読み取り専用で表示されます。Remote を選ぶと既存サーバの gRPC URL に接続先を上書きできます (http/https)。",
       "target": "接続先",
       "starting": "starting…",
       "saving": "保存中…",
@@ -520,7 +520,7 @@
     },
     "logs": {
       "title": "Logs",
-      "desc": "app / sidecar のログ末尾を表示します (NFR-6)。障害切り分け用。app は Import の失敗理由などアプリ側のログです。",
+      "desc": "app / sidecar のログ末尾を表示します。障害切り分け用。app は Import の失敗理由などアプリ側のログです。",
       "process": "プロセス",
       "stream": "ストリーム",
       "singleFile": "単一ファイル (stdout/stderr 共通)",
@@ -622,9 +622,20 @@
       "effectivePathCurrent": "現在の実効パス",
       "customIncomplete": "カスタムパスを入力してください。"
     },
+    "timezone": {
+      "title": "タイムゾーン",
+      "desc": "日次 / 週次 / 月次の要約が「1日」の境界をどのタイムゾーンで区切るかを指定します。夏時間 (DST) や UTC より西の地域にも正しく対応します。",
+      "label": "タイムゾーン",
+      "auto": "自動 (OS 設定に従う)",
+      "autoHelp": "OS のタイムゾーン (または環境変数 TZ) を使います。日本以外の環境でも自動で追従します。",
+      "manualHelp": "タイムゾーン一覧を取得できません。IANA 名を手入力するか、空欄のまま自動にしてください。",
+      "remoteDisabled": "Remote server 接続中は、ここで保存するローカル設定をリモート workflow の境界に反映できないため変更できません。",
+      "effectiveCurrent": "現在の実効タイムゾーン",
+      "restartHint": "保存するとサイドカーを再起動して反映します。"
+    },
     "dataRoot": {
       "title": "Data location",
-      "desc": "sqlite / LanceDB / プラグイン / ログの保存先。空欄でデフォルト ({{defaultRoot}}) に戻ります。「全データを削除」から一括削除できます (ARCH-4 / NFR-5)。",
+      "desc": "sqlite / LanceDB / プラグイン / ログの保存先。空欄でデフォルト ({{defaultRoot}}) に戻ります。「全データを削除」から一括削除できます。",
       "pick": "選択…",
       "createTitle": "このパスに新規ディレクトリを作成します (mkdir -p)",
       "creating": "作成中…",
@@ -649,12 +660,20 @@
     },
     "llmPreset": {
       "desc": {
+        "gemma-4-e2b-it-qat-ud-q4-k-xl": "デフォルト。最軽量の Gemma 4 QAT 非MTP構成。最初に要約を行う標準運用向けです。最大 context は 131k です。",
+        "gemma-4-e2b-it-qat-mtp-ud-q4-k-xl": "最軽量の Gemma 4 QAT MTP 構成。同じ本体GGUFに draft GGUF を追加して投機推論します。チャットは高速化しやすい一方、要約では多くの場合遅くなります。",
+        "gemma-4-e4b-it-qat-ud-q4-k-xl": "軽量な Gemma 4 QAT 非MTP構成。E2Bより大きい要約・チャット向けです。",
+        "gemma-4-e4b-it-qat-mtp-ud-q4-k-xl": "軽量な Gemma 4 QAT MTP 構成。同じ本体GGUFに draft GGUF を追加して投機推論します。チャットは高速化しやすい一方、要約では多くの場合遅くなります。",
+        "gemma-4-12b-it-qat-ud-q4-k-xl": "中規模の Gemma 4 QAT 非MTP構成。256k context を使うため、より大きいRAM環境向けです。",
+        "gemma-4-12b-it-qat-mtp-ud-q4-k-xl": "中規模の Gemma 4 QAT MTP 構成。本体は gemma-4-12B-it-qat-UD-Q4_K_XL.gguf、draft は mtp-gemma-4-12b-it.gguf です。要約では多くの場合遅くなります。",
+        "qwen3-6-35b-a3b-mtp-ud-q4-k-m": "MTP 対応の Qwen3.6 MoE (active 3B)。same-file MTP で別 draft GGUF は不要です。チャットは高速化しやすい一方、要約では多くの場合遅くなります。",
+        "qwen3-6-27b-mtp-ud-q4-k-xl": "MTP 対応の Qwen3.6 27B。チャット品質と長文 context を重視する構成です。要約では多くの場合遅くなります。",
+        "qwen3-5-9b-mtp-ud-q4-k-xl": "MTP 対応の軽量 Qwen3.5。日常チャットや短いやり取りで扱いやすい構成です。要約では多くの場合遅くなります。",
+        "qwen3-5-122b-a10b-mtp-ud-q4-k-s": "MTP 対応の最大規模 Qwen3.5 MoE 122B (active 10B)。複数 shard の高メモリ環境向けです。要約では多くの場合遅くなります。",
         "qwen3-6-27b-ud-q4-k-xl": "日本語の要約・自省・チャット品質が最も安定。長文 context (262k) 対応。実際のRAM目安はctx_sizeとKV cache typeで変わります。",
         "qwen3-6-35b-a3b-ud-iq4-nl": "MoE (active 3B)。27B 密モデルに近い品質を比較的小さいggufで得られる省メモリ版。実際のRAM目安はctx_sizeとKV cache typeで変わります。",
         "qwen3-5-9b-ud-q4-k-xl": "軽量・高速な Qwen3.5。日常チャットや日次要約に十分な日本語品質。ctx_sizeを小さくすると16GB級でも扱いやすくなります。",
         "gemma-4-26b-a4b-it-ud-iq4-nl": "MoE (active 4B)。日本語応答が良好な中規模 Gemma 4。実際のRAM目安はctx_sizeとKV cache typeで変わります。",
-        "gemma-4-e4b-it-ud-q4-k-xl": "軽量な Gemma 4 マルチモーダル版。最小構成で動作。ctx_sizeを小さくすると低メモリ環境でも扱いやすくなります。",
-        "gemma-4-e2b-it-ud-q4-k-xl": "デフォルト。最軽量の Gemma 4 IT。小さいRAM環境でローカルチャットを試しやすい構成。最大 context は 131k です。",
         "qwen3-5-122b-a10b-ud-iq4-xs": "最大規模。MoE 122B (active 10B)。最高品質を狙うフラッグシップ。gguf本体が大きいため大容量RAM環境向けです。"
       }
     },

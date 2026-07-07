@@ -69,7 +69,7 @@ sha2 = "0.10"
 # method signatures (Option<&opentelemetry::Context>); we only ever pass None.
 # `prost-reflect` decodes streamed proto bytes for human-readable progress.
 jobworkerp-client = { git = "https://github.com/jobworkerp-rs/jobworkerp-client-rs", branch = "main" }
-opentelemetry = "0.31"
+opentelemetry = "0.32"
 prost-reflect = { version = "0.16", features = ["serde"] }
 
 [dev-dependencies]

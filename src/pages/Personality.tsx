@@ -22,6 +22,7 @@ import { useDeleteAction } from "@/hooks/useDeleteAction";
 import { useEscape } from "@/hooks/useEscape";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
 import type { StepStreamProgressHandle } from "@/hooks/useStepStreamProgress";
+import { useTimezone } from "@/hooks/useTimezone";
 import { resolveThreadHighlight } from "@/lib/chatSourceNav";
 import { formatDateTime, formatNumber } from "@/lib/localeFormat";
 import {
@@ -45,6 +46,7 @@ export function Personality({
 }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   const [enqueueError, setEnqueueError] = useState<string | null>(null);
   const [enqueueBusy, setEnqueueBusy] = useState(false);
   // `Force 再抽出` — when checked, the next generate run passes
@@ -188,7 +190,7 @@ export function Personality({
             ? t("common.loading")
             : personality.data?.profile
               ? t("personality.updatedAt", {
-                  time: formatDateTime(personality.data.profile.updated_at_ms, locale),
+                  time: formatDateTime(personality.data.profile.updated_at_ms, locale, timezone),
                 })
               : t("personality.profileNotGenerated")
         }
@@ -505,6 +507,7 @@ function SignalRow({
 }) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
+  const timezone = useTimezone();
   const views = useMemo(() => formatSignalContent(parsePersonalitySignalContent(signal)), [signal]);
   const rawFallback = useMemo(
     () => (views.length === 0 ? rawSignalFallback(signal.content_json) : null),
@@ -516,7 +519,9 @@ function SignalRow({
         <button type="button" className="signal-thread-link" onClick={onOpenThread}>
           {t("personality.threadFallback", { id: signal.source_thread_id })}
         </button>
-        <span className="signal-row-date">{formatDateTime(signal.updated_at_ms, locale)}</span>
+        <span className="signal-row-date">
+          {formatDateTime(signal.updated_at_ms, locale, timezone)}
+        </span>
         <button
           type="button"
           className="btn danger"

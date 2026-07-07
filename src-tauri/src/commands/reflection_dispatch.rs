@@ -1,4 +1,4 @@
-//! Tauri command for the "Generate reflection" button (FR-REF / AC-5).
+//! Tauri command for the "Generate reflection" button.
 //!
 //! Streams the `memories-reflection-batch` named worker via
 //! `jobworkerp::run_cancellable_named_stream`. The command returns

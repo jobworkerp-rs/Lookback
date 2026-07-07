@@ -1,6 +1,9 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { I18nextProvider } from "react-i18next";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SidecarStatus } from "@/hooks/useSidecarStatus";
+import { TimezoneContext } from "@/hooks/useTimezone";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
 import { ImportDialog } from "./ImportDialog";
@@ -18,17 +21,39 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 const READY: SidecarStatus = { phase: "ready", warnings: [] };
 
-function renderDialog(onStarted = vi.fn()) {
-  return renderWithProviders(
+function importDialog(open = true, onStarted = vi.fn()) {
+  return (
     <ImportDialog
-      open
+      open={open}
       onClose={vi.fn()}
       onStarted={onStarted}
       memoriesImportBin="/bin/memories-import"
       resolveError={null}
       sidecar={READY}
-    />,
+    />
   );
+}
+
+function renderDialog(onStarted = vi.fn()) {
+  return renderWithProviders(importDialog(true, onStarted));
+}
+
+function renderDialogWithTimezone(timezone: string, open = true) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const renderTree = (isOpen: boolean) => (
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <TimezoneContext.Provider value={timezone}>{importDialog(isOpen)}</TimezoneContext.Provider>
+      </QueryClientProvider>
+    </I18nextProvider>
+  );
+  const result = render(renderTree(open));
+  return {
+    ...result,
+    rerenderDialog: (isOpen: boolean) => result.rerender(renderTree(isOpen)),
+  };
 }
 
 /** Enable the plain source checkbox so its sub-block renders. */
@@ -42,6 +67,48 @@ beforeEach(() => {
   localStorage.clear();
   startImport.mockResolvedValue({ job_id: "import-1" });
   i18n.changeLanguage("ja");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.useRealTimers();
+});
+
+describe("ImportDialog since date timezone", () => {
+  it("seeds the default since date from the display timezone when the dialog opens", async () => {
+    vi.stubEnv("TZ", "Asia/Tokyo");
+    vi.useFakeTimers({ now: new Date("2026-01-02T03:00:00.000Z"), toFake: ["Date"] });
+
+    const { rerenderDialog } = renderDialogWithTimezone("America/New_York", false);
+
+    rerenderDialog(true);
+    fireEvent.click(screen.getByText(i18n.t("import.start")));
+
+    expect(startImport).toHaveBeenCalled();
+    const req = startImport.mock.calls[0]?.[0];
+    expect(req.since).toBe("2025-12-31T05:00:00.000Z");
+  });
+
+  it("keeps a user-edited since date when the dialog closes and reopens", async () => {
+    vi.stubEnv("TZ", "Asia/Tokyo");
+    vi.useFakeTimers({ now: new Date("2026-01-02T03:00:00.000Z"), toFake: ["Date"] });
+
+    const { rerenderDialog } = renderDialogWithTimezone("America/New_York");
+    await act(async () => {});
+    fireEvent.change(screen.getByDisplayValue("2025-12-31"), {
+      target: { value: "2025-12-25" },
+    });
+    expect(screen.getByDisplayValue("2025-12-25")).toBeTruthy();
+    await act(async () => {});
+    rerenderDialog(false);
+    rerenderDialog(true);
+    expect(screen.getByDisplayValue("2025-12-25")).toBeTruthy();
+    fireEvent.click(screen.getByText(i18n.t("import.start")));
+
+    expect(startImport).toHaveBeenCalled();
+    const req = startImport.mock.calls[0]?.[0];
+    expect(req.since).toBe("2025-12-25T05:00:00.000Z");
+  });
 });
 
 describe("ImportDialog plain source", () => {

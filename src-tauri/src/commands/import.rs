@@ -1,4 +1,4 @@
-//! Tauri commands backing Import (FR-IMPORT-1..6). Drives the 4-step
+//! Tauri commands backing Import. Drives the 4-step
 //! pipeline (import → summary → personality → reflection) directly via
 //! `jobworkerp::run_named_stream` so `import://step` events surface
 //! per-chunk progress to the toast. The three post-import generation
@@ -291,7 +291,7 @@ pub async fn start_import(
     // vector store, which is unaffected).
     state.ensure_local_embedding_available()?;
 
-    // Honor the connection override (FR-CONFIG-1): import targets the same
+    // Honor the connection override: import targets the same
     // memories / jobworkerp the browse clients use — local sidecar by default,
     // or a remote server (incl. HTTPS) when configured.
     let targets = state.resolve_targets()?;

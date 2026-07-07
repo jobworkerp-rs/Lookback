@@ -8,7 +8,7 @@
 //!      `workers/function-sets.yaml`, targeting `lookback_recall`. The
 //!      chat command itself dispatches `memories-llm` directly with
 //!      this set as `function_options.function_set_name`, so no
-//!      separate chat worker is registered (ARCH-CHAT-1).
+//!      separate chat worker is registered.
 //!
 //! End-to-end retrieval — embedding → HybridSearch on both layers →
 //! source_kind projection — and the LLM tool-call loop are covered in

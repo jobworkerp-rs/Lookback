@@ -280,7 +280,7 @@ describe("command wrappers", () => {
     invokeMock.mockResolvedValue({ restart_required: false });
     const req = {
       data_root: null,
-      settings: { llm: null, embedding: null, hf_home: null, mcp: null },
+      settings: { llm: null, embedding: null, hf_home: null, mcp: null, timezone: null },
     };
     await applySetup(req);
     expect(invokeMock).toHaveBeenCalledWith("apply_setup", { req });

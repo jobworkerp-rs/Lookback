@@ -121,7 +121,7 @@ describe("SetupWizard", () => {
     await waitFor(() => expect(applySetupMock).toHaveBeenCalledTimes(1));
     expect(applySetupMock).toHaveBeenCalledWith({
       data_root: null,
-      settings: { llm: null, embedding: null, hf_home: null, mcp: null },
+      settings: { llm: null, embedding: null, hf_home: null, mcp: null, timezone: null },
     });
     await waitFor(() => expect(onComplete).toHaveBeenCalled());
   });
@@ -213,6 +213,7 @@ describe("SetupWizard", () => {
           local_preset_id: "qwen3-5-9b-ud-q4-k-xl",
         }),
         mcp: null,
+        timezone: null,
       },
     });
   });

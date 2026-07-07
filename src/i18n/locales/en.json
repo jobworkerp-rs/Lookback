@@ -397,7 +397,7 @@
     },
     "list": {
       "emptyTitle": "No summaries generated yet",
-      "emptyDesc": "Generated automatically after import completes (FR-IMPORT-6)"
+      "emptyDesc": "Generated automatically after import completes"
     },
     "card": {
       "openThreadTitle": "Open the source thread",
@@ -498,7 +498,7 @@
       "ggufFile": "GGUF file",
       "customHintPre": "Specify the Hugging Face repository",
       "customHintMid": "and the",
-      "customHintPost": "file name inside it. Only Qwen3.5-family and Gemma 4-family models are supported. Only the format is checked (existence on HF is not verified).",
+      "customHintPost": "file name inside it. Only Qwen3.5/3.6-family and Gemma 4-family models are supported. Only the format is checked (existence on HF is not verified).",
       "advancedToggleOpen": "▼ Advanced",
       "advancedToggleClosed": "▶ Advanced",
       "ctxSizeHint": "Leave blank to use the preset's recommended value ({{value}})",
@@ -514,7 +514,7 @@
       "modeLocal": "Local sidecar",
       "modeRemote": "Remote server",
       "title": "Connection",
-      "desc": "By default it connects to the bundled sidecar. The actual port is chosen at startup and shown read-only when Local is selected (ARCH-7). Choosing Remote lets you override the target with an existing server's gRPC URL (http/https).",
+      "desc": "By default it connects to the bundled sidecar. The actual port is chosen at startup and shown read-only when Local is selected. Choosing Remote lets you override the target with an existing server's gRPC URL (http/https).",
       "target": "Target",
       "starting": "starting…",
       "saving": "Saving…",
@@ -526,7 +526,7 @@
     },
     "logs": {
       "title": "Logs",
-      "desc": "Shows the tail of the app / sidecar logs (NFR-6), for troubleshooting. \"app\" is Lookback's own log, including import failure reasons.",
+      "desc": "Shows the tail of the app / sidecar logs for troubleshooting. \"app\" is Lookback's own log, including import failure reasons.",
       "process": "Process",
       "stream": "Stream",
       "singleFile": "Single file (shared stdout/stderr)",
@@ -628,9 +628,20 @@
       "effectivePathCurrent": "Current effective path",
       "customIncomplete": "Enter a custom path."
     },
+    "timezone": {
+      "title": "Timezone",
+      "desc": "Which timezone the daily / weekly / monthly summaries use to delimit the \"day\" boundary. Correctly handles DST and zones west of UTC.",
+      "label": "Timezone",
+      "auto": "Auto (follow OS setting)",
+      "autoHelp": "Uses the OS timezone (or the TZ environment variable). Follows non-JST hosts automatically.",
+      "manualHelp": "Timezone list unavailable. Enter an IANA name manually, or leave blank for Auto.",
+      "remoteDisabled": "Disabled while connected to a remote server because this local setting cannot change the remote workflow boundaries.",
+      "effectiveCurrent": "Current effective timezone",
+      "restartHint": "Saving restarts the sidecar to apply the change."
+    },
     "dataRoot": {
       "title": "Data location",
-      "desc": "Where sqlite / LanceDB / plugins / logs are stored. Leave blank to revert to the default ({{defaultRoot}}). Use \"Delete all data\" to remove everything (ARCH-4 / NFR-5).",
+      "desc": "Where sqlite / LanceDB / plugins / logs are stored. Leave blank to revert to the default ({{defaultRoot}}). Use \"Delete all data\" to remove everything.",
       "pick": "Choose…",
       "createTitle": "Creates a new directory at this path (mkdir -p)",
       "creating": "Creating…",
@@ -655,12 +666,20 @@
     },
     "llmPreset": {
       "desc": {
+        "gemma-4-e2b-it-qat-ud-q4-k-xl": "Default. The lightest non-MTP Gemma 4 QAT preset, intended for the standard flow that summarizes before chat. Maximum context is 131k.",
+        "gemma-4-e2b-it-qat-mtp-ud-q4-k-xl": "The lightest Gemma 4 QAT MTP preset. It uses the same target GGUF plus a draft GGUF for speculative decoding. MTP often speeds up chat, but summary workloads are usually slower.",
+        "gemma-4-e4b-it-qat-ud-q4-k-xl": "Lightweight non-MTP Gemma 4 QAT preset for summary and chat workloads larger than E2B.",
+        "gemma-4-e4b-it-qat-mtp-ud-q4-k-xl": "Lightweight Gemma 4 QAT MTP preset. It uses the same target GGUF plus a draft GGUF for speculative decoding. MTP often speeds up chat, but summary workloads are usually slower.",
+        "gemma-4-12b-it-qat-ud-q4-k-xl": "Mid-size non-MTP Gemma 4 QAT preset for larger RAM environments with 256k context.",
+        "gemma-4-12b-it-qat-mtp-ud-q4-k-xl": "Mid-size Gemma 4 QAT MTP preset. The target is gemma-4-12B-it-qat-UD-Q4_K_XL.gguf, and mtp-gemma-4-12b-it.gguf is only the draft model. Summary workloads are usually slower with MTP.",
+        "qwen3-6-35b-a3b-mtp-ud-q4-k-m": "MTP-capable Qwen3.6 MoE (active 3B). Same-file MTP needs no separate draft GGUF. MTP often speeds up chat, but summary workloads are usually slower.",
+        "qwen3-6-27b-mtp-ud-q4-k-xl": "MTP-capable Qwen3.6 27B for chat quality and long-context operation. Summary workloads are usually slower with MTP.",
+        "qwen3-5-9b-mtp-ud-q4-k-xl": "MTP-capable lightweight Qwen3.5 for everyday chat and short interactions. Summary workloads are usually slower with MTP.",
+        "qwen3-5-122b-a10b-mtp-ud-q4-k-s": "MTP-capable largest-scale Qwen3.5 MoE 122B (active 10B). A multi-shard, high-memory preset. Summary workloads are usually slower with MTP.",
         "qwen3-6-27b-ud-q4-k-xl": "The most stable for Japanese summary / reflection / chat quality. Supports long context (262k). The actual RAM estimate changes with ctx_size and KV cache type.",
         "qwen3-6-35b-a3b-ud-iq4-nl": "MoE (active 3B). A memory-efficient variant that delivers near-27B-dense quality from a comparatively small gguf. The actual RAM estimate changes with ctx_size and KV cache type.",
         "qwen3-5-9b-ud-q4-k-xl": "Lightweight and fast Qwen3.5. Japanese quality sufficient for everyday chat and daily summaries. Lower ctx_size makes it easier to run on 16GB-class machines.",
         "gemma-4-26b-a4b-it-ud-iq4-nl": "MoE (active 4B). A mid-size Gemma 4 with good Japanese responses. The actual RAM estimate changes with ctx_size and KV cache type.",
-        "gemma-4-e4b-it-ud-q4-k-xl": "A lightweight Gemma 4 multimodal variant. Runs in a minimal configuration. Lower ctx_size makes it easier to run in low-memory environments.",
-        "gemma-4-e2b-it-ud-q4-k-xl": "Default. The lightest Gemma 4 IT preset. A practical local-chat option for smaller RAM environments. Maximum context is 131k.",
         "qwen3-5-122b-a10b-ud-iq4-xs": "Largest scale. MoE 122B (active 10B). A flagship aiming for top quality. The gguf itself is large, so this targets high-memory machines."
       }
     },

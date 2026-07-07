@@ -111,25 +111,53 @@ do:
              else "LABEL_ALL"
              end }
 
+  # The import window start is `today - lookback_days` on the local
+  # calendar. When the worker's TZ env var is set, jq's `strflocaltime`
+  # honours it (DST-aware); otherwise fall back to the fixed +9 offset.
+  # The day stepping must run on the local CALENDAR: anchor today's local
+  # date at 12:00 UTC-as-if (immune to the ±1h DST shift), step back
+  # lookback_days, then reformat. `regular_import_start_date` is a
+  # tz-invariant YYYY-MM-DD; the numeric offset for its 00:00 is resolved
+  # separately in buildRegularImportSince.
   - buildRegularImportWindow:
       if: "${ $workflow.input.task.task_kind == \"regular\" }"
       set:
         regular_import_tz_offset_hours: "${ 9 }"
-        regular_import_local_start_epoch: >-
-          ${ now + (9 * 3600)
-             - (($workflow.input.task.lookback_days // 1) * 86400) }
+        regular_import_start_date: >-
+          ${ ($workflow.input.task.lookback_days // 1) as $days
+             | if (env.TZ // "") != ""
+               then ((now | strflocaltime("%Y-%m-%d")) as $today
+                     | (($today + "T12:00:00Z") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                     | ((. - ($days * 86400)) | strftime("%Y-%m-%d")))
+               else ((now + (9 * 3600) - ($days * 86400)) | strftime("%Y-%m-%d"))
+               end }
         regular_import_server_url: >-
           ${ (if $workflow.input.runtime.memories_grpc_tls then "https://" else "http://" end)
              + $workflow.input.runtime.memories_grpc_host
              + ":"
              + ($workflow.input.runtime.memories_grpc_port | tostring) }
 
+  # Resolve the numeric offset for the start date's 00:00. TZ path uses the
+  # candidate offset so a midnight DST gap can still be represented as
+  # "YYYY-MM-DDT00:00:00+HH:MM". Offset path: the fixed +09:00.
+  - buildRegularImportTzOffset:
+      if: "${ $workflow.input.task.task_kind == \"regular\" }"
+      set:
+        regular_import_tz_offset_str: >-
+          ${ if (env.TZ // "") != ""
+             then (($regular_import_start_date + "T00:00:00")
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                  | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                  | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                  | ($candidate_epoch | strflocaltime("%:z"))
+             else "+09:00"
+             end }
+
   - buildRegularImportSince:
       if: "${ $workflow.input.task.task_kind == \"regular\" }"
       set:
         regular_import_since_iso: >-
-          ${ ($regular_import_local_start_epoch | strftime("%Y-%m-%d"))
-             + "T00:00:00+09:00" }
+          ${ $regular_import_start_date + "T00:00:00" + $regular_import_tz_offset_str }
 
   - buildRegularImportArgs:
       if: "${ $workflow.input.task.task_kind == \"regular\" }"
