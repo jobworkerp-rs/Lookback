@@ -125,12 +125,12 @@ pub fn stage_lindera_from(source: &Path, dest_ipadic: &Path) -> AppResult<Linder
     })
 }
 
-/// `lance-index`'s `LinderaBuilder::load` reads `config.yml` and resolves
-/// the dictionary by the absolute `dictionary.path`. Generated fresh each
-/// run so a moved data root never leaves a stale absolute path behind.
+/// `lance-index`'s `LinderaBuilder::load` reads `config.yml` and passes
+/// `segmenter.dictionary` directly to Lindera. Generated fresh each run so
+/// a moved data root never leaves a stale absolute path behind.
 fn render_config_yml(dict_dir: &Path) -> String {
     format!(
-        "segmenter:\n  mode: \"normal\"\n  dictionary:\n    path: \"{}\"\n",
+        "segmenter:\n  mode: \"normal\"\n  dictionary: \"{}\"\n",
         dict_dir.display()
     )
 }
@@ -189,6 +189,8 @@ mod tests {
         let cfg = std::fs::read_to_string(ipadic.join("config.yml")).unwrap();
         assert!(cfg.contains(&ipadic.display().to_string()));
         assert!(cfg.contains("mode: \"normal\""));
+        assert!(cfg.contains("dictionary: \""));
+        assert!(!cfg.contains("path:"));
     }
 
     #[test]
@@ -235,6 +237,7 @@ mod tests {
     #[test]
     fn render_config_yml_embeds_absolute_path() {
         let yml = render_config_yml(Path::new("/data/lindera/ipadic"));
-        assert!(yml.contains("path: \"/data/lindera/ipadic\""));
+        assert!(yml.contains("dictionary: \"/data/lindera/ipadic\""));
+        assert!(!yml.contains("path:"));
     }
 }

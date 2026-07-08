@@ -56,6 +56,7 @@ do:
       run:
         worker:
           name: memories-mark-reflection-embedding-status
+          using: unary
           arguments:
             json_body: >-
               ${ {
@@ -97,6 +98,7 @@ do:
             run:
               worker:
                 name: memories-upsert-reflection-intent-embedding
+                using: unary
                 arguments:
                   json_body: >-
                     ${ {
@@ -117,7 +119,7 @@ do:
             export:
               as:
                 upsert_skipped: >-
-                  ${ ((.jsonBody // "{}") | fromjson | (.success_count // 0)) == 0 }
+                  ${ ((.jsonBody // "{}") | fromjson | .successCount // 0) == 0 }
 
         # Status bookkeeping — branch on whether the server actually
         # persisted a row. The DSL has no if/then/else task and rejects
@@ -129,6 +131,7 @@ do:
             run:
               worker:
                 name: memories-mark-reflection-embedding-status
+                using: unary
                 arguments:
                   json_body: >-
                     ${ {
@@ -142,6 +145,7 @@ do:
             run:
               worker:
                 name: memories-mark-reflection-embedding-status
+                using: unary
                 arguments:
                   json_body: >-
                     ${ {
@@ -156,6 +160,7 @@ do:
               run:
                 worker:
                   name: memories-mark-reflection-embedding-status
+                  using: unary
                   arguments:
                     json_body: >-
                       ${ {

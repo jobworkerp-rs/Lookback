@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use super::connection::{MemoriesCallback, ResolvedTargets};
 use super::{
     AppState, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner, emit_event,
-    emit_generated_refresh, thread_summary_single_completed,
+    emit_generated_refresh, thread_reflection_single_completed, thread_summary_single_completed,
 };
 use crate::error::{AppError, AppResult};
 use crate::jobworkerp::{JobworkerpHandle, StreamEvent, run_cancellable_named_stream};
@@ -1525,6 +1525,14 @@ async fn run_cancellable_step(
                                 app,
                                 job_id,
                                 vec![GeneratedRefreshScope::ThreadSummary],
+                            );
+                        }
+                        if step == ImportStep::Reflection && thread_reflection_single_completed(raw)
+                        {
+                            emit_generated_refresh(
+                                app,
+                                job_id,
+                                vec![GeneratedRefreshScope::Reflection],
                             );
                         }
                     }

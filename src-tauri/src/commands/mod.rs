@@ -186,6 +186,14 @@ pub(super) fn thread_summary_single_completed(raw: &str) -> bool {
     position.contains("summarizeEach") && position.contains("recordSuccess")
 }
 
+pub(super) fn thread_reflection_single_completed(raw: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let position = v.get("position").and_then(|p| p.as_str()).unwrap_or("");
+    position.contains("reflectEach") && position.contains("recordSuccess")
+}
+
 /// Status of a single step in a streaming dispatch (import pipeline,
 /// reflection generation). Shared between `commands::import` and
 /// `commands::reflection_dispatch` so the frontend gets a single

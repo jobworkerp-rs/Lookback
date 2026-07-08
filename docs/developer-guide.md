@@ -59,7 +59,7 @@ Rust tests are run with one test thread because several tests share backend-like
    GGUF as `model` and set `LlamaRunnerSettings.mtp.draft_model` to the draft GGUF.
 
    The current macOS bundle path uses `.dylib` files. Linux builds should use the corresponding shared library extension and resource mapping.
-3. If the `memory-store` `front` binary is built with Lindera FTS support, place a compatible lindera 3.x IPADIC search dictionary at `dict/lindera/ipadic`, or set `LOOKBACK_LINDERA_SRC` to that directory. Lookback only stages the files and sets `LANCE_LANGUAGE_MODEL_HOME` for `memory-store`; it does not load the dictionary directly.
+3. If the `memory-store` `front` binary is built with Lindera FTS support, place a compatible lindera 3.x IPADIC search dictionary at `dict/lindera/ipadic`, or set `LOOKBACK_LINDERA_SRC` to that directory. Lookback stages the files into the data directory, generates `lance_language_models/lindera/ipadic/config.yml` on each launch, and sets `LANCE_LANGUAGE_MODEL_HOME` for `memory-store`; it does not load the dictionary directly.
 4. Start the app with explicit paths when the binaries are not available from the repository fallback locations:
 
 ```bash
@@ -154,9 +154,9 @@ The release build must package backend binaries and resources before running Tau
 5. If the packaged `memory-store` `front` build needs Lindera FTS, populate `dict/lindera/ipadic`
    with the IPADIC search dictionary. Nothing under `dict/` is committed — generate it with
    `scripts/build-release.sh --lindera-only`, which downloads the lindera 3.0.7 release dictionary
-   and stages the IPADIC `COPYING` license beside it. This is also useful before `pnpm tauri:dev`
-   if you want morphological FTS in development (otherwise the sidecar falls back to the ngram
-   tokenizer).
+   and stages the IPADIC `COPYING` license beside it. The runtime generates `config.yml` in the
+   data directory. This is also useful before `pnpm tauri:dev` if you want morphological FTS in
+   development (otherwise the sidecar falls back to the ngram tokenizer).
 6. Run `pnpm tauri:build`.
 
 When `LOOKBACK_RELEASE_VERSION` is set, `scripts/build-release.sh` applies that tag to

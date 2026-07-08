@@ -58,3 +58,14 @@ describe("interpolation placeholder parity", () => {
     expect(mismatches).toEqual([]);
   });
 });
+
+describe("search copy", () => {
+  it("does not describe embedding search as server-side or GPU-only", () => {
+    const forbidden = /サーバ側|server-side|GPU|MultimodalEmbeddingRunner|未配備/i;
+    const searchCopy = [...flatJa, ...flatEn]
+      .filter(([key]) => key.startsWith("search.modeTitle.") || key.startsWith("search.hint."))
+      .map(([, value]) => value);
+
+    expect(searchCopy.filter((value) => forbidden.test(value))).toEqual([]);
+  });
+});

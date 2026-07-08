@@ -240,6 +240,10 @@ impl DataPaths {
         self.root.join("periodic-defaults-seeded.json")
     }
 
+    pub fn jobworkerp_maintenance_marker_path(&self) -> PathBuf {
+        self.root.join("jobworkerp-maintenance.json")
+    }
+
     /// Where pre-resize LanceDB directories are renamed to when the user
     /// switches embedding model (= vector dimension changes). The actual
     /// per-resize directory under here is suffixed with a timestamp so
@@ -786,6 +790,15 @@ mod tests {
         assert_eq!(
             paths.periodic_defaults_seed_path(),
             PathBuf::from("/tmp/lookback-periodic-test/periodic-defaults-seeded.json")
+        );
+    }
+
+    #[test]
+    fn jobworkerp_maintenance_marker_path_is_under_root() {
+        let paths = DataPaths::with_root("/tmp/lookback-maintenance-test");
+        assert_eq!(
+            paths.jobworkerp_maintenance_marker_path(),
+            PathBuf::from("/tmp/lookback-maintenance-test/jobworkerp-maintenance.json")
         );
     }
 
@@ -1549,6 +1562,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reflection_embedding_workflows_pin_grpc_runner_method() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        let dir = workers_bundle_dir()
+            .unwrap()
+            .join("workflows")
+            .join("thread-reflection");
+        for name in [
+            "auto-reflection-summary-embedding.yaml",
+            "auto-reflection-intent-embedding.yaml",
+        ] {
+            let yaml = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(
+                yaml.matches("using: unary").count() >= 5,
+                "{name}: all GRPC worker calls must specify using: unary"
+            );
+        }
+        let intent_yaml =
+            std::fs::read_to_string(dir.join("auto-reflection-intent-embedding.yaml")).unwrap();
+        assert!(
+            intent_yaml.contains(".successCount") && !intent_yaml.contains(".success_count"),
+            "intent workflow must read protobuf JSON's lowerCamelCase successCount field"
+        );
+    }
+
     /// Every workflow YAML under `workers/workflows/` must parse as
     /// valid YAML. `jobworkerp-client`'s `$file:` loader embeds these
     /// files verbatim into the worker `settings.workflow_data` payload;
@@ -1850,6 +1888,28 @@ mod tests {
     }
 
     #[test]
+    fn thread_reflection_timeouts_allow_slow_local_llm() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+
+        let batch_path = workers_bundle_dir()
+            .unwrap()
+            .join("workflows/thread-reflection/thread-reflection-batch.yaml");
+        let batch_body = std::fs::read_to_string(&batch_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", batch_path.display()));
+        assert_yaml_timeout_hours(&batch_body, 24, "thread-reflection-batch top-level timeout");
+        assert_eq!(
+            timeout_hours_after_marker(&batch_body, "  - reflectEach:"),
+            Some(24),
+            "thread-reflection-batch fan-out timeout"
+        );
+        assert_eq!(
+            timeout_after_marker(&batch_body, "              - invokeSingle:"),
+            Some(TimeoutAfter::Hours(3)),
+            "thread-reflection-batch invokeSingle timeout"
+        );
+    }
+
+    #[test]
     fn thread_personality_filters_non_conversation_scaffolding() {
         unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
         // The single moved under lang-workers (it's registered as a language
@@ -1975,6 +2035,19 @@ mod tests {
     }
 
     fn timeout_hours_after_marker(body: &str, marker: &str) -> Option<i64> {
+        match timeout_after_marker(body, marker)? {
+            TimeoutAfter::Hours(hours) => Some(hours),
+            TimeoutAfter::Minutes(_) => None,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TimeoutAfter {
+        Hours(i64),
+        Minutes(i64),
+    }
+
+    fn timeout_after_marker(body: &str, marker: &str) -> Option<TimeoutAfter> {
         let start = body.find(marker)?;
         let mut after_timeout = false;
         let mut after_after = false;
@@ -1991,7 +2064,10 @@ mod tests {
             }
             if after_timeout && after_after {
                 if let Some(raw) = trimmed.strip_prefix("hours:") {
-                    return raw.trim().parse().ok();
+                    return raw.trim().parse().ok().map(TimeoutAfter::Hours);
+                }
+                if let Some(raw) = trimmed.strip_prefix("minutes:") {
+                    return raw.trim().parse().ok().map(TimeoutAfter::Minutes);
                 }
                 if !trimmed.is_empty() && !trimmed.starts_with('#') {
                     return None;

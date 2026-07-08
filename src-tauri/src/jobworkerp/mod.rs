@@ -30,6 +30,7 @@ use crate::error::{AppError, AppResult};
 
 pub mod embedding;
 pub mod llm_chat;
+pub mod maintenance;
 
 /// jobworkerp's stream-end protocol: when a streaming runner (LLM /
 /// WORKFLOW) fails mid-stream the server still closes with a successful
@@ -356,6 +357,47 @@ impl JobworkerpHandle {
             .map_err(|e| AppError::Jobworkerp(format!("listen_stream: {e}")))?
             .into_inner();
         Ok(ListenStream { inner })
+    }
+
+    pub async fn run_maintenance(
+        &self,
+        requests: maintenance::MaintenanceRequests,
+    ) -> AppResult<maintenance::MaintenanceReport> {
+        let deleted_job_results = self
+            .inner
+            .jobworkerp_client
+            .job_result_client()
+            .await
+            .delete_bulk(requests.delete_bulk)
+            .await
+            .map_err(|e| AppError::Jobworkerp(format!("job_result delete_bulk: {e}")))?
+            .into_inner()
+            .deleted_count;
+        let marked_stale_statuses = self
+            .inner
+            .jobworkerp_client
+            .job_processing_status_client()
+            .await
+            .purge_stale_jobs(requests.purge_stale_jobs)
+            .await
+            .map_err(|e| AppError::Jobworkerp(format!("job status purge_stale_jobs: {e}")))?
+            .into_inner()
+            .marked_count;
+        let deleted_status_rows = self
+            .inner
+            .jobworkerp_client
+            .job_processing_status_client()
+            .await
+            .cleanup(requests.cleanup)
+            .await
+            .map_err(|e| AppError::Jobworkerp(format!("job status cleanup: {e}")))?
+            .into_inner()
+            .deleted_count;
+        Ok(maintenance::MaintenanceReport {
+            deleted_job_results,
+            marked_stale_statuses,
+            deleted_status_rows,
+        })
     }
 }
 

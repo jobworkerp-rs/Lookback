@@ -13,6 +13,7 @@ pub mod error;
 pub mod grpc;
 pub mod jobworkerp;
 pub mod lindera;
+pub mod maintenance;
 pub mod plugins;
 pub mod serde_id;
 pub mod sidecar;
@@ -140,9 +141,13 @@ pub fn run() {
             // Spawn sidecars on a tokio task — keep the Tauri setup path
             // non-blocking so the UI shell renders immediately.
             let handle_for_task = handle.clone();
+            let sidecars_for_task = sidecars.clone();
+            let data_for_task = data.clone();
             tauri::async_runtime::spawn(async move {
-                stage_and_start_sidecars(&handle_for_task, &sidecars, &data).await;
+                stage_and_start_sidecars(&handle_for_task, &sidecars_for_task, &data_for_task)
+                    .await;
             });
+            crate::maintenance::spawn_jobworkerp_maintenance_loop(sidecars.clone(), data.clone());
 
             Ok(())
         })

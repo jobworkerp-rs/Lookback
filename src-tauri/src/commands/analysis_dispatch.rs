@@ -922,6 +922,30 @@ mod tests {
     }
 
     #[test]
+    fn thread_reflection_single_completed_detects_record_success_chunk() {
+        let chunk = serde_json::json!({
+            "status": "Running",
+            "position": "/ROOT/do/3/reflectEach/for/do/1/invokeSingleWithRetry/try/do/1/recordSuccess",
+            "output": "{}"
+        })
+        .to_string();
+
+        assert!(crate::commands::thread_reflection_single_completed(&chunk));
+    }
+
+    #[test]
+    fn thread_reflection_single_completed_ignores_progress_chunk() {
+        let chunk = serde_json::json!({
+            "status": "Running",
+            "position": "/ROOT/do/3/reflectEach/for/do/0/reportProgress",
+            "output": "{}"
+        })
+        .to_string();
+
+        assert!(!crate::commands::thread_reflection_single_completed(&chunk));
+    }
+
+    #[test]
     fn job_id_prefixes_distinguish_the_two_dispatches() {
         let summary = format!("summary-{}", 1_700_000_000_000_i64);
         let personality = format!("personality-{}", 1_700_000_000_000_i64);

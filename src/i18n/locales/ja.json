@@ -99,13 +99,13 @@
     },
     "modeTitle": {
       "keyword": "BM25 keyword 検索",
-      "semantic": "サーバ側で embed (GPU MultimodalEmbeddingRunner 必須)",
-      "hybrid": "ベクトル + BM25 融合 (クライアント側で embed → HybridSearch)"
+      "semantic": "クエリを embedding worker で埋め込み検索",
+      "hybrid": "ベクトル + BM25 融合 (embedding worker + HybridSearch)"
     },
     "hint": {
       "keyword": "BM25 keyword 検索",
-      "semantic": "サーバ側で embed (GPU MultimodalEmbeddingRunner)。未配備時は失敗します",
-      "hybrid": "ベクトル + BM25 融合。クライアント側で embed (embedding worker 必須)"
+      "semantic": "クエリを Lookback の embedding worker で埋め込み、Semantic 検索します。worker 未準備時は Settings の embedding モデルを確認してください。",
+      "hybrid": "ベクトル + BM25 融合。クエリを embedding worker で埋め込みます。"
     },
     "errorHint": {
       "shortQuery": "検索語をもう少し長くするか、複数の語句で検索してください。短い語句だけで探す場合は Keyword 検索を試してください。",

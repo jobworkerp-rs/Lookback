@@ -251,6 +251,19 @@ describe("Threads page label filter", () => {
     expect(screen.queryByText(/MultimodalEmbeddingRunner/)).toBeNull();
   });
 
+  it("describes empty semantic search without server-side or GPU wording", async () => {
+    listThreads.mockResolvedValue([]);
+    findDistinctLabels.mockResolvedValue(labels);
+
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Semantic" }));
+
+    expect(screen.getAllByText("クエリを入力してください").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Lookback の embedding worker/)).toBeInTheDocument();
+    expect(screen.queryByText(/サーバ側|GPU|MultimodalEmbeddingRunner|未配備/)).toBeNull();
+  });
+
   it("keeps the embedding readiness hint for semantic worker failures", async () => {
     listThreads.mockResolvedValue([]);
     findDistinctLabels.mockResolvedValue(labels);

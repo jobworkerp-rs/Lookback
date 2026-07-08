@@ -99,13 +99,13 @@
     },
     "modeTitle": {
       "keyword": "BM25 keyword search",
-      "semantic": "Embed server-side (requires GPU MultimodalEmbeddingRunner)",
-      "hybrid": "Vector + BM25 fusion (embed client-side → HybridSearch)"
+      "semantic": "Embed the query with the embedding worker",
+      "hybrid": "Vector + BM25 fusion (embedding worker + HybridSearch)"
     },
     "hint": {
       "keyword": "BM25 keyword search",
-      "semantic": "Embed server-side (GPU MultimodalEmbeddingRunner). Fails if not deployed.",
-      "hybrid": "Vector + BM25 fusion. Embed client-side (embedding worker required)."
+      "semantic": "Embeds the query with Lookback's embedding worker, then runs Semantic search. If the worker is not ready, check the embedding model in Settings.",
+      "hybrid": "Vector + BM25 fusion. The query is embedded with the embedding worker."
     },
     "errorHint": {
       "shortQuery": "Try a longer search term, or combine several words. To search with short terms only, use Keyword search.",

@@ -24,7 +24,7 @@ use super::import::{
 };
 use super::{
     AppState, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner, emit_event,
-    emit_generated_refresh,
+    emit_generated_refresh, thread_reflection_single_completed,
 };
 
 const REFLECTION_WORKER_NAME: &str = "memories-reflection-batch";
@@ -122,6 +122,13 @@ pub async fn enqueue_reflection_job(
                 let (status, message) = match ev {
                     StreamEvent::Active(msg) => {
                         let digest = msg.map(|raw| {
+                            if thread_reflection_single_completed(raw) {
+                                emit_generated_refresh(
+                                    &app_for_emit,
+                                    &job_id_for_emit,
+                                    vec![GeneratedRefreshScope::Reflection],
+                                );
+                            }
                             let (d, p) = summarize_workflow_chunk(raw, last_progress);
                             last_progress = p;
                             d

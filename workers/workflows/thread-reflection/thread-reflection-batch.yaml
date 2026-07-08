@@ -207,7 +207,7 @@ do:
               - invokeSingle:
                   timeout:
                     after:
-                      minutes: 30
+                      hours: 3
                   run:
                     function:
                       # Resolve the language-specific single worker by name.
