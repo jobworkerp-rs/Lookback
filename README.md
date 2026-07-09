@@ -6,6 +6,10 @@ It imports session logs into [`memory-store`](https://github.com/jobworkerp-rs/m
 
 Japanese documentation is available in [README_ja.md](README_ja.md). Developer-focused setup, test, and environment details are in [docs/developer-guide.md](docs/developer-guide.md).
 
+## Screenshot
+
+![Lookback Threads tab showing imported sessions, label filtering, and import progress.](docs/thread1.png)
+
 ## What You Can Do
 
 - Import local `claude-code` and `codex` session logs.
