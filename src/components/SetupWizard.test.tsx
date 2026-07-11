@@ -121,6 +121,7 @@ describe("SetupWizard", () => {
     await waitFor(() => expect(applySetupMock).toHaveBeenCalledTimes(1));
     expect(applySetupMock).toHaveBeenCalledWith({
       data_root: null,
+      preferred_language: "ja",
       settings: { llm: null, embedding: null, hf_home: null, mcp: null, timezone: null },
     });
     await waitFor(() => expect(onComplete).toHaveBeenCalled());
@@ -205,6 +206,7 @@ describe("SetupWizard", () => {
     await waitFor(() => expect(applySetupMock).toHaveBeenCalledTimes(1));
     expect(applySetupMock).toHaveBeenCalledWith({
       data_root: "/Volumes/Ext/lookback",
+      preferred_language: "ja",
       settings: {
         embedding: null,
         hf_home: { mode: "data_root", path: null },

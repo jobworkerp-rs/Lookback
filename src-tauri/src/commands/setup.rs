@@ -34,6 +34,8 @@ pub struct SetupStatus {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApplySetupRequest {
     pub data_root: Option<String>,
+    #[serde(default)]
+    pub preferred_language: Option<String>,
     pub settings: ApplySettingsRequest,
 }
 
@@ -62,7 +64,10 @@ fn force_setup_wizard() -> bool {
     env_flag_enabled(std::env::var(FORCE_SETUP_ENV).ok().as_deref())
 }
 
-fn with_setup_defaults(mut settings: ApplySettingsRequest) -> ApplySettingsRequest {
+fn with_setup_defaults(
+    mut settings: ApplySettingsRequest,
+    preferred_language: Option<&str>,
+) -> ApplySettingsRequest {
     settings.llm.get_or_insert(SetLlmSettingsRequest {
         mode: LlmMode::Local,
         provider_model: None,
@@ -79,7 +84,11 @@ fn with_setup_defaults(mut settings: ApplySettingsRequest) -> ApplySettingsReque
     settings
         .embedding
         .get_or_insert_with(|| SetEmbeddingSettingsRequest {
-            preset_id: Some(super::embedding_presets::DEFAULT_EMBEDDING_PRESET_ID.into()),
+            preset_id: Some(
+                super::embedding_presets::default_preset_for_language(preferred_language)
+                    .id
+                    .into(),
+            ),
             custom_model_id: None,
             custom_tokenizer_id: None,
             custom_vector_size: None,
@@ -167,7 +176,7 @@ pub async fn apply_setup(
     state: State<'_, AppState>,
     req: ApplySetupRequest,
 ) -> AppResult<ApplySetupResponse> {
-    let settings = with_setup_defaults(req.settings);
+    let settings = with_setup_defaults(req.settings, req.preferred_language.as_deref());
     let target = req
         .data_root
         .as_deref()
@@ -213,13 +222,16 @@ mod tests {
 
     #[test]
     fn setup_defaults_materialise_every_setting() {
-        let settings = with_setup_defaults(ApplySettingsRequest {
-            llm: None,
-            embedding: None,
-            hf_home: None,
-            mcp: None,
-            timezone: None,
-        });
+        let settings = with_setup_defaults(
+            ApplySettingsRequest {
+                llm: None,
+                embedding: None,
+                hf_home: None,
+                mcp: None,
+                timezone: None,
+            },
+            None,
+        );
         assert!(settings.llm.is_some());
         assert_eq!(
             settings.embedding.unwrap().preset_id.as_deref(),
@@ -237,17 +249,38 @@ mod tests {
             mode: paths::HfHomeMode::DataRoot,
             path: None,
         };
-        let settings = with_setup_defaults(ApplySettingsRequest {
-            llm: None,
-            embedding: None,
-            hf_home: Some(explicit),
-            mcp: None,
-            timezone: None,
-        });
+        let settings = with_setup_defaults(
+            ApplySettingsRequest {
+                llm: None,
+                embedding: None,
+                hf_home: Some(explicit),
+                mcp: None,
+                timezone: None,
+            },
+            None,
+        );
         assert!(matches!(
             settings.hf_home.unwrap().mode,
             paths::HfHomeMode::DataRoot
         ));
+    }
+
+    #[test]
+    fn setup_defaults_use_ruri_only_for_japanese_first_run() {
+        let settings = with_setup_defaults(
+            ApplySettingsRequest {
+                llm: None,
+                embedding: None,
+                hf_home: None,
+                mcp: None,
+                timezone: None,
+            },
+            Some("ja"),
+        );
+        assert_eq!(
+            settings.embedding.unwrap().preset_id.as_deref(),
+            Some("ruri-v3-310m-onnx-int8")
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ import type {
   ApplySetupRequest,
   ApplySetupResponse,
   AppSettingsResponse,
+  BackgroundJobQueueStatus,
   ChatAskRequest,
   ChatAskResponse,
   ConnectionConfig,
@@ -336,6 +337,11 @@ export async function redispatchReflectionEmbeddings(
  *  Settings "Embedding index" card next to the Embedding model card. */
 export async function getMemoryEmbeddingStats(): Promise<MemoryEmbeddingStats> {
   return invoke<MemoryEmbeddingStats>("get_memory_embedding_stats");
+}
+
+/** Active local jobworkerp queue counts for the Settings monitor. */
+export async function getBackgroundJobQueueStatus(): Promise<BackgroundJobQueueStatus> {
+  return invoke<BackgroundJobQueueStatus>("get_background_job_queue_status");
 }
 
 /** Re-enqueue embedding jobs for every memory. Idempotent at the server

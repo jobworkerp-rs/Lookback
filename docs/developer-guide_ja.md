@@ -323,3 +323,14 @@ cargo clippy -p lookback-tauri --all-targets -- -D warnings
 ```
 
 一部の統合テストは実際のバックエンドバイナリとプラグインパスを必要とします。テストファイルに必要な `LOOKBACK_*` 変数が記載されている場合は、そのテストを実行する前に明示的に設定してください。
+## Ruri ONNX の実機確認
+
+Ruri 対応 runner と `memories` を配置した後は、既存データを変更しない一時 data root で
+次の順に確認します。
+
+1. `LOOKBACK_FORCE_SETUP_WIZARD=1` と一時 data root を指定して Lookback を起動する。
+2. 日本語 UI の embedding 手順で `Ruri v3 310M` が選択されていることを確認する。
+3. setup を適用し、初回ダウンロードと worker load の完了を待つ。
+4. Sidecar 状態でモデル名、768 次元、`INT8`、text-only を確認する。
+5. テキストを import し、Semantic / Hybrid / チャット RAG の検索結果が返ることを確認する。
+6. ログに `UnsupportedDevice`、次元不一致、ONNX operator error がないことを確認する。

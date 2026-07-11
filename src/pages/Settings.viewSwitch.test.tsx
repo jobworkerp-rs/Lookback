@@ -17,6 +17,7 @@ const listEmbeddingPresets = vi.fn();
 const getAppSettings = vi.fn();
 const getConnectionConfig = vi.fn();
 const getMemoryEmbeddingStats = vi.fn();
+const getBackgroundJobQueueStatus = vi.fn();
 const getModelStatus = vi.fn();
 const getSettings = vi.fn();
 const getMcpSettings = vi.fn();
@@ -31,6 +32,7 @@ vi.mock("@/api", () => ({
   getAppSettings: () => getAppSettings(),
   getConnectionConfig: () => getConnectionConfig(),
   getMemoryEmbeddingStats: () => getMemoryEmbeddingStats(),
+  getBackgroundJobQueueStatus: () => getBackgroundJobQueueStatus(),
   getModelStatus: () => getModelStatus(),
   getSettings: () => getSettings(),
   setConnectionConfig: () => Promise.resolve(),
@@ -198,6 +200,7 @@ describe("Settings view switching", () => {
       records_without_embedding: 0,
       vector_dimension: 1024,
     });
+    getBackgroundJobQueueStatus.mockResolvedValue({ active: false, rows: [] });
     // Both models report a concrete state; the production refetchInterval
     // reads `d.llm.state` / `d.embedding.state` and would NPE on null sides.
     getModelStatus.mockResolvedValue({

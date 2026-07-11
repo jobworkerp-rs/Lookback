@@ -119,6 +119,7 @@ pub fn run() {
             commands::setup::restart_for_setup,
             commands::embeddings::get_memory_embedding_stats,
             commands::embeddings::redispatch_memory_embeddings,
+            commands::background_jobs::get_background_job_queue_status,
             commands::recovery::recover_evacuate_lancedb,
             commands::recovery::recover_purge_lancedb,
             commands::recovery::recover_reset_embedding_settings,

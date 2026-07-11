@@ -1,6 +1,7 @@
 pub mod analysis_dispatch;
 pub mod app_settings;
 pub mod apply_settings;
+pub mod background_jobs;
 pub mod chat;
 pub mod connection;
 pub mod embedding_presets;

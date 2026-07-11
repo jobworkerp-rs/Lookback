@@ -26,19 +26,21 @@ use super::{
 
 // Worker names must match what the import pipeline dispatches
 // (import.rs success path). Kept as constants here and guarded by a
-// drift test against those literals.
-const SUMMARY_WORKER_NAME: &str = "memories-summarize-batch";
-const PERSONALITY_WORKER_NAME: &str = "memories-personality-batch";
+// drift test against those literals. `pub(crate)` so the Settings queue
+// card (`background_jobs.rs`) can classify counts by the same names
+// instead of carrying its own copy that could drift.
+pub(crate) const SUMMARY_WORKER_NAME: &str = "memories-summarize-batch";
+pub(crate) const PERSONALITY_WORKER_NAME: &str = "memories-personality-batch";
 /// Base name of the Layer-2 merge lang-worker. The full worker name is
 /// `<base>-<lang>` (`memories-user-personality-merge-ja` / `-en`), registered
 /// by `memories-import upsert-generation-workers`. The Personality tab uses it
 /// to skip per-thread fan-out and re-run the merge alone (e.g. after a 429
 /// storm left signals but no profile). Same lang-worker the personality batch
 /// resolves for its tail merge step.
-const PERSONALITY_MERGE_WORKER_BASE: &str = "memories-user-personality-merge";
+pub(crate) const PERSONALITY_MERGE_WORKER_BASE: &str = "memories-user-personality-merge";
 /// Staged pipeline parent (per-thread → daily → weekly → monthly). Must
 /// match the `name:` in workers/llm-workers.yaml.
-const SUMMARIES_PIPELINE_WORKER_NAME: &str = "memories-summaries-pipeline";
+pub(crate) const SUMMARIES_PIPELINE_WORKER_NAME: &str = "memories-summaries-pipeline";
 
 const SUMMARY_EVENT: &str = "summary://step";
 const PERSONALITY_EVENT: &str = "personality://step";

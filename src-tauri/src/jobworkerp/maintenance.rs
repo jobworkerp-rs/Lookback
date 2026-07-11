@@ -12,6 +12,7 @@ use jobworkerp_client::jobworkerp::service::{
 const RETENTION_DAYS: i64 = 7;
 const RETENTION_HOURS: u64 = (RETENTION_DAYS * 24) as u64;
 const RETENTION_MS: i64 = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const STARTUP_ORPHAN_SWEEP_THRESHOLD_HOURS: u64 = 0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaintenanceRequests {
@@ -44,6 +45,16 @@ pub fn build_maintenance_requests(now_ms: i64) -> MaintenanceRequests {
     }
 }
 
+/// Build the startup-only sweep request. Zero selects every status row older
+/// than the current instant; orphaned-only verification still protects rows
+/// that have a live status or a persisted job.
+pub fn build_startup_orphan_sweep_request() -> PurgeStaleJobsRequest {
+    PurgeStaleJobsRequest {
+        stale_threshold_hours: STARTUP_ORPHAN_SWEEP_THRESHOLD_HOURS,
+        orphaned_only: Some(true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +73,13 @@ mod tests {
         assert_eq!(requests.purge_stale_jobs.stale_threshold_hours, 168);
         assert_eq!(requests.purge_stale_jobs.orphaned_only, Some(true));
         assert_eq!(requests.cleanup.retention_hours_override, Some(168));
+    }
+
+    #[test]
+    fn startup_orphan_sweep_checks_every_orphaned_status_row() {
+        let request = build_startup_orphan_sweep_request();
+
+        assert_eq!(request.stale_threshold_hours, 0);
+        assert_eq!(request.orphaned_only, Some(true));
     }
 }

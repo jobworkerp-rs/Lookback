@@ -48,10 +48,10 @@ serde_yaml = "0.9"
 # Misc
 once_cell = "1"
 parking_lot = "0.12"
-dirs = "5"
+dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
-which = "7"
+which = "8"
 dotenvy = "0.15"
 
 [profile.release]

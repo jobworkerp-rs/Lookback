@@ -67,6 +67,13 @@ pub fn parse_embedding_values(json: serde_json::Value) -> AppResult<Vec<f32>> {
     Ok(first.values)
 }
 
+fn embed_text_arguments(text: &str, prefix: Option<&str>) -> serde_json::Value {
+    match prefix.filter(|value| !value.is_empty()) {
+        Some(prefix) => serde_json::json!({ "text": text, "prefix": prefix }),
+        None => serde_json::json!({ "text": text }),
+    }
+}
+
 /// Embed a search query into a single vector via the jobworkerp embedding
 /// worker. Empty/whitespace input is rejected before dispatch so the
 /// failure is observable rather than a 5xx from the runner.
@@ -83,7 +90,12 @@ pub async fn embed_query(handle: &JobworkerpHandle, text: &str) -> AppResult<Vec
     let result = handle
         .dispatch_unary(
             &worker,
-            serde_json::json!({ "text": trimmed }),
+            embed_text_arguments(
+                trimmed,
+                std::env::var("MEMORY_EMBEDDING_QUERY_PREFIX")
+                    .ok()
+                    .as_deref(),
+            ),
             Some(&method),
         )
         .await?;
@@ -137,6 +149,18 @@ mod tests {
         // A non-object payload can't deserialize into EmbeddingResult.
         let err = parse_embedding_values(serde_json::json!("not an object")).unwrap_err();
         assert!(matches!(err, AppError::Jobworkerp(_)));
+    }
+
+    #[test]
+    fn embed_text_arguments_keep_prefix_out_of_source_text() {
+        assert_eq!(
+            embed_text_arguments("本文", Some("検索クエリ: ")),
+            serde_json::json!({ "text": "本文", "prefix": "検索クエリ: " })
+        );
+        assert_eq!(
+            embed_text_arguments("plain", None),
+            serde_json::json!({ "text": "plain" })
+        );
     }
 
     #[test]

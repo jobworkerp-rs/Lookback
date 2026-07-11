@@ -76,6 +76,7 @@ do:
                 using: embed_text
                 arguments:
                   text: "${$workflow.input.content}"
+                  prefix: "%{MEMORY_EMBEDDING_DOCUMENT_PREFIX:-}"
             # N-row: store every chunk. `embed_text` chunks long text;
             # `text_rows` builds one VectorRow per chunk (vector_kind
             # "text", chunk_index from the 0-based array index). A

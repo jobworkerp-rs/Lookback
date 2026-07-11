@@ -118,7 +118,25 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
    ```
 
 2. ランナープラグイン（`libjobworkerp_llama_cpp_plugin` と `libmm_embedding_runner`）を対象 OS
-   向けにビルドし、共有ライブラリを `plugins/` に配置します。
+   向けにビルドし、共有ライブラリを `plugins/` に配置します。macOS で Ruri ONNX を使う
+   mm runner は、Qwen 用 Metal と ONNX 用 CoreML の両 feature を有効にします。
+
+   ```bash
+   cd /path/to/mm-embedding-runner
+   cargo build --release --features metal,onnx-coreml
+   cp target/release/libmm_embedding_runner.dylib \
+     /path/to/agent-app/src-tauri/plugins/
+   ```
+
+   prefix 対応を含む `memories` の `front` も再ビルドして、Tauri の target triple 付き名称で
+   配置します。
+
+   ```bash
+   cd /path/to/memories
+   cargo build --release -p grpc-admin --bin front --features lindera
+   cp target/release/front \
+     /path/to/agent-app/src-tauri/bin/front-aarch64-apple-darwin
+   ```
 3. `memory-store` の `front` を Lindera FTS 対応でビルドする場合は、検索用辞書（`metadata.json`
    を含む lindera 3.x 形式）を `dict/lindera/ipadic` に配置します。Lookback はこのディレクトリを
    パッケージに含めて `memory-store` 用に配置しますが、辞書を直接読み込んで解析するわけではありません。
@@ -132,7 +150,8 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
    - データルートと Hugging Face キャッシュの場所を選びます。
    - ローカルまたは外部 LLM プロバイダーを選びます。
      - 外部 LLM の API キーは、Keychain など OS の認証情報ストアに保存されます。
-   - 埋め込みモデルを選びます。
+   - 埋め込みモデルを選びます。日本語 UI の新規セットアップでは Ruri v3 310M INT8 ONNX
+     が初期選択されます。既存設定や英語 UI の既定モデルは変更されません。
    - バックエンドとモデル準備状態の検査結果を確認します。
 3. プロバイダー、モデルパス、キャッシュパス、言語、タイムゾーン、MCP 公開設定を変更したい場合は、後から **設定** を開きます。
    - Connection を **Remote server** にする場合でも **Embedding model** は変更できます。Semantic / Hybrid 検索を使う場合は、ローカルで各記事の embedding は生成されないため、リモートサーバ側の embedding モデル・ベクトル次元と同じ設定に揃えます。Remote server 接続中の変更では、ローカル embedding インデックスのリセットや再生成は行いません。

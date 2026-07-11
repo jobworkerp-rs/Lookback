@@ -568,6 +568,22 @@
       "redispatchConfirm": "Memory {{count}} 件分の embedding を再生成します。完了までに時間がかかります。続行しますか?",
       "result": "再生成: 投入 {{dispatched}} / スキップ {{skipped}} / 失敗 {{failed}} ({{ms}} ms)"
     },
+    "backgroundJobs": {
+      "title": "バックグラウンド処理",
+      "desc": "ローカル jobworkerp の処理待ち・実行中ジョブ数です。処理中は10秒間隔、待機中は1分間隔で自動更新します。",
+      "pending": "保留",
+      "running": "実行中",
+      "waitResult": "結果待ち",
+      "cancelling": "取消中",
+      "delayHint": "状態インデックスの反映には数秒の遅延があり得ます。",
+      "kind": {
+        "embedding": "Embedding",
+        "summary": "要約",
+        "personality": "人格",
+        "reflection": "自省",
+        "llmOther": "LLM・その他"
+      }
+    },
     "mcp": {
       "title": "MCP Server",
       "descPre": "Lookback の検索ツール",
@@ -685,7 +701,8 @@
       "desc": {
         "qwen3-vl-embedding-2b": "テキストと画像を同一ベクトル空間に埋め込めるマルチモーダル版。画像検索を使う場合はこれ。",
         "qwen3-embedding-0-6b": "デフォルト。軽量・高速。日常運用に十分な品質で、消費メモリも小さい。",
-        "qwen3-embedding-4b": "中規模・高品質。長文 context (40k) 対応で要約や日本語検索の精度が安定。画像検索は無効化される。"
+        "qwen3-embedding-4b": "中規模・高品質。長文 context (40k) 対応で要約や日本語検索の精度が安定。画像検索は無効化される。",
+        "ruri-v3-310m-onnx-int8": "日本語検索向けの軽量な Ruri v3。INT8 ONNX と検索用途別の接頭辞を使用します。画像検索は無効化されます。"
       }
     }
   },

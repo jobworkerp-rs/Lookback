@@ -116,12 +116,20 @@ init_submodules() {
 }
 
 # gpu_features -> the cargo --features flag (or empty) for the GPU backend.
-# Both llama-cpp-runner (jobworkerp-llama-cpp-plugin) and mm-embedding-runner
-# expose `metal` and `cuda` features, so the mapping is identical for both.
+# llama-cpp-runner uses the candle GPU feature only. mm-embedding-runner also
+# needs the matching ONNX Runtime EP for ModernBERT checkpoints.
 gpu_features() {
   case "${GPU}" in
     metal) echo "--features metal" ;;
     cuda)  echo "--features cuda" ;;
+    cpu)   echo "" ;;
+  esac
+}
+
+mm_gpu_features() {
+  case "${GPU}" in
+    metal) echo "--features metal,onnx-coreml" ;;
+    cuda)  echo "--features cuda,onnx-cuda" ;;
     cpu)   echo "" ;;
   esac
 }
@@ -160,7 +168,7 @@ build_llama() {
 }
 
 build_mm() {
-  local feat; feat=$(gpu_features)
+  local feat; feat=$(mm_gpu_features)
   log "build mm-embedding plugin (${GPU})"
   # shellcheck disable=SC2086
   cargo_build "$(repo_path mm)" --release ${feat}

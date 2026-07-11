@@ -15,7 +15,9 @@ use tracing::{debug, info, warn};
 
 use crate::data::DataPaths;
 use crate::error::{AppError, AppResult};
-use crate::jobworkerp::maintenance::build_maintenance_requests;
+use crate::jobworkerp::maintenance::{
+    build_maintenance_requests, build_startup_orphan_sweep_request,
+};
 use crate::sidecar::Sidecars;
 
 const RUN_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -40,8 +42,46 @@ pub fn spawn_jobworkerp_maintenance_loop(sidecars: Arc<Sidecars>, data: DataPath
     });
 }
 
+/// Schedule a best-effort sweep after every successful local sidecar start.
+/// The caller supplies an endpoint published only after the full start
+/// sequence, so the RPC cannot race the jobworkerp TCP health check.
+pub(crate) fn spawn_startup_orphan_sweep(jobworkerp_url: String) {
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            let handle = crate::jobworkerp::JobworkerpHandle::connect(&jobworkerp_url).await?;
+            handle
+                .purge_orphaned_job_processing_status(build_startup_orphan_sweep_request())
+                .await
+        }
+        .await;
+        let _ = finish_startup_orphan_sweep(result);
+    });
+}
+
+fn completed_start_jobworkerp_url(
+    report: Option<crate::sidecar::SidecarStartReport>,
+) -> Option<String> {
+    report.map(|report| report.endpoints.jobworkerp_url())
+}
+
+fn finish_startup_orphan_sweep(result: AppResult<u64>) -> Option<u64> {
+    match result {
+        Ok(marked_count) => {
+            info!(
+                marked_count,
+                "jobworkerp startup orphaned status sweep completed"
+            );
+            Some(marked_count)
+        }
+        Err(e) => {
+            warn!(error = %e, "jobworkerp startup orphaned status sweep failed");
+            None
+        }
+    }
+}
+
 async fn wait_for_sidecars(sidecars: &Sidecars) {
-    while sidecars.current_endpoints().is_none() {
+    while completed_start_jobworkerp_url(sidecars.last_report()).is_none() {
         tokio::time::sleep(READY_POLL_INTERVAL).await;
     }
 }
@@ -53,11 +93,10 @@ async fn run_if_due(sidecars: &Sidecars, data: &DataPaths) {
         debug!("jobworkerp maintenance skipped; last success is still recent");
         return;
     }
-    let Some(endpoints) = sidecars.current_endpoints() else {
-        debug!("jobworkerp maintenance skipped; sidecars are not ready");
+    let Some(url) = completed_start_jobworkerp_url(sidecars.last_report()) else {
+        debug!("jobworkerp maintenance skipped; sidecars are not fully ready");
         return;
     };
-    let url = endpoints.jobworkerp_url();
     let result = async {
         let handle = crate::jobworkerp::JobworkerpHandle::connect(&url).await?;
         handle
@@ -65,7 +104,6 @@ async fn run_if_due(sidecars: &Sidecars, data: &DataPaths) {
             .await
     }
     .await;
-
     match result {
         Ok(report) => {
             if let Err(e) = save_marker(&marker_path, now_ms) {
@@ -181,5 +219,31 @@ mod tests {
             load_marker(&path),
             1_700_000_000_000
         ));
+    }
+
+    #[test]
+    fn startup_orphan_sweep_failure_is_non_fatal() {
+        assert_eq!(finish_startup_orphan_sweep(Ok(4)), Some(4));
+        assert_eq!(
+            finish_startup_orphan_sweep(Err(AppError::Jobworkerp("unavailable".into()))),
+            None
+        );
+    }
+
+    #[test]
+    fn completed_start_jobworkerp_url_requires_a_successful_start_report() {
+        assert_eq!(completed_start_jobworkerp_url(None), None);
+        assert_eq!(
+            completed_start_jobworkerp_url(Some(crate::sidecar::SidecarStartReport {
+                endpoints: crate::sidecar::SidecarEndpoints {
+                    jobworkerp_port: 19_000,
+                    memories_port: 19_001,
+                    conductor_port: 19_002,
+                    mcp_server_port: None,
+                },
+                warnings: Vec::new(),
+            })),
+            Some("http://127.0.0.1:19000".to_string())
+        );
     }
 }

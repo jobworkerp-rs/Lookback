@@ -122,6 +122,7 @@ do:
           using: embed_text
           arguments:
             text: "${ $workflow.input.query }"
+            prefix: "%{MEMORY_EMBEDDING_QUERY_PREFIX:-}"
       export:
         as:
           # `embed_text` returns { embeddings: [{ values: [...] }, ...] }.

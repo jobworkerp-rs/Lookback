@@ -36,6 +36,7 @@ do:
           using: embed_text
           arguments:
             text: "${ .content }"
+            prefix: "%{MEMORY_EMBEDDING_DOCUMENT_PREFIX:-}"
       output:
         as:
           model_name: "${ .model_info.model_name? // \"unknown\" }"

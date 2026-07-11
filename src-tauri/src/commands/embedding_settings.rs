@@ -30,7 +30,9 @@ const MAX_SEQ_LEN_MAX: u32 = 131_072;
 /// else at registration time with `UnsupportedDType`.
 const SUPPORTED_DTYPES: &[&str] = &["F16", "BF16", "F32"];
 
-/// Single source of truth for the `LOOKBACK_EMBEDDING_*` env namespace.
+/// Single source of truth for embedding env managed by Lookback. Runner
+/// overrides use `LOOKBACK_EMBEDDING_*`; memories-owned retrieval prefixes
+/// use `MEMORY_EMBEDDING_*` so the downstream contract stays app-agnostic.
 /// Used by [`resolve_embedding_env_vars`] (producer), the sidecar
 /// lifecycle's `apply_embedding_env` (consumer that clears stale keys),
 /// and the test helpers in `commands::model`. Adding a key here propagates
@@ -41,6 +43,8 @@ pub const EMBEDDING_ENV_KEYS: &[&str] = &[
     "LOOKBACK_EMBEDDING_DTYPE",
     "LOOKBACK_EMBEDDING_MAX_SEQ_LEN",
     "LOOKBACK_EMBEDDING_VECTOR_SIZE",
+    "MEMORY_EMBEDDING_DOCUMENT_PREFIX",
+    "MEMORY_EMBEDDING_QUERY_PREFIX",
 ];
 
 /// Persisted (non-secret) embedding-model config.
@@ -146,6 +150,10 @@ pub struct EmbeddingRuntime {
     pub vector_size: u32,
     pub dtype: String,
     pub max_sequence_length: u32,
+    pub onnx_model_file: Option<String>,
+    pub onnx_pooling: Option<String>,
+    pub document_prefix: Option<String>,
+    pub query_prefix: Option<String>,
     /// `false` ⇒ the UI shows the "画像検索は無効化されます" chip. Does
     /// not affect sidecar env on its own — the image path is gated by
     /// `MEMORY_IMAGE_SEARCH_MODE` on the memories side, which agent-app
@@ -161,6 +169,10 @@ fn runtime_from_preset(preset: &EmbeddingPreset) -> EmbeddingRuntime {
         vector_size: preset.vector_size,
         dtype: preset.dtype.to_string(),
         max_sequence_length: preset.max_sequence_length,
+        onnx_model_file: preset.onnx_model_file.map(str::to_string),
+        onnx_pooling: preset.onnx_pooling.map(str::to_string),
+        document_prefix: preset.document_prefix.map(str::to_string),
+        query_prefix: preset.query_prefix.map(str::to_string),
         is_multimodal: preset.is_multimodal,
     }
 }
@@ -214,6 +226,10 @@ where
             max_sequence_length: settings
                 .custom_max_sequence_length
                 .unwrap_or(default.max_sequence_length),
+            onnx_model_file: None,
+            onnx_pooling: None,
+            document_prefix: None,
+            query_prefix: None,
             // `is_multimodal` defaults to `false` for custom because we
             // cannot infer it from a free-text HF repo, and silently
             // claiming text+image support would render the image search
@@ -251,6 +267,14 @@ where
         max_sequence_length: env_lookup("LOOKBACK_EMBEDDING_MAX_SEQ_LEN")
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(preset_runtime.max_sequence_length),
+        onnx_model_file: preset_runtime.onnx_model_file,
+        onnx_pooling: preset_runtime.onnx_pooling,
+        document_prefix: env_lookup("MEMORY_EMBEDDING_DOCUMENT_PREFIX")
+            .filter(|s| !s.is_empty())
+            .or(preset_runtime.document_prefix),
+        query_prefix: env_lookup("MEMORY_EMBEDDING_QUERY_PREFIX")
+            .filter(|s| !s.is_empty())
+            .or(preset_runtime.query_prefix),
         is_multimodal: preset_runtime.is_multimodal,
     }
 }
@@ -263,7 +287,7 @@ pub fn resolve_embedding_runtime(settings: &EmbeddingSettings) -> EmbeddingRunti
     resolve_embedding_runtime_with_env(settings, |_| None)
 }
 
-/// `LOOKBACK_EMBEDDING_*` env vars derived from `runtime`. The runtime
+/// Embedding env vars derived from `runtime`. The runtime
 /// IS the source of truth for these values, so deriving the env from it
 /// guarantees the staged YAML, `MEMORY_VECTOR_SIZE`, and the process-env-
 /// driven `expand_env` placeholders all agree. Callers that already
@@ -286,6 +310,12 @@ pub fn resolve_embedding_env_vars_from_runtime(
         "LOOKBACK_EMBEDDING_VECTOR_SIZE",
         runtime.vector_size.to_string(),
     ));
+    if let Some(prefix) = runtime.document_prefix.as_ref() {
+        out.push(("MEMORY_EMBEDDING_DOCUMENT_PREFIX", prefix.clone()));
+    }
+    if let Some(prefix) = runtime.query_prefix.as_ref() {
+        out.push(("MEMORY_EMBEDDING_QUERY_PREFIX", prefix.clone()));
+    }
     out
 }
 
@@ -793,6 +823,51 @@ mod tests {
         assert_eq!(rt.model_id, preset.hf_repo);
         assert_eq!(rt.vector_size, preset.vector_size);
         assert!(!rt.is_multimodal);
+    }
+
+    #[test]
+    fn resolve_ruri_preset_emits_retrieval_prefix_env() {
+        let settings = EmbeddingSettings {
+            preset_id: Some("ruri-v3-310m-onnx-int8".into()),
+            ..Default::default()
+        };
+        let runtime = resolve_embedding_runtime(&settings);
+        assert_eq!(
+            runtime.onnx_model_file.as_deref(),
+            Some("onnx/model_int8.onnx")
+        );
+        assert_eq!(runtime.onnx_pooling.as_deref(), Some("ONNX_POOLING_MEAN"));
+        let env: std::collections::HashMap<_, _> =
+            resolve_embedding_env_vars_from_runtime(&runtime)
+                .into_iter()
+                .collect();
+        assert_eq!(
+            env.get("MEMORY_EMBEDDING_DOCUMENT_PREFIX")
+                .map(String::as_str),
+            Some("検索文書: ")
+        );
+        assert_eq!(
+            env.get("MEMORY_EMBEDDING_QUERY_PREFIX").map(String::as_str),
+            Some("検索クエリ: ")
+        );
+    }
+
+    #[test]
+    fn bundled_embedding_workflows_route_document_and_query_prefixes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../workers/workflows");
+        for relative in [
+            "auto-embedding.yaml",
+            "thread-reflection/auto-reflection-intent-embedding.yaml",
+            "thread-reflection/auto-reflection-summary-embedding.yaml",
+        ] {
+            let yaml = std::fs::read_to_string(root.join(relative)).unwrap();
+            assert!(
+                yaml.contains("prefix: \"%{MEMORY_EMBEDDING_DOCUMENT_PREFIX:-}\""),
+                "document prefix missing from {relative}"
+            );
+        }
+        let rag = std::fs::read_to_string(root.join("rag/lookback-recall.yaml")).unwrap();
+        assert!(rag.contains("prefix: \"%{MEMORY_EMBEDDING_QUERY_PREFIX:-}\""));
     }
 
     #[test]

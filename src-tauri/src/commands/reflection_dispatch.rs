@@ -27,7 +27,9 @@ use super::{
     emit_generated_refresh, thread_reflection_single_completed,
 };
 
-const REFLECTION_WORKER_NAME: &str = "memories-reflection-batch";
+// `pub(crate)` so the Settings queue card (`background_jobs.rs`) can
+// classify counts by this name instead of carrying its own copy.
+pub(crate) const REFLECTION_WORKER_NAME: &str = "memories-reflection-batch";
 const REFLECTION_EVENT: &str = "reflection://step";
 
 #[derive(Debug, Clone, Deserialize, Default)]

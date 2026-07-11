@@ -152,6 +152,44 @@ message JobProcessingStatusDetailResponse {
   int64 updated_at = 11;  // Last RDB update time (for detecting sync delay)
 }
 
+// Count mode for JobProcessingStatusService.CountByCondition.
+enum CountJobProcessingStatusMode {
+  // Count all rows matching the condition.
+  COUNT_JOB_PROCESSING_STATUS_MODE_TOTAL = 0;
+
+  // Count rows matching the condition grouped by processing status.
+  COUNT_JOB_PROCESSING_STATUS_MODE_GROUP_BY_STATUS = 1;
+}
+
+// Request for counting job processing statuses with the same predicates as FindByCondition.
+message CountJobProcessingStatusRequest {
+  // Status filter
+  optional jobworkerp.data.JobProcessingStatus status = 1;
+
+  // Worker ID filter
+  optional int64 worker_id = 2;
+
+  // Channel filter
+  optional string channel = 3;
+
+  // Long-running job filter (milliseconds)
+  optional int64 min_elapsed_time_ms = 4;
+
+  // Count mode. Default is TOTAL.
+  CountJobProcessingStatusMode mode = 5;
+}
+
+message JobProcessingStatusCount {
+  jobworkerp.data.JobProcessingStatus status = 1;
+  int64 count = 2;
+}
+
+message CountJobProcessingStatusResponse {
+  int64 total = 1;
+  repeated JobProcessingStatusCount counts = 2;
+  CountJobProcessingStatusMode mode = 3;
+}
+
 // Cleanup request message
 message CleanupRequest {
   // Optional: Override default retention hours (for testing purposes)
@@ -210,6 +248,11 @@ service JobProcessingStatusService {
   rpc FindByCondition(FindJobProcessingStatusRequest)
       returns (stream JobProcessingStatusDetailResponse);
 
+  // Count active rows using the same RDB index predicates as FindByCondition.
+  // Returns UNIMPLEMENTED error if JOB_STATUS_RDB_INDEXING=false
+  rpc CountByCondition(CountJobProcessingStatusRequest)
+      returns (CountJobProcessingStatusResponse);
+
   // Cleanup logically deleted records from job_processing_status table
   //
   // This operation physically deletes records marked as deleted (deleted_at IS NOT NULL)
@@ -236,7 +279,7 @@ service JobProcessingStatusService {
   //
   // Modes:
   // - orphaned_only=false (default): Purges all stale records in bulk.
-  // - orphaned_only=true: Purges stale records whose job_id is absent from BOTH the live JobProcessingStatusRepository (Redis/Memory) AND the `job` table.
+  // - orphaned_only=true: Purges stale records whose job_id is absent from BOTH the live JobProcessingStatusRepository (Redis/Memory) AND the `job` table. A zero threshold is allowed in this mode and selects every row older than the current instant.
   //
   // Redis/Memory is the source of truth for live job processing state; the
   // `job` table is the SoT for queue types without a live-status entry
@@ -249,7 +292,7 @@ service JobProcessingStatusService {
   // Requirements:
   // - JOB_STATUS_RDB_INDEXING=true (returns FAILED_PRECONDITION if disabled)
   // - AUTH_TOKEN environment variable must match jobworkerp-auth header (if set)
-  // - stale_threshold_hours must be > 0 (returns INVALID_ARGUMENT if 0)
+  // - stale_threshold_hours must be > 0 when orphaned_only=false (returns INVALID_ARGUMENT if 0)
   rpc PurgeStaleJobs(PurgeStaleJobsRequest) returns (PurgeStaleJobsResponse);
 }
 

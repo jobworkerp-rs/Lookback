@@ -6,6 +6,7 @@ import {
   applySettings,
   createDataRoot,
   getAppSettings,
+  getBackgroundJobQueueStatus,
   getConnectionConfig,
   getEmbeddingSettings,
   getLlmSettings,
@@ -29,6 +30,7 @@ import { Modal } from "@/components/Modal";
 import { Toolbar } from "@/components/Toolbar";
 import type { SettingsDirtyControl } from "@/hooks/useSettingsDirty";
 import type {
+  BackgroundTaskKind,
   ConnectionMode,
   DataRootValidation,
   EmbeddingPreset,
@@ -300,6 +302,7 @@ export function Settings({
         queryClient.invalidateQueries({ queryKey: ["app-settings"] }),
         queryClient.invalidateQueries({ queryKey: ["settings"] }),
         queryClient.invalidateQueries({ queryKey: ["memory-embedding-stats"] }),
+        queryClient.invalidateQueries({ queryKey: ["background-job-queue-status"] }),
         queryClient.invalidateQueries({ queryKey: ["reflection-intent-stats"] }),
       ]);
     } catch (e) {
@@ -387,6 +390,8 @@ export function Settings({
             />
 
             <MemoryEmbeddingCard />
+
+            <BackgroundJobQueueCard />
 
             <HfHomeCard onDirtyChange={reportHf} resetSignal={resetSignal} />
 
@@ -1690,6 +1695,7 @@ export function EmbeddingProviderCard({
   onDirtyChange,
   onResetsVectordbChange,
   suppressResetWarning = false,
+  preferredDefaultLanguage,
   resetSignal,
 }: {
   retrying: boolean;
@@ -1702,6 +1708,9 @@ export function EmbeddingProviderCard({
   onResetsVectordbChange?: (resets: boolean) => void;
   /** First-run setup starts with an empty vectordb, so reset warnings would be noise. */
   suppressResetWarning?: boolean;
+  /** First-run only: choose a language-recommended preset when no selection
+   *  has been persisted. Normal Settings deliberately leaves this unset. */
+  preferredDefaultLanguage?: string;
 } & DirtyReporter<SetEmbeddingSettingsRequest>) {
   const { t } = useTranslation();
   const { data, isLoading } = useQuery({
@@ -1734,10 +1743,21 @@ export function EmbeddingProviderCard({
   // Stable reference so a render churn during loading doesn't force the
   // reseed effect to fire repeatedly with the same data.
   const presetList: EmbeddingPreset[] = useMemo(() => presets.data ?? [], [presets.data]);
+  const defaultPresetId = useMemo(
+    () =>
+      presetList.find((preset) =>
+        preset.recommended_languages?.some(
+          (language) => language.toLowerCase() === preferredDefaultLanguage?.toLowerCase(),
+        ),
+      )?.id ??
+      presetList[0]?.id ??
+      "",
+    [presetList, preferredDefaultLanguage],
+  );
 
   const seedFromData = useCallback(() => {
     if (!data) return;
-    setPresetId(data.preset_id ?? presetList[0]?.id ?? "");
+    setPresetId(data.preset_id ?? defaultPresetId);
     setCustomModel(data.custom_model_id ?? "");
     setCustomTokenizer(data.custom_tokenizer_id ?? "");
     setCustomVectorSize(data.custom_vector_size != null ? String(data.custom_vector_size) : "");
@@ -1747,7 +1767,7 @@ export function EmbeddingProviderCard({
     );
     setCustomMultimodal(data.custom_is_multimodal ?? false);
     setEvacuate(true);
-  }, [data, presetList[0]?.id]);
+  }, [data, defaultPresetId]);
 
   // Re-seed when the server data (re)loads OR the parent fires a discard.
   useEffect(() => {
@@ -1768,8 +1788,8 @@ export function EmbeddingProviderCard({
     if (presetList.length === 0) return;
     if (presetId !== "") return;
     if (data?.preset_id != null) return;
-    setPresetId(presetList[0]?.id ?? "");
-  }, [presetList, data]);
+    setPresetId(defaultPresetId);
+  }, [presetList, data, defaultPresetId]);
 
   const selectedPreset = useMemo(
     () => presetList.find((p) => p.id === presetId),
@@ -1810,7 +1830,7 @@ export function EmbeddingProviderCard({
     // save-time policy, not persisted state, so it is excluded from the
     // diff (toggling it alone is not "dirty").
     const clean =
-      payload.preset_id === (data.preset_id ?? presetList[0]?.id ?? null) &&
+      payload.preset_id === (data.preset_id ?? (defaultPresetId || null)) &&
       payload.custom_model_id === (data.custom_model_id ?? null) &&
       payload.custom_tokenizer_id === (data.custom_tokenizer_id ?? null) &&
       payload.custom_vector_size === (data.custom_vector_size ?? null) &&
@@ -1829,7 +1849,7 @@ export function EmbeddingProviderCard({
     customMaxSeq,
     customMultimodal,
     evacuate,
-    presetList,
+    defaultPresetId,
   ]);
 
   // Whether the form differs from the persisted value, IGNORING the
@@ -1838,7 +1858,7 @@ export function EmbeddingProviderCard({
   const edited = useMemo(() => {
     if (!data) return false;
     return !(
-      (presetId === "" ? null : presetId) === (data.preset_id ?? presetList[0]?.id ?? null) &&
+      (presetId === "" ? null : presetId) === (data.preset_id ?? (defaultPresetId || null)) &&
       (isCustom ? customModel.trim() || null : null) === (data.custom_model_id ?? null) &&
       (isCustom ? customTokenizer.trim() || null : null) === (data.custom_tokenizer_id ?? null) &&
       (isCustom && customVectorSize ? Number.parseInt(customVectorSize, 10) || null : null) ===
@@ -1859,7 +1879,7 @@ export function EmbeddingProviderCard({
     customDtype,
     customMaxSeq,
     customMultimodal,
-    presetList,
+    defaultPresetId,
   ]);
 
   useEffect(() => {
@@ -2312,6 +2332,82 @@ function SavingBlockerModal({ title, description }: { title: string; description
   );
 }
 
+const BACKGROUND_JOB_KIND_KEYS: Record<BackgroundTaskKind, string> = {
+  embedding: "settings.backgroundJobs.kind.embedding",
+  summary: "settings.backgroundJobs.kind.summary",
+  personality: "settings.backgroundJobs.kind.personality",
+  reflection: "settings.backgroundJobs.kind.reflection",
+  llm_other: "settings.backgroundJobs.kind.llmOther",
+};
+
+export const BACKGROUND_JOB_QUEUE_REFETCH_INTERVAL_MS = 10_000;
+export const BACKGROUND_JOB_QUEUE_IDLE_REFETCH_INTERVAL_MS = 60_000;
+
+export function backgroundJobQueueRefetchInterval(active: boolean): number {
+  return active
+    ? BACKGROUND_JOB_QUEUE_REFETCH_INTERVAL_MS
+    : BACKGROUND_JOB_QUEUE_IDLE_REFETCH_INTERVAL_MS;
+}
+
+export function BackgroundJobQueueCard() {
+  const { t } = useTranslation();
+  const jobs = useQuery({
+    queryKey: ["background-job-queue-status"],
+    queryFn: getBackgroundJobQueueStatus,
+    refetchInterval: (query) =>
+      backgroundJobQueueRefetchInterval(query.state.data?.active ?? false),
+  });
+  const rows = jobs.data?.rows ?? [];
+  const count = (value: number) => (jobs.isLoading ? "…" : String(value));
+
+  return (
+    <div className="settings-card">
+      <div className="settings-card-title">{t("settings.backgroundJobs.title")}</div>
+      <div className="settings-card-desc">{t("settings.backgroundJobs.desc")}</div>
+      {jobs.error && (
+        <div style={{ color: "var(--danger)", fontSize: 11 }}>{(jobs.error as Error).message}</div>
+      )}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "minmax(90px, 1fr) repeat(4, auto)",
+          gap: "4px 10px",
+          fontSize: 11,
+          marginTop: 8,
+        }}
+      >
+        <span />
+        <span>{t("settings.backgroundJobs.pending")}</span>
+        <span>{t("settings.backgroundJobs.running")}</span>
+        <span>{t("settings.backgroundJobs.waitResult")}</span>
+        <span>{t("settings.backgroundJobs.cancelling")}</span>
+        {rows.map((row) => (
+          <div key={row.kind} style={{ display: "contents" }}>
+            <span>{t(BACKGROUND_JOB_KIND_KEYS[row.kind])}</span>
+            <span>{count(row.pending)}</span>
+            <span>{count(row.running)}</span>
+            <span>{count(row.wait_result)}</span>
+            <span>{count(row.cancelling)}</span>
+          </div>
+        ))}
+      </div>
+      <div className="settings-row" style={{ marginTop: 8 }}>
+        <div style={{ color: "var(--label-tertiary)", fontSize: 11 }}>
+          {t("settings.backgroundJobs.delayHint")}
+        </div>
+        <button
+          type="button"
+          className="btn"
+          onClick={() => void jobs.refetch()}
+          disabled={jobs.isFetching}
+        >
+          {jobs.isFetching ? t("common.loading") : t("common.reload")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function MemoryEmbeddingCard() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -2350,6 +2446,7 @@ export function MemoryEmbeddingCard() {
       const res = await redispatchMemoryEmbeddings({});
       setResult(res);
       await queryClient.invalidateQueries({ queryKey: ["memory-embedding-stats"] });
+      await queryClient.invalidateQueries({ queryKey: ["background-job-queue-status"] });
     } catch (e) {
       setError((e as Error).message);
     } finally {

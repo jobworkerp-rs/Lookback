@@ -17,7 +17,8 @@ use jobworkerp_client::jobworkerp::data::{
 };
 use jobworkerp_client::jobworkerp::function::data::FunctionSetId;
 use jobworkerp_client::jobworkerp::service::{
-    ListenRequest, LoadWorkerRequest, ReleaseStaticWorkerRequest, listen_request,
+    CountJobProcessingStatusRequest, CountJobProcessingStatusResponse, ListenRequest,
+    LoadWorkerRequest, PurgeStaleJobsRequest, ReleaseStaticWorkerRequest, listen_request,
     load_worker_request, release_static_worker_request,
 };
 use prost_reflect::{DynamicMessage, MessageDescriptor};
@@ -94,6 +95,34 @@ impl JobworkerpHandle {
                 yaml_path.display()
             ))
         })
+    }
+
+    /// Resolve a registered worker name to its stable numeric id.
+    pub async fn worker_id_by_name(&self, name: &str) -> AppResult<Option<i64>> {
+        self.inner
+            .find_worker_by_name(None, Arc::new(HashMap::new()), name)
+            .await
+            .map_err(|e| AppError::Jobworkerp(format!("find worker {name}: {e}")))
+            .map(|found| found.map(|(id, _)| id.value))
+    }
+
+    /// Count active job_processing_status rows matching `request` on the
+    /// shared channel. Reuses the same `tonic::transport::Channel` every
+    /// other command goes through (`job_processing_status_client()` just
+    /// clones the cell) instead of dialing a fresh connection per call —
+    /// the Settings queue card issues several of these per refresh.
+    pub async fn count_job_processing_status(
+        &self,
+        request: CountJobProcessingStatusRequest,
+    ) -> AppResult<CountJobProcessingStatusResponse> {
+        self.inner
+            .jobworkerp_client
+            .job_processing_status_client()
+            .await
+            .count_by_condition(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(|e| AppError::Jobworkerp(format!("count_job_processing_status: {e}")))
     }
 
     pub async fn register_workers_from_yaml(
@@ -398,6 +427,22 @@ impl JobworkerpHandle {
             marked_stale_statuses,
             deleted_status_rows,
         })
+    }
+
+    /// Logically delete status-index rows that no longer have either live or
+    /// persisted job state. Used only after a local sidecar restart.
+    pub async fn purge_orphaned_job_processing_status(
+        &self,
+        request: PurgeStaleJobsRequest,
+    ) -> AppResult<u64> {
+        self.inner
+            .jobworkerp_client
+            .job_processing_status_client()
+            .await
+            .purge_stale_jobs(request)
+            .await
+            .map_err(|e| AppError::Jobworkerp(format!("job status startup orphan sweep: {e}")))
+            .map(|response| response.into_inner().marked_count)
     }
 }
 

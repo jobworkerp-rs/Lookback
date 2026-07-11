@@ -562,6 +562,11 @@ export interface EmbeddingPreset {
   vector_size: number;
   dtype: string;
   max_sequence_length: number;
+  onnx_model_file?: string | null;
+  onnx_pooling?: string | null;
+  document_prefix?: string | null;
+  query_prefix?: string | null;
+  recommended_languages?: string[];
   is_multimodal: boolean;
   estimated_ram_gb: number;
   /** An i18n key (`settings.embeddingPreset.desc.<id>`), not a localized
@@ -582,6 +587,10 @@ export interface EmbeddingRuntime {
   vector_size: number;
   dtype: string;
   max_sequence_length: number;
+  onnx_model_file?: string | null;
+  onnx_pooling?: string | null;
+  document_prefix?: string | null;
+  query_prefix?: string | null;
   is_multimodal: boolean;
 }
 
@@ -731,6 +740,7 @@ export interface SetupStatus {
 
 export interface ApplySetupRequest {
   data_root: string | null;
+  preferred_language?: "ja" | "en";
   settings: ApplySettingsRequest;
 }
 
@@ -907,6 +917,27 @@ export interface MemoryEmbeddingStats {
   records_with_embedding: number;
   records_without_embedding: number;
   vector_dimension: number;
+}
+
+/** Live local-jobworkerp queue counts, grouped for the Settings monitor. */
+export type BackgroundTaskKind =
+  | "embedding"
+  | "summary"
+  | "personality"
+  | "reflection"
+  | "llm_other";
+
+export interface BackgroundJobQueueRow {
+  kind: BackgroundTaskKind;
+  pending: number;
+  running: number;
+  wait_result: number;
+  cancelling: number;
+}
+
+export interface BackgroundJobQueueStatus {
+  rows: BackgroundJobQueueRow[];
+  active: boolean;
 }
 
 /** Redispatch every memory's embedding job. The backend

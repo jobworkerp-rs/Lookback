@@ -63,6 +63,23 @@ const PRESETS: EmbeddingPreset[] = [
     estimated_ram_gb: 6,
     description: "multimodal",
   },
+  {
+    id: "ruri-v3-310m-onnx-int8",
+    display_name: "Ruri v3 310M (Japanese, text-only, 768 dim, INT8)",
+    hf_repo: "sirasagi62/ruri-v3-310m-ONNX",
+    tokenizer_hf_repo: null,
+    vector_size: 768,
+    dtype: "F32",
+    max_sequence_length: 8192,
+    onnx_model_file: "onnx/model_int8.onnx",
+    onnx_pooling: "ONNX_POOLING_MEAN",
+    document_prefix: "検索文書: ",
+    query_prefix: "検索クエリ: ",
+    recommended_languages: ["ja"],
+    is_multimodal: false,
+    estimated_ram_gb: 2,
+    description: "ruri",
+  },
 ];
 
 const DEFAULT_LOCAL_SETTINGS: EmbeddingSettingsResponse = {
@@ -230,6 +247,15 @@ describe("EmbeddingProviderCard", () => {
       expect(select.value).toBe("qwen3-embedding-0-6b");
     });
     expect(screen.queryByText(/text-only モデルです。画像検索は無効化されます/)).toBeNull();
+  });
+
+  it("uses the Japanese recommendation only when first-run requests it", async () => {
+    getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
+    renderCard(vi.fn(), vi.fn(), { preferredDefaultLanguage: "ja" });
+    await waitFor(() => {
+      const select = screen.getByRole("combobox") as HTMLSelectElement;
+      expect(select.value).toBe("ruri-v3-310m-onnx-int8");
+    });
   });
 
   it("reports null when custom vector size is empty even with a model id", async () => {

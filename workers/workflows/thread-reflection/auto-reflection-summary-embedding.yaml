@@ -77,6 +77,7 @@ do:
                 using: embed_text
                 arguments:
                   text: "${.content}"
+                  prefix: "%{MEMORY_EMBEDDING_DOCUMENT_PREFIX:-}"
             output:
               as:
                 # `?` suppresses jaq's "cannot use null as iterable"

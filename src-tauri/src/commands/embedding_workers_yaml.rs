@@ -45,6 +45,15 @@ pub fn render_auto_embedding_workers_yaml(runtime: &EmbeddingRuntime) -> String 
     }
     settings.push_str(&format!("      device: {}\n", embedding_device()));
     settings.push_str(&format!("      dtype: {}\n", yaml_escape(&runtime.dtype)));
+    if let Some(path) = runtime.onnx_model_file.as_deref() {
+        settings.push_str(&format!(
+            "      onnx_model_file: \"{}\"\n",
+            yaml_escape(path)
+        ));
+    }
+    if let Some(pooling) = runtime.onnx_pooling.as_deref() {
+        settings.push_str(&format!("      onnx_pooling: {}\n", yaml_escape(pooling)));
+    }
     settings.push_str(&format!(
         "      max_sequence_length: {}\n",
         runtime.max_sequence_length
@@ -193,7 +202,7 @@ pub fn stage_auto_embedding_workers_yaml(
 mod tests {
     use super::*;
     use crate::commands::embedding_presets;
-    use crate::commands::embedding_settings::resolve_embedding_runtime;
+    use crate::commands::embedding_settings::{EmbeddingSettings, resolve_embedding_runtime};
 
     fn default_runtime() -> EmbeddingRuntime {
         resolve_embedding_runtime(&Default::default())
@@ -226,6 +235,10 @@ mod tests {
             vector_size: 768,
             dtype: "BF16".into(),
             max_sequence_length: 512,
+            onnx_model_file: None,
+            onnx_pooling: None,
+            document_prefix: None,
+            query_prefix: None,
             is_multimodal: false,
         };
         let yaml = render_auto_embedding_workers_yaml(&runtime);
@@ -240,6 +253,10 @@ mod tests {
             vector_size: 1024,
             dtype: "BF16".into(),
             max_sequence_length: 256,
+            onnx_model_file: None,
+            onnx_pooling: None,
+            document_prefix: None,
+            query_prefix: None,
             is_multimodal: false,
         };
         let yaml = render_auto_embedding_workers_yaml(&runtime);
@@ -288,6 +305,10 @@ mod tests {
             vector_size: 768,
             dtype: "F16".into(),
             max_sequence_length: 512,
+            onnx_model_file: None,
+            onnx_pooling: None,
+            document_prefix: None,
+            query_prefix: None,
             is_multimodal: false,
         };
         let yaml = render_auto_embedding_workers_yaml(&runtime);
@@ -300,6 +321,18 @@ mod tests {
             .and_then(|s| s.as_str())
             .unwrap();
         assert_eq!(model, "org/with\"quote");
+    }
+
+    #[test]
+    fn render_ruri_preset_emits_int8_onnx_settings() {
+        let runtime = resolve_embedding_runtime(&EmbeddingSettings {
+            preset_id: Some("ruri-v3-310m-onnx-int8".into()),
+            ..Default::default()
+        });
+        let yaml = render_auto_embedding_workers_yaml(&runtime);
+        assert!(yaml.contains("model_id: \"sirasagi62/ruri-v3-310m-ONNX\""));
+        assert!(yaml.contains("onnx_model_file: \"onnx/model_int8.onnx\""));
+        assert!(yaml.contains("onnx_pooling: ONNX_POOLING_MEAN"));
     }
 
     #[test]

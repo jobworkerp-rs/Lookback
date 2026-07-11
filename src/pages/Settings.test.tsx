@@ -5,6 +5,7 @@ import { I18nextProvider } from "react-i18next";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type {
+  BackgroundJobQueueStatus,
   ConnectionConfig,
   EmbeddingSettingsResponse,
   LlmSettingsResponse,
@@ -13,7 +14,15 @@ import type {
   SetEmbeddingSettingsRequest,
   SetLlmSettingsRequest,
 } from "@/types/api";
-import { ConnectionCard, LlmProviderCard, MemoryEmbeddingCard } from "./Settings";
+import {
+  BACKGROUND_JOB_QUEUE_IDLE_REFETCH_INTERVAL_MS,
+  BACKGROUND_JOB_QUEUE_REFETCH_INTERVAL_MS,
+  BackgroundJobQueueCard,
+  backgroundJobQueueRefetchInterval,
+  ConnectionCard,
+  LlmProviderCard,
+  MemoryEmbeddingCard,
+} from "./Settings";
 
 const getConnectionConfig = vi.fn();
 const setConnectionConfig = vi.fn();
@@ -21,6 +30,7 @@ const testConnectionConfig = vi.fn();
 const getLlmSettings = vi.fn();
 const getEmbeddingSettings = vi.fn();
 const getMemoryEmbeddingStats = vi.fn();
+const getBackgroundJobQueueStatus = vi.fn();
 const redispatchMemoryEmbeddings = vi.fn();
 const listLlmPresets = vi.fn();
 const listEmbeddingPresets = vi.fn();
@@ -31,6 +41,7 @@ vi.mock("@/api", () => ({
   getLlmSettings: () => getLlmSettings(),
   getEmbeddingSettings: () => getEmbeddingSettings(),
   getMemoryEmbeddingStats: () => getMemoryEmbeddingStats(),
+  getBackgroundJobQueueStatus: () => getBackgroundJobQueueStatus(),
   redispatchMemoryEmbeddings: (req: unknown) => redispatchMemoryEmbeddings(req),
   listLlmPresets: () => listLlmPresets(),
   listEmbeddingPresets: () => listEmbeddingPresets(),
@@ -710,6 +721,48 @@ function renderEmbeddingCard() {
     </I18nextProvider>,
   );
 }
+
+const BACKGROUND_QUEUE: BackgroundJobQueueStatus = {
+  active: true,
+  rows: [
+    { kind: "embedding", pending: 3, running: 1, wait_result: 0, cancelling: 0 },
+    { kind: "summary", pending: 2, running: 0, wait_result: 1, cancelling: 0 },
+    { kind: "personality", pending: 0, running: 0, wait_result: 0, cancelling: 0 },
+    { kind: "reflection", pending: 0, running: 0, wait_result: 0, cancelling: 0 },
+    { kind: "llm_other", pending: 1, running: 0, wait_result: 0, cancelling: 0 },
+  ],
+};
+
+describe("BackgroundJobQueueCard", () => {
+  beforeEach(() => {
+    i18n.changeLanguage("ja");
+    getBackgroundJobQueueStatus.mockReset();
+  });
+
+  it("renders task-specific active queue counts", async () => {
+    getBackgroundJobQueueStatus.mockResolvedValue(BACKGROUND_QUEUE);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={client}>
+          <BackgroundJobQueueCard />
+        </QueryClientProvider>
+      </I18nextProvider>,
+    );
+
+    await screen.findByText("Embedding");
+    expect(screen.getByText("要約")).toBeInTheDocument();
+    expect(screen.getByText("3")).toBeInTheDocument();
+    expect(screen.getAllByText("1")).toHaveLength(3);
+  });
+
+  it("uses a slower interval while queues are idle", () => {
+    expect(BACKGROUND_JOB_QUEUE_REFETCH_INTERVAL_MS).toBe(10_000);
+    expect(BACKGROUND_JOB_QUEUE_IDLE_REFETCH_INTERVAL_MS).toBe(60_000);
+    expect(backgroundJobQueueRefetchInterval(true)).toBe(10_000);
+    expect(backgroundJobQueueRefetchInterval(false)).toBe(60_000);
+  });
+});
 
 describe("MemoryEmbeddingCard", () => {
   beforeEach(() => {

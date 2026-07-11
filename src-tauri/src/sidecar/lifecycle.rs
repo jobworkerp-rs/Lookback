@@ -54,6 +54,13 @@ const DEFAULT_SIDECAR_LOG: &str = "info,app=warn,worker_app=warn,lance=warn";
 const DEFAULT_JOBWORKERP_LOG: &str = "debug,hyper=info,hyper_util=info,tonic=info,h2=info,tower=info,reqwest=info,sqlx=warn,tokio=info,runtime=info,lance=warn";
 const MEMORIES_START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The document prefix is consumed while expanding Lookback's jobworkerp
+/// workflow YAMLs. The memories frontend rejects it because its internally
+/// chunked text embedding path cannot preserve persisted offsets after
+/// prepending text. The query prefix remains valid because it does not alter
+/// persisted document chunks.
+const MEMORIES_UNSUPPORTED_DOCUMENT_PREFIX_ENV_KEY: &str = "MEMORY_EMBEDDING_DOCUMENT_PREFIX";
+
 /// TCP health-check budget for the in-process MCP HTTP server. Much shorter
 /// than the per-sidecar 30s because by the time we check it the jobworkerp
 /// process is already up (its gRPC port passed) and the MCP server binds
@@ -692,11 +699,17 @@ impl Sidecars {
         &self,
         warnings: Vec<SidecarWarning>,
     ) -> AppResult<SidecarStartReport> {
+        let was_running = self.current_endpoints().is_some();
         let result = self.start_inner(warnings).await;
         match &result {
-            Ok(_) => {
+            Ok(report) => {
                 *self.last_start_error.lock() = None;
                 *self.last_start_failure.lock() = None;
+                if Self::should_spawn_startup_orphan_sweep(was_running, true) {
+                    crate::maintenance::spawn_startup_orphan_sweep(
+                        report.endpoints.jobworkerp_url(),
+                    );
+                }
             }
             Err(e) => {
                 *self.last_start_error.lock() = Some(e.to_string());
@@ -708,6 +721,10 @@ impl Sidecars {
             }
         }
         result
+    }
+
+    fn should_spawn_startup_orphan_sweep(was_running: bool, start_succeeded: bool) -> bool {
+        !was_running && start_succeeded
     }
 
     async fn start_inner(
@@ -833,7 +850,7 @@ impl Sidecars {
             &self.config.data.embedding_settings_path(),
         );
         // Resolve runtime + env vars from the SAME env-aware projection so
-        // a dev `LOOKBACK_EMBEDDING_*` override flows into all three
+        // a dev embedding env override flows into all three
         // consumers consistently: the staged YAML, `MEMORY_VECTOR_SIZE` on
         // the memories child, and the process env that the YAML loader's
         // `expand_env` reads. Without this, env overrides reached
@@ -1707,12 +1724,12 @@ impl Sidecars {
             embedding_runtime.vector_size,
             &self.config.data.lancedb_dir().join("memories.lancedb"),
         );
-        // NOTE: `LOOKBACK_EMBEDDING_*` env vars are NOT injected into the
-        // memories child — memories itself does not read them. They are
-        // applied to the Tauri process env (`apply_embedding_env`) so the
-        // jobworkerp YAML loader's `expand_env` can substitute the committed
-        // `auto-embedding-workers.yaml` placeholders. The staged YAML (when
-        // present) bakes the values in directly.
+        // Prefixes are intentionally inherited by jobworkerp, whose workflow
+        // YAML expands them into `embed_text` calls. Remove only the document
+        // prefix from memories: its internally chunked embedding path rejects
+        // it to protect persisted chunk offsets, while the query prefix is
+        // needed for retrieval embeddings.
+        strip_memories_document_embedding_prefix(&mut cmd);
 
         // Point the embedding dispatchers at the agent-app's bundled YAMLs
         // (Metal device + unified `memories-mm-embedding` names) instead of
@@ -1986,6 +2003,13 @@ pub(crate) unsafe fn apply_embedding_env(vars: &[(&'static str, String)]) {
             }
         }
     }
+}
+
+/// Remove the document embedding prefix from the memories child command.
+/// `Command` otherwise inherits the parent environment, which is required by
+/// jobworkerp YAML expansion. The query prefix remains for retrieval queries.
+fn strip_memories_document_embedding_prefix(cmd: &mut Command) {
+    cmd.env_remove(MEMORIES_UNSUPPORTED_DOCUMENT_PREFIX_ENV_KEY);
 }
 
 fn effective_rust_log() -> String {
@@ -2679,6 +2703,13 @@ mod tests {
         assert!(sidecars.last_report().is_none());
     }
 
+    #[test]
+    fn orphan_sweep_runs_only_after_a_new_successful_start() {
+        assert!(Sidecars::should_spawn_startup_orphan_sweep(false, true));
+        assert!(!Sidecars::should_spawn_startup_orphan_sweep(true, true));
+        assert!(!Sidecars::should_spawn_startup_orphan_sweep(false, false));
+    }
+
     #[tokio::test]
     async fn failed_start_does_not_leave_a_phantom_mcp_port() {
         // Regression: `active_mcp_port` used to be recorded BEFORE the spawn,
@@ -2854,6 +2885,36 @@ mod tests {
         assert_eq!(
             env.get(std::ffi::OsStr::new("MEMORY_VECTOR_SIZE")),
             Some(&None)
+        );
+    }
+
+    #[test]
+    fn memories_command_removes_document_prefix_but_keeps_query_prefix() {
+        let mut cmd = Command::new("/bin/true");
+        cmd.env("MEMORY_EMBEDDING_DOCUMENT_PREFIX", "検索文書: ")
+            .env("MEMORY_EMBEDDING_QUERY_PREFIX", "検索クエリ: ")
+            .env(
+                "LOOKBACK_EMBEDDING_MODEL_ID",
+                "sirasagi62/ruri-v3-310m-ONNX",
+            );
+
+        strip_memories_document_embedding_prefix(&mut cmd);
+
+        let env = cmd
+            .as_std()
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("MEMORY_EMBEDDING_DOCUMENT_PREFIX")),
+            Some(&None)
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("MEMORY_EMBEDDING_QUERY_PREFIX")),
+            Some(&Some(std::ffi::OsStr::new("検索クエリ: ")))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("LOOKBACK_EMBEDDING_MODEL_ID")),
+            Some(&Some(std::ffi::OsStr::new("sirasagi62/ruri-v3-310m-ONNX")))
         );
     }
 

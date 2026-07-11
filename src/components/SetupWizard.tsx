@@ -35,7 +35,8 @@ export function SetupWizard({
   defaultDataRoot,
   onComplete,
 }: SetupWizardProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const preferredLanguage = i18n.resolvedLanguage === "ja" ? "ja" : "en";
   const [step, setStep] = useState<number>(resumeApply ? STEP.apply : STEP.welcome);
   const [dataRoot, setDataRoot] = useState("");
   const [dataRootValidation, setDataRootValidation] = useState<DataRootValidation | null>(null);
@@ -81,6 +82,7 @@ export function SetupWizard({
       }
       const response = await applySetup({
         data_root: dataRoot.trim() || null,
+        preferred_language: preferredLanguage,
         settings: { llm, embedding, hf_home: hfHome, mcp: null, timezone: null },
       });
       if (response.restart_required) {
@@ -94,7 +96,7 @@ export function SetupWizard({
     } finally {
       setBusy(false);
     }
-  }, [dataRoot, embedding, hfHome, llm, onComplete, resumeApply]);
+  }, [dataRoot, embedding, hfHome, llm, onComplete, preferredLanguage, resumeApply]);
 
   useEffect(() => {
     if (step !== STEP.apply || applyStarted.current) return;
@@ -189,6 +191,7 @@ export function SetupWizard({
             retrying={false}
             onRetry={() => {}}
             onDirtyChange={setEmbedding}
+            preferredDefaultLanguage={preferredLanguage}
             suppressResetWarning
             resetSignal={0}
           />

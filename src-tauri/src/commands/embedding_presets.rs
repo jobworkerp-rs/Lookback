@@ -33,6 +33,15 @@ pub struct EmbeddingPreset {
     /// name verbatim. The runner accepts `F16` / `BF16` / `F32`.
     pub dtype: &'static str,
     pub max_sequence_length: u32,
+    /// ONNX artifact and pooling are emitted only for ONNX-backed presets.
+    pub onnx_model_file: Option<&'static str>,
+    pub onnx_pooling: Option<&'static str>,
+    /// Model-specific retrieval prefixes. They are passed separately from
+    /// source text so stored content and offsets remain unchanged.
+    pub document_prefix: Option<&'static str>,
+    pub query_prefix: Option<&'static str>,
+    /// UI languages for which first-run setup recommends this preset.
+    pub recommended_languages: &'static [&'static str],
     /// `true` ⇒ the model jointly embeds text and images. `false` ⇒
     /// text-only; image search must be disabled (see module docs).
     pub is_multimodal: bool,
@@ -62,6 +71,11 @@ pub const PRESETS: &[EmbeddingPreset] = &[
         vector_size: 1024,
         dtype: "F16",
         max_sequence_length: 32_768,
+        onnx_model_file: None,
+        onnx_pooling: None,
+        document_prefix: None,
+        query_prefix: None,
+        recommended_languages: &[],
         is_multimodal: false,
         estimated_ram_gb: 2,
         description: "settings.embeddingPreset.desc.qwen3-embedding-0-6b",
@@ -74,6 +88,11 @@ pub const PRESETS: &[EmbeddingPreset] = &[
         vector_size: 2048,
         dtype: "F16",
         max_sequence_length: 8192,
+        onnx_model_file: None,
+        onnx_pooling: None,
+        document_prefix: None,
+        query_prefix: None,
+        recommended_languages: &[],
         is_multimodal: true,
         estimated_ram_gb: 6,
         description: "settings.embeddingPreset.desc.qwen3-vl-embedding-2b",
@@ -86,14 +105,34 @@ pub const PRESETS: &[EmbeddingPreset] = &[
         vector_size: 2560,
         dtype: "F16",
         max_sequence_length: 40_960,
+        onnx_model_file: None,
+        onnx_pooling: None,
+        document_prefix: None,
+        query_prefix: None,
+        recommended_languages: &[],
         is_multimodal: false,
         estimated_ram_gb: 10,
         description: "settings.embeddingPreset.desc.qwen3-embedding-4b",
     },
-    // NOTE: cl-nagoya/ruri-v3-310m (ModernBert) is intentionally NOT listed:
-    // the MultimodalEmbeddingRunner currently supports only Qwen3-VL and
-    // Qwen3 text-only checkpoints (architectures[0] branching). Adding ruri
-    // back to this list requires ModernBert support in the runner first.
+    EmbeddingPreset {
+        id: "ruri-v3-310m-onnx-int8",
+        display_name: "Ruri v3 310M (Japanese, text-only, 768 dim, INT8)",
+        hf_repo: "sirasagi62/ruri-v3-310m-ONNX",
+        tokenizer_hf_repo: None,
+        vector_size: 768,
+        // Kept for the shared runner settings schema. ONNX precision is
+        // selected by `onnx_model_file`, not this candle dtype.
+        dtype: "F32",
+        max_sequence_length: 8192,
+        onnx_model_file: Some("onnx/model_int8.onnx"),
+        onnx_pooling: Some("ONNX_POOLING_MEAN"),
+        document_prefix: Some("検索文書: "),
+        query_prefix: Some("検索クエリ: "),
+        recommended_languages: &["ja"],
+        is_multimodal: false,
+        estimated_ram_gb: 2,
+        description: "settings.embeddingPreset.desc.ruri-v3-310m-onnx-int8",
+    },
 ];
 
 pub fn find_preset(id: &str) -> Option<&'static EmbeddingPreset> {
@@ -102,6 +141,19 @@ pub fn find_preset(id: &str) -> Option<&'static EmbeddingPreset> {
 
 pub fn default_preset() -> &'static EmbeddingPreset {
     &PRESETS[0]
+}
+
+pub fn default_preset_for_language(language: Option<&str>) -> &'static EmbeddingPreset {
+    language
+        .and_then(|language| {
+            PRESETS.iter().find(|preset| {
+                preset
+                    .recommended_languages
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(language.trim()))
+            })
+        })
+        .unwrap_or_else(default_preset)
 }
 
 #[tauri::command]
@@ -143,6 +195,29 @@ mod tests {
     #[test]
     fn default_preset_is_at_index_zero() {
         assert_eq!(PRESETS[0].id, DEFAULT_EMBEDDING_PRESET_ID);
+    }
+
+    #[test]
+    fn japanese_first_run_recommends_ruri_without_changing_global_default() {
+        assert_eq!(default_preset().id, DEFAULT_EMBEDDING_PRESET_ID);
+        let ruri = default_preset_for_language(Some("ja"));
+        assert_eq!(ruri.id, "ruri-v3-310m-onnx-int8");
+        assert_eq!(ruri.hf_repo, "sirasagi62/ruri-v3-310m-ONNX");
+        assert_eq!(ruri.vector_size, 768);
+        assert_eq!(ruri.max_sequence_length, 8192);
+        assert_eq!(ruri.onnx_model_file, Some("onnx/model_int8.onnx"));
+        assert_eq!(ruri.onnx_pooling, Some("ONNX_POOLING_MEAN"));
+        assert_eq!(ruri.document_prefix, Some("検索文書: "));
+        assert_eq!(ruri.query_prefix, Some("検索クエリ: "));
+        assert!(!ruri.is_multimodal);
+        assert_eq!(
+            default_preset_for_language(Some("en")).id,
+            DEFAULT_EMBEDDING_PRESET_ID
+        );
+        assert_eq!(
+            default_preset_for_language(None).id,
+            DEFAULT_EMBEDDING_PRESET_ID
+        );
     }
 
     #[test]
