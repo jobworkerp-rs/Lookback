@@ -5,13 +5,15 @@ import type { StepStreamProgressHandle } from "@/hooks/useStepStreamProgress";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
 import type { ResolvedSummaryMemoryRef, SummaryEntry } from "@/types/api";
-import { Summaries } from "./Summaries";
+import { periodKeyPrefixesForMonth, Summaries } from "./Summaries";
 
 // Mock the API surface that Summaries (and its descendants via
 // `resolveSummaryRefNavigation` / `ThreadDetail`) hits during render.
 vi.mock("@/api", () => ({
   listSummaries: vi.fn(),
   listSummaryPeriodKeys: vi.fn().mockResolvedValue([]),
+  findSummaryDistinctLabels: vi.fn().mockResolvedValue([]),
+  findSummaryCoOccurringLabels: vi.fn().mockResolvedValue([]),
   deleteSummary: vi.fn(),
   findMemoryPosition: vi.fn().mockResolvedValue(null),
   findMemoriesByThreadId: vi.fn().mockResolvedValue([]),
@@ -33,10 +35,21 @@ vi.mock("@/api", () => ({
   },
 }));
 
-import { listSummaries, resolveSummaryMemoryRef } from "@/api";
+import {
+  findSummaryCoOccurringLabels,
+  findSummaryDistinctLabels,
+  listSummaries,
+  listSummaryPeriodKeys,
+  resolveSummaryMemoryRef,
+  searchMemoriesKeyword,
+} from "@/api";
 
 const mockListSummaries = vi.mocked(listSummaries);
+const mockListSummaryPeriodKeys = vi.mocked(listSummaryPeriodKeys);
 const mockResolveSummaryMemoryRef = vi.mocked(resolveSummaryMemoryRef);
+const mockFindSummaryDistinctLabels = vi.mocked(findSummaryDistinctLabels);
+const mockFindSummaryCoOccurringLabels = vi.mocked(findSummaryCoOccurringLabels);
+const mockSearchMemoriesKeyword = vi.mocked(searchMemoriesKeyword);
 
 beforeAll(() => {
   // ThreadDetail uses IntersectionObserver / scrollIntoView, which jsdom lacks.
@@ -57,7 +70,15 @@ beforeAll(() => {
 beforeEach(() => {
   i18n.changeLanguage("ja");
   mockListSummaries.mockReset();
+  mockListSummaryPeriodKeys.mockReset();
   mockResolveSummaryMemoryRef.mockReset();
+  mockFindSummaryDistinctLabels.mockReset();
+  mockFindSummaryCoOccurringLabels.mockReset();
+  mockSearchMemoriesKeyword.mockReset();
+  mockFindSummaryDistinctLabels.mockResolvedValue([]);
+  mockFindSummaryCoOccurringLabels.mockResolvedValue([]);
+  mockListSummaryPeriodKeys.mockResolvedValue([]);
+  mockSearchMemoriesKeyword.mockResolvedValue([]);
 });
 
 function noopProgress(): StepStreamProgressHandle {
@@ -113,6 +134,102 @@ function perThreadEntry(over: Partial<SummaryEntry> = {}): SummaryEntry {
 function renderSummaries() {
   return renderWithProviders(<Summaries summaryProgress={noopProgress()} sidecar={readySidecar} />);
 }
+
+function renderCalendar(kind: "daily" | "weekly" | "monthly", month = "2026-07") {
+  return renderWithProviders(
+    <Summaries
+      summaryProgress={noopProgress()}
+      sidecar={readySidecar}
+      focus={{ kind, month, periodKey: "" }}
+    />,
+  );
+}
+
+const summaryLabel = (label: string, count: number) =>
+  screen.getByRole("button", { name: `${label} (${count})` });
+
+async function openSummaryLabelBar() {
+  const summary = await screen.findByText(/^ラベルで絞り込む/);
+  fireEvent.click(summary);
+}
+
+describe("Summaries calendar", () => {
+  it("uses period-key prefixes for daily, weekly, and monthly calendar windows", () => {
+    expect(periodKeyPrefixesForMonth("daily", "2026-07")).toEqual(["2026-07-"]);
+    expect(periodKeyPrefixesForMonth("monthly", "2026-07")).toEqual(["2026-07"]);
+    expect(periodKeyPrefixesForMonth("weekly", "2026-07")).toEqual([
+      "2026-W27",
+      "2026-W28",
+      "2026-W29",
+      "2026-W30",
+      "2026-W31",
+    ]);
+  });
+
+  it("discovers daily keys by period-key prefix instead of updated_at", async () => {
+    renderCalendar("daily");
+
+    await waitFor(() => {
+      expect(mockListSummaryPeriodKeys).toHaveBeenCalledWith({
+        kind: "daily",
+        period_key_prefixes: ["2026-07-"],
+      });
+    });
+  });
+});
+
+describe("Summaries per-thread label filter", () => {
+  it("passes summary plus selected labels with ALL matching to the list", async () => {
+    mockListSummaries.mockResolvedValue([perThreadEntry()]);
+    mockFindSummaryDistinctLabels.mockResolvedValue([{ label: "agent:codex", thread_count: 3 }]);
+    renderSummaries();
+
+    await openSummaryLabelBar();
+    fireEvent.click(summaryLabel("agent:codex", 3));
+
+    await waitFor(() => {
+      expect(mockListSummaries).toHaveBeenLastCalledWith(
+        expect.objectContaining({ labels_any: ["summary", "agent:codex"] }),
+      );
+    });
+  });
+
+  it("uses the same fixed ALL filter for keyword search", async () => {
+    mockListSummaries.mockResolvedValue([perThreadEntry()]);
+    mockFindSummaryDistinctLabels.mockResolvedValue([{ label: "agent:codex", thread_count: 3 }]);
+    renderSummaries();
+
+    await openSummaryLabelBar();
+    fireEvent.click(summaryLabel("agent:codex", 3));
+    fireEvent.click(screen.getByRole("button", { name: "検索" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keyword" }));
+    fireEvent.change(screen.getByPlaceholderText("検索クエリ"), { target: { value: "review" } });
+
+    await waitFor(() => {
+      expect(mockSearchMemoriesKeyword).toHaveBeenLastCalledWith(
+        expect.objectContaining({ labels_any: ["summary", "agent:codex"], label_match: "all" }),
+      );
+    });
+  });
+
+  it("hides the filter and clears its selection for period summaries", async () => {
+    mockListSummaries.mockResolvedValue([perThreadEntry()]);
+    mockFindSummaryDistinctLabels.mockResolvedValue([{ label: "agent:codex", thread_count: 3 }]);
+    renderSummaries();
+
+    await openSummaryLabelBar();
+    fireEvent.click(summaryLabel("agent:codex", 3));
+    fireEvent.click(screen.getByRole("button", { name: "日次" }));
+
+    expect(screen.queryByText(/^ラベルで絞り込む/)).toBeNull();
+    await waitFor(() => {
+      const request = mockListSummaries.mock.calls.at(-1)?.[0];
+      expect(request).toMatchObject({ kind: "daily" });
+      expect(request).not.toHaveProperty("labels_any");
+      expect(request).not.toHaveProperty("label_match");
+    });
+  });
+});
 
 describe("Summaries per-thread Thread link", () => {
   it("renders Thread #{id} as a button and opens ThreadDetail on click", async () => {

@@ -136,6 +136,16 @@ export async function listSummaries(req: ListSummariesRequest): Promise<SummaryE
   return invoke<SummaryEntry[]>("list_summaries", { req });
 }
 
+/** Labels attached to per-thread summary threads, excluding internal period axes. */
+export async function findSummaryDistinctLabels(): Promise<LabelWithCount[]> {
+  return invoke<LabelWithCount[]>("find_summary_distinct_labels");
+}
+
+/** Labels co-occurring with every selected label on per-thread summary threads. */
+export async function findSummaryCoOccurringLabels(labels: string[]): Promise<LabelWithCount[]> {
+  return invoke<LabelWithCount[]>("find_summary_co_occurring_labels", { req: { labels } });
+}
+
 export async function countSummaries(req: CountSummariesRequest = {}): Promise<number> {
   return invoke<number>("count_summaries", { req });
 }

@@ -145,6 +145,22 @@ describe("LabelFilter", () => {
     expect(onSetMatch).toHaveBeenCalledWith("all");
   });
 
+  it("can hide the AND/OR toggle for a fixed-match consumer", () => {
+    render(
+      <LabelFilter
+        labels={labels}
+        selected={["summary", "branch:main"]}
+        match="all"
+        onToggle={noop}
+        onToggleMany={noop}
+        onSetMatch={noop}
+        showMatchToggle={false}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "AND" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "OR" })).toBeNull();
+  });
+
   // Find the section heading button by its visible prefix text (the
   // button renders <prefix><count><action> as inline spans).
   const sectionHead = (prefix: string) =>

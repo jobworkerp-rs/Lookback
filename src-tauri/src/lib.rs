@@ -48,6 +48,8 @@ pub fn run() {
             commands::threads::count_threads,
             commands::threads::delete_thread,
             commands::summaries::list_summaries,
+            commands::summaries::find_summary_distinct_labels,
+            commands::summaries::find_summary_co_occurring_labels,
             commands::summaries::count_summaries,
             commands::summaries::list_summary_period_keys,
             commands::summaries::delete_summary,

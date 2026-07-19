@@ -82,6 +82,23 @@ describe("SummaryCalendar", () => {
     expect(onSelectKey).toHaveBeenCalledWith("2026-05");
   });
 
+  it("selects the monthly summary when any day in that month is clicked", () => {
+    const onSelectKey = vi.fn();
+    renderWithProviders(
+      <SummaryCalendar
+        kind="monthly"
+        month="2026-05"
+        periodKeys={["2026-05"]}
+        selectedKey={null}
+        onSelectKey={onSelectKey}
+        onMonthChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "18" }));
+    expect(onSelectKey).toHaveBeenCalledWith("2026-05");
+  });
+
   it("navigates months via the prev/next controls", () => {
     const onMonthChange = vi.fn();
     renderWithProviders(

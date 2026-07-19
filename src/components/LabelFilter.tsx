@@ -12,6 +12,8 @@ export interface LabelFilterProps {
   onToggle: (label: string) => void;
   onToggleMany: (labels: string[], turnOn: boolean) => void;
   onSetMatch: (m: LabelMatch) => void;
+  /** Hides the AND/OR control when the embedding page fixes the match mode. */
+  showMatchToggle?: boolean;
   isLoading?: boolean;
 }
 
@@ -23,6 +25,7 @@ export function LabelFilter({
   onToggle,
   onToggleMany,
   onSetMatch,
+  showMatchToggle = true,
   isLoading,
 }: LabelFilterProps) {
   const { t } = useTranslation();
@@ -56,7 +59,7 @@ export function LabelFilter({
   if (labels.length === 0) return null;
 
   const open = localOpen || selected.length > 0;
-  const showMatchToggle = selected.length >= 2;
+  const canSetMatch = showMatchToggle && selected.length >= 2;
 
   return (
     <details
@@ -66,7 +69,7 @@ export function LabelFilter({
     >
       <summary className="label-filter-fold-summary">
         <span>{t("labelFilter.title", { count: selected.length })}</span>
-        {showMatchToggle && (
+        {canSetMatch && (
           <span className="segment label-match-toggle">
             <button
               type="button"

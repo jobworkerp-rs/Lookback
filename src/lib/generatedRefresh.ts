@@ -20,6 +20,8 @@ export function refreshGeneratedCaches(
     invalidate(queryClient, ["summaries"]);
     invalidate(queryClient, ["count-summaries"]);
     invalidate(queryClient, ["summary-search"]);
+    invalidate(queryClient, ["summary-distinct-labels"]);
+    invalidate(queryClient, ["summary-co-occurring-labels"]);
     invalidate(queryClient, ["summary-hit"]);
     invalidate(queryClient, ["memories"]);
   }

@@ -252,6 +252,10 @@ export interface ListSummariesRequest {
   created_before_ms?: number;
   updated_after_ms?: number;
   updated_before_ms?: number;
+  /** Exact period token within a daily/weekly/monthly summary external ID. */
+  period_key?: string;
+  /** Thread labels that must match the backing summary thread (AND-only; see FR-SUM-2a). */
+  labels_any?: string[];
 }
 
 export interface CountSummariesRequest {
@@ -273,8 +277,8 @@ export interface ResolvedSummaryMemoryRef {
 
 export interface ListSummaryPeriodKeysRequest {
   kind: SummaryKind;
-  updated_after_ms?: number;
-  updated_before_ms?: number;
+  /** Prefixes of period tokens visible in the calendar month. */
+  period_key_prefixes?: string[];
 }
 
 export interface StartImportRequest {

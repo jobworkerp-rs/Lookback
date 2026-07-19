@@ -137,8 +137,8 @@ interface CalendarCellProps {
 
 /** A single day cell. The period_key it maps to depends on the granularity:
  *  the day itself (daily), its ISO week (weekly), or the shown month
- *  (monthly). Monthly cells are inert — the whole month is selected via the
- *  header button — so they render as a plain div. */
+ *  (monthly). Every enabled monthly day selects the same month key as the
+ *  header button, so users can open its summary from any date cell. */
 function CalendarCell({
   cell,
   kind,
@@ -155,16 +155,21 @@ function CalendarCell({
         ? isoWeekOfDate(cell)
         : monthKey;
   const has = keySet.has(periodKey);
+  const selected = selectedKey === periodKey;
 
   if (kind === "monthly") {
     return (
-      <div className={`sum-cal-cell month ${has ? "has" : "empty"}`}>
+      <button
+        type="button"
+        className={`sum-cal-cell month ${has ? "has" : "empty"} ${selected ? "selected" : ""}`}
+        disabled={!has}
+        onClick={() => onSelectKey(periodKey)}
+      >
         <span className="sum-cal-day">{day}</span>
-      </div>
+      </button>
     );
   }
 
-  const selected = selectedKey === periodKey;
   return (
     <button
       type="button"

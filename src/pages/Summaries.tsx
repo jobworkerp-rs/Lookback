@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 import {
   deleteSummary,
   findMemoriesByThreadId,
+  findSummaryCoOccurringLabels,
+  findSummaryDistinctLabels,
   listSummaries,
   listSummaryPeriodKeys,
   parseSummaryContent,
@@ -11,6 +13,7 @@ import {
 import { AnalysisProgress } from "@/components/AnalysisProgress";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DateInput } from "@/components/DateInput";
+import { LabelFilter } from "@/components/LabelFilter";
 import {
   extractSummaryTitle,
   SummaryBody,
@@ -23,18 +26,31 @@ import { type OpenThreadState, ThreadDetail } from "@/components/ThreadDetail";
 import { Toolbar } from "@/components/Toolbar";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useDeleteAction } from "@/hooks/useDeleteAction";
+import { useLabelSelection } from "@/hooks/useLabelSelection";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
 import { isVectorDegraded, type SidecarStatus } from "@/hooks/useSidecarStatus";
 import type { StepStreamProgressHandle } from "@/hooks/useStepStreamProgress";
 import { useTimezone } from "@/hooks/useTimezone";
-import { dayRangeToEpochMs, localDateToEpochMs } from "@/lib/dateInput";
+import { localDateToEpochMs } from "@/lib/dateInput";
 import { formatDateTime } from "@/lib/localeFormat";
 import { isEmbeddingSearchMode, resolveSearchErrorHint, SEARCH_MODES } from "@/lib/searchModes";
 import { KIND_LABEL_KEYS } from "@/lib/summaryKind";
-import { dayKey, monthKeyToYearMonth, yearMonthToKey } from "@/lib/summaryPeriod";
+import {
+  buildMonthGrid,
+  isoWeekOfDate,
+  monthKeyToYearMonth,
+  yearMonthToKey,
+} from "@/lib/summaryPeriod";
 import { resolveSummaryRefNavigation } from "@/lib/summaryRefNav";
 import { synthesizeThreadSummary } from "@/lib/threadSummary";
-import type { ConnectionMode, SearchMode, SummaryEntry, SummaryKind, ThreadHit } from "@/types/api";
+import type {
+  ConnectionMode,
+  LabelMatch,
+  SearchMode,
+  SummaryEntry,
+  SummaryKind,
+  ThreadHit,
+} from "@/types/api";
 
 // Synthetic owner of all summaries (Rust SUMMARY_USER_ID); summary search
 // scopes to this owner so it never returns raw conversation memories.
@@ -92,6 +108,9 @@ export function Summaries({
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 300);
   const [mode, setMode] = useState<SearchMode>("keyword");
+  const { selectedLabels, setSelectedLabels, sortedLabels, toggleLabel, toggleManyLabels } =
+    useLabelSelection();
+  const labelMatch: LabelMatch = "all";
   // Semantic / hybrid embed the query, so they're gated while the local vector
   // store is degraded; keyword (FTS) stays available.
   const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
@@ -134,55 +153,96 @@ export function Summaries({
     ["count-summaries"],
     ["summary-period-keys"],
     ["summary-search"],
+    ["summary-distinct-labels"],
+    ["summary-co-occurring-labels"],
   ]);
 
   // per-thread has no period_key, so the calendar view is meaningless there.
   const calendarKind: CalendarKind | null = kind === "per-thread" ? null : kind;
+  const isPerThread = kind === "per-thread";
   const effectiveView: View = view === "calendar" && calendarKind == null ? "list" : view;
-  const monthWindow = useMemo(() => monthBounds(month, timezone), [month, timezone]);
+  const calendarPeriodKeyPrefixes = useMemo(
+    () => (calendarKind == null ? [] : periodKeyPrefixesForMonth(calendarKind, month)),
+    [calendarKind, month],
+  );
+  const summaryLabelArgs = useMemo(
+    () =>
+      isPerThread && sortedLabels.length > 0 ? { labels_any: ["summary", ...sortedLabels] } : {},
+    [isPerThread, sortedLabels],
+  );
+  const searchLabels = useMemo(
+    () => (isPerThread ? ["summary", ...sortedLabels] : [KIND_SEARCH_LABEL[kind]]),
+    [isPerThread, kind, sortedLabels],
+  );
+
+  const labelAggregate = useQuery({
+    queryKey: ["summary-distinct-labels"],
+    queryFn: findSummaryDistinctLabels,
+    enabled: isPerThread,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const coOccurringLabels = useQuery({
+    queryKey: ["summary-co-occurring-labels", sortedLabels],
+    queryFn: () => findSummaryCoOccurringLabels(sortedLabels),
+    enabled: isPerThread && sortedLabels.length > 0,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
 
   const listQuery = useQuery({
-    queryKey: ["summaries", kind, updatedAfter, updatedBefore, timezone],
+    queryKey: ["summaries", kind, updatedAfter, updatedBefore, sortedLabels, timezone],
     queryFn: () =>
-      fetchSummaries(
-        kind,
-        localDateToEpochMs(updatedAfter, timezone),
-        localDateToEpochMs(updatedBefore, timezone),
-      ),
+      fetchSummaries(kind, {
+        after: localDateToEpochMs(updatedAfter, timezone),
+        before: localDateToEpochMs(updatedBefore, timezone),
+        ...summaryLabelArgs,
+      }),
     enabled: effectiveView === "list",
   });
 
   // Calendar existence dots: the period_keys present in the shown month.
   const periodKeysQuery = useQuery({
-    queryKey: ["summary-period-keys", kind, monthWindow.after, monthWindow.before],
+    queryKey: ["summary-period-keys", kind, calendarPeriodKeyPrefixes],
     queryFn: () =>
       listSummaryPeriodKeys({
         kind: calendarKind as CalendarKind,
-        updated_after_ms: monthWindow.after,
-        updated_before_ms: monthWindow.before,
+        period_key_prefixes: calendarPeriodKeyPrefixes,
       }),
     enabled: effectiveView === "calendar" && calendarKind != null,
   });
 
-  // Detail for the calendar-selected period: the whole month is fetched once
-  // and the selected period_key is picked client-side, so switching days
-  // within the month reuses the cache instead of refetching.
+  // Detail is selected by the external-id period token, rather than its
+  // updated_at. A period summary's timestamp comes from its source memories
+  // and need not fall in the calendar month named by that token.
   const detailQuery = useQuery({
-    queryKey: ["summaries", kind, monthWindow.after, monthWindow.before, "detail"],
-    queryFn: () => fetchSummaries(kind, monthWindow.after, monthWindow.before),
-    enabled: effectiveView === "calendar" && calendarKind != null && selectedKey != null,
+    queryKey: ["summaries", kind, selectedKey, "detail"],
+    queryFn: () => fetchSummaries(kind, { period_key: selectedKey ?? undefined }),
+    enabled:
+      effectiveView === "calendar" &&
+      calendarKind != null &&
+      selectedKey != null &&
+      selectedKey !== "",
   });
 
   const searchEnabled = effectiveView === "search" && debouncedQuery.trim().length > 0;
   const search = useQuery({
-    queryKey: ["summary-search", kind, mode, debouncedQuery, updatedAfter, updatedBefore, timezone],
+    queryKey: [
+      "summary-search",
+      kind,
+      mode,
+      debouncedQuery,
+      updatedAfter,
+      updatedBefore,
+      sortedLabels,
+      timezone,
+    ],
     enabled: searchEnabled,
     queryFn: () =>
       SEARCH_MODES[mode].fn({
         query_text: debouncedQuery.trim(),
         mode,
         user_id: SUMMARY_USER_ID,
-        labels_any: [KIND_SEARCH_LABEL[kind]],
+        labels_any: searchLabels,
+        label_match: isPerThread && searchLabels.length > 1 ? labelMatch : undefined,
         created_after_ms: localDateToEpochMs(updatedAfter, timezone),
         created_before_ms: localDateToEpochMs(updatedBefore, timezone),
         limit: 50,
@@ -307,6 +367,7 @@ export function Summaries({
                 onClick={() => {
                   setKind(k);
                   setSelectedKey(null);
+                  setSelectedLabels([]);
                 }}
               >
                 {t(KIND_LABEL_KEYS[k])}
@@ -394,6 +455,20 @@ export function Summaries({
           )}
         </div>
 
+        {isPerThread && (
+          <LabelFilter
+            labels={labelAggregate.data ?? []}
+            coOccurringLabels={selectedLabels.length > 0 ? coOccurringLabels.data : undefined}
+            selected={selectedLabels}
+            match={labelMatch}
+            onToggle={toggleLabel}
+            onToggleMany={toggleManyLabels}
+            onSetMatch={() => {}}
+            showMatchToggle={false}
+            isLoading={labelAggregate.isLoading}
+          />
+        )}
+
         {effectiveView === "list" && <ListView query={listQuery} onDelete={del.request} />}
 
         {effectiveView === "search" && (
@@ -478,14 +553,20 @@ export function Summaries({
 
 function fetchSummaries(
   kind: SummaryKind,
-  after: number | undefined,
-  before: number | undefined,
+  options: {
+    after?: number;
+    before?: number;
+    labels_any?: string[];
+    period_key?: string;
+  } = {},
 ): Promise<SummaryEntry[]> {
   return listSummaries({
     kind,
     limit: 200,
-    updated_after_ms: after,
-    updated_before_ms: before,
+    ...(options.after !== undefined ? { updated_after_ms: options.after } : {}),
+    ...(options.before !== undefined ? { updated_before_ms: options.before } : {}),
+    ...(options.labels_any !== undefined ? { labels_any: options.labels_any } : {}),
+    ...(options.period_key !== undefined ? { period_key: options.period_key } : {}),
   });
 }
 
@@ -678,17 +759,14 @@ function SearchHitCard({ hit }: { hit: ThreadHit }) {
   );
 }
 
-/** Local-TZ epoch-ms bounds covering exactly the shown month. Delegates the
- *  ±1ms boundary nudging (strict-`>` after / inclusive-`<=` before) to the
- *  shared `dayRangeToEpochMs` so the rule lives in one place. */
-function monthBounds(
-  monthKey: string,
-  timeZone?: string,
-): { after: number | undefined; before: number | undefined } {
+/** Prefixes that cover exactly the calendar period tokens drawn for `month`.
+ *  They intentionally derive from `external_id`, not Memory timestamps. */
+export function periodKeyPrefixesForMonth(kind: CalendarKind, monthKey: string): string[] {
+  if (kind === "daily") return [`${monthKey}-`];
+  if (kind === "monthly") return [monthKey];
   const ym = monthKeyToYearMonth(monthKey);
-  if (!ym) return { after: undefined, before: undefined };
-  const firstDay = dayKey(new Date(ym.y, ym.m - 1, 1));
-  // Day 0 of the next month is the last day of this month.
-  const lastDay = dayKey(new Date(ym.y, ym.m, 0));
-  return dayRangeToEpochMs(firstDay, lastDay, timeZone);
+  if (!ym) return [];
+  return [
+    ...new Set(buildMonthGrid(ym.y, ym.m).flatMap((day) => (day ? [isoWeekOfDate(day)] : []))),
+  ];
 }
