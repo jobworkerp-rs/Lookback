@@ -318,7 +318,8 @@
     "status": {
       "preparing": "Preparing…",
       "searching": "Searching memories…",
-      "generating": "Generating answer…"
+      "generating": "Generating answer…",
+      "noAnswer": "No answer was generated."
     },
     "errorPrefix": "Error:",
     "sources": {
@@ -567,6 +568,10 @@
       "embedded": "Embedded",
       "pending": "Not generated",
       "allDone": "All generated (auto-generation is working).",
+      "migrationPendingTitle": "Post-migration vector regeneration is incomplete.",
+      "migrationPendingBody": "The SQLite migration is complete. Retry vector regeneration for memory, thread, and reflection to restore the search index. Details:",
+      "migrationRetry": "Retry post-migration regeneration",
+      "migrationRetrying": "Retrying post-migration regeneration…",
       "redispatch": "Re-generate",
       "redispatchTitle": "Use this to fill gaps or rebuild after changing the embedding model (this takes a while)",
       "redispatching": "Re-generating…",
@@ -874,6 +879,18 @@
     }
   },
   "bootError": {
+    "memoryKindMigrationRequired": {
+      "title": "Memory data migration is required",
+      "body": "This Lookback data has not been migrated to memory_kind. Migration creates a SQLite backup, runs the bundled conversion, and redispatches vectors. Database: {{db_path}}"
+    },
+    "memoryKindDatabaseSchemaInvalid": {
+      "title": "Check the memory database state",
+      "body": "The memory database cannot be migrated from its current state. Verify the backup, then follow the migration procedure. Database: {{db_path}}\nDetails: {{reason}}"
+    },
+    "unexpectedMemoryData": {
+      "title": "Unexpected memory data was found",
+      "body": "This data cannot be migrated automatically. Review the audit, then start first-time setup in a new empty data location. Database: {{db_path}}\nDetails: {{reason}}"
+    },
     "raw": {
       "title": "Sidecar failed to start"
     },
@@ -922,15 +939,25 @@
         "label": "Reset embedding settings and restart",
         "pending": "Resetting embedding settings and restarting the sidecar…"
       },
+      "migrateMemoryKind": {
+        "label": "Run migration",
+        "pending": "Backing up data and migrating…"
+      },
       "openLog": {
         "label": "Open logs"
+      },
+      "openMemoryKindMigrationGuide": {
+        "label": "Open manual migration guide"
+      },
+      "startFreshSetup": {
+        "label": "Start with a new empty data location"
       },
       "quit": {
         "label": "Quit the app"
       }
     },
     "actionRunning": "Running…",
-    "restartFailed": "Restart failed: {{message}}",
+    "restartFailed": "Recovery action failed: {{message}}",
     "restartFailedFallback": "The sidecar could not be restarted."
   }
 }

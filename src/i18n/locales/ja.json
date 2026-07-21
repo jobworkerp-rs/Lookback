@@ -314,7 +314,8 @@
     "status": {
       "preparing": "準備中…",
       "searching": "記憶を検索中…",
-      "generating": "回答を生成中…"
+      "generating": "回答を生成中…",
+      "noAnswer": "回答を生成できませんでした"
     },
     "errorPrefix": "エラー:",
     "sources": {
@@ -561,6 +562,10 @@
       "embedded": "埋め込み済み",
       "pending": "未生成",
       "allDone": "全件生成済みです (自動生成が機能しています)。",
+      "migrationPendingTitle": "移行後のベクトル再生成が完了していません。",
+      "migrationPendingBody": "SQLite の移行は完了しています。検索インデックスを復元するため、memory・thread・reflection のベクトル再生成を再試行してください。詳細:",
+      "migrationRetry": "移行後の再生成を再試行",
+      "migrationRetrying": "移行後の再生成を再試行中…",
       "redispatch": "再生成",
       "redispatchTitle": "未生成分の補填、または embedding モデル変更後の張り直しに使います (時間がかかります)",
       "redispatching": "再生成中…",
@@ -868,6 +873,18 @@
     }
   },
   "bootError": {
+    "memoryKindMigrationRequired": {
+      "title": "メモリデータの移行が必要です",
+      "body": "この Lookback データは memory_kind 形式へ未移行です。移行を実行すると、SQLite のバックアップを作成してから同梱ツールで変換し、ベクトルを再生成します。対象 DB: {{db_path}}"
+    },
+    "memoryKindDatabaseSchemaInvalid": {
+      "title": "メモリデータベースの状態を確認してください",
+      "body": "memory_kind 移行を開始できないデータベース状態です。バックアップを確認してから移行手順に従ってください。対象 DB: {{db_path}}\n詳細: {{reason}}"
+    },
+    "unexpectedMemoryData": {
+      "title": "想定外のメモリデータが見つかりました",
+      "body": "このデータは安全に自動移行できません。監査内容を確認し、新しい空の保存先で初回セットアップを開始してください。対象 DB: {{db_path}}\n詳細: {{reason}}"
+    },
     "raw": {
       "title": "サイドカーの起動に失敗しました"
     },
@@ -916,15 +933,25 @@
         "label": "Embedding 設定をリセットして再起動",
         "pending": "Embedding 設定をリセットしてサイドカーを再起動中…"
       },
+      "migrateMemoryKind": {
+        "label": "移行を実行",
+        "pending": "データをバックアップして移行中…"
+      },
       "openLog": {
         "label": "ログを開く"
+      },
+      "openMemoryKindMigrationGuide": {
+        "label": "手動移行手順を開く"
+      },
+      "startFreshSetup": {
+        "label": "新しい空の保存先で開始"
       },
       "quit": {
         "label": "アプリを終了"
       }
     },
     "actionRunning": "実行中…",
-    "restartFailed": "再起動に失敗しました: {{message}}",
+    "restartFailed": "復旧処理に失敗しました: {{message}}",
     "restartFailedFallback": "サイドカーが再起動できませんでした。"
   }
 }

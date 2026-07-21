@@ -51,6 +51,9 @@ message MemoryData {
   // Output-only thread memberships hydrated by read APIs. A memory can be
   // attached to multiple threads through the thread_memory junction.
   repeated ThreadId thread_ids = 15;
+  // Data kind owned by this memory. Zero is accepted only during the
+  // expand/compatibility migration and is rejected at the persistence boundary.
+  MemoryKind memory_kind = 16;
 }
 
 // Unique identifier for a memory record.

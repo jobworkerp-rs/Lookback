@@ -15,9 +15,15 @@
 
 use std::path::Path;
 
+use prost::Message;
+use prost_types::FileDescriptorProto;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tonic::transport::Endpoint;
+use tonic_reflection::pb::v1::{
+    ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+    server_reflection_request::MessageRequest,
+};
 
 use crate::error::{AppError, AppResult};
 use crate::grpc;
@@ -57,6 +63,192 @@ pub struct ResolvedTargets {
 pub struct ConnectionTestReport {
     pub jobworkerp_url: String,
     pub memories_url: String,
+}
+
+const REMOTE_REQUIRED_MEMORIES_SERVICES: [&str; 6] = [
+    "llm_memory.service.MemoryService",
+    "llm_memory.service.ThreadService",
+    "llm_memory.service.ReflectionService",
+    "llm_memory.service.MemoryVectorService",
+    "llm_memory.service.ThreadVectorService",
+    "llm_memory.service.ReflectionVectorService",
+];
+
+const REMOTE_REQUIRED_MEMORIES_SCHEMA_FIELDS: [(&str, &str, i32); 2] = [
+    (
+        "llm_memory.service.FindDistinctLabelsRequest",
+        "memory_kinds",
+        8,
+    ),
+    (
+        "llm_memory.service.FindCoOccurringLabelsRequest",
+        "memory_kinds",
+        9,
+    ),
+];
+
+/// Confirms that a remote memories endpoint exposes the service surface
+/// Lookback needs without introducing a version-maintenance RPC.
+pub async fn validate_remote_memories_services(url: &str) -> AppResult<()> {
+    let channel = crate::grpc::connect(url).await?;
+    let request = ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(MessageRequest::ListServices(String::new())),
+    };
+    let mut client = ServerReflectionClient::new(channel);
+    let response = client
+        .server_reflection_info(tokio_stream::iter([request]))
+        .await?
+        .into_inner()
+        .message()
+        .await?
+        .ok_or_else(|| {
+            AppError::Config("remote memories reflection returned no services".into())
+        })?;
+    let services = match response.message_response {
+        Some(tonic_reflection::pb::v1::server_reflection_response::MessageResponse::ListServicesResponse(list)) => list
+            .service
+            .into_iter()
+            .map(|service| service.name)
+            .collect::<std::collections::BTreeSet<_>>(),
+        Some(tonic_reflection::pb::v1::server_reflection_response::MessageResponse::ErrorResponse(error)) => {
+            return Err(AppError::Config(format!(
+                "remote memories reflection failed for {url}: {}",
+                error.error_message
+            )));
+        }
+        _ => return Err(AppError::Config(format!("remote memories reflection returned an invalid response for {url}"))),
+    };
+    let missing = missing_remote_memories_services(&services);
+    if !missing.is_empty() {
+        Err(AppError::Config(format!(
+            "remote memories at {url} is incompatible; missing services: {}",
+            missing.join(", ")
+        )))?;
+    }
+    let mut descriptors = Vec::new();
+    for (message, ..) in REMOTE_REQUIRED_MEMORIES_SCHEMA_FIELDS {
+        descriptors.extend(reflect_file_containing_symbol(&mut client, message, url).await?);
+    }
+    let missing = missing_remote_memories_schema_fields(&descriptors);
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "remote memories at {url} is incompatible; missing reflection fields: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+async fn reflect_file_containing_symbol(
+    client: &mut ServerReflectionClient<tonic::transport::Channel>,
+    symbol: &str,
+    url: &str,
+) -> AppResult<Vec<FileDescriptorProto>> {
+    let request = ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(MessageRequest::FileContainingSymbol(symbol.to_string())),
+    };
+    let response = client
+        .server_reflection_info(tokio_stream::iter([request]))
+        .await?
+        .into_inner()
+        .message()
+        .await?
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "remote memories reflection returned no descriptor for {symbol}"
+            ))
+        })?;
+    match response.message_response {
+        Some(tonic_reflection::pb::v1::server_reflection_response::MessageResponse::FileDescriptorResponse(response)) => response
+            .file_descriptor_proto
+            .into_iter()
+            .map(|encoded| FileDescriptorProto::decode(encoded.as_ref()).map_err(|error| AppError::Config(format!(
+                "remote memories reflection returned an invalid descriptor for {symbol} at {url}: {error}"
+            ))))
+            .collect(),
+        Some(tonic_reflection::pb::v1::server_reflection_response::MessageResponse::ErrorResponse(error)) => {
+            Err(AppError::Config(format!(
+                "remote memories reflection failed for {symbol} at {url}: {}",
+                error.error_message
+            )))
+        }
+        _ => Err(AppError::Config(format!(
+            "remote memories reflection returned an invalid descriptor response for {symbol} at {url}"
+        ))),
+    }
+}
+
+fn missing_remote_memories_services(
+    services: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    REMOTE_REQUIRED_MEMORIES_SERVICES
+        .iter()
+        .filter(|required| !services.contains(**required))
+        .copied()
+        .collect()
+}
+
+fn missing_remote_memories_schema_fields(files: &[FileDescriptorProto]) -> Vec<String> {
+    REMOTE_REQUIRED_MEMORIES_SCHEMA_FIELDS
+        .iter()
+        .filter(|(message, field, number)| {
+            !descriptor_has_memory_kind_field(files, message, field, *number)
+        })
+        .map(|(message, field, _)| format!("{message}.{field}"))
+        .collect()
+}
+
+fn descriptor_has_memory_kind_field(
+    files: &[FileDescriptorProto],
+    target_message: &str,
+    target_field: &str,
+    target_number: i32,
+) -> bool {
+    files.iter().any(|file| {
+        let package = file.package.as_deref().unwrap_or_default();
+        file.message_type.iter().any(|message| {
+            let Some(name) = message.name.as_deref() else {
+                return false;
+            };
+            let full_name = if package.is_empty() {
+                name.to_string()
+            } else {
+                format!("{package}.{name}")
+            };
+            full_name == target_message
+                && message.field.iter().any(|field| {
+                    field.name.as_deref() == Some(target_field)
+                        && field.number == Some(target_number)
+                        && field.label
+                            == Some(prost_types::field_descriptor_proto::Label::Repeated as i32)
+                        && field.r#type
+                            == Some(prost_types::field_descriptor_proto::Type::Enum as i32)
+                        && field.type_name.as_deref() == Some(".llm_memory.data.MemoryKind")
+                })
+        })
+    })
+}
+
+/// Returns whether the saved configuration changes either endpoint that is
+/// currently active. Remote URL fields are intentionally ignored in local
+/// mode: they are only draft values until the mode actually changes.
+fn active_connection_targets_changed(old: &ConnectionConfig, new: &ConnectionConfig) -> bool {
+    old.mode != new.mode
+        || (old.mode == ConnectionMode::Remote
+            && (old.remote_jobworkerp_url != new.remote_jobworkerp_url
+                || old.remote_memories_url != new.remote_memories_url))
+}
+
+fn should_restart_sidecars_for_connection_change(
+    old: &ConnectionConfig,
+    new: &ConnectionConfig,
+    sidecars_running: bool,
+    mcp_enabled: bool,
+) -> bool {
+    sidecars_running && (mcp_enabled || active_connection_targets_changed(old, new))
 }
 
 /// The memories endpoint decomposed for the workflow runner's gRPC callback
@@ -146,9 +338,12 @@ pub fn resolve_targets(
         ConnectionMode::Local => {
             let eps = local
                 .ok_or_else(|| AppError::SidecarNotReady("local sidecars not started".into()))?;
+            let memories_url = eps.memories_url().ok_or_else(|| {
+                AppError::SidecarNotReady("local memories sidecar not started".into())
+            })?;
             Ok(ResolvedTargets {
                 jobworkerp_url: eps.jobworkerp_url(),
-                memories_url: eps.memories_url(),
+                memories_url,
             })
         }
         ConnectionMode::Remote => {
@@ -252,6 +447,9 @@ pub async fn test_connection_config(
         );
         target_connect_error("memories", &targets.memories_url, e)
     })?;
+    if cfg.mode == ConnectionMode::Remote {
+        validate_remote_memories_services(&targets.memories_url).await?;
+    }
 
     Ok(ConnectionTestReport {
         jobworkerp_url: targets.jobworkerp_url,
@@ -266,8 +464,8 @@ pub async fn set_connection_config(
     cfg: ConnectionConfig,
 ) -> AppResult<()> {
     if cfg.mode == ConnectionMode::Remote {
-        // Validate before persisting so a typo can't lock the app into an
-        // unusable remote target on next launch.
+        // Validate the complete startup contract before persisting so an
+        // incompatible remote target cannot lock the app into a failed boot.
         let jobworkerp = non_empty(cfg.remote_jobworkerp_url.as_deref())
             .ok_or_else(|| AppError::Config("remote jobworkerp URL not configured".into()))?;
         validate_remote_url(jobworkerp)?;
@@ -280,24 +478,25 @@ pub async fn set_connection_config(
         // that `Endpoint::from_shared` tolerates but `parse_callback` can't
         // (e.g. an unsupported scheme) is rejected on save, not mid-import.
         parse_callback(memories)?;
+        validate_remote_memories_services(memories).await?;
     }
     let config_path = state.data.connection_config_path();
     let old_cfg = load_connection_config(&config_path);
+    let sidecars_running = state.sidecars.current_endpoints().is_some();
+    let mcp_enabled =
+        super::mcp_settings::load_mcp_settings(&state.data.mcp_settings_path()).enabled;
     save_connection_config(&config_path, &cfg)?;
     // Drop cached gRPC clients so the next command reconnects to the new
     // target instead of the previous one (mirrors retry_model_setup).
     state.invalidate_clients().await;
 
-    // When the MCP server is enabled, the connection target is baked into the
-    // `lookback_recall` workflow's input defaults at sidecar start
-    // (`lifecycle::apply_rag_memories_env`) — the MCP path can't inject it
-    // per-dispatch like chat does. A client-cache drop alone leaves those
-    // defaults pointing at the OLD memories, so an external MCP search would
-    // keep hitting the previous target until the next restart. Restart here so
-    // the workflow is re-registered against the NEW connection. Chat / browse
-    // need no restart (they inject / reconnect per-call), so this is gated on
-    // MCP being on — the common no-MCP case stays a lightweight cache drop.
-    if super::mcp_settings::load_mcp_settings(&state.data.mcp_settings_path()).enabled {
+    // Workflow runtime is assembled at sidecar start. Besides the MCP recall
+    // workflow, periodic summary/reflection jobs also retain the memories
+    // callback in conductor. Restart every running sidecar set when its active
+    // connection target changes so no scheduled write continues to the old
+    // memories endpoint. MCP retains its existing always-refresh behavior.
+    if should_restart_sidecars_for_connection_change(&old_cfg, &cfg, sidecars_running, mcp_enabled)
+    {
         state.sidecars.stop().await?;
         // `start_with_warnings` returns the start Result (unlike
         // `stage_and_start_sidecars`, which only emits an event), so a failed
@@ -345,11 +544,83 @@ pub async fn set_connection_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto};
+
+    #[test]
+    fn remote_reflection_requires_the_lookback_service_surface() {
+        let services = REMOTE_REQUIRED_MEMORIES_SERVICES
+            .iter()
+            .map(|service| (*service).to_string())
+            .collect();
+        assert!(missing_remote_memories_services(&services).is_empty());
+
+        let missing = missing_remote_memories_services(&std::collections::BTreeSet::new());
+        assert_eq!(missing, REMOTE_REQUIRED_MEMORIES_SERVICES);
+    }
+
+    #[test]
+    fn remote_reflection_requires_raw_label_filter_fields() {
+        let legacy = vec![thread_label_request_descriptors(&[])];
+        assert_eq!(
+            missing_remote_memories_schema_fields(&legacy),
+            vec![
+                "llm_memory.service.FindDistinctLabelsRequest.memory_kinds",
+                "llm_memory.service.FindCoOccurringLabelsRequest.memory_kinds",
+            ]
+        );
+
+        let current = vec![thread_label_request_descriptors(&[
+            "FindDistinctLabelsRequest",
+            "FindCoOccurringLabelsRequest",
+        ])];
+        assert!(missing_remote_memories_schema_fields(&current).is_empty());
+
+        let mut malformed = thread_label_request_descriptors(&[
+            "FindDistinctLabelsRequest",
+            "FindCoOccurringLabelsRequest",
+        ]);
+        malformed.message_type[1].field[0].number = Some(8);
+        assert_eq!(
+            missing_remote_memories_schema_fields(&[malformed]),
+            vec!["llm_memory.service.FindCoOccurringLabelsRequest.memory_kinds"]
+        );
+    }
+
+    fn thread_label_request_descriptors(with_memory_kinds: &[&str]) -> FileDescriptorProto {
+        let message = |name: &str| DescriptorProto {
+            name: Some(name.to_string()),
+            field: with_memory_kinds
+                .contains(&name)
+                .then(|| FieldDescriptorProto {
+                    name: Some("memory_kinds".to_string()),
+                    number: Some(if name == "FindDistinctLabelsRequest" {
+                        8
+                    } else {
+                        9
+                    }),
+                    label: Some(prost_types::field_descriptor_proto::Label::Repeated as i32),
+                    r#type: Some(prost_types::field_descriptor_proto::Type::Enum as i32),
+                    type_name: Some(".llm_memory.data.MemoryKind".to_string()),
+                    ..Default::default()
+                })
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        FileDescriptorProto {
+            package: Some("llm_memory.service".to_string()),
+            message_type: vec![
+                message("FindDistinctLabelsRequest"),
+                message("FindCoOccurringLabelsRequest"),
+            ],
+            ..Default::default()
+        }
+    }
 
     fn local_eps() -> SidecarEndpoints {
         SidecarEndpoints {
             jobworkerp_port: 9000,
-            memories_port: 9010,
+            memories_port: Some(9010),
             conductor_port: 9020,
             mcp_server_port: None,
         }
@@ -587,10 +858,11 @@ mod tests {
 
     #[test]
     fn save_time_validation_accepts_what_dispatch_can_parse() {
-        // The set_connection_config guard runs validate_remote_url AND
-        // parse_callback on the memories URL, so a save that succeeds must not
-        // later fail in memories_callback(). Cover the cases the old splitter
-        // broke (IPv6) plus the common ones.
+        // The URL-shape portion of set_connection_config's guard runs
+        // validate_remote_url and parse_callback before its live Reflection
+        // check. A URL that passes this pure validation must not later fail in
+        // memories_callback(). Cover the cases the old splitter broke (IPv6)
+        // plus the common ones.
         for url in [
             "http://127.0.0.1:9010",
             "https://memories.example.com:8443",
@@ -613,5 +885,54 @@ mod tests {
         assert_eq!(c.host, "127.0.0.1");
         assert_eq!(c.port, 9010);
         assert!(!c.tls);
+    }
+
+    #[test]
+    fn running_sidecars_restart_when_active_connection_target_changes() {
+        let local = ConnectionConfig::default();
+        let remote_a = ConnectionConfig {
+            mode: ConnectionMode::Remote,
+            remote_jobworkerp_url: Some("http://remote-a:9000".into()),
+            remote_memories_url: Some("http://remote-a:9010".into()),
+        };
+        let remote_b = ConnectionConfig {
+            remote_memories_url: Some("http://remote-b:9010".into()),
+            ..remote_a.clone()
+        };
+
+        assert!(should_restart_sidecars_for_connection_change(
+            &local, &remote_a, true, false
+        ));
+        assert!(should_restart_sidecars_for_connection_change(
+            &remote_a, &remote_b, true, false
+        ));
+        assert!(!should_restart_sidecars_for_connection_change(
+            &remote_a, &remote_b, false, false
+        ));
+    }
+
+    #[test]
+    fn local_mode_does_not_restart_for_dormant_remote_url_edits() {
+        let local = ConnectionConfig::default();
+        let edited_remote = ConnectionConfig {
+            remote_jobworkerp_url: Some("http://remote:9000".into()),
+            remote_memories_url: Some("http://remote:9010".into()),
+            ..local.clone()
+        };
+
+        assert!(!should_restart_sidecars_for_connection_change(
+            &local,
+            &edited_remote,
+            true,
+            false
+        ));
+        // Preserve the existing MCP invariant: its workflow defaults are
+        // rebuilt whenever MCP settings request a restart.
+        assert!(should_restart_sidecars_for_connection_change(
+            &local,
+            &edited_remote,
+            true,
+            true
+        ));
     }
 }

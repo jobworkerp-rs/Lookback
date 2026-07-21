@@ -68,6 +68,7 @@ fn build_redispatch_request(
         thread_id: req.thread_id,
         batch_size: req.batch_size,
         kinds: Vec::new(),
+        memory_kinds: Vec::new(),
     }
 }
 

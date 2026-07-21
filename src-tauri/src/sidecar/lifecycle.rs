@@ -74,7 +74,7 @@ const MCP_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SidecarEndpoints {
     pub jobworkerp_port: u16,
-    pub memories_port: u16,
+    pub memories_port: Option<u16>,
     pub conductor_port: u16,
     /// MCP HTTP server bind port when the user enabled it (and the sidecar
     /// is up), else `None`. jobworkerp boots the MCP server inside the same
@@ -90,8 +90,9 @@ impl SidecarEndpoints {
         format!("http://127.0.0.1:{}", self.jobworkerp_port)
     }
 
-    pub fn memories_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.memories_port)
+    pub fn memories_url(&self) -> Option<String> {
+        self.memories_port
+            .map(|port| format!("http://127.0.0.1:{port}"))
     }
 
     pub fn conductor_url(&self) -> String {
@@ -370,6 +371,21 @@ fn memories_cache_env_vars() -> [(&'static str, &'static str); 3] {
         ("MEMORY_CACHE_NUM_COUNTERS", "12960"),
         ("MEMORY_CACHE_MAX_COST", "12960"),
         ("MEMORY_CACHE_USE_METRICS", "true"),
+    ]
+}
+
+fn memories_sqlite_env_vars(data: &DataPaths) -> [(&'static str, String); 2] {
+    [
+        (
+            "SQLITE_URL",
+            format!(
+                "sqlite://{}?mode=rwc",
+                data.memories_sqlite_path().display()
+            ),
+        ),
+        // `front` deserializes both fields of RdbUrlConfigImpl. Supplying the
+        // URL alone makes it silently fall back to its default database.
+        ("SQLITE_MAX_CONNECTIONS", "5".to_string()),
     ]
 }
 
@@ -753,7 +769,70 @@ impl Sidecars {
         // LanceDB at the configured dimension.
         *self.degraded.lock() = None;
 
-        self.config.data.ensure()?;
+        let connection = crate::commands::connection::load_connection_config(
+            &self.config.data.connection_config_path(),
+        );
+        let remote_memories = matches!(
+            connection.mode,
+            crate::commands::connection::ConnectionMode::Remote
+        );
+        let remote_callback = if remote_memories {
+            let target = crate::commands::connection::resolve_targets(&connection, None)?;
+            crate::commands::connection::validate_remote_memories_services(&target.memories_url)
+                .await?;
+            Some(target.memories_callback()?)
+        } else {
+            None
+        };
+        let memory_db = self.config.data.memories_sqlite_path();
+        if !remote_memories {
+            // An interrupted migration is examined before `ensure()`: creating
+            // the LanceDB directory here would destroy the evidence needed to
+            // restore its paired SQLite backup.
+            if let Some(reason) =
+                crate::commands::recovery::migration_startup_blocker(&self.config.data)?
+            {
+                return Err(AppError::MemoryKindDatabaseSchemaInvalid {
+                    db_path: memory_db.display().to_string(),
+                    reason,
+                });
+            }
+            match crate::sidecar::memory_kind_gate::inspect(&memory_db) {
+                Ok(crate::sidecar::memory_kind_gate::GateState::Fresh)
+                | Ok(crate::sidecar::memory_kind_gate::GateState::ContractReady) => {}
+                Ok(crate::sidecar::memory_kind_gate::GateState::MigrationRequired) => {
+                    return Err(AppError::MemoryKindMigrationRequired {
+                        db_path: memory_db.display().to_string(),
+                    });
+                }
+                Ok(crate::sidecar::memory_kind_gate::GateState::UnexpectedMemoryData {
+                    reason,
+                }) => {
+                    return Err(AppError::UnexpectedMemoryData {
+                        db_path: memory_db.display().to_string(),
+                        reason,
+                    });
+                }
+                Ok(crate::sidecar::memory_kind_gate::GateState::DatabaseSchemaInvalid) => {
+                    return Err(AppError::MemoryKindDatabaseSchemaInvalid {
+                        db_path: memory_db.display().to_string(),
+                        reason: "memory and thread tables are incomplete".into(),
+                    });
+                }
+                Err(reason) => {
+                    return Err(AppError::MemoryKindDatabaseSchemaInvalid {
+                        db_path: memory_db.display().to_string(),
+                        reason,
+                    });
+                }
+            }
+        }
+
+        if remote_memories {
+            self.config.data.ensure_runtime()?;
+        } else {
+            self.config.data.ensure()?;
+        }
 
         // Reap any sidecars stranded by a previous crash (no PR_SET_PDEATHSIG
         // on macOS) BEFORE picking ports, so this launch can reclaim 9000/9010
@@ -784,7 +863,7 @@ impl Sidecars {
         *self.instance_lock.lock() = Some(lock);
 
         let jw_port = ports::pick(9000)?;
-        let mem_port = ports::pick(9010)?;
+        let mem_port = (!remote_memories).then(|| ports::pick(9010)).transpose()?;
         let conductor_port = ports::pick(9020)?;
         // MCP server inside jobworkerp listens on 8000 by default. Prefer
         // `MCP_DEFAULT_PORT` (a private-range port chosen to avoid the 9000
@@ -803,7 +882,7 @@ impl Sidecars {
 
         info!(
             jobworkerp_port = jw_port,
-            memories_port = mem_port,
+            memories_port = ?mem_port,
             conductor_port,
             mcp_server_port,
             "starting sidecars"
@@ -930,13 +1009,20 @@ impl Sidecars {
             return Err(e);
         }
 
-        // Publish the LOCAL memories sidecar endpoint into THIS process's
+        let memories_callback =
+            remote_callback.unwrap_or_else(|| crate::commands::connection::MemoriesCallback {
+                host: "127.0.0.1".to_string(),
+                port: mem_port.expect("local mode always picks a memories port"),
+                tls: false,
+            });
+
+        // Publish the active memories endpoint into THIS process's
         // env so the worker-YAML loader (which expands `%{...}` via
         // `std::env::var` on the calling process) can substitute it into
         // the `auto-embedding-workers.yaml` family's `%{MEMORY_GRPC_HOST}`
-        // / `%{MEMORY_GRPC_PORT}` placeholders. Auto-embedding always runs
-        // against the local sidecar (it writes vectors into the DB the
-        // import is populating), so a fixed `127.0.0.1` is correct there.
+        // / `%{MEMORY_GRPC_PORT}` placeholders. `memories_callback` follows
+        // the active connection target, so in remote mode this points
+        // embedding upserts at the remote memories endpoint too.
         //
         // NOTE: `MEMORY_GRPC_*` here is the embedding-upsert callback, not
         // RAG retrieval. The chat path injects `memories_grpc_{host,port,tls}`
@@ -963,8 +1049,16 @@ impl Sidecars {
         // stage_and_start) while sidecars are down, so the same
         // single-thread invariant holds.
         unsafe {
-            std::env::set_var("MEMORY_GRPC_HOST", "127.0.0.1");
-            std::env::set_var("MEMORY_GRPC_PORT", mem_port.to_string());
+            std::env::set_var("MEMORY_GRPC_HOST", &memories_callback.host);
+            std::env::set_var("MEMORY_GRPC_PORT", memories_callback.port.to_string());
+            std::env::set_var(
+                "MEMORY_GRPC_TLS",
+                if memories_callback.tls {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
             // RAG retrieval endpoint for `lookback-recall.yaml`'s
             // `memories_grpc_*` input DEFAULTS. The chat path injects these
             // per-dispatch (chat.rs) so the defaults never apply there; the
@@ -976,7 +1070,7 @@ impl Sidecars {
             // remote mode targets the configured remote memories rather than
             // the empty local sidecar. Cleared-to-default on a parse failure
             // so a malformed remote URL can't wedge worker registration.
-            apply_rag_memories_env(&self.config.data, mem_port);
+            apply_rag_memories_env(&self.config.data, memories_callback.port);
             apply_external_llm_env(
                 llm_settings.provider_model.as_deref(),
                 llm_settings.base_url.as_deref(),
@@ -1089,70 +1183,72 @@ impl Sidecars {
         )
         .await;
 
-        self.spawn_and_register_memories(
-            mem_port,
-            jw_port,
-            &rust_log,
-            &embedding_runtime,
-            staged_embedding_workers_yaml.as_deref(),
-            None,
-        )?;
-
-        if let Err(e) = wait_for_tcp_or_failure(
-            ("127.0.0.1", mem_port),
-            MEMORIES_START_TIMEOUT,
-            Some(&self.startup_failure),
-        )
-        .await
-        {
-            // A dimension-mismatch on the local LanceDB (the memories child
-            // `exit(1)`s via `StartupError::*Mismatch::fatal()`) is NOT
-            // fatal to the whole app: retry the memories child once with the
-            // vector store disabled (degraded mode) so browse / FTS keep
-            // working and only embedding-dependent features are gated. Any
-            // other startup failure stays fatal → BootError.
-            let Some(info) = plan_degraded_retry(&e) else {
-                self.stop_blocking();
-                return Err(e);
-            };
-            warn!(
-                expected_dim = info.expected_dim,
-                actual_dim = info.actual_dim,
-                reason = info.reason,
-                "memories vector dimension mismatch; restarting with vector store disabled (degraded)"
-            );
-            // Kill the dead memories child (jobworkerp stays up — its workers
-            // are already registered) and clear the structured-failure slot:
-            // otherwise the re-spawn's TCP wait would short-circuit on the
-            // stale failure.
-            self.kill_memories_child();
-            *self.startup_failure.lock() = None;
-
+        if let Some(mem_port) = mem_port {
             self.spawn_and_register_memories(
                 mem_port,
                 jw_port,
                 &rust_log,
                 &embedding_runtime,
                 staged_embedding_workers_yaml.as_deref(),
-                Some(false),
+                None,
             )?;
 
-            // Second wait: with vector disabled the LanceDB is never opened,
-            // so a mismatch can't recur. A failure here is a genuine problem
-            // → fatal.
-            if let Err(e2) = wait_for_tcp_or_failure(
+            if let Err(e) = wait_for_tcp_or_failure(
                 ("127.0.0.1", mem_port),
                 MEMORIES_START_TIMEOUT,
                 Some(&self.startup_failure),
             )
             .await
             {
-                self.stop_blocking();
-                return Err(e2);
-            }
+                // A dimension-mismatch on the local LanceDB (the memories child
+                // `exit(1)`s via `StartupError::*Mismatch::fatal()`) is NOT
+                // fatal to the whole app: retry the memories child once with the
+                // vector store disabled (degraded mode) so browse / FTS keep
+                // working and only embedding-dependent features are gated. Any
+                // other startup failure stays fatal → BootError.
+                let Some(info) = plan_degraded_retry(&e) else {
+                    self.stop_blocking();
+                    return Err(e);
+                };
+                warn!(
+                    expected_dim = info.expected_dim,
+                    actual_dim = info.actual_dim,
+                    reason = info.reason,
+                    "memories vector dimension mismatch; restarting with vector store disabled (degraded)"
+                );
+                // Kill the dead memories child (jobworkerp stays up — its workers
+                // are already registered) and clear the structured-failure slot:
+                // otherwise the re-spawn's TCP wait would short-circuit on the
+                // stale failure.
+                self.kill_memories_child();
+                *self.startup_failure.lock() = None;
 
-            *self.degraded.lock() = Some(info.clone());
-            warnings.push(info.into_warning());
+                self.spawn_and_register_memories(
+                    mem_port,
+                    jw_port,
+                    &rust_log,
+                    &embedding_runtime,
+                    staged_embedding_workers_yaml.as_deref(),
+                    Some(false),
+                )?;
+
+                // Second wait: with vector disabled the LanceDB is never opened,
+                // so a mismatch can't recur. A failure here is a genuine problem
+                // → fatal.
+                if let Err(e2) = wait_for_tcp_or_failure(
+                    ("127.0.0.1", mem_port),
+                    MEMORIES_START_TIMEOUT,
+                    Some(&self.startup_failure),
+                )
+                .await
+                {
+                    self.stop_blocking();
+                    return Err(e2);
+                }
+
+                *self.degraded.lock() = Some(info.clone());
+                warnings.push(info.into_warning());
+            }
         }
 
         let conductor_child = self.spawn_conductor(conductor_port, &rust_log)?;
@@ -1188,7 +1284,7 @@ impl Sidecars {
         let periodic_refresh = crate::commands::periodic_tasks::refresh_lookback_periodic_runtime(
             &format!("http://127.0.0.1:{conductor_port}"),
             jw_port,
-            mem_port,
+            &memories_callback,
             llm_worker_name,
             &periodic_output_language,
             &memories_import_bin,
@@ -1252,7 +1348,7 @@ impl Sidecars {
         let guard = self.state.lock();
         let procs = guard.as_ref()?;
         let jw = procs.iter().find(|p| p.name == "jobworkerp")?.port;
-        let mem = procs.iter().find(|p| p.name == "memories")?.port;
+        let mem = procs.iter().find(|p| p.name == "memories").map(|p| p.port);
         let conductor = procs.iter().find(|p| p.name == "conductor")?.port;
         Some(SidecarEndpoints {
             jobworkerp_port: jw,
@@ -1699,14 +1795,10 @@ impl Sidecars {
             .env(
                 "LANCE_LANGUAGE_MODEL_HOME",
                 self.config.lance_language_model_home.as_os_str(),
-            )
-            .env(
-                "SQLITE_URL",
-                format!(
-                    "sqlite://{}/memory.sqlite3?mode=rwc",
-                    self.config.data.memories_data_dir().display()
-                ),
             );
+        for (key, value) in memories_sqlite_env_vars(&self.config.data) {
+            cmd.env(key, value);
+        }
         for (key, value) in memories_cache_env_vars() {
             cmd.env(key, value);
         }
@@ -2471,6 +2563,22 @@ mod tests {
     }
 
     #[test]
+    fn memories_sqlite_env_is_complete_for_rdb_url_config() {
+        let data = DataPaths::with_root("/tmp/lookback-memories-rdb-test");
+        let envs: std::collections::HashMap<&str, String> =
+            memories_sqlite_env_vars(&data).into_iter().collect();
+
+        assert_eq!(
+            envs.get("SQLITE_URL").map(String::as_str),
+            Some("sqlite:///tmp/lookback-memories-rdb-test/memories/default.sqlite3?mode=rwc")
+        );
+        assert_eq!(
+            envs.get("SQLITE_MAX_CONNECTIONS").map(String::as_str),
+            Some("5")
+        );
+    }
+
+    #[test]
     fn jobworkerp_channel_config_is_complete() {
         assert_eq!(
             jobworkerp_channel_env_vars(),
@@ -2626,12 +2734,12 @@ mod tests {
     fn sidecar_endpoints_format_urls() {
         let eps = SidecarEndpoints {
             jobworkerp_port: 9000,
-            memories_port: 9010,
+            memories_port: Some(9010),
             conductor_port: 9020,
             mcp_server_port: None,
         };
         assert_eq!(eps.jobworkerp_url(), "http://127.0.0.1:9000");
-        assert_eq!(eps.memories_url(), "http://127.0.0.1:9010");
+        assert_eq!(eps.memories_url().as_deref(), Some("http://127.0.0.1:9010"));
         assert_eq!(eps.conductor_url(), "http://127.0.0.1:9020");
     }
 
@@ -2642,7 +2750,7 @@ mod tests {
         // and break the on/off rendering. Pin the null shape.
         let eps = SidecarEndpoints {
             jobworkerp_port: 9000,
-            memories_port: 9010,
+            memories_port: Some(9010),
             conductor_port: 9020,
             mcp_server_port: None,
         };
@@ -2689,7 +2797,7 @@ mod tests {
         *sidecars.last_report.lock() = Some(SidecarStartReport {
             endpoints: SidecarEndpoints {
                 jobworkerp_port: 9000,
-                memories_port: 9010,
+                memories_port: Some(9010),
                 conductor_port: 9020,
                 mcp_server_port: None,
             },
@@ -2968,7 +3076,7 @@ mod tests {
         SidecarStartReport {
             endpoints: SidecarEndpoints {
                 jobworkerp_port: 9000,
-                memories_port: 9010,
+                memories_port: Some(9010),
                 conductor_port: 9020,
                 mcp_server_port: None,
             },

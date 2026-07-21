@@ -44,6 +44,7 @@ message FindThreadListByUserIdRequest {
     optional int64 updated_before = 7;
     // Sort key. UNSPECIFIED = UPDATED_DESC (default).
     optional llm_memory.data.ThreadListSort sort = 8;
+    repeated llm_memory.data.MemoryKind memory_kinds = 9;
 }
 
 // Request to attach a Memory to a Thread.
@@ -147,6 +148,7 @@ message FindThreadListByLabelsRequest {
     optional int64 updated_before = 9;
     // Sort key. UNSPECIFIED = UPDATED_DESC (default).
     optional llm_memory.data.ThreadListSort sort = 10;
+    repeated llm_memory.data.MemoryKind memory_kinds = 11;
 }
 
 // Distinct label listing
@@ -163,6 +165,8 @@ message FindDistinctLabelsRequest {
     optional int64 created_before = 5;
     optional int64 updated_after  = 6;
     optional int64 updated_before = 7;
+    // MemoryKind values to include (empty = all kinds, OR logic).
+    repeated llm_memory.data.MemoryKind memory_kinds = 8;
 }
 
 message FindDistinctLabelsResponse {
@@ -206,6 +210,8 @@ message FindCoOccurringLabelsRequest {
     optional int64 created_before = 6;
     optional int64 updated_after  = 7;
     optional int64 updated_before = 8;
+    // MemoryKind values to include (empty = all kinds, OR logic).
+    repeated llm_memory.data.MemoryKind memory_kinds = 9;
 }
 
 message FindCoOccurringLabelsResponse {

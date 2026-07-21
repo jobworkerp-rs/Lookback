@@ -27,4 +27,11 @@ GPU=cpu
 [[ -z "$(gpu_features)" ]] || fail "llama CPU build must not enable GPU features"
 [[ -z "$(mm_gpu_features)" ]] || fail "mm CPU build must not enable GPU features"
 
+[[ "$(repo_url memory-store)" == "https://github.com/jobworkerp-rs/memory-store" ]] \
+  || fail "memory-store must default to the public GitHub repository"
+
+LOOKBACK_MEMORY_STORE_REPO_URL="https://example.invalid/memory-store.git"
+[[ "$(repo_url memory-store)" == "${LOOKBACK_MEMORY_STORE_REPO_URL}" ]] \
+  || fail "memory-store repository URL override must be honoured"
+
 echo "build dependency feature tests passed"

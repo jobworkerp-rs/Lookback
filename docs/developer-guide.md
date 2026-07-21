@@ -200,21 +200,6 @@ The CUDA AppImage job sets `LOOKBACK_TAURI_VERBOSE=1` so linuxdeploy stderr is v
 Actions logs. If bundling fails, `scripts/build-release.sh` also dumps the AppDir tree and staged
 plugin `ldd` output.
 
-### CUDA Release Asset Limit
-
-The gitea CUDA Linux workflow builds and uploads only the CUDA AppImage. The
-CUDA `.deb` can exceed GitHub's per-asset size limit because it carries many
-large shared libraries. The AppImage carries the same runtime payload more
-compactly via squashfs, so it is the published CUDA bundle. The public GitHub
-workflow that builds CPU bundles does not include the CUDA runtime, so it still
-builds `.deb` for now.
-
-After changing `.gitea/workflows/build-and-release-cuda.yml`, run:
-
-```bash
-bash scripts/test-gitea-cuda-release-upload.sh
-```
-
 ### GitHub Actions Disk Cleanup
 
 The GitHub-hosted Linux release job runs `scripts/ci-free-disk-space.sh` before Tauri deb/AppImage

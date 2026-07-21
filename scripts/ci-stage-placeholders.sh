@@ -39,11 +39,12 @@ LIBEXT=$([[ "${TRIPLE}" == *darwin ]] && echo dylib || echo so)
 BIN_DIR="${AGENT_APP}/src-tauri/bin"
 PLUGINS_DIR="${AGENT_APP}/src-tauri/plugins"
 DICT_DIR="${AGENT_APP}/dict"
+TOOLKIT_DIR="${AGENT_APP}/src-tauri/migration-toolkit"
 
-mkdir -p "${BIN_DIR}" "${PLUGINS_DIR}" "${DICT_DIR}"
+mkdir -p "${BIN_DIR}" "${PLUGINS_DIR}" "${DICT_DIR}" "${TOOLKIT_DIR}/sqlite" "${TOOLKIT_DIR}/postgres"
 
 # externalBin entries (tauri.conf.json) with the platform-triple suffix.
-for name in all-in-one front conductor-main memories-import protoc; do
+for name in all-in-one front conductor-main memories-import migrate-memory-kind protoc; do
   dest="${BIN_DIR}/${name}-${TRIPLE}"
   [[ -e "${dest}" ]] || : > "${dest}"
 done
@@ -52,5 +53,9 @@ done
 # matches at least one file. Real plugins overwrite/join these later.
 placeholder="${PLUGINS_DIR}/libplaceholder_ci.${LIBEXT}"
 [[ -e "${placeholder}" ]] || : > "${placeholder}"
+
+for name in sqlite/011_add_memory_kind.sql sqlite/012_contract_memory_kind.sql postgres/010_add_memory_kind.sql postgres/011_contract_memory_kind.sql memory-kind-client-migration_ja.md vectordb-rebuild-runbook_ja.md; do
+  [[ -e "${TOOLKIT_DIR}/${name}" ]] || : > "${TOOLKIT_DIR}/${name}"
+done
 
 echo "staged CI placeholders for ${TRIPLE} (bin/*, plugins/*.${LIBEXT}*, dict/)" >&2

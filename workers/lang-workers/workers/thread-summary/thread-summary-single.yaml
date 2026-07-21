@@ -35,10 +35,6 @@ input:
         # centrally without editing every workflow YAML.
         memory_thread_label_prefix: { type: string, default: "summary" }
         force_resummarize: { type: boolean, default: false }
-        summary_user_id:
-          type: integer
-          default: 100000
-          description: Owner user ID for summary memory threads. Must differ from user_id to prevent recursive summarization.
 
 do:
   # Step 0: Initialize variables that may be referenced from `output.as`
@@ -55,29 +51,6 @@ do:
         summary_json: "${ null }"
         skipped: "${ false }"
         result: "${ null }"
-
-  # Step 0a: Defensive fallback for summary_user_id when callers
-  # bypass the input schema (e.g. legacy clients). Schema default
-  # is 100000.
-  - normalizeSummaryUserId:
-      set:
-        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
-
-  # Step 0b: Reject summary_user_id == user_id outright. Sharing the
-  # owner would surface summary threads in the source user's listings
-  # and trigger recursive summarization on subsequent batch runs.
-  - failOnSelfOwnedSummary:
-      if: "${ $effective_summary_user_id == $workflow.input.user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "summary_user_id must differ from user_id"
-          detail: >-
-            ${ "summary_user_id (" + ($effective_summary_user_id | tostring)
-               + ") must differ from user_id ("
-               + ($workflow.input.user_id | tostring)
-               + ") to prevent recursive summarization." }
 
   # Step 1: Fetch the target thread
   - fetchThread:
@@ -180,7 +153,8 @@ do:
                            // ["thread_" + ($workflow.input.thread_id | tostring)])
                           + [$workflow.input.memory_thread_label_prefix] ),
                 match_mode: "LABEL_ALL",
-                user_id: $effective_summary_user_id,
+                user_id: $workflow.input.user_id,
+                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
                 limit: 1
               } | tojson }
             as_json: true
@@ -371,7 +345,7 @@ do:
             method: "/llm_memory.service.ThreadService/Create"
             json_body: >-
               ${ {
-                user_id: { value: $effective_summary_user_id },
+                user_id: { value: $workflow.input.user_id },
                 description: (($thread.data.labels
                                // ["thread_" + ($workflow.input.thread_id | tostring)])
                               | join(", ")) + " の要約集",
@@ -379,7 +353,8 @@ do:
                            // ["thread_" + ($workflow.input.thread_id | tostring)])
                           + [$workflow.input.memory_thread_label_prefix] ),
                 created_at: $thread.data.createdAt,
-                updated_at: $thread.data.updatedAt
+                updated_at: $thread.data.updatedAt,
+                memory_kind: "MEMORY_KIND_THREAD_SUMMARY"
               } | tojson }
             as_json: true
       export:
@@ -420,7 +395,8 @@ do:
                     ${ {
                       labels: [$workflow.input.memory_thread_label_prefix],
                       match_mode: "LABEL_ANY",
-                      user_id: $effective_summary_user_id
+                      user_id: $workflow.input.user_id,
+                      memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"]
                     } | tojson }
                   as_json: true
             export:
@@ -530,7 +506,7 @@ do:
               ${ {
                 thread_id: { value: $memory_thread_id },
                 memory: {
-                  user_id: { value: $effective_summary_user_id },
+                  user_id: { value: $workflow.input.user_id },
                   content: ($summary_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",
@@ -541,7 +517,8 @@ do:
                   } | tojson),
                   external_id: ("summary:" + ($workflow.input.thread_id | tostring)),
                   created_at: $thread.data.createdAt,
-                  updated_at: $thread.data.updatedAt
+                  updated_at: $thread.data.updatedAt,
+                  memory_kind: "MEMORY_KIND_THREAD_SUMMARY"
                 }
               } | tojson }
             as_json: true

@@ -118,6 +118,7 @@ async fn has_existing_threads(state: &AppState) -> bool {
         updated_after: None,
         updated_before: None,
         sort: None,
+        memory_kinds: vec![crate::grpc::proto::llm_memory::data::MemoryKind::Raw as i32],
     };
     let Ok(response) = client.find_thread_list_by_user_id(request).await else {
         return false;
@@ -216,6 +217,33 @@ pub fn restart_for_setup(app: AppHandle) -> AppResult<()> {
     app.restart();
 }
 
+/// Leave an unrecoverable legacy data root untouched and start the first-run
+/// flow against a separately selected empty directory. This is intentionally
+/// stricter than the Settings data-root picker: recovery must never point at
+/// another populated root by accident.
+#[tauri::command]
+pub fn start_fresh_setup(path: String, app: AppHandle) -> AppResult<()> {
+    let target = PathBuf::from(path.trim());
+    validate_fresh_data_root(&target)?;
+    super::app_settings::set_data_root(Some(target.display().to_string()))?;
+    save_setup_completed(false)?;
+    app.restart();
+}
+
+fn validate_fresh_data_root(target: &std::path::Path) -> AppResult<()> {
+    if !target.is_absolute() || !target.is_dir() || !paths::is_writable(target) {
+        return Err(crate::error::AppError::Config(
+            "new data root must be an existing writable directory".into(),
+        ));
+    }
+    if target.read_dir()?.next().transpose()?.is_some() {
+        return Err(crate::error::AppError::Config(
+            "new data root must be empty to preserve the unrecoverable migration evidence".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +326,18 @@ mod tests {
         for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
             assert!(!env_flag_enabled(value));
         }
+    }
+
+    #[test]
+    fn fresh_data_root_requires_an_empty_writable_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_fresh_data_root(tmp.path()).is_ok());
+        std::fs::write(tmp.path().join("existing-evidence"), "keep").unwrap();
+        assert!(
+            validate_fresh_data_root(tmp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("must be empty")
+        );
     }
 }

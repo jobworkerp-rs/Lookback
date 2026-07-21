@@ -7,7 +7,7 @@ document:
 # Layer 2: aggregate per-thread personality signals into a single
 # user-level profile memory.
 #
-# Reads layer-1 signals owned by `personality_user_id` (default 200000),
+# Reads layer-1 signals with `PERSONALITY` kind for the real user,
 # filters by `metadata.source_user_id == input.user_id` (invariant I6),
 # asks an LLM to merge them, then post-processes per-entry first/last
 # seen timestamps in jq so the LLM cannot fabricate dates. The result
@@ -38,14 +38,6 @@ input:
         # this is logging/validation metadata only — the worker name already
         # pins the language. Kept in schema so batch-supplied input validates.
         output_language: { type: string, enum: ["ja", "en"], default: "ja" }
-        personality_user_id: { type: integer, default: 200000 }
-        summary_user_id:
-          type: integer
-          default: 100000
-          description: >-
-            Reference value for collision detection only. Same purpose
-            as in thread-personality-single — keep the two extraction
-            domains disjoint.
         max_context_chars: { type: integer, default: 150000 }
         # LLM is configured on `memories-llm` named worker
         # (workers/llm-workers.yaml; Phase C).
@@ -65,35 +57,7 @@ timeout:
 do:
   - normalizePersonalityUserId:
       set:
-        effective_personality_user_id: "${ $workflow.input.personality_user_id // 200000 }"
-        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
-
-  # See thread-personality-single for the rationale of these two guards.
-  - failOnSelfOwnedPersonality:
-      if: "${ $effective_personality_user_id == $workflow.input.user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "personality_user_id must differ from user_id"
-          detail: >-
-            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
-               + ") must differ from user_id ("
-               + ($workflow.input.user_id | tostring)
-               + ") to prevent recursive personality extraction." }
-
-  - failOnSummaryUserCollision:
-      if: "${ $effective_personality_user_id == $effective_summary_user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "personality_user_id must differ from summary_user_id"
-          detail: >-
-            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
-               + ") must differ from summary_user_id ("
-               + ($effective_summary_user_id | tostring)
-               + ") to keep the two extraction domains disjoint." }
+        effective_personality_user_id: "${ $workflow.input.user_id }"
 
   # Initialised early so an early `then: exit` does not leave
   # `output.as` referencing undefined variables. `truncated_signals`
@@ -130,6 +94,7 @@ do:
                          "user:" + ($workflow.input.user_id | tostring)],
                 match_mode: "LABEL_ALL",
                 user_id: $effective_personality_user_id,
+                memory_kinds: ["MEMORY_KIND_PERSONALITY"],
                 limit: 1
               } | tojson }
             as_json: true
@@ -195,10 +160,12 @@ do:
               ${ {
                 roles: ["ROLE_ASSISTANT"],
                 user_id: { value: $effective_personality_user_id },
+                memory_kinds: ["MEMORY_KIND_PERSONALITY"],
                 external_id_prefix: "personality:",
                 content_types: ["TEXT"],
                 thread_filter: {
                   user_id: $effective_personality_user_id,
+                  memory_kinds: ["MEMORY_KIND_PERSONALITY"],
                   labels: ["personality",
                            "user:" + ($workflow.input.user_id | tostring)],
                   label_match_mode: "LABEL_ALL"
@@ -657,7 +624,8 @@ do:
                 labels: ["personality_profile",
                          "user:" + ($workflow.input.user_id | tostring)],
                 created_at: $max_signal_updated_at,
-                updated_at: $max_signal_updated_at
+                updated_at: $max_signal_updated_at,
+                memory_kind: "MEMORY_KIND_PERSONALITY"
               } | tojson }
             as_json: true
       export:
@@ -756,7 +724,8 @@ do:
                   metadata: $profile_metadata_json,
                   external_id: $profile_external_id,
                   created_at: $max_signal_updated_at,
-                  updated_at: $max_signal_updated_at
+                  updated_at: $max_signal_updated_at,
+                  memory_kind: "MEMORY_KIND_PERSONALITY"
                 }
               } | tojson }
             as_json: true

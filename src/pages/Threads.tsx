@@ -80,8 +80,8 @@ export function Threads({ onOpenImport, sidecar, connectionMode = "local" }: Thr
   };
   // Thread deletion (initiated from the detail modal) removes the thread and
   // its attached conversation Memories. Derived per-thread summaries/reflections
-  // live under separate owner threads (SUMMARY_USER_ID / reflection_user_id) and
-  // are NOT cascade-deleted, so their caches are intentionally left alone.
+  // are separated by memory kind, so the raw-thread list must not include them.
+  // They are NOT cascade-deleted, so their caches are intentionally left alone.
   // Label aggregates (distinct + co-occurring) ARE invalidated — removing the
   // last thread carrying a label should drop it from the filter bar.
   const del = useDeleteAction(deleteThread, [

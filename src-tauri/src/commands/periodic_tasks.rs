@@ -477,25 +477,6 @@ pub fn current_runtime(
     })
 }
 
-/// Runtime for the local sidecar. `refresh_lookback_periodic_runtime` only ever
-/// rewrites schedulers at startup with the freshly-bound local memories port, so
-/// the endpoint is always plaintext loopback — never the configured remote.
-fn local_runtime(
-    memories_port: u16,
-    llm_worker_name: &str,
-    output_language: &str,
-    memories_import_bin: &str,
-) -> AppResult<PeriodicRuntime> {
-    Ok(PeriodicRuntime {
-        memories_grpc_host: "127.0.0.1".to_string(),
-        memories_grpc_port: memories_port,
-        memories_grpc_tls: false,
-        llm_worker_name: llm_worker_name.to_string(),
-        output_language: runtime_output_language(output_language),
-        memories_import_bin: memories_import_bin.to_string(),
-    })
-}
-
 async fn conductor_channel(url: &str) -> AppResult<Channel> {
     grpc::connect(url).await
 }
@@ -701,7 +682,7 @@ async fn current_periodic_context(
 pub async fn refresh_lookback_periodic_runtime(
     conductor_url: &str,
     jobworkerp_port: u16,
-    memories_port: u16,
+    memories: &super::connection::MemoriesCallback,
     llm_worker_name: &str,
     output_language: &str,
     memories_import_bin: &Path,
@@ -710,8 +691,8 @@ pub async fn refresh_lookback_periodic_runtime(
     let channel = conductor_channel(conductor_url).await?;
     let server_id = ensure_local_jobworkerp_server(channel.clone(), jobworkerp_port).await?;
     let memories_import_bin = memories_import_bin.to_string_lossy().into_owned();
-    let runtime = local_runtime(
-        memories_port,
+    let runtime = current_runtime(
+        memories,
         llm_worker_name,
         output_language,
         &memories_import_bin,
@@ -1043,13 +1024,13 @@ mod tests {
             "en"
         );
         assert_eq!(
-            local_runtime(9010, "memories-llm", "", import_bin)
+            current_runtime(&cb, "memories-llm", "", import_bin)
                 .unwrap()
                 .output_language,
             "ja"
         );
         assert_eq!(
-            local_runtime(9010, "memories-llm", "ja", import_bin)
+            current_runtime(&cb, "memories-llm", "ja", import_bin)
                 .unwrap()
                 .memories_import_bin,
             "/bin/memories-import"

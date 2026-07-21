@@ -32,7 +32,7 @@ Local LLM execution currently supports only Qwen 3.5/3.6-family and Gemma 4-fami
 The app UI lives in this repository, but running the complete desktop app also needs bundled backend binaries and jobworkerp plugins:
 
 - [`jobworkerp`](https://github.com/jobworkerp-rs/jobworkerp-rs): `all-in-one`
-- [`memory-store`](https://github.com/jobworkerp-rs/memory-store): `front` and `memories-import`
+- [`memory-store`](https://github.com/jobworkerp-rs/memory-store): `front`, `memories-import`, and `migrate-memory-kind`
 - [`jobworkerp-conductor`](https://github.com/jobworkerp-rs/jobworkerp-conductor): `conductor-main`
 - `protoc`: the official self-contained protobuf compiler, fetched automatically by the build
   (children run it to compile runner schemas at worker-registration time, so it is shipped as a
@@ -96,12 +96,23 @@ If you build the backend components yourself, place the outputs as follows and r
    src-tauri/bin/front-<triple>
    src-tauri/bin/conductor-main-<triple>
    src-tauri/bin/memories-import-<triple>
+   src-tauri/bin/migrate-memory-kind-<triple>
    src-tauri/bin/protoc-<triple>
    ```
 
 2. Build the runner plugins (`libjobworkerp_llama_cpp_plugin` and `libmm_embedding_runner`) for
    your target OS and place the shared libraries under `plugins/`.
-3. If your `memory-store` `front` build uses Lindera FTS, place the search dictionary under
+3. Stage the migration toolkit from the **same `memories` checkout and revision** that produced
+   `front`, `memories-import`, and `migrate-memory-kind`:
+
+   ```bash
+   scripts/stage-memory-kind-toolkit.sh /absolute/path/to/memories
+   ```
+
+   This fills `src-tauri/migration-toolkit/` with the client-apply runbook and SQL. Do not bundle
+   the CI placeholder files; an existing database blocked for migration needs this real guide for
+   recovery.
+4. If your `memory-store` `front` build uses Lindera FTS, place the search dictionary under
    `dict/lindera/ipadic` (lindera 3.x format with `metadata.json`). Lookback packages and stages
    this directory for `memory-store`; it does not load the dictionary directly.
 
@@ -117,7 +128,7 @@ For development launch commands and path overrides, see [docs/developer-guide.md
    - Choose the embedding model.
    - Confirm the backend and model readiness checks.
 3. Open **Settings** later if you need to change providers, model paths, cache paths, language, timezone, or MCP exposure.
-   - **Embedding model** remains editable when Connection is **Remote server**. For semantic or hybrid search, local article embeddings are not generated, so match the local query embedding model and vector dimension to the remote server embeddings. Remote-server changes do not reset or regenerate the local embedding index.
+   - **Embedding model** remains editable when Connection is **Remote server**. For semantic or hybrid search, local article embeddings are not generated, so match the local query embedding model and vector dimension to the remote server embeddings. Remote-server changes do not reset or regenerate the local embedding index. Local memories SQLite/LanceDB is neither started nor read; all memories reads and writes use the remote endpoint. Startup verifies required memories services and thread-label RPC schemas through gRPC Server Reflection, so the remote must be memory_kind-migrated, support the `memory_kinds` filters for thread-label RPCs, and expose Reflection v1. Deploy a matching updated memories binary; older binaries are rejected because they ignore this field and can mix non-RAW labels into the Threads tab.
    - **Timezone** controls the wall-clock boundaries used by summaries, imports, and timestamp display. **Auto** follows the app environment / OS timezone; saving an explicit timezone restarts the sidecar because worker processes read `TZ` at startup. This setting is disabled while Connection is **Remote server** because the remote workflows use the remote server environment.
 4. Open **Threads** and click **Import** to import Claude Code or Codex session logs. To import a directory of plain text instead, check **Plain text (directory)**, choose the target directory, and pick a thread split strategy:
    - **Per file**: one thread per file.

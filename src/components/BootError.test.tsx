@@ -51,6 +51,60 @@ describe("BootError", () => {
     expect(screen.queryByText(/ベクトル DB をバックアップ/)).not.toBeInTheDocument();
   });
 
+  it("starts the bundled memory-kind migration for an unmigrated database", async () => {
+    renderWithProviders(
+      <BootError
+        failure={{
+          kind: "memory_kind_migration_required",
+          db_path: "/data/memories/default.sqlite3",
+        }}
+      />,
+    );
+    expect(screen.getByText("メモリデータの移行が必要です")).toBeInTheDocument();
+    expect(screen.getByText(/SQLite のバックアップ/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("移行を実行"));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("migrate_memory_kind");
+    });
+    expect(screen.queryByText("手動移行手順を開く")).not.toBeInTheDocument();
+  });
+
+  it("offers the manual migration guide only after automatic migration fails", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("bundled migration failed"));
+    renderWithProviders(
+      <BootError
+        failure={{
+          kind: "memory_kind_migration_required",
+          db_path: "/data/memories/default.sqlite3",
+        }}
+      />,
+    );
+
+    expect(screen.queryByText("手動移行手順を開く")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("移行を実行"));
+    await waitFor(() => {
+      expect(screen.getByText("手動移行手順を開く")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("手動移行手順を開く"));
+    expect(invokeMock).toHaveBeenCalledWith("open_memory_kind_migration_guide");
+  });
+
+  it("refuses automatic migration for unexpected owner evidence", () => {
+    renderWithProviders(
+      <BootError
+        failure={{
+          kind: "unexpected_memory_data",
+          db_path: "/data/memories/default.sqlite3",
+          reason: "memory.user_id is not a Lookback owner",
+        }}
+      />,
+    );
+    expect(screen.getByText("想定外のメモリデータが見つかりました")).toBeInTheDocument();
+    expect(screen.queryByText("移行を実行")).not.toBeInTheDocument();
+    expect(screen.getByText("新しい空の保存先で開始")).toBeInTheDocument();
+    expect(screen.queryByText("手動移行手順を開く")).not.toBeInTheDocument();
+  });
+
   it("invokes recover_evacuate_lancedb when the primary action is clicked", async () => {
     renderWithProviders(
       <BootError
@@ -98,7 +152,7 @@ describe("BootError", () => {
     );
     fireEvent.click(screen.getByText("ベクトル DB をバックアップして再起動"));
     await waitFor(() => {
-      expect(screen.getByText(/再起動に失敗しました: still failing/)).toBeInTheDocument();
+      expect(screen.getByText(/復旧処理に失敗しました: still failing/)).toBeInTheDocument();
     });
   });
 

@@ -71,6 +71,7 @@ workers:
       # the placeholder is substituted there. Mirrors llm-workers.yaml.
       host: "%{MEMORY_GRPC_HOST}"
       port: "%{MEMORY_GRPC_PORT}"
+      tls: %{MEMORY_GRPC_TLS:-false}
       use_reflection: true
       method: llm_memory.service.MemoryVectorService/BatchUpsertEmbeddings
       as_json: true

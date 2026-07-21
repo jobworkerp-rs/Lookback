@@ -2,10 +2,10 @@
 //!
 //! The MVP surfaces both layers of the personality model:
 //! - layer 2: the merged profile stored as a memory owned by
-//!   `personality_user_id=200000` with
+//!   the Lookback user ID with
 //!   `external_id = "personality_profile:<user_id>"` (`get_personality`).
 //! - layer 1: per-thread signals (`external_id = "personality:<thread_id>"`,
-//!   owned by the same `personality_user_id`) listed by
+//!   owned by the same Lookback user ID) listed by
 //!   `list_personality_signals` — the evidence the merge actually consumed,
 //!   surfaced when the user drills into the persona-stats "Signals" count.
 //!
@@ -30,7 +30,7 @@ use crate::grpc::proto::llm_memory::service::thread_service_client::ThreadServic
 
 use super::AppState;
 
-const PERSONALITY_USER_ID: i64 = 200_000;
+const PERSONALITY_USER_ID: i64 = 1;
 const PROFILE_EXTERNAL_ID_PREFIX: &str = "personality_profile:";
 const SIGNAL_EXTERNAL_ID_PREFIX: &str = "personality:";
 /// Labels that thread-personality-single applies to a layer-1 personality
@@ -174,6 +174,7 @@ async fn fetch_signals(
         // surfaces at the top while a generation run is still in progress.
         sort: None,
         external_id_prefix: Some(SIGNAL_EXTERNAL_ID_PREFIX.to_string()),
+        memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
     };
     let mut stream = client.find_list_by_condition(request).await?.into_inner();
     let mut out = Vec::new();
@@ -208,6 +209,7 @@ async fn fetch_profile(
         created_before: None,
         sort: None,
         external_id_prefix: None,
+        memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
     };
     let mut stream = client.find_list_by_condition(request).await?.into_inner();
     while let Some(item) = stream.next().await {
@@ -239,6 +241,7 @@ async fn fetch_thread_count(
         updated_after: None,
         updated_before: None,
         sort: None,
+        memory_kinds: vec![mem_data::MemoryKind::Raw as i32],
     };
     let mut stream = client
         .find_thread_list_by_user_id(request)
@@ -298,7 +301,7 @@ pub async fn delete_personality_signal(
 }
 
 /// Temporary investigation report for the "Signals count never grows" symptom.
-/// Crosses three independent gRPC views over the `personality_user_id=200000`
+/// Crosses three independent gRPC views over the Lookback user ID
 /// space so we can tell apart the failure modes the merge skip / drawer empty
 /// behaviour does not distinguish:
 ///
@@ -366,6 +369,7 @@ pub async fn debug_personality_inventory(
                 updated_after: None,
                 updated_before: None,
                 sort: None,
+                memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
             })
             .await?
             .into_inner();
@@ -422,6 +426,7 @@ pub async fn debug_personality_inventory(
                 created_before: None,
                 sort: None,
                 external_id_prefix: Some(SIGNAL_EXTERNAL_ID_PREFIX.to_string()),
+                memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
             })
             .await?
             .into_inner();
@@ -528,6 +533,7 @@ async fn count_threads_by_labels(
             updated_after: None,
             updated_before: None,
             sort: None,
+            memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
         })
         .await?
         .into_inner();
@@ -585,6 +591,7 @@ fn signal_thread_filter(user_id: i64) -> mem_data::ThreadSearchFilter {
         created_before: None,
         updated_after: None,
         updated_before: None,
+        memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
     }
 }
 
@@ -620,6 +627,7 @@ async fn fetch_signal_count(channel: tonic::transport::Channel, user_id: i64) ->
         created_before: None,
         sort: None,
         external_id_prefix: Some(SIGNAL_EXTERNAL_ID_PREFIX.to_string()),
+        memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
     };
     let mut stream = client.find_list_by_condition(request).await?.into_inner();
     let mut count: i64 = 0;

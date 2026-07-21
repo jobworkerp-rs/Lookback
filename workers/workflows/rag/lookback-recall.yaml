@@ -132,13 +132,15 @@ do:
           # caller (chat) sees a real error rather than a silent zero-hit.
           query_vector: "${ (.embeddings // [{}])[0].values // [] }"
 
-  # Step 2: Summary layer. owner=100000 + thread_filter.labels narrows to
+  # Step 2: Summary layer. The real owner is user 1; memory_kind separates
   # the summary threads. `external_id_prefix` does not exist on
   # MemorySearchFilter, so label matching is the only server-side
   # narrowing path. When the caller supplies `summary_labels` we honour
   # it (with `summary_label_match`, default ALL so a kind+period pair like
-  # ["daily_summary","date:2026-05-29"] pins exactly that summary);
-  # otherwise we fall back to the four summary kinds matched as ANY.
+  # ["daily_summary","date:2026-05-29"] pins exactly that summary). Without
+  # explicit labels, memory_kinds already selects all summary layers; avoid a
+  # redundant thread_filter because it expands every matching thread into
+  # memory IDs before the bounded FTS candidate search.
   # `label_match_mode` is the proto enum NAME (LABEL_ANY / LABEL_ALL),
   # mapped from the user-facing ANY/ALL here so the LLM never sees the
   # proto prefix.
@@ -169,14 +171,19 @@ do:
                   query_text: $workflow.input.query,
                   options: {
                     limit: ($workflow.input.limit_per_layer // 5),
-                    filter: {
-                      user_id: "100000",
-                      thread_filter: {
-                        user_id: "100000",
-                        labels: $labels,
-                        label_match_mode: $match
+                    filter: (
+                      {
+                        user_id: "1",
+                        memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY", "MEMORY_KIND_DAILY_SUMMARY", "MEMORY_KIND_WEEKLY_SUMMARY", "MEMORY_KIND_MONTHLY_SUMMARY"]
                       }
-                    }
+                      + (if $has then {
+                           thread_filter: {
+                             user_id: "1",
+                             labels: $labels,
+                             label_match_mode: $match
+                           }
+                         } else {} end)
+                    )
                   }
                 } | tojson }
             as_json: true
@@ -184,8 +191,11 @@ do:
         as:
           summary_hits: ${ (.jsonBody // "[]") | fromjson }
 
-  # Step 3: Raw-message layer. owner=user_id=1 (the human user; spec
-  # Lookback currently runs as a single local user.
+  # Step 3: Raw-message layer. owner=user_id=1 (the human user; Lookback
+  # currently runs as a single local user). Do not add a thread_filter here:
+  # it duplicates this memory-level owner/kind scope but first expands every
+  # matching thread into memory IDs, exceeding the server's bounded FTS
+  # candidate set for large histories.
   - searchRaw:
       run:
         function:
@@ -204,7 +214,10 @@ do:
                 query_text: $workflow.input.query,
                 options: {
                   limit: ($workflow.input.limit_per_layer // 5),
-                  filter: { user_id: "1" }
+                  filter: {
+                    user_id: "1",
+                    memory_kinds: ["MEMORY_KIND_RAW"]
+                  }
                 }
               } | tojson }
             as_json: true
@@ -244,7 +257,7 @@ do:
                       end
                     ),
                     period_key: (
-                      ($ext | capture("^(?<k>daily|weekly|monthly):(?<p>[^:]+):")
+                      ($ext | capture("^(?<k>daily|weekly|monthly):1:(?<p>[^:]+):")
                             | .p) // null
                     ),
                     scope_key: (

@@ -245,6 +245,46 @@ describe("Chat composer stop button — OPEN-CHAT-2", () => {
   });
 });
 
+describe("Chat terminal status", () => {
+  it("localizes the empty terminal state instead of showing a perpetual generating state", () => {
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([
+          turn({
+            answer: "",
+            phase: "done",
+            message: null,
+            sources: [],
+          }),
+        ])}
+      />,
+    );
+
+    expect(screen.getByText("回答を生成できませんでした")).toBeTruthy();
+    expect(screen.queryByText("回答を生成中…")).toBeNull();
+  });
+
+  it("uses the active locale for an empty terminal state", async () => {
+    await i18n.changeLanguage("en");
+    try {
+      renderWithProviders(
+        <Chat
+          onNavigate={vi.fn()}
+          onNavigateSummariesFocus={vi.fn()}
+          rag={makeRag([turn({ answer: "", phase: "done", message: null, sources: [] })])}
+        />,
+      );
+
+      expect(screen.getByText("No answer was generated.")).toBeTruthy();
+      expect(screen.queryByText("回答を生成できませんでした")).toBeNull();
+    } finally {
+      await i18n.changeLanguage("ja");
+    }
+  });
+});
+
 describe("Chat source list collapse", () => {
   // Prefix the memory_id with the kind so concatenating breakdowns
   // doesn't accidentally produce duplicate React keys. ChatSource is a

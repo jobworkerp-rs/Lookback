@@ -347,6 +347,9 @@ message RedispatchEmbeddingsRequest {
   // DISPATCH_KIND_UNSPECIFIED => invalid_argument. Added field
   // (back-compat: old clients omit it and get all kinds).
   repeated DispatchKind kinds = 4;
+  // Memory lifecycle kinds to scan. Empty = all memory kinds; multiple values
+  // use OR semantics.
+  repeated llm_memory.data.MemoryKind memory_kinds = 5;
 }
 
 message RedispatchEmbeddingsResponse {

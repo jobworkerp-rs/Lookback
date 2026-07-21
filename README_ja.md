@@ -154,7 +154,7 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
      が初期選択されます。既存設定や英語 UI の既定モデルは変更されません。
    - バックエンドとモデル準備状態の検査結果を確認します。
 3. プロバイダー、モデルパス、キャッシュパス、言語、タイムゾーン、MCP 公開設定を変更したい場合は、後から **設定** を開きます。
-   - Connection を **Remote server** にする場合でも **Embedding model** は変更できます。Semantic / Hybrid 検索を使う場合は、ローカルで各記事の embedding は生成されないため、リモートサーバ側の embedding モデル・ベクトル次元と同じ設定に揃えます。Remote server 接続中の変更では、ローカル embedding インデックスのリセットや再生成は行いません。
+   - Connection を **Remote server** にする場合でも **Embedding model** は変更できます。Semantic / Hybrid 検索を使う場合は、ローカルで各記事の embedding は生成されないため、リモートサーバ側の embedding モデル・ベクトル次元と同じ設定に揃えます。Remote server 接続中の変更では、ローカル embedding インデックスのリセットや再生成は行いません。ローカル memories SQLite/LanceDB は起動・参照せず、すべての memories 読み書きはリモート endpoint を使います。接続時には gRPC Server Reflection で必要な memories service とスレッドラベル RPC の schema を検証するため、リモート側は memory_kind 移行済みで、スレッドラベル RPC の `memory_kinds` フィルタを実装し、Reflection v1 を公開している必要があります。対応する更新済み memories バイナリを配布・設定してください。旧バイナリはこのフィールドを無視するため接続時に拒否され、スレッドタブに RAW 以外のラベルは混在しません。
    - **タイムゾーン** は、要約・インポート・タイムスタンプ表示で使う日付境界を制御します。**自動** はアプリの環境変数または OS のタイムゾーンに従います。明示的なタイムゾーンを保存すると、worker プロセスが起動時に `TZ` を読むため sidecar を再起動します。Connection が **Remote server** の間は、リモート workflow がリモートサーバ側の環境を使うため、この設定は変更できません。
 4. **スレッド** を開き、**インポート** から Claude Code または Codex のセッションログを取り込みます。ディレクトリ内のプレーンテキストを取り込む場合は、**プレーンテキスト (ディレクトリ)** をチェックし、対象ディレクトリを選択して、スレッド分割方法を選びます。
    - **ファイルごと**: 1 ファイル = 1 スレッド。

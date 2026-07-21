@@ -43,6 +43,7 @@ import type {
   LogTail,
   McpSettingsResponse,
   MemoryEmbeddingStats,
+  MemoryKindRedispatchStatus,
   MemoryPosition,
   MemoryRow,
   MemoryThreadPosition,
@@ -254,7 +255,7 @@ export async function deletePersonalityProfile(memory_id: string): Promise<void>
 
 /**
  * Temporary investigation: cross-tabulates threads / memories under
- * `personality_user_id=200000` to expose which failure mode the
+ * the Lookback user ID to expose which failure mode the
  * "signals never grow" symptom is in (LLM all-no_signal vs missing
  * AddLabels vs memory not stored). See `debug_personality_inventory`
  * on the Rust side for the field semantics.
@@ -503,6 +504,12 @@ export async function createDataRoot(path: string): Promise<void> {
   return invoke<void>("create_data_root", { path });
 }
 
+/** Switch to a separately selected empty root and restart into first-time setup.
+ * The old root remains untouched for manual recovery and audit. */
+export async function startFreshSetup(path: string): Promise<void> {
+  return invoke<void>("start_fresh_setup", { path });
+}
+
 /** Curated local LLM presets shown in the Settings dropdown. Sourced from
  *  the Rust `llm_presets::PRESETS` constant; safe to cache (staleTime:
  *  Infinity) because the list only changes when the app binary changes. */
@@ -652,6 +659,26 @@ export function recoverResetEmbeddingSettings(): Promise<RecoveryResult> {
  * BootError for failures that need manual investigation. */
 export function openLogDir(): Promise<void> {
   return invoke<void>("open_log_dir");
+}
+
+/** Open the client-apply runbook bundled with the current release. */
+export function openMemoryKindMigrationGuide(): Promise<void> {
+  return invoke<void>("open_memory_kind_migration_guide");
+}
+
+/** Run the bundled client migration after the startup gate blocks a legacy DB. */
+export function migrateMemoryKind(): Promise<RecoveryResult> {
+  return invoke<RecoveryResult>("migrate_memory_kind");
+}
+
+/** Read the durable post-migration vector redispatch notice. */
+export function getMemoryKindRedispatchStatus(): Promise<MemoryKindRedispatchStatus> {
+  return invoke<MemoryKindRedispatchStatus>("get_memory_kind_redispatch_status");
+}
+
+/** Retry all migration vector enqueue RPCs and clear the notice on success. */
+export function retryMemoryKindRedispatch(): Promise<void> {
+  return invoke<void>("retry_memory_kind_redispatch");
 }
 
 /** Cleanly stop the sidecars and quit the app. */

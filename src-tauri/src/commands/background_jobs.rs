@@ -366,7 +366,7 @@ mod tests {
     fn local_jobworkerp_url_uses_live_sidecar_endpoint() {
         let endpoints = crate::sidecar::SidecarEndpoints {
             jobworkerp_port: 19_000,
-            memories_port: 19_001,
+            memories_port: Some(19_001),
             conductor_port: 19_002,
             mcp_server_port: None,
         };

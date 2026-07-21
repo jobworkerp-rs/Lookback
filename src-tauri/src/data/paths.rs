@@ -57,17 +57,28 @@ impl DataPaths {
     }
 
     pub fn ensure(&self) -> AppResult<()> {
+        self.ensure_runtime()?;
+        for sub in [
+            self.lancedb_dir(),
+            self.lancedb_backup_dir(),
+            self.memories_data_dir(),
+        ] {
+            std::fs::create_dir_all(sub)?;
+        }
+        Ok(())
+    }
+
+    /// Creates state required by local jobworkerp/conductor without creating
+    /// a memories SQLite or LanceDB store for a remote-only connection.
+    pub fn ensure_runtime(&self) -> AppResult<()> {
         for sub in [
             self.root.as_path(),
             &self.db_dir(),
             &self.plugins_dir(),
             &self.models_dir(),
             &self.log_dir(),
-            &self.lancedb_dir(),
-            &self.lancedb_backup_dir(),
             &self.workers_dir(),
             &self.staged_workers_dir(),
-            &self.memories_data_dir(),
             &self.lance_language_model_home(),
         ] {
             std::fs::create_dir_all(sub)?;
@@ -172,6 +183,20 @@ impl DataPaths {
 
     pub fn memories_data_dir(&self) -> PathBuf {
         self.root.join("memories")
+    }
+
+    /// Canonical memories SQLite database.
+    ///
+    /// The released v0.0.6 DMG's memories sidecar actually opened this
+    /// `default.sqlite3` file. Although its Lookback host source attempted
+    /// to set `SQLITE_URL` to `memory.sqlite3`, it omitted the companion
+    /// `SQLITE_MAX_CONNECTIONS` required by memories' RDB config and the
+    /// sidecar silently used its default filename instead. Therefore this is
+    /// the existing production store, not a rename from `memory.sqlite3`.
+    /// All local-sidecar, startup-gate, and migration code must share this
+    /// path so they cannot create or inspect a parallel empty database.
+    pub fn memories_sqlite_path(&self) -> PathBuf {
+        self.memories_data_dir().join("default.sqlite3")
     }
 
     /// `LANCE_LANGUAGE_MODEL_HOME` target. `lance-index` reads the Lindera
@@ -283,6 +308,23 @@ impl DataPaths {
     /// purge wipes it too.
     pub fn sidecar_lock_path(&self) -> PathBuf {
         self.root.join("sidecar.lock")
+    }
+
+    /// Migration owns this lock before it writes the legacy memories DB. It is
+    /// distinct from the sidecar lock because startup can be blocked before
+    /// any child process exists.
+    pub fn memory_kind_migration_lock_path(&self) -> PathBuf {
+        self.root.join("memory-kind-migration.lock")
+    }
+
+    /// The single active migration marker. Historical audits live below the
+    /// work root and must never be mistaken for work that needs recovery.
+    pub fn memory_kind_migration_marker_path(&self) -> PathBuf {
+        self.root.join("memory-kind-migration.active.json")
+    }
+
+    pub fn memory_kind_migration_work_dir(&self) -> PathBuf {
+        self.root.join("memory-kind-migration")
     }
 }
 
@@ -738,6 +780,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tempdir_in_target_returns_a_unique_directory_per_test() {
+        let first = tempdir_in_target();
+        let second = tempdir_in_target();
+
+        assert_ne!(first.path(), second.path());
+        std::fs::remove_dir_all(first).ok();
+        std::fs::remove_dir_all(second).ok();
+    }
+
+    #[test]
     fn ensure_creates_all_subdirs() {
         let tmp = tempdir_in_target();
         let paths = DataPaths::with_root(&tmp);
@@ -751,6 +803,20 @@ mod tests {
         assert!(paths.lancedb_backup_dir().exists());
         assert!(paths.workers_dir().exists());
         assert!(paths.staged_workers_dir().exists());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn ensure_runtime_leaves_the_local_memory_store_absent() {
+        let tmp = tempdir_in_target();
+        let paths = DataPaths::with_root(&tmp);
+        paths.ensure_runtime().unwrap();
+
+        assert!(paths.db_dir().exists());
+        assert!(paths.workers_dir().exists());
+        assert!(!paths.memories_data_dir().exists());
+        assert!(!paths.lancedb_dir().exists());
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -814,6 +880,19 @@ mod tests {
     }
 
     #[test]
+    fn memory_kind_migration_paths_are_root_local() {
+        let paths = DataPaths::with_root("/tmp/lookback-migration-test");
+        assert_eq!(
+            paths.memory_kind_migration_lock_path(),
+            PathBuf::from("/tmp/lookback-migration-test/memory-kind-migration.lock")
+        );
+        assert_eq!(
+            paths.memory_kind_migration_marker_path(),
+            PathBuf::from("/tmp/lookback-migration-test/memory-kind-migration.active.json")
+        );
+    }
+
+    #[test]
     fn staged_workers_dir_is_under_workers_dir() {
         // Keep staged YAMLs separate from the committed bundle so a
         // future `LOOKBACK_WORKERS_DIR` pointed at staged/ would fail
@@ -831,6 +910,16 @@ mod tests {
         let url = paths.sqlite_url();
         assert!(url.starts_with("sqlite:///tmp/lookback-test/db/jobworkerp.sqlite3"));
         assert!(url.ends_with("?mode=rwc"));
+    }
+
+    #[test]
+    fn memories_sqlite_path_preserves_the_released_dmg_database_name() {
+        let paths = DataPaths::with_root("/tmp/lookback-data");
+
+        assert_eq!(
+            paths.memories_sqlite_path(),
+            PathBuf::from("/tmp/lookback-data/memories/default.sqlite3")
+        );
     }
 
     #[test]
@@ -1634,6 +1723,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lookback_raw_recall_search_avoids_thread_filter_expansion() {
+        let workflow = std::fs::read_to_string(
+            workers_bundle_dir()
+                .unwrap()
+                .join("workflows/rag/lookback-recall.yaml"),
+        )
+        .unwrap();
+        let raw_step = workflow
+            .split_once("  - searchRaw:")
+            .and_then(|(_, rest)| rest.split_once("  - projectHits:").map(|(step, _)| step))
+            .expect("lookback recall must contain distinct raw-search and projection steps");
+
+        assert!(raw_step.contains("memory_kinds: [\"MEMORY_KIND_RAW\"]"));
+        assert!(
+            !raw_step.contains("thread_filter:"),
+            "RAW recall must not expand every matching thread into memory IDs"
+        );
+    }
+
+    #[test]
+    fn lookback_summary_recall_expands_threads_only_for_explicit_labels() {
+        let workflow = std::fs::read_to_string(
+            workers_bundle_dir()
+                .unwrap()
+                .join("workflows/rag/lookback-recall.yaml"),
+        )
+        .unwrap();
+        let summary_step = workflow
+            .split_once("  - searchSummaries:")
+            .and_then(|(_, rest)| rest.split_once("  - searchRaw:").map(|(step, _)| step))
+            .expect("lookback recall must contain distinct summary and raw-search steps");
+
+        assert!(summary_step.contains("memory_kinds: [\"MEMORY_KIND_THREAD_SUMMARY\""));
+        assert!(
+            summary_step.contains("if $has then {"),
+            "only an explicit summary_labels request may add a thread filter"
+        );
+        assert!(
+            summary_step.contains("thread_filter:"),
+            "explicit summary labels must remain searchable through thread labels"
+        );
+    }
+
     /// The lang-worker single YAMLs (day/week/month summary) live outside
     /// `workers/workflows/`, so `workflow_yamls_parse` never scans them —
     /// yet they carry the same UTC/TZ jq boundary logic (memories 5e996f5,
@@ -2110,7 +2243,7 @@ mod tests {
         let tmp = tempdir_in_target();
         unsafe { std::env::set_var("LOOKBACK_WORKERS_DIR", &tmp) };
         let dir = workers_bundle_dir().unwrap();
-        assert_eq!(dir, tmp);
+        assert_eq!(dir, tmp.path());
         unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -2136,10 +2269,40 @@ mod tests {
         line
     }
 
-    fn tempdir_in_target() -> PathBuf {
-        let base = std::env::temp_dir().join(format!("lookback-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        base
+    struct TestTempDir(tempfile::TempDir);
+
+    impl TestTempDir {
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    impl std::ops::Deref for TestTempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.path()
+        }
+    }
+
+    impl AsRef<Path> for TestTempDir {
+        fn as_ref(&self) -> &Path {
+            self.path()
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for TestTempDir {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.path().as_ref()
+        }
+    }
+
+    fn tempdir_in_target() -> TestTempDir {
+        TestTempDir(
+            tempfile::Builder::new()
+                .prefix("lookback-test-")
+                .tempdir_in(std::env::temp_dir())
+                .unwrap(),
+        )
     }
 }

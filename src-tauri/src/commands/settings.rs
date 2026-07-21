@@ -38,7 +38,7 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsSnapshot> {
         models_path: data.models_dir(),
         log_path: data.log_dir(),
         jobworkerp_url: eps.as_ref().map(|e| e.jobworkerp_url()),
-        memories_url: eps.map(|e| e.memories_url()),
+        memories_url: eps.and_then(|e| e.memories_url()),
     })
 }
 

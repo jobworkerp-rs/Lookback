@@ -319,7 +319,7 @@ export interface ImportStepUpdate {
 
 export interface SidecarEndpoints {
   jobworkerp_port: number;
-  memories_port: number;
+  memories_port: number | null;
   conductor_port: number;
   /**
    * MCP HTTP server bind port when the user enabled it (and the sidecar is
@@ -432,6 +432,9 @@ export type StartupFailure =
  */
 export type SidecarErrorPayload =
   | { kind: "structured"; failure: StartupFailure }
+  | { kind: "memory_kind_migration_required"; db_path: string }
+  | { kind: "unexpected_memory_data"; db_path: string; reason: string }
+  | { kind: "memory_kind_database_schema_invalid"; db_path: string; reason: string }
   | { kind: "raw"; message: string };
 
 /** Response of every `recover_*` command. */
@@ -439,6 +442,12 @@ export interface RecoveryResult {
   restarted: boolean;
   backupPath: string | null;
   restartError: string | null;
+}
+
+/** Durable notice left only when the post-migration vector enqueue failed. */
+export interface MemoryKindRedispatchStatus {
+  pending: boolean;
+  error: string | null;
 }
 
 export interface SettingsSnapshot {
@@ -863,7 +872,7 @@ export interface SearchReflectionsRequest {
 
 export interface SearchReflectionsHybridRequest {
   query_text: string;
-  /** Backing reflection memory owner. Defaults to reflection_user_id=300000. */
+  /** Backing reflection memory owner. Defaults to the Lookback user ID. */
   user_id?: number;
   outcomes?: number[];
   created_after_ms?: number;
@@ -1271,6 +1280,8 @@ export interface SearchThreadsRequest {
   created_before_ms?: number;
   labels_any?: string[];
   label_match?: LabelMatch;
+  /** Lifecycle kinds to search. Omit for the Threads tab's RAW-only scope. */
+  memory_kinds?: number[];
   limit?: number;
 }
 

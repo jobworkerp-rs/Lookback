@@ -171,10 +171,6 @@ input:
         daily_work_summary_single_yaml:
           type: string
           description: Absolute path / URL of daily-work-summary-single.yaml.
-        summary_user_id:
-          type: integer
-          default: 100000
-          description: Summary memory owner. Must differ from user_id.
         # LLM model / endpoint inputs were dropped in Phase C: every
         # LLM call now routes through the `memories-llm` named worker
         # (workers/llm-workers.yaml), so the pipeline no longer needs to
@@ -205,9 +201,8 @@ input:
         # Set `thread_personality_batch_yaml` (and the matching `*_single_yaml`
         # / `user_personality_merge_yaml`) to opt in. Empty defaults skip
         # the personality branch entirely so existing pipelines remain
-        # unaffected. The two-layer extraction owns its own user_id space
-        # (`personality_user_id`, default 200000) and is fully disjoint
-        # from the summary side.
+        # unaffected. The two-layer extraction is isolated from summaries
+        # by `PERSONALITY` memory kind.
         thread_personality_batch_yaml:
           type: string
           default: ""
@@ -227,15 +222,6 @@ input:
             Absolute path / URL of user-personality-merge.yaml. Empty
             runs the per-thread layer only and skips the user-level
             merge.
-        personality_user_id:
-          type: integer
-          default: 200000
-          description: >-
-            Owner user_id for personality memories. MUST differ from
-            both `user_id` and `summary_user_id`.
-        # `personality_model` removed in Phase C — see comment near
-        # `summary_user_id`. Personality LLM is routed through the same
-        # `memories-llm` named worker as the summary side.
         min_user_messages:
           type: integer
           default: 2
@@ -597,9 +583,8 @@ do:
              and ($workflow.input.user_personality_merge_yaml // "") != "" }
 
   # Step 5: Run the summary and personality pipelines concurrently.
-  # The two systems own disjoint user_id spaces (summary_user_id vs
-  # personality_user_id) and never read each other's data, so a fork
-  # is safe. The personality branch is wrapped in try/catch — failure
+  # The two systems write distinct memory kinds, so a fork is safe. The
+  # personality branch is wrapped in try/catch — failure
   # there is logged as a warning but does not fail the workflow,
   # since personality is supplementary context.
   - downstreamStages:
@@ -641,7 +626,6 @@ do:
                               updated_after_ms: $updated_after_ms_effective,
                               memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
                               force_resummarize: $workflow.input.force_resummarize,
-                              summary_user_id: $workflow.input.summary_user_id,
                               min_message_count: 4,
                               max_context_chars: $workflow.input.max_context_chars
                             } | tojson }
@@ -668,7 +652,7 @@ do:
                         arguments:
                           input: >-
                             ${ {
-                              source_user_id: $workflow.input.summary_user_id,
+                              user_id: $workflow.input.user_id,
                               single_workflow_path: $workflow.input.daily_work_summary_single_yaml,
                               start_date: $since_date_resolved,
                               end_date: $end_date_resolved,
@@ -713,8 +697,6 @@ do:
                               single_workflow_path: $workflow.input.thread_personality_single_yaml,
                               updated_after_ms: $updated_after_ms_effective,
                               force_reextract: $workflow.input.force_reextract,
-                              personality_user_id: $workflow.input.personality_user_id,
-                              summary_user_id: $workflow.input.summary_user_id,
                               min_message_count: 4,
                               min_user_messages: $workflow.input.min_user_messages,
                               max_context_chars: $workflow.input.max_context_chars
@@ -743,8 +725,6 @@ do:
                               memories_grpc_port: $memories_port,
                               memories_grpc_tls: $memories_tls,
                               llm_worker_name: $workflow.input.llm_worker_name,
-                              personality_user_id: $workflow.input.personality_user_id,
-                              summary_user_id: $workflow.input.summary_user_id,
                               max_context_chars: $workflow.input.max_context_chars,
                               force_remerge: $workflow.input.force_remerge,
                               max_signals: $workflow.input.max_signals

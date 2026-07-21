@@ -49,6 +49,7 @@ workers:
     settings:
       host: "%{MEMORY_GRPC_HOST}"
       port: "%{MEMORY_GRPC_PORT}"
+      tls: %{MEMORY_GRPC_TLS:-false}
       use_reflection: true
       method: llm_memory.service.ReflectionService/MarkReflectionEmbeddingStatus
       as_json: true
@@ -62,6 +63,7 @@ workers:
     settings:
       host: "%{MEMORY_GRPC_HOST}"
       port: "%{MEMORY_GRPC_PORT}"
+      tls: %{MEMORY_GRPC_TLS:-false}
       use_reflection: true
       method: llm_memory.service.ReflectionVectorService/BatchUpsertIntentEmbeddings
       as_json: true

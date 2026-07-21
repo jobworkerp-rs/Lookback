@@ -13,6 +13,8 @@ use crate::grpc::proto::llm_memory::service::thread_service_client::ThreadServic
 
 use super::AppState;
 
+const RAW_MEMORY_KIND: i32 = mem_data::MemoryKind::Raw as i32;
+
 /// One thread shaped for the frontend.
 ///
 /// Mirrors `llm_memory.data.Thread` but flattens optional nested ids to
@@ -85,6 +87,7 @@ pub async fn list_threads(
             updated_after: None,
             updated_before: None,
             sort: None,
+            memory_kinds: vec![RAW_MEMORY_KIND],
         };
         client
             .find_thread_list_by_user_id(request)
@@ -102,6 +105,7 @@ pub async fn list_threads(
             updated_after: None,
             updated_before: None,
             sort: None,
+            memory_kinds: vec![RAW_MEMORY_KIND],
         };
         client
             .find_thread_list_by_labels(request)
@@ -153,20 +157,25 @@ pub async fn find_distinct_labels(
     req: FindDistinctLabelsRequest,
 ) -> AppResult<Vec<LabelWithCount>> {
     let mut client = ThreadServiceClient::new(state.memories_channel().await?);
-    let user_id = req.user_id.unwrap_or(1);
+    let request = build_distinct_labels_request(req);
 
-    let request = mem_svc::FindDistinctLabelsRequest {
-        user_id: Some(user_id),
+    let resp = client.find_distinct_labels(request).await?.into_inner();
+    Ok(resp.labels.into_iter().map(Into::into).collect())
+}
+
+fn build_distinct_labels_request(
+    req: FindDistinctLabelsRequest,
+) -> mem_svc::FindDistinctLabelsRequest {
+    mem_svc::FindDistinctLabelsRequest {
+        user_id: Some(req.user_id.unwrap_or(1)),
         limit: req.limit,
         offset: req.offset,
         created_after: req.created_after_ms,
         created_before: req.created_before_ms,
         updated_after: None,
         updated_before: None,
-    };
-
-    let resp = client.find_distinct_labels(request).await?.into_inner();
-    Ok(resp.labels.into_iter().map(Into::into).collect())
+        memory_kinds: vec![RAW_MEMORY_KIND],
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -185,21 +194,26 @@ pub async fn find_co_occurring_labels(
     req: FindCoOccurringLabelsRequest,
 ) -> AppResult<Vec<LabelWithCount>> {
     let mut client = ThreadServiceClient::new(state.memories_channel().await?);
-    let user_id = req.user_id.unwrap_or(1);
+    let request = build_co_occurring_labels_request(req);
 
-    let request = mem_svc::FindCoOccurringLabelsRequest {
+    let resp = client.find_co_occurring_labels(request).await?.into_inner();
+    Ok(resp.labels.into_iter().map(Into::into).collect())
+}
+
+fn build_co_occurring_labels_request(
+    req: FindCoOccurringLabelsRequest,
+) -> mem_svc::FindCoOccurringLabelsRequest {
+    mem_svc::FindCoOccurringLabelsRequest {
         labels: req.labels,
-        user_id: Some(user_id),
+        user_id: Some(req.user_id.unwrap_or(1)),
         limit: req.limit,
         offset: req.offset,
         created_after: req.created_after_ms,
         created_before: req.created_before_ms,
         updated_after: None,
         updated_before: None,
-    };
-
-    let resp = client.find_co_occurring_labels(request).await?.into_inner();
-    Ok(resp.labels.into_iter().map(Into::into).collect())
+        memory_kinds: vec![RAW_MEMORY_KIND],
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -609,5 +623,61 @@ mod tests {
             serde_json::from_str(r#"{"labels":["a","b"]}"#).unwrap();
         assert_eq!(req.labels, vec!["a".to_string(), "b".to_string()]);
         assert!(req.user_id.is_none());
+    }
+
+    #[test]
+    fn distinct_labels_request_is_raw_only_and_preserves_filters() {
+        let request = build_distinct_labels_request(FindDistinctLabelsRequest {
+            user_id: Some(7),
+            limit: Some(25),
+            offset: Some(50),
+            created_after_ms: Some(100),
+            created_before_ms: Some(200),
+        });
+
+        assert_eq!(request.user_id, Some(7));
+        assert_eq!(request.limit, Some(25));
+        assert_eq!(request.offset, Some(50));
+        assert_eq!(request.created_after, Some(100));
+        assert_eq!(request.created_before, Some(200));
+        assert_eq!(request.updated_after, None);
+        assert_eq!(request.updated_before, None);
+        assert_eq!(request.memory_kinds, vec![RAW_MEMORY_KIND]);
+    }
+
+    #[test]
+    fn co_occurring_labels_request_is_raw_only_and_preserves_filters() {
+        let request = build_co_occurring_labels_request(FindCoOccurringLabelsRequest {
+            user_id: Some(7),
+            labels: vec!["alpha".to_string(), "beta".to_string()],
+            limit: Some(25),
+            offset: Some(50),
+            created_after_ms: Some(100),
+            created_before_ms: Some(200),
+        });
+
+        assert_eq!(request.labels, vec!["alpha", "beta"]);
+        assert_eq!(request.user_id, Some(7));
+        assert_eq!(request.limit, Some(25));
+        assert_eq!(request.offset, Some(50));
+        assert_eq!(request.created_after, Some(100));
+        assert_eq!(request.created_before, Some(200));
+        assert_eq!(request.updated_after, None);
+        assert_eq!(request.updated_before, None);
+        assert_eq!(request.memory_kinds, vec![RAW_MEMORY_KIND]);
+    }
+
+    #[test]
+    fn label_requests_default_to_the_raw_threads_user() {
+        let distinct = build_distinct_labels_request(FindDistinctLabelsRequest::default());
+        let co_occurring = build_co_occurring_labels_request(FindCoOccurringLabelsRequest {
+            labels: vec!["alpha".to_string()],
+            ..Default::default()
+        });
+
+        assert_eq!(distinct.user_id, Some(1));
+        assert_eq!(co_occurring.user_id, Some(1));
+        assert_eq!(distinct.memory_kinds, vec![RAW_MEMORY_KIND]);
+        assert_eq!(co_occurring.memory_kinds, vec![RAW_MEMORY_KIND]);
     }
 }

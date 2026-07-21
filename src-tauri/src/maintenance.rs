@@ -237,7 +237,7 @@ mod tests {
             completed_start_jobworkerp_url(Some(crate::sidecar::SidecarStartReport {
                 endpoints: crate::sidecar::SidecarEndpoints {
                     jobworkerp_port: 19_000,
-                    memories_port: 19_001,
+                    memories_port: Some(19_001),
                     conductor_port: 19_002,
                     mcp_server_port: None,
                 },

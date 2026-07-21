@@ -32,6 +32,7 @@ message FindRecentListByUserIdRequest {
     // Return only rows whose updated_at is less than or equal to this
     // epoch-milliseconds timestamp.
     optional int64 updated_before = 4;
+    repeated llm_memory.data.MemoryKind memory_kinds = 5;
 }
 
 // MemoryService-specific conditional list request.
@@ -79,6 +80,7 @@ message FindMemoryListRequest {
     // Mutually exclusive with `external_id` (exact match): the server returns
     // `InvalidArgument` if both are set.
     optional string external_id_prefix = 14;
+    repeated llm_memory.data.MemoryKind memory_kinds = 15;
 }
 
 // MemoryService-specific count condition. Accepts the same filter
@@ -112,6 +114,7 @@ message MemoryCountCondition {
     // Same semantics and exclusivity rules as
     // `FindMemoryListRequest.external_id_prefix`.
     optional string external_id_prefix = 11;
+    repeated llm_memory.data.MemoryKind memory_kinds = 12;
     // sort intentionally absent — Count returns a scalar.
 }
 

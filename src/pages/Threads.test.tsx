@@ -99,6 +99,7 @@ describe("Threads page label filter", () => {
 
     await openLabelBar();
     await waitFor(() => barChip("lookback", 5));
+    expect(findDistinctLabels).toHaveBeenCalledWith({ user_id: 1, limit: 10_000 });
     // First load: no label filter.
     await waitFor(() => expect(listThreads).toHaveBeenCalled());
     expect((listThreads.mock.calls[0]?.[0] as ListThreadsRequest).labels_any).toBeUndefined();
@@ -210,9 +211,10 @@ describe("Threads page label filter", () => {
     // Default is AND — picking one label is enough to trigger co-occurring.
     fireEvent.click(barChip("lookback", 5));
     await waitFor(() => expect(findCoOccurringLabels).toHaveBeenCalled());
-    expect(findCoOccurringLabels.mock.calls.at(-1)?.[0]).toMatchObject({
+    expect(findCoOccurringLabels.mock.calls.at(-1)?.[0]).toEqual({
       user_id: 1,
       labels: ["lookback"],
+      limit: 10_000,
     });
 
     // Pick a second label, then flip to OR; the prior co-occurring call

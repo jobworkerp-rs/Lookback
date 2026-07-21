@@ -50,6 +50,11 @@ pub struct SearchThreadsRequest {
     pub labels_any: Vec<String>,
     #[serde(default)]
     pub label_match: Option<LabelMatch>,
+    /// Lifecycle kinds to search. Omitting this keeps the Threads tab's
+    /// historical RAW-only behavior; generated-memory views supply their
+    /// specific kind explicitly.
+    #[serde(default)]
+    pub memory_kinds: Vec<i32>,
     /// Memory-side cap, default 50. Aggregated thread count is always
     /// ≤ this number.
     pub limit: Option<u32>,
@@ -168,13 +173,17 @@ pub(crate) fn build_hybrid_request(
 /// Label filter lives inside `thread_filter` so it ANDs with the memory
 /// owner filter rather than overlapping it.
 ///
-/// Reused for summary search: callers pass `user_id=100000` (the synthetic
-/// summary owner) plus `labels_any=[<kind>_summary]` to scope to a
-/// granularity. `MemorySearchFilter` has no `external_id` field, so the
-/// daily/weekly/monthly distinction can only be made via the summary-thread
-/// label — not the `external_id` prefix that list queries use.
+/// Reused for summary search: callers pass the Lookback user ID and the
+/// selected summary `memory_kind`. Labels further narrow per-thread facets;
+/// they are not the lifecycle boundary. `MemorySearchFilter` has no
+/// `external_id` field, so it cannot use the list query's prefix filter.
 fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
     let user_id = req.user_id.unwrap_or(1);
+    let memory_kinds = if req.memory_kinds.is_empty() {
+        vec![mem_data::MemoryKind::Raw as i32]
+    } else {
+        req.memory_kinds.clone()
+    };
     let thread_filter = if req.labels_any.is_empty() {
         None
     } else {
@@ -187,6 +196,7 @@ fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
             created_before: None,
             updated_after: None,
             updated_before: None,
+            memory_kinds: memory_kinds.clone(),
         })
     };
 
@@ -199,6 +209,7 @@ fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
         updated_after: None,
         updated_before: None,
         thread_filter,
+        memory_kinds,
     };
     mem_data::SearchOptions {
         limit: req.limit.unwrap_or(50),
@@ -342,10 +353,13 @@ mod tests {
             created_before_ms: None,
             labels_any: vec![],
             label_match: None,
+            memory_kinds: vec![],
             limit: None,
         };
         let opts = build_search_options(&req);
-        assert_eq!(opts.filter.unwrap().user_id, Some(1));
+        let filter = opts.filter.expect("filter");
+        assert_eq!(filter.user_id, Some(1));
+        assert_eq!(filter.memory_kinds, vec![mem_data::MemoryKind::Raw as i32]);
     }
 
     #[test]
@@ -358,6 +372,7 @@ mod tests {
             created_before_ms: Some(2_000),
             labels_any: vec![],
             label_match: None,
+            memory_kinds: vec![],
             limit: None,
         };
         let opts = build_search_options(&req);
@@ -379,6 +394,7 @@ mod tests {
             created_before_ms: None,
             labels_any: vec!["lookback".into(), "review".into()],
             label_match: None,
+            memory_kinds: vec![],
             limit: Some(100),
         };
         let opts = build_search_options(&req);
@@ -407,6 +423,7 @@ mod tests {
             created_before_ms: None,
             labels_any: vec!["lookback".into(), "review".into()],
             label_match: Some(LabelMatch::All),
+            memory_kinds: vec![],
             limit: None,
         };
         let opts = build_search_options(&req);
@@ -414,6 +431,31 @@ mod tests {
         assert_eq!(
             tf.label_match_mode,
             Some(mem_data::LabelMatchMode::LabelAll as i32)
+        );
+    }
+
+    #[test]
+    fn build_search_options_uses_requested_summary_kind_for_memory_and_thread() {
+        let req = SearchThreadsRequest {
+            query_text: "x".into(),
+            mode: SearchMode::Keyword,
+            user_id: Some(1),
+            created_after_ms: None,
+            created_before_ms: None,
+            labels_any: vec!["daily_summary".into()],
+            label_match: Some(LabelMatch::All),
+            memory_kinds: vec![mem_data::MemoryKind::DailySummary as i32],
+            limit: None,
+        };
+
+        let filter = build_search_options(&req).filter.expect("filter");
+        assert_eq!(
+            filter.memory_kinds,
+            vec![mem_data::MemoryKind::DailySummary as i32]
+        );
+        assert_eq!(
+            filter.thread_filter.expect("thread filter").memory_kinds,
+            vec![mem_data::MemoryKind::DailySummary as i32]
         );
     }
 
@@ -506,6 +548,7 @@ mod tests {
             created_before_ms: None,
             labels_any: vec![],
             label_match: None,
+            memory_kinds: vec![],
             limit: Some(25),
         };
         let r = build_hybrid_request(&req, vec![0.1, 0.2, 0.3]);
@@ -531,6 +574,7 @@ mod tests {
             created_before_ms: None,
             labels_any: vec!["lookback".into()],
             label_match: None,
+            memory_kinds: vec![],
             limit: None,
         };
         let r = build_hybrid_request(&req, vec![1.0]);

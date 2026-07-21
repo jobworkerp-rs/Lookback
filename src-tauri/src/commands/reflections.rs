@@ -22,7 +22,7 @@ use super::search::{
     SearchMode, SearchThreadsRequest, build_hybrid_request as build_thread_hybrid_request,
 };
 
-const REFLECTION_MEMORY_USER_ID: i64 = 300_000;
+const REFLECTION_MEMORY_USER_ID: i64 = 1;
 
 /// Projected reflection record. Reflection proto has ~40 fields, of which
 /// only the ones used by the Reflections tab are forwarded. Frontend maps
@@ -426,9 +426,18 @@ fn build_hybrid_search_request(
         created_before_ms: req.created_before_ms,
         labels_any: vec![],
         label_match: None,
+        memory_kinds: vec![],
         limit: req.limit,
     };
-    build_thread_hybrid_request(&thread_req, vector)
+    let mut request = build_thread_hybrid_request(&thread_req, vector);
+    if let Some(filter) = request
+        .options
+        .as_mut()
+        .and_then(|options| options.filter.as_mut())
+    {
+        filter.memory_kinds = vec![mem_data::MemoryKind::Reflection as i32];
+    }
+    request
 }
 
 fn reflection_memory_ids_from_hits(hits: Vec<mem_svc::MemorySearchResult>) -> Vec<i64> {
@@ -639,7 +648,11 @@ mod tests {
         assert_eq!(opts.limit, 25);
         assert_eq!(opts.include_content, Some(true));
         let filter = opts.filter.expect("filter always set");
-        assert_eq!(filter.user_id, Some(300_000));
+        assert_eq!(filter.user_id, Some(REFLECTION_MEMORY_USER_ID));
+        assert_eq!(
+            filter.memory_kinds,
+            vec![mem_data::MemoryKind::Reflection as i32]
+        );
         assert_eq!(filter.created_after, Some(1_000));
         assert_eq!(filter.created_before, Some(2_000));
         assert!(filter.thread_filter.is_none());

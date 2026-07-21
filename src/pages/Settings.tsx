@@ -12,6 +12,7 @@ import {
   getLlmSettings,
   getMcpSettings,
   getMemoryEmbeddingStats,
+  getMemoryKindRedispatchStatus,
   getModelStatus,
   getSettings,
   listEmbeddingPresets,
@@ -19,6 +20,7 @@ import {
   purgeAllData,
   readSidecarLog,
   redispatchMemoryEmbeddings,
+  retryMemoryKindRedispatch,
   retryModelSetup,
   setConnectionConfig,
   setDataRoot,
@@ -2415,9 +2417,15 @@ export function MemoryEmbeddingCard() {
     queryKey: ["memory-embedding-stats"],
     queryFn: getMemoryEmbeddingStats,
   });
+  const migrationRedispatch = useQuery({
+    queryKey: ["memory-kind-redispatch-status"],
+    queryFn: getMemoryKindRedispatchStatus,
+  });
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<RedispatchEmbeddingsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryingMigration, setRetryingMigration] = useState(false);
+  const [migrationRetryError, setMigrationRetryError] = useState<string | null>(null);
 
   const {
     total_records: total = 0,
@@ -2432,6 +2440,11 @@ export function MemoryEmbeddingCard() {
   const tableMissing = vectorDim === 0;
   const fmtCount = (n: number) => (stats.isLoading ? "…" : String(n));
 
+  const invalidateEmbeddingStats = async () => {
+    await queryClient.invalidateQueries({ queryKey: ["memory-embedding-stats"] });
+    await queryClient.invalidateQueries({ queryKey: ["background-job-queue-status"] });
+  };
+
   const handleRedispatch = async () => {
     // Even with zero un-embedded rows the action is sometimes desired
     // (e.g. embedding model swap), so the confirm names both the cost and
@@ -2445,8 +2458,7 @@ export function MemoryEmbeddingCard() {
     try {
       const res = await redispatchMemoryEmbeddings({});
       setResult(res);
-      await queryClient.invalidateQueries({ queryKey: ["memory-embedding-stats"] });
-      await queryClient.invalidateQueries({ queryKey: ["background-job-queue-status"] });
+      await invalidateEmbeddingStats();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -2454,10 +2466,46 @@ export function MemoryEmbeddingCard() {
     }
   };
 
+  const retryMigrationRedispatch = async () => {
+    setRetryingMigration(true);
+    setMigrationRetryError(null);
+    try {
+      await retryMemoryKindRedispatch();
+      await queryClient.invalidateQueries({ queryKey: ["memory-kind-redispatch-status"] });
+      await invalidateEmbeddingStats();
+    } catch (e) {
+      setMigrationRetryError((e as Error).message);
+    } finally {
+      setRetryingMigration(false);
+    }
+  };
+
   return (
     <div className="settings-card">
       <div className="settings-card-title">{t("settings.embeddingIndex.title")}</div>
       <div className="settings-card-desc">{t("settings.embeddingIndex.desc")}</div>
+      {migrationRedispatch.data?.pending && (
+        <div className="warning-banner" role="alert">
+          <div className="warning-banner-title">
+            {t("settings.embeddingIndex.migrationPendingTitle")}
+          </div>
+          <div className="warning-banner-body">
+            {t("settings.embeddingIndex.migrationPendingBody")}
+            {migrationRedispatch.data.error && ` ${migrationRedispatch.data.error}`}
+          </div>
+          <button
+            type="button"
+            className="warning-banner-cta"
+            onClick={() => void retryMigrationRedispatch()}
+            disabled={retryingMigration}
+          >
+            {retryingMigration
+              ? t("settings.embeddingIndex.migrationRetrying")
+              : t("settings.embeddingIndex.migrationRetry")}
+          </button>
+          {migrationRetryError && <div className="warning-banner-body">{migrationRetryError}</div>}
+        </div>
+      )}
       {stats.error && (
         <div style={{ color: "var(--danger)", fontSize: 11 }}>{(stats.error as Error).message}</div>
       )}

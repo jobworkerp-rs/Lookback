@@ -45,11 +45,13 @@
       "bin/front",
       "bin/conductor-main",
       "bin/memories-import",
+      "bin/migrate-memory-kind",
       "bin/protoc"
     ],
     "resources": {
       "../workers/": "workers/",
-      "../dict/": "dict/"
+      "../dict/": "dict/",
+      "migration-toolkit/": "migration-toolkit/"
     }
   }
 }

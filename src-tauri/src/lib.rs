@@ -119,13 +119,18 @@ pub fn run() {
             commands::setup::apply_setup,
             commands::setup::resume_setup,
             commands::setup::restart_for_setup,
+            commands::setup::start_fresh_setup,
             commands::embeddings::get_memory_embedding_stats,
             commands::embeddings::redispatch_memory_embeddings,
             commands::background_jobs::get_background_job_queue_status,
             commands::recovery::recover_evacuate_lancedb,
             commands::recovery::recover_purge_lancedb,
             commands::recovery::recover_reset_embedding_settings,
+            commands::recovery::migrate_memory_kind,
+            commands::recovery::get_memory_kind_redispatch_status,
+            commands::recovery::retry_memory_kind_redispatch,
             commands::recovery::open_log_dir,
+            commands::recovery::open_memory_kind_migration_guide,
             commands::recovery::quit_app,
             resolve_memories_import_bin,
         ])
@@ -298,7 +303,14 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
     let data = DataPaths::resolve()?;
     // Ensure the data dirs exist before staging the Lindera dictionary into
     // them (sidecars also call ensure(), but staging runs first here).
-    data.ensure()?;
+    if matches!(
+        commands::connection::load_connection_config(&data.connection_config_path()).mode,
+        commands::connection::ConnectionMode::Remote
+    ) {
+        data.ensure_runtime()?;
+    } else {
+        data.ensure()?;
+    }
 
     // Resolve sidecar binary paths. Priority:
     //   1. LOOKBACK_JOBWORKERP_BIN / LOOKBACK_MEMORIES_BIN env (dev override).
@@ -600,6 +612,10 @@ mod tests {
 
         assert_eq!(resources.get("../workers/"), Some(&"workers/".into()));
         assert_eq!(resources.get("../dict/"), Some(&"dict/".into()));
+        assert_eq!(
+            resources.get("migration-toolkit/"),
+            Some(&"migration-toolkit/".into())
+        );
         // The plugin glob must NOT be in the shared config (would break the
         // other platform's build).
         assert!(resources.get("plugins/*.dylib").is_none());

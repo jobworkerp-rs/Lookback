@@ -60,7 +60,6 @@ input:
         # UTC-only and ignores it).
         timezone_offset_hours: { type: integer, default: 9 }
         user_id: { type: integer, default: 1 }
-        summary_user_id: { type: integer, default: 100000 }
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
@@ -123,7 +122,6 @@ do:
                       memories_grpc_tls: $workflow.input.memories_grpc_tls,
                       llm_worker_name: $workflow.input.llm_worker_name,
                       output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
-                      summary_user_id: $workflow.input.summary_user_id,
                       updated_after_ms: $workflow.input.updated_after_ms,
                       updated_before_ms: $workflow.input.updated_before_ms
                     }
@@ -163,7 +161,7 @@ do:
                 arguments:
                   input: >-
                     ${ {
-                      source_user_id: $workflow.input.summary_user_id,
+                      user_id: $workflow.input.user_id,
                       output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
                       start_date: $workflow.input.daily_start,
                       end_date: $workflow.input.daily_end,
@@ -206,7 +204,7 @@ do:
                 arguments:
                   input: >-
                     ${ {
-                      source_user_id: $workflow.input.summary_user_id,
+                      user_id: $workflow.input.user_id,
                       output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
                       start_week: $workflow.input.weekly_start,
                       end_week: $workflow.input.weekly_end,
@@ -249,7 +247,7 @@ do:
                 arguments:
                   input: >-
                     ${ {
-                      source_user_id: $workflow.input.summary_user_id,
+                      user_id: $workflow.input.user_id,
                       output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
                       start_month: $workflow.input.monthly_start,
                       end_month: $workflow.input.monthly_end,

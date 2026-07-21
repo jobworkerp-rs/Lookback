@@ -69,3 +69,15 @@ describe("search copy", () => {
     expect(searchCopy.filter((value) => forbidden.test(value))).toEqual([]);
   });
 });
+
+describe("boot error copy", () => {
+  it("renders the unexpected-memory detail on a new line in both locales", () => {
+    for (const body of [
+      ja.bootError.unexpectedMemoryData.body,
+      en.bootError.unexpectedMemoryData.body,
+    ]) {
+      expect(body).toContain("\n");
+      expect(body).not.toContain("\\n");
+    }
+  });
+});

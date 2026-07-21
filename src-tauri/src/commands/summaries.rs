@@ -1,12 +1,12 @@
 //! Tauri commands backing the Summaries page.
 //!
-//! Summaries are stored as memories owned by the synthetic
-//! `summary_user_id=100000`. Their `external_id` encodes the summary kind:
+//! Summaries are lifecycle-kind memories owned by the Lookback user. Their
+//! `external_id` encodes the summary kind:
 //!
 //! - per-thread: `summary:<thread_id>`
-//! - daily:      `daily:<YYYY-MM-DD>:<scope_key>`
-//! - weekly:     `weekly:<YYYY-Www>:<scope_key>`  (ISO 8601 week)
-//! - monthly:    `monthly:<YYYY-MM>:<scope_key>`
+//! - daily:      `daily:<user_id>:<YYYY-MM-DD>:<scope_key>`
+//! - weekly:     `weekly:<user_id>:<YYYY-Www>:<scope_key>`  (ISO 8601 week)
+//! - monthly:    `monthly:<user_id>:<YYYY-MM>:<scope_key>`
 //!
 //! The `content` field is a JSON document with `title` / `context` /
 //! `decisions` / `open_questions` / `followups` categories (see
@@ -29,7 +29,7 @@ use super::threads::{LabelMatch, LabelWithCount};
 
 /// Synthetic owner of every summary memory (per-thread and period). Shared
 /// with the dispatch input builders in `commands::import`.
-pub(crate) const SUMMARY_USER_ID: i64 = 100_000;
+pub(crate) const LOOKBACK_USER_ID: i64 = 1;
 
 /// The summary granularities, distinguished by `external_id` prefix. Each
 /// period kind also carries a summary-thread label (`<kind>_summary`) that
@@ -47,8 +47,9 @@ pub enum SummaryKind {
 }
 
 impl SummaryKind {
-    /// The `external_id` prefix used for the server-side LIKE prefix filter.
-    fn external_id_prefix(self) -> &'static str {
+    /// Stable namespace used only when parsing a summary external ID. Queries
+    /// must use `user_id` plus `memory_kind`, not this textual convention.
+    fn external_id_namespace(self) -> &'static str {
         match self {
             SummaryKind::PerThread => "summary:",
             SummaryKind::Daily => "daily:",
@@ -88,10 +89,16 @@ pub(crate) fn parse_summary_external_id(ext: &str) -> Option<ParsedSummaryExtern
         SummaryKind::Weekly,
         SummaryKind::Monthly,
     ] {
-        if let Some(rest) = ext.strip_prefix(kind.external_id_prefix()) {
-            // `<period>:<scope_key>`. scope_key may itself carry `,`-joined
-            // labels but never a `:`, so splitting on the first `:` is safe.
-            let (period_key, scope_key) = rest.split_once(':')?;
+        if let Some(rest) = ext.strip_prefix(kind.external_id_namespace()) {
+            // Current memories IDs are `<namespace>:<owner>:<period>:<scope>`.
+            // Accept the owner-less predecessor as well so an ID convention
+            // change cannot make otherwise correctly typed summaries vanish.
+            let (first, remainder) = rest.split_once(':')?;
+            let (period_key, scope_key) = if first.parse::<i64>().is_ok() {
+                remainder.split_once(':')?
+            } else {
+                (first, remainder)
+            };
             if period_key.is_empty() {
                 return None;
             }
@@ -157,7 +164,7 @@ fn build_find_request(req: &ListSummariesRequest) -> mem_svc::FindMemoryListRequ
         offset: req.offset,
         roles: vec![],
         user_id: Some(mem_data::UserId {
-            value: SUMMARY_USER_ID,
+            value: LOOKBACK_USER_ID,
         }),
         thread_id: None,
         updated_after: req.updated_after_ms,
@@ -165,7 +172,7 @@ fn build_find_request(req: &ListSummariesRequest) -> mem_svc::FindMemoryListRequ
         external_id: None,
         content_types: vec![],
         thread_filter: (!req.labels_any.is_empty()).then(|| mem_data::ThreadSearchFilter {
-            user_id: Some(SUMMARY_USER_ID),
+            user_id: Some(LOOKBACK_USER_ID),
             labels: req.labels_any.clone(),
             label_match_mode: Some(LabelMatch::All.to_proto()),
             channel: None,
@@ -173,23 +180,13 @@ fn build_find_request(req: &ListSummariesRequest) -> mem_svc::FindMemoryListRequ
             created_before: None,
             updated_after: None,
             updated_before: None,
+            memory_kinds: vec![summary_memory_kind(req.kind)],
         }),
         created_after: req.created_after_ms,
         created_before: req.created_before_ms,
         sort: None,
-        external_id_prefix: Some(summary_external_id_prefix(
-            req.kind,
-            req.period_key.as_deref(),
-        )),
-    }
-}
-
-fn summary_external_id_prefix(kind: SummaryKind, period_key: Option<&str>) -> String {
-    match (kind, period_key) {
-        (SummaryKind::Daily | SummaryKind::Weekly | SummaryKind::Monthly, Some(key)) => {
-            format!("{}{}:", kind.external_id_prefix(), key)
-        }
-        _ => kind.external_id_prefix().to_string(),
+        external_id_prefix: None,
+        memory_kinds: vec![summary_memory_kind(req.kind)],
     }
 }
 
@@ -254,12 +251,13 @@ async fn summary_threads(
         match_mode: Some(LabelMatch::All.to_proto()),
         limit: None,
         offset: None,
-        user_id: Some(SUMMARY_USER_ID),
+        user_id: Some(LOOKBACK_USER_ID),
         created_after: None,
         created_before: None,
         updated_after: None,
         updated_before: None,
         sort: None,
+        memory_kinds: vec![summary_memory_kind(SummaryKind::PerThread)],
     };
     let mut stream = client
         .find_thread_list_by_labels(request)
@@ -305,7 +303,7 @@ fn build_summary_memory_request() -> mem_svc::FindMemoryListRequest {
         offset: None,
         roles: vec![],
         user_id: Some(mem_data::UserId {
-            value: SUMMARY_USER_ID,
+            value: LOOKBACK_USER_ID,
         }),
         thread_id: None,
         updated_after: None,
@@ -316,7 +314,8 @@ fn build_summary_memory_request() -> mem_svc::FindMemoryListRequest {
         created_after: None,
         created_before: None,
         sort: None,
-        external_id_prefix: Some(SummaryKind::PerThread.external_id_prefix().to_string()),
+        external_id_prefix: None,
+        memory_kinds: vec![summary_memory_kind(SummaryKind::PerThread)],
     }
 }
 
@@ -404,7 +403,12 @@ pub async fn list_summaries(
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         let entry = item?;
-        if let Some(s) = entry_to_summary(entry) {
+        if let Some(s) = entry_to_summary(entry, req.kind)
+            && req
+                .period_key
+                .as_deref()
+                .is_none_or(|key| s.period_key.as_deref() == Some(key))
+        {
             out.push(s);
         }
     }
@@ -427,7 +431,7 @@ pub async fn count_summaries(
     let request = mem_svc::MemoryCountCondition {
         roles: vec![],
         user_id: Some(mem_data::UserId {
-            value: SUMMARY_USER_ID,
+            value: LOOKBACK_USER_ID,
         }),
         thread_id: None,
         updated_after: None,
@@ -437,7 +441,8 @@ pub async fn count_summaries(
         thread_filter: None,
         created_after: None,
         created_before: None,
-        external_id_prefix: Some(req.kind.external_id_prefix().to_string()),
+        external_id_prefix: None,
+        memory_kinds: vec![summary_memory_kind(req.kind)],
     };
 
     let resp = client.count_by_condition(request).await?;
@@ -465,37 +470,35 @@ pub async fn list_summary_period_keys(
 ) -> AppResult<Vec<String>> {
     let mut client = MemoryServiceClient::new(state.memories_channel().await?);
     let mut keys: BTreeSet<String> = BTreeSet::new();
-    for period_prefix in req.period_key_prefixes {
-        let request = summary_period_keys_request(req.kind, &period_prefix);
-        let mut stream = client.find_list_by_condition(request).await?.into_inner();
-        while let Some(item) = stream.next().await {
-            let entry = item?;
-            if let Some(ext) = entry
-                .memory
-                .and_then(|m| m.data)
-                .and_then(|d| d.external_id)
-                && let Some(parsed) = parse_summary_external_id(&ext)
-                && parsed.kind == req.kind
-                && let Some(period_key) = parsed.period_key
-                && period_key.starts_with(&period_prefix)
-            {
-                keys.insert(period_key);
-            }
+    let request = summary_period_keys_request(req.kind);
+    let mut stream = client.find_list_by_condition(request).await?.into_inner();
+    while let Some(item) = stream.next().await {
+        let entry = item?;
+        if let Some(ext) = entry
+            .memory
+            .and_then(|m| m.data)
+            .and_then(|d| d.external_id)
+            && let Some(parsed) = parse_summary_external_id(&ext)
+            && parsed.kind == req.kind
+            && let Some(period_key) = parsed.period_key
+            && req
+                .period_key_prefixes
+                .iter()
+                .any(|prefix| period_key.starts_with(prefix))
+        {
+            keys.insert(period_key);
         }
     }
     Ok(keys.into_iter().collect())
 }
 
-fn summary_period_keys_request(
-    kind: SummaryKind,
-    period_prefix: &str,
-) -> mem_svc::FindMemoryListRequest {
+fn summary_period_keys_request(kind: SummaryKind) -> mem_svc::FindMemoryListRequest {
     mem_svc::FindMemoryListRequest {
         limit: None,
         offset: None,
         roles: vec![],
         user_id: Some(mem_data::UserId {
-            value: SUMMARY_USER_ID,
+            value: LOOKBACK_USER_ID,
         }),
         thread_id: None,
         updated_after: None,
@@ -506,7 +509,17 @@ fn summary_period_keys_request(
         created_after: None,
         created_before: None,
         sort: None,
-        external_id_prefix: Some(format!("{}{}", kind.external_id_prefix(), period_prefix)),
+        external_id_prefix: None,
+        memory_kinds: vec![summary_memory_kind(kind)],
+    }
+}
+
+fn summary_memory_kind(kind: SummaryKind) -> i32 {
+    match kind {
+        SummaryKind::PerThread => mem_data::MemoryKind::ThreadSummary as i32,
+        SummaryKind::Daily => mem_data::MemoryKind::DailySummary as i32,
+        SummaryKind::Weekly => mem_data::MemoryKind::WeeklySummary as i32,
+        SummaryKind::Monthly => mem_data::MemoryKind::MonthlySummary as i32,
     }
 }
 
@@ -600,7 +613,7 @@ pub struct DeleteSummaryRequest {
 }
 
 /// Delete a single summary. Summaries are Memory rows (owned by
-/// `SUMMARY_USER_ID`), so deletion is `/llm_memory.service.MemoryService/Delete`
+/// `LOOKBACK_USER_ID`), so deletion is `/llm_memory.service.MemoryService/Delete`
 /// by the backing `memory_id` — identical for per-thread / daily / weekly /
 /// monthly. The UI gates this behind a confirm dialog.
 #[tauri::command]
@@ -617,7 +630,10 @@ pub async fn delete_summary(
     Ok(())
 }
 
-fn entry_to_summary(e: mem_svc::MemoryListEntry) -> Option<SummaryEntry> {
+fn entry_to_summary(
+    e: mem_svc::MemoryListEntry,
+    expected_kind: SummaryKind,
+) -> Option<SummaryEntry> {
     let memory = e.memory?;
     let data = memory.data?;
     let coords = summary_coords_from_external_id(data.external_id.as_deref());
@@ -625,7 +641,7 @@ fn entry_to_summary(e: mem_svc::MemoryListEntry) -> Option<SummaryEntry> {
         memory_id: memory.id?.value,
         thread_id: coords.thread_id,
         external_id: data.external_id,
-        kind: coords.kind.unwrap_or_default(),
+        kind: expected_kind,
         period_key: coords.period_key,
         scope_key: coords.scope_key,
         content_json: data.content,
@@ -655,7 +671,7 @@ mod tests {
 
     #[test]
     fn parse_daily_external_id() {
-        let p = parse_summary_external_id("daily:2026-05-24:_all").expect("parse");
+        let p = parse_summary_external_id("daily:1:2026-05-24:_all").expect("parse");
         assert_eq!(p.kind, SummaryKind::Daily);
         assert_eq!(p.period_key.as_deref(), Some("2026-05-24"));
         assert_eq!(p.scope_key.as_deref(), Some("_all"));
@@ -664,16 +680,24 @@ mod tests {
 
     #[test]
     fn parse_weekly_external_id() {
-        let p = parse_summary_external_id("weekly:2026-W21:_all").expect("parse");
+        let p = parse_summary_external_id("weekly:1:2026-W21:_all").expect("parse");
         assert_eq!(p.kind, SummaryKind::Weekly);
         assert_eq!(p.period_key.as_deref(), Some("2026-W21"));
         assert_eq!(p.scope_key.as_deref(), Some("_all"));
     }
 
     #[test]
+    fn parse_ownerless_period_external_id_for_display_compatibility() {
+        let p = parse_summary_external_id("daily:2026-05-24:_all").expect("parse");
+        assert_eq!(p.kind, SummaryKind::Daily);
+        assert_eq!(p.period_key.as_deref(), Some("2026-05-24"));
+        assert_eq!(p.scope_key.as_deref(), Some("_all"));
+    }
+
+    #[test]
     fn parse_monthly_external_id_with_comma_scope() {
         // scope_key can carry `,`-joined labels; only the first `:` splits.
-        let p = parse_summary_external_id("monthly:2026-05:proj,team").expect("parse");
+        let p = parse_summary_external_id("monthly:1:2026-05:proj,team").expect("parse");
         assert_eq!(p.kind, SummaryKind::Monthly);
         assert_eq!(p.period_key.as_deref(), Some("2026-05"));
         assert_eq!(p.scope_key.as_deref(), Some("proj,team"));
@@ -692,28 +716,32 @@ mod tests {
     }
 
     #[test]
-    fn summary_kind_prefixes() {
-        assert_eq!(SummaryKind::PerThread.external_id_prefix(), "summary:");
-        assert_eq!(SummaryKind::Daily.external_id_prefix(), "daily:");
-        assert_eq!(SummaryKind::Weekly.external_id_prefix(), "weekly:");
-        assert_eq!(SummaryKind::Monthly.external_id_prefix(), "monthly:");
+    fn summary_kind_namespaces_do_not_embed_the_owner() {
+        assert_eq!(SummaryKind::PerThread.external_id_namespace(), "summary:");
+        assert_eq!(SummaryKind::Daily.external_id_namespace(), "daily:");
+        assert_eq!(SummaryKind::Weekly.external_id_namespace(), "weekly:");
+        assert_eq!(SummaryKind::Monthly.external_id_namespace(), "monthly:");
     }
 
     #[test]
-    fn build_find_request_selects_prefix_by_kind() {
+    fn build_find_request_scopes_by_owner_and_kind_without_external_id() {
         let req = ListSummariesRequest {
             kind: SummaryKind::Weekly,
             ..Default::default()
         };
         let r = build_find_request(&req);
-        assert_eq!(r.external_id_prefix.as_deref(), Some("weekly:"));
-        assert_eq!(r.user_id.unwrap().value, SUMMARY_USER_ID);
+        assert!(r.external_id_prefix.is_none());
+        assert_eq!(r.user_id.unwrap().value, LOOKBACK_USER_ID);
+        assert_eq!(
+            r.memory_kinds,
+            vec![mem_data::MemoryKind::WeeklySummary as i32]
+        );
     }
 
     #[test]
-    fn build_find_request_default_kind_is_per_thread() {
+    fn build_find_request_default_kind_has_no_external_id_condition() {
         let r = build_find_request(&ListSummariesRequest::default());
-        assert_eq!(r.external_id_prefix.as_deref(), Some("summary:"));
+        assert!(r.external_id_prefix.is_none());
     }
 
     #[test]
@@ -729,7 +757,7 @@ mod tests {
             data: Some(mem_data::MemoryData {
                 parent_ids: vec![],
                 user_id: Some(mem_data::UserId {
-                    value: SUMMARY_USER_ID,
+                    value: LOOKBACK_USER_ID,
                 }),
                 content: String::new(),
                 content_type: 0,
@@ -741,6 +769,7 @@ mod tests {
                 external_id: external_id.map(str::to_string),
                 media_object_id: None,
                 thread_ids: vec![],
+                memory_kind: mem_data::MemoryKind::ThreadSummary as i32,
             }),
             media: None,
         }
@@ -760,7 +789,7 @@ mod tests {
 
     #[test]
     fn memory_to_resolved_ref_extracts_daily_period() {
-        let m = memory_with_external_id(7, Some("daily:2026-05-24:_all"));
+        let m = memory_with_external_id(7, Some("daily:1:2026-05-24:_all"));
         let r = memory_to_resolved_ref(m).expect("resolved");
         assert_eq!(r.memory_id, 7);
         assert_eq!(r.thread_id, None);
@@ -771,7 +800,7 @@ mod tests {
 
     #[test]
     fn memory_to_resolved_ref_extracts_monthly_with_scope() {
-        let m = memory_with_external_id(11, Some("monthly:2026-05:proj"));
+        let m = memory_with_external_id(11, Some("monthly:1:2026-05:proj"));
         let r = memory_to_resolved_ref(m).expect("resolved");
         assert_eq!(r.kind, Some(SummaryKind::Monthly));
         assert_eq!(r.period_key.as_deref(), Some("2026-05"));
@@ -833,9 +862,9 @@ mod tests {
             ..Default::default()
         };
         let r = build_find_request(&req);
-        assert_eq!(r.external_id_prefix.as_deref(), Some("summary:"));
+        assert!(r.external_id_prefix.is_none());
         let filter = r.thread_filter.expect("thread label filter");
-        assert_eq!(filter.user_id, Some(SUMMARY_USER_ID));
+        assert_eq!(filter.user_id, Some(LOOKBACK_USER_ID));
         assert_eq!(filter.labels, vec!["summary", "agent:codex"]);
         assert_eq!(
             filter.label_match_mode,
@@ -844,28 +873,26 @@ mod tests {
     }
 
     #[test]
-    fn build_find_request_scopes_period_detail_by_external_id_token() {
+    fn build_find_request_leaves_period_detail_for_local_external_id_parsing() {
         let request = build_find_request(&ListSummariesRequest {
             kind: SummaryKind::Daily,
             period_key: Some("2026-07-01".into()),
             ..Default::default()
         });
 
-        assert_eq!(
-            request.external_id_prefix.as_deref(),
-            Some("daily:2026-07-01:")
-        );
+        assert!(request.external_id_prefix.is_none());
         assert!(request.updated_after.is_none());
         assert!(request.updated_before.is_none());
     }
 
     #[test]
-    fn summary_period_keys_request_scopes_calendar_to_external_id_prefix() {
-        let request = summary_period_keys_request(SummaryKind::Daily, "2026-07-");
+    fn summary_period_keys_request_scopes_calendar_by_owner_and_kind() {
+        let request = summary_period_keys_request(SummaryKind::Daily);
 
+        assert!(request.external_id_prefix.is_none());
         assert_eq!(
-            request.external_id_prefix.as_deref(),
-            Some("daily:2026-07-")
+            request.memory_kinds,
+            vec![mem_data::MemoryKind::DailySummary as i32]
         );
         assert!(request.updated_after.is_none());
         assert!(request.updated_before.is_none());
@@ -943,11 +970,11 @@ mod tests {
     }
 
     #[test]
-    fn summary_memory_request_uses_prefix_without_thread_filter() {
+    fn summary_memory_request_uses_kind_without_thread_filter() {
         let request = build_summary_memory_request();
 
-        assert_eq!(request.user_id.map(|id| id.value), Some(SUMMARY_USER_ID));
-        assert_eq!(request.external_id_prefix.as_deref(), Some("summary:"));
+        assert_eq!(request.user_id.map(|id| id.value), Some(LOOKBACK_USER_ID));
+        assert!(request.external_id_prefix.is_none());
         assert!(request.thread_filter.is_none());
     }
 }

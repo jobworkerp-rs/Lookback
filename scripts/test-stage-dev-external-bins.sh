@@ -38,6 +38,7 @@ test_env_overrides_stage_target_triple_bins() {
   make_bin "${src}/front"
   make_bin "${src}/conductor-main"
   make_bin "${src}/memories-import"
+  make_bin "${src}/migrate-memory-kind"
   make_bin "${src}/protoc"
   make_plugin "${TMP_ROOT}/plugins/libexisting.so"
 
@@ -46,6 +47,7 @@ test_env_overrides_stage_target_triple_bins() {
     LOOKBACK_MEMORIES_BIN="${src}/front" \
     LOOKBACK_CONDUCTOR_BIN="${src}/conductor-main" \
     LOOKBACK_MEMORIES_IMPORT_BIN="${src}/memories-import" \
+    LOOKBACK_MIGRATE_MEMORY_KIND_BIN="${src}/migrate-memory-kind" \
     LOOKBACK_PLUGINS_SRC="${TMP_ROOT}/plugins" \
     PROTOC="${src}/protoc" \
     bash "${SCRIPT}" --agent-app "${app}" --triple test-triple >/tmp/stage-dev-test.out
@@ -54,6 +56,7 @@ test_env_overrides_stage_target_triple_bins() {
   assert_file "${app}/src-tauri/bin/front-test-triple"
   assert_file "${app}/src-tauri/bin/conductor-main-test-triple"
   assert_file "${app}/src-tauri/bin/memories-import-test-triple"
+  assert_file "${app}/src-tauri/bin/migrate-memory-kind-test-triple"
   assert_file "${app}/src-tauri/bin/protoc-test-triple"
 }
 
@@ -64,6 +67,7 @@ test_stages_cuda_runner_plugins_from_workspace_plugins_cuda_runner() {
   make_bin "${TMP_ROOT}/src/front"
   make_bin "${TMP_ROOT}/src/conductor-main"
   make_bin "${TMP_ROOT}/src/memories-import"
+  make_bin "${TMP_ROOT}/src/migrate-memory-kind"
   make_bin "${TMP_ROOT}/src/protoc"
   make_plugin "${workspace}/plugins/cuda_runner/libcuda_runner.so"
   mkdir -p "$(dirname "${src}")"
@@ -72,6 +76,7 @@ test_stages_cuda_runner_plugins_from_workspace_plugins_cuda_runner() {
     LOOKBACK_MEMORIES_BIN="${TMP_ROOT}/src/front" \
     LOOKBACK_CONDUCTOR_BIN="${TMP_ROOT}/src/conductor-main" \
     LOOKBACK_MEMORIES_IMPORT_BIN="${TMP_ROOT}/src/memories-import" \
+    LOOKBACK_MIGRATE_MEMORY_KIND_BIN="${TMP_ROOT}/src/migrate-memory-kind" \
     PROTOC="${TMP_ROOT}/src/protoc" \
     bash "${SCRIPT}" --agent-app "${src}" --triple test-triple >/tmp/stage-dev-plugin.out
 
@@ -89,6 +94,7 @@ test_stages_nested_plugins_from_env_override() {
   make_bin "${TMP_ROOT}/src/front"
   make_bin "${TMP_ROOT}/src/conductor-main"
   make_bin "${TMP_ROOT}/src/memories-import"
+  make_bin "${TMP_ROOT}/src/migrate-memory-kind"
   make_bin "${TMP_ROOT}/src/protoc"
   make_plugin "${plugin_src}/libcustom.so"
 
@@ -96,6 +102,7 @@ test_stages_nested_plugins_from_env_override() {
     LOOKBACK_MEMORIES_BIN="${TMP_ROOT}/src/front" \
     LOOKBACK_CONDUCTOR_BIN="${TMP_ROOT}/src/conductor-main" \
     LOOKBACK_MEMORIES_IMPORT_BIN="${TMP_ROOT}/src/memories-import" \
+    LOOKBACK_MIGRATE_MEMORY_KIND_BIN="${TMP_ROOT}/src/migrate-memory-kind" \
     LOOKBACK_PLUGINS_SRC="${TMP_ROOT}/custom-plugins" \
     PROTOC="${TMP_ROOT}/src/protoc" \
     bash "${SCRIPT}" --agent-app "${app}" --triple test-triple >/tmp/stage-dev-plugin-env.out
@@ -121,6 +128,7 @@ test_dry_run_does_not_write_files() {
   make_bin "${src}/front"
   make_bin "${src}/conductor-main"
   make_bin "${src}/memories-import"
+  make_bin "${src}/migrate-memory-kind"
   make_bin "${src}/protoc"
   local app="${TMP_ROOT}/dry-app"
   local dry_parent
@@ -131,6 +139,7 @@ test_dry_run_does_not_write_files() {
     LOOKBACK_MEMORIES_BIN="${src}/front" \
     LOOKBACK_CONDUCTOR_BIN="${src}/conductor-main" \
     LOOKBACK_MEMORIES_IMPORT_BIN="${src}/memories-import" \
+    LOOKBACK_MIGRATE_MEMORY_KIND_BIN="${src}/migrate-memory-kind" \
     LOOKBACK_PLUGINS_SRC="${TMP_ROOT}/plugins" \
     PROTOC="${src}/protoc" \
     bash "${SCRIPT}" --agent-app "${app}" --triple test-triple --dry-run >/tmp/stage-dev-dry.out

@@ -125,6 +125,7 @@ stage_one "$(resolve_required_bin all-in-one LOOKBACK_JOBWORKERP_BIN all-in-one 
 stage_one "$(resolve_required_bin front LOOKBACK_MEMORIES_BIN memories-front ../memories/target/release/front)" front
 stage_one "$(resolve_required_bin conductor-main LOOKBACK_CONDUCTOR_BIN conductor-main ../conductor/target/release/conductor-main)" conductor-main
 stage_one "$(resolve_required_bin memories-import LOOKBACK_MEMORIES_IMPORT_BIN memories-import ../memories/target/release/memories-import)" memories-import
+stage_one "$(resolve_required_bin migrate-memory-kind LOOKBACK_MIGRATE_MEMORY_KIND_BIN migrate-memory-kind ../memories/target/release/migrate-memory-kind)" migrate-memory-kind
 # protoc: default to the official self-contained release binary. A developer can
 # still point PROTOC at their own self-contained protoc to skip the download.
 if [[ -n "${PROTOC:-}" ]]; then

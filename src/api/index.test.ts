@@ -13,6 +13,8 @@ import {
   deletePeriodicTask,
   enqueuePersonalityJob,
   enqueueSummaryJob,
+  findCoOccurringLabels,
+  findDistinctLabels,
   findMemoryPosition,
   findMemoryThreadPosition,
   generateSummaries,
@@ -239,6 +241,20 @@ describe("command wrappers", () => {
       req: { memory_id: "99" },
     });
     expect(res?.thread_id).toBe("7");
+  });
+
+  it("findDistinctLabels keeps the UI request free of memory kinds", async () => {
+    await findDistinctLabels({ user_id: 1, limit: 100 });
+    expect(invokeMock).toHaveBeenCalledWith("find_distinct_labels", {
+      req: { user_id: 1, limit: 100 },
+    });
+  });
+
+  it("findCoOccurringLabels keeps the UI request free of memory kinds", async () => {
+    await findCoOccurringLabels({ user_id: 1, labels: ["rust"], limit: 100 });
+    expect(invokeMock).toHaveBeenCalledWith("find_co_occurring_labels", {
+      req: { user_id: 1, labels: ["rust"], limit: 100 },
+    });
   });
 
   it("redispatchReflectionEmbeddings defaults to an empty request", async () => {

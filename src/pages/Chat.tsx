@@ -229,6 +229,9 @@ function ChatAnswerBody({ turn }: { turn: ChatTurn }) {
     // verbatim so we don't claim "generating" before the LLM is.
     return <ChatStatus text={turn.message ?? t("chat.status.searching")} />;
   }
+  if (turn.phase === "done" && !turn.answer) {
+    return <ChatStatus text={turn.message ?? t("chat.status.noAnswer")} />;
+  }
   if (!turn.answer) {
     return <ChatStatus text={t("chat.status.generating")} />;
   }

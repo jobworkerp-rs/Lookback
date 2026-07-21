@@ -17,11 +17,12 @@
 # macOS ships bash 3.2 (no associative arrays), so URL/dir lookups are
 # case-based rather than `declare -A`.
 
-# repo_url NAME -> public git URL (branch=main).
+# repo_url NAME -> git URL (branch=main). Callers can override the memory-store
+# URL when they need to build an audited mirror.
 repo_url() {
   case "$1" in
     jobworkerp)   echo "https://github.com/jobworkerp-rs/jobworkerp-rs" ;;
-    memory-store) echo "https://github.com/jobworkerp-rs/memory-store" ;;
+    memory-store) echo "${LOOKBACK_MEMORY_STORE_REPO_URL:-https://github.com/jobworkerp-rs/memory-store}" ;;
     conductor)    echo "https://github.com/jobworkerp-rs/jobworkerp-conductor" ;;
     llama)        echo "https://github.com/jobworkerp-rs/llama-cpp-runner" ;;
     mm)           echo "https://github.com/jobworkerp-rs/mm-embedding-runner" ;;
@@ -150,8 +151,9 @@ build_jobworkerp() {
 
 build_memory_store() {
   local dir; dir=$(repo_path memory-store)
-  log "build front (lindera) + memories-import"
+  log "build front (lindera) + memories-import + migrate-memory-kind"
   cargo_build "${dir}" --release -p grpc-admin --bin front --features lindera
+  cargo_build "${dir}" --release -p grpc-admin --bin migrate-memory-kind
   cargo_build "${dir}" --release -p agent-chat-import --bin memories-import
 }
 
@@ -196,7 +198,7 @@ build_all() {
   done
 }
 
-# stage_binaries: copy the 5 externalBin targets with the platform-triple
+# stage_binaries: copy the externalBin targets with the platform-triple
 # suffix Tauri expects. protoc is fetched from the official protobuf release
 # (a self-contained binary) rather than the host's — see lib/protoc-fetch.sh.
 stage_binaries() {
@@ -208,7 +210,25 @@ stage_binaries() {
   want_repo memory-store && install_file "${mem}/target/release/front"            "${BIN_DIR}/front-${TRIPLE}"
   want_repo conductor    && install_file "${cond}/target/release/conductor-main"  "${BIN_DIR}/conductor-main-${TRIPLE}"
   want_repo memory-store && install_file "${mem}/target/release/memories-import"  "${BIN_DIR}/memories-import-${TRIPLE}"
+  want_repo memory-store && install_file "${mem}/target/release/migrate-memory-kind" "${BIN_DIR}/migrate-memory-kind-${TRIPLE}"
   fetch_protoc_bin "${TRIPLE}" "${BIN_DIR}/protoc-${TRIPLE}"
+}
+
+# Stage the migration material from the exact memories checkout that produced
+# the sidecar binaries. Keeping it in a Tauri resource makes the blocked-start
+# recovery procedure available without relying on a developer checkout.
+stage_memory_kind_toolkit() {
+  want_repo memory-store || return 0
+  local mem toolkit
+  mem=$(repo_path memory-store)
+  toolkit="${AGENT_APP}/src-tauri/migration-toolkit"
+  run mkdir -p "${toolkit}/sqlite" "${toolkit}/postgres"
+  run install -m644 "${mem}/infra/sql/sqlite/manual/011_add_memory_kind.sql" "${toolkit}/sqlite/011_add_memory_kind.sql"
+  run install -m644 "${mem}/infra/sql/sqlite/manual/012_contract_memory_kind.sql" "${toolkit}/sqlite/012_contract_memory_kind.sql"
+  run install -m644 "${mem}/infra/sql/postgres/manual/010_add_memory_kind.sql" "${toolkit}/postgres/010_add_memory_kind.sql"
+  run install -m644 "${mem}/infra/sql/postgres/manual/011_contract_memory_kind.sql" "${toolkit}/postgres/011_contract_memory_kind.sql"
+  [[ -f "${toolkit}/memory-kind-client-migration_ja.md" ]] || die "missing Lookback migration runbook: ${toolkit}/memory-kind-client-migration_ja.md"
+  [[ -f "${toolkit}/vectordb-rebuild-runbook_ja.md" ]] || die "missing Lookback vector rebuild runbook: ${toolkit}/vectordb-rebuild-runbook_ja.md"
 }
 
 # CUDA runtime shared libraries the plugins link against (cudart, cublas, …).

@@ -4,6 +4,15 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WRAPPER="${SCRIPT_DIR}/run-tauri.sh"
 
+case "$(uname -s)" in
+  Darwin) PLUGIN_EXT=dylib ;;
+  Linux) PLUGIN_EXT=so ;;
+  *)
+    echo "unsupported host OS: $(uname -s)" >&2
+    exit 1
+    ;;
+esac
+
 TMP_ROOT=$(mktemp -d)
 cleanup() {
   rm -rf "${TMP_ROOT}"
@@ -21,9 +30,10 @@ make_bin "${TMP_ROOT}/src/all-in-one"
 make_bin "${TMP_ROOT}/src/front"
 make_bin "${TMP_ROOT}/src/conductor-main"
 make_bin "${TMP_ROOT}/src/memories-import"
+make_bin "${TMP_ROOT}/src/migrate-memory-kind"
 make_bin "${TMP_ROOT}/src/protoc"
 mkdir -p "${TMP_ROOT}/plugins/cuda_runner" "${TMP_ROOT}/github"
-printf 'plugin\n' >"${TMP_ROOT}/plugins/cuda_runner/libcuda_runner.so"
+printf 'plugin\n' >"${TMP_ROOT}/plugins/cuda_runner/libcuda_runner.${PLUGIN_EXT}"
 
 mkdir -p "${TMP_ROOT}/toolbin"
 cat >"${TMP_ROOT}/toolbin/tauri" <<'EOF'
@@ -39,6 +49,8 @@ LOOKBACK_AGENT_APP="${TMP_ROOT}/github/agent-app" \
   LOOKBACK_MEMORIES_BIN="${TMP_ROOT}/src/front" \
   LOOKBACK_CONDUCTOR_BIN="${TMP_ROOT}/src/conductor-main" \
   LOOKBACK_MEMORIES_IMPORT_BIN="${TMP_ROOT}/src/memories-import" \
+  LOOKBACK_MIGRATE_MEMORY_KIND_BIN="${TMP_ROOT}/src/migrate-memory-kind" \
+  LOOKBACK_PLUGINS_SRC="${TMP_ROOT}/plugins" \
   PROTOC="${TMP_ROOT}/src/protoc" \
   TAURI_ARG_LOG="${TMP_ROOT}/args.log" \
   TAURI_GDK_LOG="${TMP_ROOT}/gdk.log" \
@@ -47,17 +59,22 @@ LOOKBACK_AGENT_APP="${TMP_ROOT}/github/agent-app" \
   bash "${WRAPPER}" dev --no-watch
 
 grep -q '^dev --no-watch$' "${TMP_ROOT}/args.log"
-grep -q '^x11$' "${TMP_ROOT}/gdk.log"
-grep -q '^1$' "${TMP_ROOT}/webkit.log"
-[[ -f "${TMP_ROOT}/github/agent-app/src-tauri/bin/all-in-one-x86_64-unknown-linux-gnu" ]] || {
+if [[ "$(uname -s)" == "Linux" ]]; then
+  grep -q '^x11$' "${TMP_ROOT}/gdk.log"
+  grep -q '^1$' "${TMP_ROOT}/webkit.log"
+else
+  grep -q '^$' "${TMP_ROOT}/gdk.log"
+  grep -q '^$' "${TMP_ROOT}/webkit.log"
+fi
+find "${TMP_ROOT}/github/agent-app/src-tauri/bin" -maxdepth 1 -type f -name 'all-in-one-*' | grep -q . || {
   echo "expected dev wrapper to stage external bins" >&2
   exit 1
 }
-[[ -f "${TMP_ROOT}/github/agent-app/src-tauri/plugins/libcuda_runner.so" ]] || {
+[[ -f "${TMP_ROOT}/github/agent-app/src-tauri/plugins/libcuda_runner.${PLUGIN_EXT}" ]] || {
   echo "expected dev wrapper to stage cuda_runner plugins" >&2
   exit 1
 }
-[[ ! -e "${TMP_ROOT}/github/plugins/libcuda_runner.so" ]] || {
+[[ ! -e "${TMP_ROOT}/github/plugins/libcuda_runner.${PLUGIN_EXT}" ]] || {
   echo "dev wrapper wrote plugins outside agent-app" >&2
   exit 1
 }
@@ -67,6 +84,8 @@ LOOKBACK_AGENT_APP="${TMP_ROOT}/github/agent-app-explicit" \
   LOOKBACK_MEMORIES_BIN="${TMP_ROOT}/src/front" \
   LOOKBACK_CONDUCTOR_BIN="${TMP_ROOT}/src/conductor-main" \
   LOOKBACK_MEMORIES_IMPORT_BIN="${TMP_ROOT}/src/memories-import" \
+  LOOKBACK_MIGRATE_MEMORY_KIND_BIN="${TMP_ROOT}/src/migrate-memory-kind" \
+  LOOKBACK_PLUGINS_SRC="${TMP_ROOT}/plugins" \
   PROTOC="${TMP_ROOT}/src/protoc" \
   GDK_BACKEND=wayland \
   WEBKIT_DISABLE_DMABUF_RENDERER=0 \

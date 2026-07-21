@@ -257,8 +257,9 @@ workers:
   #
   # `lookback_recall` is the single tool the chat LLM auto-calls (via
   # function_options.is_auto_calling) to retrieve grounding from BOTH
-  # the summary layer (owner=100000, label LABEL_ANY) and the raw layer
-  # (user_id=1) in one shot. See specs/rag-chat-design.md DECIDE-CHAT-1.
+  # the summary layer (user_id=1 plus summary memory_kind) and the raw layer
+  # (user_id=1 plus RAW memory_kind) in one shot. See specs/rag-chat-design.md
+  # DECIDE-CHAT-1.
   #
   # `channel: rag` (concurrency 2) is intentionally separate from `llm`
   # (concurrency 1) — sharing would deadlock when the chat LLM holds

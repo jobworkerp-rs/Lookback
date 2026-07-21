@@ -18,6 +18,8 @@
 #                 bundle version after stripping the leading v.
 #   LOOKBACK_TAURI_VERBOSE=1
 #                 Pass -v to the Tauri CLI so linuxdeploy stderr is surfaced.
+#   LOOKBACK_MEMORY_STORE_REPO_URL
+#                 Override the memory-store clone source.
 #
 # Run with -h for the full option list.
 
@@ -347,6 +349,7 @@ main() {
   run mkdir -p "${WORKDIR}"
   build_all
   stage_binaries
+  stage_memory_kind_toolkit
   stage_plugins
   sign_macos_plugins
   stage_lindera "${LINDERA}"

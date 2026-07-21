@@ -690,8 +690,6 @@ impl ImportPlan {
     }
 }
 
-use super::summaries::SUMMARY_USER_ID;
-
 /// Period-summary granularity. Each kind reads the layer below's output and
 /// writes its own: daily aggregates per-thread `summary` memories, weekly
 /// aggregates `daily_summary`, monthly aggregates `weekly_summary`.
@@ -930,7 +928,6 @@ impl BatchDispatch {
             "user_id": self.user_id,
             "memory_thread_label_prefix": "summary",
             "force_resummarize": false,
-            "summary_user_id": SUMMARY_USER_ID,
             "min_message_count": 4,
             "max_context_chars": 200_000,
         });
@@ -964,8 +961,6 @@ impl BatchDispatch {
             // longer relayed — the batch resolves the lang-worker by name.
             "merge_enabled": true,
             "force_reextract": force_reextract,
-            "personality_user_id": 200_000,
-            "summary_user_id": SUMMARY_USER_ID,
             "min_message_count": 4,
             "min_user_messages": 2,
             "max_context_chars": PERSONALITY_MAX_CONTEXT_CHARS,
@@ -993,8 +988,6 @@ impl BatchDispatch {
     pub(super) fn merge_only_input(&self, force_remerge: bool) -> serde_json::Value {
         let mut v = serde_json::json!({
             "user_id": self.user_id,
-            "personality_user_id": 200_000,
-            "summary_user_id": SUMMARY_USER_ID,
             "max_context_chars": PERSONALITY_MAX_CONTEXT_CHARS,
             "force_remerge": force_remerge,
             // Hard-coded because the merge-only path has no batch parent.
@@ -1021,13 +1014,12 @@ impl BatchDispatch {
     }
 
     /// Build the input for a period (daily/weekly/monthly) work-summary batch.
-    /// Period summaries own the synthetic `source_user_id` and scope by period
-    /// window, so the importer's `user_id` / `updated_after_ms` are
-    /// deliberately NOT forwarded (their absence keeps the two lineages apart).
+    /// Period summaries use the same real owner as their source lineage and
+    /// scope their rows by period.
     pub(super) fn period_input(&self, kind: PeriodKind, range: PeriodRange) -> serde_json::Value {
         let spec = kind.spec();
         let mut v = serde_json::json!({
-            "source_user_id": SUMMARY_USER_ID,
+            "user_id": self.user_id,
             "timezone_offset_hours": 9,
             "min_thread_count": 1,
             "max_context_chars": 200_000,
@@ -1060,7 +1052,6 @@ impl BatchDispatch {
             "monthly_end": req.monthly_end,
             "timezone_offset_hours": req.timezone_offset_hours,
             "user_id": self.user_id,
-            "summary_user_id": SUMMARY_USER_ID,
             "per_thread_batch_yaml": self.workflow_path("thread-summary", "thread-summary-batch.yaml"),
             "daily_batch_yaml": self.workflow_path("daily-work-summary", "daily-work-summary-batch.yaml"),
             "weekly_batch_yaml": self.workflow_path("weekly-work-summary", "weekly-work-summary-batch.yaml"),
@@ -2200,16 +2191,14 @@ mod tests {
         // `output_language`; the old single-yaml path relay is gone.
         assert!(v.get("single_workflow_path").is_none());
         assert_eq!(v["output_language"], "ja");
-        assert_eq!(v["summary_user_id"], 100_000);
+        assert!(v.get("summary_user_id").is_none());
         assert_eq!(v["max_context_chars"], 200_000);
     }
 
     #[test]
     fn batch_dispatch_daily_input_matches_workflow_schema() {
         let v = dispatch().period_input(PeriodKind::Daily, PeriodRange::Auto);
-        // Period summaries own user 100000, NOT the importing user_id.
-        assert_eq!(v["source_user_id"], 100_000);
-        assert!(v.get("user_id").is_none());
+        assert_eq!(v["user_id"], 1);
         assert!(v.get("single_workflow_path").is_none());
         assert_eq!(v["output_language"], "ja");
         // Daily reads per-thread `summary` and writes `daily_summary`.
@@ -2228,7 +2217,7 @@ mod tests {
     #[test]
     fn batch_dispatch_weekly_input_matches_workflow_schema() {
         let v = dispatch().period_input(PeriodKind::Weekly, PeriodRange::LastN(4));
-        assert_eq!(v["source_user_id"], 100_000);
+        assert_eq!(v["user_id"], 1);
         assert!(v.get("single_workflow_path").is_none());
         assert_eq!(v["output_language"], "ja");
         // Weekly reads `daily_summary` and writes `weekly_summary`.
@@ -2240,7 +2229,7 @@ mod tests {
     #[test]
     fn batch_dispatch_monthly_input_matches_workflow_schema() {
         let v = dispatch().period_input(PeriodKind::Monthly, PeriodRange::LastN(3));
-        assert_eq!(v["source_user_id"], 100_000);
+        assert_eq!(v["user_id"], 1);
         assert!(v.get("single_workflow_path").is_none());
         assert_eq!(v["output_language"], "ja");
         // Monthly reads `weekly_summary` and writes `monthly_summary`.
@@ -2690,7 +2679,7 @@ mod tests {
         assert_eq!(v["updated_before_ms"], 1_748_735_999_999_i64);
         assert_eq!(v["timezone_offset_hours"], 9);
         assert_eq!(v["user_id"], 1);
-        assert_eq!(v["summary_user_id"], 100_000);
+        assert!(v.get("summary_user_id").is_none());
     }
 
     #[test]
@@ -2809,7 +2798,7 @@ mod tests {
         let v = dispatch().personality_input();
         assert!(v.get("single_workflow_path").is_none());
         assert_eq!(v["output_language"], "ja");
-        assert_eq!(v["personality_user_id"], 200_000);
+        assert!(v.get("personality_user_id").is_none());
         assert_eq!(v["min_user_messages"], 2);
         assert_eq!(v["max_context_chars"], 150_000);
     }
@@ -2868,8 +2857,8 @@ mod tests {
         let v = dispatch().merge_only_input(true);
         assert_eq!(v["force_remerge"], true);
         assert_eq!(v["user_id"], 1);
-        assert_eq!(v["personality_user_id"], 200_000);
-        assert_eq!(v["summary_user_id"], SUMMARY_USER_ID);
+        assert!(v.get("personality_user_id").is_none());
+        assert!(v.get("summary_user_id").is_none());
         assert_eq!(v["max_signals"], 100);
         assert_eq!(v["max_context_chars"], 150_000);
         assert_eq!(v["memories_grpc_host"], "127.0.0.1");

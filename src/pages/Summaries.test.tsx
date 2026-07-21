@@ -207,7 +207,32 @@ describe("Summaries per-thread label filter", () => {
 
     await waitFor(() => {
       expect(mockSearchMemoriesKeyword).toHaveBeenLastCalledWith(
-        expect.objectContaining({ labels_any: ["summary", "agent:codex"], label_match: "all" }),
+        expect.objectContaining({
+          user_id: 1,
+          memory_kinds: [2],
+          labels_any: ["summary", "agent:codex"],
+          label_match: "all",
+        }),
+      );
+    });
+  });
+
+  it.each([
+    ["日次", 3],
+    ["週次", 4],
+    ["月次", 5],
+  ])("searches %s summaries by their memory kind", async (kindLabel, memoryKind) => {
+    mockListSummaries.mockResolvedValue([perThreadEntry()]);
+    renderSummaries();
+
+    fireEvent.click(screen.getByRole("button", { name: kindLabel }));
+    fireEvent.click(screen.getByRole("button", { name: "検索" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keyword" }));
+    fireEvent.change(screen.getByPlaceholderText("検索クエリ"), { target: { value: "review" } });
+
+    await waitFor(() => {
+      expect(mockSearchMemoriesKeyword).toHaveBeenLastCalledWith(
+        expect.objectContaining({ user_id: 1, memory_kinds: [memoryKind] }),
       );
     });
   });

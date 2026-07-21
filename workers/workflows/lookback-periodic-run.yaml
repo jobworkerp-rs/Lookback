@@ -279,8 +279,6 @@ do:
                       labels_filter: $source_filter_labels,
                       labels_filter_match_mode: $source_filter_match_mode,
                       force_reextract: false,
-                      personality_user_id: 200000,
-                      summary_user_id: 100000,
                       min_message_count: 4,
                       min_user_messages: 2,
                       max_context_chars: 150000

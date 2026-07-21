@@ -75,11 +75,11 @@ async fn rag_chat_scaffolding_registers_cleanly() {
     let inputs = [
         format!(
             "{{\"query\":\"cache\",\"memories_grpc_host\":\"127.0.0.1\",\"memories_grpc_port\":{},\"memories_grpc_tls\":false}}",
-            report.endpoints.memories_port
+            report.endpoints.memories_port.expect("local memories port")
         ),
         format!(
             "{{\"query\":\"yesterday\",\"summary_labels\":[\"daily_summary\",\"date:2026-05-29\"],\"summary_label_match\":\"ALL\",\"memories_grpc_host\":\"127.0.0.1\",\"memories_grpc_port\":{},\"memories_grpc_tls\":false}}",
-            report.endpoints.memories_port
+            report.endpoints.memories_port.expect("local memories port")
         ),
     ];
     for input in inputs {
@@ -147,7 +147,7 @@ async fn lookback_recall_dispatch_unary_envelope_shape() {
             serde_json::json!({
                 "input": format!(
                     "{{\"query\":\"cache\",\"memories_grpc_host\":\"127.0.0.1\",\"memories_grpc_port\":{},\"memories_grpc_tls\":false}}",
-                    report.endpoints.memories_port
+                    report.endpoints.memories_port.expect("local memories port")
                 )
             }),
             Some("run"),

@@ -32,7 +32,6 @@ pub(crate) const LOOKBACK_RECALL_TOOL: &str = "lookback_recall";
 
 const DEFAULT_MAX_TOOL_HOPS: usize = 4;
 const TOOL_RUN_METHOD: &str = "run";
-const MAX_HOPS_REACHED_MESSAGE: &str = "tool 呼び出し回数の上限に達しました";
 
 /// System prompt steering the LLM toward grounded answers + citation
 /// honesty. Embedded here (not in a workflow YAML) because the chat
@@ -361,6 +360,17 @@ fn emit_cancelled_done(app: &AppHandle, job_id: &str) {
     );
 }
 
+// Keep the terminal event language-neutral. The frontend knows that an
+// empty Done response is an empty-answer state and owns its locale-specific
+// copy for that state.
+fn emit_done(app: &AppHandle, job_id: &str) {
+    emit_event(
+        app,
+        CHAT_EVENT,
+        ChatStepUpdate::bare(job_id.to_string(), ChatPhase::Done),
+    );
+}
+
 /// Drive the LLM stream + client-side tool-execution loop. On budget
 /// exhaustion the loop emits Done (not Error) so any partial assistant
 /// text stays as the user's answer.
@@ -398,21 +408,37 @@ async fn run_chat_stream(
         "chat agent loop started"
     );
 
-    for hop in 0..max_hops {
+    // `max_hops` bounds retrieval calls, not answer generation. If the
+    // final retrieval asks for another tool call, the extra iteration below
+    // has no tools and turns the accumulated TOOL results into an answer.
+    for hop in 0..=max_hops {
         if cancel.is_cancelled() {
             tracing::info!(job_id = %job_id, hop, "agent loop cancelled before hop start");
             emit_cancelled_done(&app, &job_id);
             return;
         }
-        let args = build_chat_args(
-            &messages,
-            &tools_json,
-            &system_text,
-            external,
-            thinking_kwarg,
-            max_tokens,
-            temperature,
-        );
+        let is_final_answer_hop = hop == max_hops;
+        let hop_system_text = hop_system_prompt(&system_text, hop, max_hops);
+        let args = if is_final_answer_hop {
+            build_final_answer_args(
+                &messages,
+                &hop_system_text,
+                external,
+                thinking_kwarg,
+                max_tokens,
+                temperature,
+            )
+        } else {
+            build_chat_args(
+                &messages,
+                &tools_json,
+                &hop_system_text,
+                external,
+                thinking_kwarg,
+                max_tokens,
+                temperature,
+            )
+        };
         tracing::trace!(job_id = %job_id, hop, args = %args, "build_chat_args");
 
         let stream = match handle
@@ -501,14 +527,19 @@ async fn run_chat_stream(
             "hop stream drained"
         );
 
+        if is_final_answer_hop {
+            tracing::info!(job_id = %job_id, hop, "chat agent loop finalized after hop budget");
+            if token_count == 0 {
+                tracing::warn!(job_id = %job_id, hop, "final answer hop completed without text");
+            }
+            emit_done(&app, &job_id);
+            return;
+        }
+
         match drive_hop(final_chunk.unwrap_or_default()) {
             HopOutcome::Done => {
                 tracing::info!(job_id = %job_id, hop, "chat agent loop done");
-                emit_event(
-                    &app,
-                    CHAT_EVENT,
-                    ChatStepUpdate::bare(job_id, ChatPhase::Done),
-                );
+                emit_done(&app, &job_id);
                 return;
             }
             HopOutcome::ContinueWithToolCalls(calls) => {
@@ -625,13 +656,6 @@ async fn run_chat_stream(
             }
         }
     }
-
-    tracing::warn!(job_id = %job_id, max_hops, "chat agent loop hit hop budget");
-    emit_event(
-        &app,
-        CHAT_EVENT,
-        ChatStepUpdate::done_with_message(job_id, MAX_HOPS_REACHED_MESSAGE.to_string()),
-    );
 }
 
 /// Streaming filter that drops in-band reasoning blocks from the visible
@@ -1091,6 +1115,52 @@ fn build_chat_args(
     max_tokens: Option<u32>,
     temperature: Option<f32>,
 ) -> serde_json::Value {
+    build_chat_args_with_tool_choice(
+        messages,
+        tools_json,
+        system_text,
+        external,
+        thinking_kwarg,
+        max_tokens,
+        temperature,
+        "auto",
+    )
+}
+
+/// Build the one forced final-answer request after retrieval has used its
+/// budget. Empty tool definitions cover local grammar-based calling, while
+/// `tool_choice=none` covers providers that enforce the OpenAI choice field.
+fn build_final_answer_args(
+    messages: &[serde_json::Value],
+    system_text: &str,
+    external: bool,
+    thinking_kwarg: super::llm_presets::ThinkingKwarg,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+) -> serde_json::Value {
+    build_chat_args_with_tool_choice(
+        messages,
+        "[]",
+        system_text,
+        external,
+        thinking_kwarg,
+        max_tokens,
+        temperature,
+        "none",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_chat_args_with_tool_choice(
+    messages: &[serde_json::Value],
+    tools_json: &str,
+    system_text: &str,
+    external: bool,
+    thinking_kwarg: super::llm_presets::ThinkingKwarg,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    tool_choice: &str,
+) -> serde_json::Value {
     // LLMChatArgs has no `system_prompt` field; the proto-JSON
     // converter on jobworkerp's side drops unknown keys silently. The
     // only way the system steering reaches the model is as a SYSTEM
@@ -1105,7 +1175,7 @@ fn build_chat_args(
     let mut function_options = serde_json::json!({
         "use_function_calling": false,
         "client_tools_json": tools_json,
-        "tool_choice": "auto",
+        "tool_choice": tool_choice,
         "parallel_tool_calls": false,
     });
     // `chat_template_kwargs.enable_thinking` is llama-cpp/jinja specific —
@@ -1135,6 +1205,23 @@ fn build_chat_args(
         },
         "function_options": function_options,
     })
+}
+
+/// Add hop-local steering without mutating the stable, date-stamped system
+/// prompt. The explicit last-hop instruction avoids needless repeat searches;
+/// the following final-answer hop still enforces the limit if it is ignored.
+fn hop_system_prompt(base: &str, hop: usize, max_hops: usize) -> String {
+    if hop == max_hops {
+        return format!(
+            "{base}\n\nRetrieval budget is exhausted. Tool use is disabled. Use only the retrieved sources already provided in this conversation to write the final answer now. Do not request a tool call. If the sources are insufficient, say so plainly rather than inventing details."
+        );
+    }
+
+    let remaining = max_hops - hop;
+    let noun = if remaining == 1 { "call" } else { "calls" };
+    format!(
+        "{base}\n\nRetrieval budget: {remaining} retrieval {noun} remaining. Use another retrieval only when it is materially needed. When one call remains, use its result to answer and do not request another tool call."
+    )
 }
 
 fn text_message_to_proto(m: &ChatMessage) -> serde_json::Value {
@@ -1662,6 +1749,32 @@ mod tests {
         assert_eq!(fo["client_tools_json"], tools);
         assert_eq!(fo["tool_choice"], "auto");
         assert_eq!(fo["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn final_answer_hop_disables_tools_and_requires_an_answer() {
+        let prompt = hop_system_prompt("base", 4, 4);
+        assert!(prompt.contains("Tool use is disabled"));
+        assert!(prompt.contains("final answer"));
+
+        let v = build_final_answer_args(
+            &proto(&[user("what did we decide?")]),
+            &prompt,
+            false,
+            super::super::llm_presets::ThinkingKwarg::Disable,
+            None,
+            None,
+        );
+        let options = &v["function_options"];
+        assert_eq!(options["client_tools_json"], "[]");
+        assert_eq!(options["tool_choice"], "none");
+    }
+
+    #[test]
+    fn retrieval_hop_prompt_includes_remaining_tool_budget() {
+        let prompt = hop_system_prompt("base", 3, 4);
+        assert!(prompt.contains("1 retrieval call remaining"));
+        assert!(prompt.contains("do not request another tool call"));
     }
 
     #[test]
@@ -2552,16 +2665,6 @@ mod tests {
         unsafe { std::env::set_var("LOOKBACK_CHAT_MAX_TOOL_HOPS", "not-a-number") };
         assert_eq!(max_tool_hops(), DEFAULT_MAX_TOOL_HOPS);
         unsafe { std::env::remove_var("LOOKBACK_CHAT_MAX_TOOL_HOPS") };
-    }
-
-    #[test]
-    fn done_with_message_carries_max_hops_text() {
-        // Budget exhaustion surfaces as Done (not Error) so any partial
-        // assistant text the user has already seen remains usable.
-        let update =
-            ChatStepUpdate::done_with_message("job-1".into(), MAX_HOPS_REACHED_MESSAGE.to_string());
-        assert_eq!(update.phase, ChatPhase::Done);
-        assert_eq!(update.message.as_deref(), Some(MAX_HOPS_REACHED_MESSAGE));
     }
 
     // -- proto-json constructors ------------------------------------------

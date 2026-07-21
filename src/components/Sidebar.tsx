@@ -150,7 +150,9 @@ function SidecarStatusPanel({ status }: { status: SidecarStatus }) {
         <span className={`dot ${dotClass}`} />
         <span>memories</span>
         <span className="port">
-          {status.endpoints ? `:${status.endpoints.memories_port}` : phaseLabel}
+          {status.endpoints?.memories_port != null
+            ? `:${status.endpoints.memories_port}`
+            : phaseLabel}
         </span>
       </div>
       <div className="sidecar-row">

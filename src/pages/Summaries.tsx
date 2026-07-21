@@ -52,15 +52,15 @@ import type {
   ThreadHit,
 } from "@/types/api";
 
-// Synthetic owner of all summaries (Rust SUMMARY_USER_ID); summary search
-// scopes to this owner so it never returns raw conversation memories.
-const SUMMARY_USER_ID = 100_000;
+// Summaries are lifecycle kinds owned by the same Lookback user as RAW
+// memories. Their labels and memory kinds, not a synthetic owner, scope them.
+const LOOKBACK_USER_ID = 1;
 
 type View = "list" | "search" | "calendar";
 type CalendarKind = Exclude<SummaryKind, "per-thread">;
 
 /** Summary-thread label that scopes full-text search to a single kind.
- *  All four kinds share `user_id=100000`, so without a label filter a search
+ *  All four kinds share the Lookback user, so without a label filter a search
  *  would mix per-thread and period summaries; each kind's thread carries a
  *  distinct label (`summary` / `daily_summary` / ...) that keeps them apart. */
 const KIND_SEARCH_LABEL: Record<SummaryKind, string> = {
@@ -68,6 +68,14 @@ const KIND_SEARCH_LABEL: Record<SummaryKind, string> = {
   daily: "daily_summary",
   weekly: "weekly_summary",
   monthly: "monthly_summary",
+};
+
+/** Numeric values of llm_memory.data.MemoryKind, kept in sync with the proto. */
+const KIND_SEARCH_MEMORY_KIND: Record<SummaryKind, number> = {
+  "per-thread": 2,
+  daily: 3,
+  weekly: 4,
+  monthly: 5,
 };
 
 /** Deep-link hint a caller (currently: the RAG chat tab's
@@ -240,7 +248,8 @@ export function Summaries({
       SEARCH_MODES[mode].fn({
         query_text: debouncedQuery.trim(),
         mode,
-        user_id: SUMMARY_USER_ID,
+        user_id: LOOKBACK_USER_ID,
+        memory_kinds: [KIND_SEARCH_MEMORY_KIND[kind]],
         labels_any: searchLabels,
         label_match: isPerThread && searchLabels.length > 1 ? labelMatch : undefined,
         created_after_ms: localDateToEpochMs(updatedAfter, timezone),
@@ -562,7 +571,10 @@ function fetchSummaries(
 ): Promise<SummaryEntry[]> {
   return listSummaries({
     kind,
-    limit: 200,
+    // A period detail is filtered after the kind-only RPC response so it
+    // remains compatible with external-id format changes. Do not cap that
+    // response before its exact period key has been selected.
+    ...(options.period_key === undefined ? { limit: 200 } : {}),
     ...(options.after !== undefined ? { updated_after_ms: options.after } : {}),
     ...(options.before !== undefined ? { updated_before_ms: options.before } : {}),
     ...(options.labels_any !== undefined ? { labels_any: options.labels_any } : {}),

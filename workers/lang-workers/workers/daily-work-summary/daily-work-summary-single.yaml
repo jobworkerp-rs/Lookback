@@ -7,15 +7,14 @@ document:
 # Aggregates per-thread summaries (produced by thread-summary-single)
 # for one calendar day into a single "daily work summary" memory.
 #
-# Input is the set of threads owned by `source_user_id` that carry the
+# Input is the set of threads owned by `user_id` that carry the
 # `summary_label` marker AND were updated within the [day_start, day_end)
 # window. Output is one memory under a daily_summary thread keyed by
-# `external_id = "daily:<YYYY-MM-DD>:<scope_key>"` so re-runs are
+# `external_id = "daily:<user_id>:<YYYY-MM-DD>:<scope_key>"` so re-runs are
 # idempotent and concurrent invocations with different
 # `extra_labels_filter` produce disjoint aggregates.
 #
-# Owner user is shared with thread summaries (default 100000) — both are
-# "summary agent" output. The two layers are distinguished only by the
+# Owner user is shared with thread summaries. The two layers are distinguished by the
 # `daily_summary` label, which callers MUST exclude when listing
 # source threads to summarize at the per-thread layer.
 
@@ -23,12 +22,9 @@ input:
   schema:
     document:
       type: object
-      required: []
+      required: [user_id]
       properties:
-        source_user_id:
-          type: integer
-          default: 100000
-          description: Owner of per-thread summaries (the summary-agent user).
+        user_id: { type: integer }
         target_date:
           type: string
           default: ""
@@ -86,8 +82,8 @@ input:
           default: "LABEL_ALL"
           description: >-
             Match mode for extra_labels_filter. LABEL_ANY is used by
-            combined source schedules; the external_id_prefix keeps the
-            summary layer scoped while the label filter supplies source OR.
+            combined source schedules; memory_kind keeps the summary layer
+            scoped while the label filter supplies source OR.
         min_thread_count:
           type: integer
           default: 1
@@ -185,10 +181,10 @@ do:
                      | mktime) + 86400 - $tz_offset_seconds)
               end) * 1000 }
 
-  # Step 3: Alias for readability. Schema-injected default is 100000.
+  # Step 3: Alias for readability. The caller supplies the Lookback user ID.
   - normalizeSourceUserId:
       set:
-        effective_source_user_id: "${ $workflow.input.source_user_id }"
+        effective_source_user_id: "${ $workflow.input.user_id }"
 
   # Step 3a: Derive scope_key from extra_labels_filter. memory.external_id
   # is UNIQUE DB-wide, so distinct filter sets must produce distinct
@@ -208,7 +204,7 @@ do:
   - composeDailyExternalId:
       set:
         daily_external_id: >-
-          ${ "daily:" + $target_date_resolved + ":" + $scope_key }
+          ${ "daily:" + ($effective_source_user_id | tostring) + ":" + $target_date_resolved + ":" + $scope_key }
         daily_thread_labels: >-
           ${ [$workflow.input.daily_label,
               "date:" + $target_date_resolved,
@@ -251,7 +247,7 @@ do:
               ${ {
                 roles: ["ROLE_ASSISTANT"],
                 user_id: { value: $effective_source_user_id },
-                external_id_prefix: "summary:",
+                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
                 # API: updated_after is strict (>), updated_before is
                 # inclusive (<=). To express the half-open interval
                 # [day_start_ms, day_end_ms): pass start-1 (becomes >=)
@@ -263,6 +259,7 @@ do:
                 content_types: ["TEXT"],
                 thread_filter: {
                   user_id: $effective_source_user_id,
+                  memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
                   labels: $summary_thread_filter_labels,
                   label_match_mode: $summary_thread_filter_match_mode
                 }
@@ -335,6 +332,7 @@ do:
                          "scope:" + $scope_key],
                 match_mode: "LABEL_ALL",
                 user_id: $effective_source_user_id,
+                memory_kinds: ["MEMORY_KIND_DAILY_SUMMARY"],
                 limit: 1
               } | tojson }
             as_json: true
@@ -353,7 +351,7 @@ do:
         existing_daily_memory: "${ null }"
 
   # Step 9: Look up the existing daily memory inside that thread,
-  # keyed by external_id = "daily:<YYYY-MM-DD>:<scope_key>".
+  # keyed by external_id = "daily:<user_id>:<YYYY-MM-DD>:<scope_key>".
   - findExistingDailyMemory:
       if: "${ $existing_daily_thread_id != null }"
       run:
@@ -515,7 +513,8 @@ do:
                               + " スレッド)"),
                 labels: $daily_thread_labels,
                 created_at: $day_start_ms,
-                updated_at: $max_source_updated_at
+                updated_at: $max_source_updated_at,
+                memory_kind: "MEMORY_KIND_DAILY_SUMMARY"
               } | tojson }
             as_json: true
       export:
@@ -589,7 +588,8 @@ do:
                   metadata: $daily_metadata_json,
                   external_id: $daily_external_id,
                   created_at: $day_start_ms,
-                  updated_at: $max_source_updated_at
+                  updated_at: $max_source_updated_at,
+                  memory_kind: "MEMORY_KIND_DAILY_SUMMARY"
                 }
               } | tojson }
             as_json: true
@@ -608,7 +608,8 @@ do:
                user_id: { value: $effective_source_user_id },
                labels: $daily_thread_labels,
                created_at: $day_start_ms,
-               updated_at: $max_source_updated_at
+               updated_at: $max_source_updated_at,
+               memory_kind: "MEMORY_KIND_DAILY_SUMMARY"
              }
              end }
 
