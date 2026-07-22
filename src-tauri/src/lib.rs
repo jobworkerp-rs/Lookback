@@ -127,6 +127,7 @@ pub fn run() {
             commands::recovery::recover_purge_lancedb,
             commands::recovery::recover_reset_embedding_settings,
             commands::recovery::migrate_memory_kind,
+            commands::recovery::preview_memory_kind_migration,
             commands::recovery::get_memory_kind_redispatch_status,
             commands::recovery::retry_memory_kind_redispatch,
             commands::recovery::open_log_dir,
@@ -318,7 +319,8 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
     //   3. `which` lookup on PATH.
     //   4. Hard-coded relative paths inside the parent jobworkerp workspace
     //      (developer convenience while sidecar bundling is not yet wired).
-    let jobworkerp_bin = resolve_bin(
+    let jobworkerp_bin = resolve_bin_for_app(
+        handle,
         "LOOKBACK_JOBWORKERP_BIN",
         "all-in-one",
         "all-in-one",
@@ -328,19 +330,27 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
     // `grpc-admin` crate (`memories/grpc-admin/Cargo.toml` [[bin]] name = "front").
     // `which` looks up the more specific name `memories-front` to avoid PATH
     // collisions; the fallback resolves to the actual artifact name.
-    let memories_bin = resolve_bin(
+    let memories_bin = resolve_bin_for_app(
+        handle,
         "LOOKBACK_MEMORIES_BIN",
         "front",
         "memories-front",
         "../../memories/target/release/front",
     )?;
-    let conductor_bin = resolve_bin(
+    let conductor_bin = resolve_bin_for_app(
+        handle,
         "LOOKBACK_CONDUCTOR_BIN",
         "conductor-main",
         "conductor-main",
         "../../conductor/target/release/conductor-main",
     )?;
-    let protoc_bin = resolve_bin("PROTOC", "protoc", "protoc", "../../protobuf/bin/protoc")?;
+    let protoc_bin = resolve_bin_for_app(
+        handle,
+        "PROTOC",
+        "protoc",
+        "protoc",
+        "../../protobuf/bin/protoc",
+    )?;
     if protoc_bin.exists() {
         // SAFETY: Tauri setup performs this before the sidecar startup task is
         // spawned. In-process registration and children then share the path.
@@ -482,36 +492,80 @@ fn resolve_memories_import_bin() -> Result<PathBuf, AppError> {
 }
 
 /// Resolve a sidecar / CLI binary in this order:
-///   1. `env_var` override (set in dev to point at a local cargo build),
+///   1. the app resource directory's package-specific sidecar locations,
 ///   2. `bundled_name` next to the running executable (Tauri `externalBin`
 ///      drops sidecars into `.app/Contents/MacOS/` alongside the app binary,
 ///      with the platform-triple suffix stripped at bundle time),
-///   3. `on_path` via `which::which`,
-///   4. relative fallback under `CARGO_MANIFEST_DIR`.
+///   3. `env_var` override (set in dev to point at a local cargo build),
+///   4. the target-triple-suffixed `externalBin` staged for `tauri dev`,
+///   5. `on_path` via `which::which`,
+///   6. a workspace fallback, only for non-packaged development runs.
 ///
 /// `CARGO_MANIFEST_DIR` resolves to `agent-app/src-tauri/`, so workspace
 /// siblings live at `../../<name>/...` (NOT `../<name>/...`, which would point
 /// at a non-existent `agent-app/<name>/`).
 ///
-/// The fallback path is returned even if it doesn't exist on disk: the caller
-/// decides whether to validate (sidecar startup surfaces this through its own
-/// error path; the `resolve_memories_import_bin` command validates eagerly).
+/// Packaged applications never use PATH or workspace fallbacks. This keeps a
+/// release independent of a developer checkout and avoids exposing local
+/// filesystem paths in user-visible startup errors.
 pub(crate) fn resolve_bin(
     env_var: &str,
     bundled_name: &str,
     on_path: &str,
     fallback_rel: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    resolve_bin_with_resources(env_var, bundled_name, on_path, fallback_rel, None)
+}
+
+/// Like [`resolve_bin`], but also consults Tauri's runtime resource directory.
+/// This handles macOS app translocation and Linux package layouts without
+/// assuming that `current_exe` retains the original bundle path.
+pub(crate) fn resolve_bin_for_app(
+    app: &AppHandle,
+    env_var: &str,
+    bundled_name: &str,
+    on_path: &str,
+    fallback_rel: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    resolve_bin_with_resources(
+        env_var,
+        bundled_name,
+        on_path,
+        fallback_rel,
+        app.path().resource_dir().ok().as_deref(),
+    )
+}
+
+fn resolve_bin_with_resources(
+    env_var: &str,
+    bundled_name: &str,
+    on_path: &str,
+    fallback_rel: &str,
+    resource_dir: Option<&std::path::Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(PathBuf::from));
+    let staged_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin");
     resolve_bin_from_dir(
         env_var,
         bundled_name,
         on_path,
         fallback_rel,
-        exe_dir.as_deref(),
+        BinResolutionPaths {
+            exe_dir: exe_dir.as_deref(),
+            resource_dir,
+            staged_dir: Some(&staged_dir),
+            target_triple: env!("LOOKBACK_TARGET_TRIPLE"),
+        },
     )
+}
+
+struct BinResolutionPaths<'a> {
+    exe_dir: Option<&'a std::path::Path>,
+    resource_dir: Option<&'a std::path::Path>,
+    staged_dir: Option<&'a std::path::Path>,
+    target_triple: &'a str,
 }
 
 fn resolve_bin_from_dir(
@@ -519,25 +573,60 @@ fn resolve_bin_from_dir(
     bundled_name: &str,
     on_path: &str,
     fallback_rel: &str,
-    exe_dir: Option<&std::path::Path>,
+    paths: BinResolutionPaths<'_>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // A packaged app must prefer its own sidecars over inherited developer
+    // overrides. For example, Finder can inherit an old terminal launch
+    // environment whose override points at a deleted build directory.
+    if let Some(resources) = paths.resource_dir {
+        for bundled in resource_sidecar_candidates(resources, bundled_name) {
+            if bundled.is_file() {
+                return Ok(bundled);
+            }
+        }
+    }
     if let Ok(p) = std::env::var(env_var) {
         return Ok(PathBuf::from(p));
+    }
+    if paths.resource_dir.is_some() {
+        return Err(format!("bundled sidecar {bundled_name} is missing").into());
     }
     // Bundled sidecar: Tauri places `externalBin` entries next to the app
     // executable using the externalBin basename. This can differ from the
     // intentionally collision-resistant name used for PATH lookup.
-    if let Some(dir) = exe_dir {
+    if let Some(dir) = paths.exe_dir {
         let bundled = dir.join(bundled_name);
         if bundled.exists() {
             return Ok(bundled);
         }
     }
+    if let Some(dir) = paths.staged_dir {
+        let staged = dir.join(format!("{bundled_name}-{}", paths.target_triple));
+        if staged.is_file() {
+            return Ok(staged);
+        }
+    }
     if let Ok(p) = which::which(on_path) {
         return Ok(p);
     }
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    Ok(PathBuf::from(manifest_dir).join(fallback_rel))
+    if cfg!(debug_assertions) {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        return Ok(PathBuf::from(manifest_dir).join(fallback_rel));
+    }
+    Err(format!("sidecar {bundled_name} is unavailable").into())
+}
+
+fn resource_sidecar_candidates(resources: &std::path::Path, name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = resources.parent() {
+        // macOS: Contents/Resources -> Contents/MacOS/<sidecar>.
+        candidates.push(parent.join("MacOS").join(name));
+        // Linux DEB/AppImage layouts commonly place sidecars next to the
+        // resource directory's parent or directly in the resource directory.
+        candidates.push(parent.join(name));
+    }
+    candidates.push(resources.join(name));
+    candidates
 }
 
 #[cfg(test)]
@@ -590,11 +679,156 @@ mod tests {
             "front",
             "lookback-nonexistent-memories-front-zzz",
             "fallback",
-            Some(dir.path()),
+            BinResolutionPaths {
+                exe_dir: Some(dir.path()),
+                resource_dir: None,
+                staged_dir: None,
+                target_triple: "test-target",
+            },
         )
         .unwrap();
 
         assert_eq!(p, bundled);
+    }
+
+    #[test]
+    fn resolve_bin_uses_a_resource_directory_sidecar_when_executable_path_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = dir.path().join("Contents/Resources");
+        let macos = dir.path().join("Contents/MacOS");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::create_dir_all(&macos).unwrap();
+        let bundled = macos.join("migrate-memory-kind");
+        std::fs::write(&bundled, b"bundled sidecar").unwrap();
+
+        let p = resolve_bin_from_dir(
+            "LOOKBACK_TEST_BIN_RESOURCE",
+            "migrate-memory-kind",
+            "lookback-nonexistent-resource-bin-zzz",
+            "fallback",
+            BinResolutionPaths {
+                exe_dir: None,
+                resource_dir: Some(&resources),
+                staged_dir: None,
+                target_triple: "test-target",
+            },
+        )
+        .unwrap();
+
+        assert_eq!(p, bundled);
+    }
+
+    #[test]
+    fn packaged_resolution_ignores_an_inherited_development_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = dir.path().join("Contents/Resources");
+        let macos = dir.path().join("Contents/MacOS");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::create_dir_all(&macos).unwrap();
+        let bundled = macos.join("front");
+        std::fs::write(&bundled, b"bundled sidecar").unwrap();
+
+        unsafe {
+            std::env::set_var(
+                "LOOKBACK_TEST_BIN_PACKAGED_OVERRIDE",
+                "/Users/example/target/release/front",
+            )
+        };
+        let resolved = resolve_bin_from_dir(
+            "LOOKBACK_TEST_BIN_PACKAGED_OVERRIDE",
+            "front",
+            "lookback-nonexistent-packaged-override-bin-zzz",
+            "fallback",
+            BinResolutionPaths {
+                exe_dir: None,
+                resource_dir: Some(&resources),
+                staged_dir: None,
+                target_triple: "test-target",
+            },
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("LOOKBACK_TEST_BIN_PACKAGED_OVERRIDE") };
+
+        assert_eq!(resolved, bundled);
+    }
+
+    #[test]
+    fn packaged_resolution_never_falls_back_to_a_development_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = dir.path().join("Contents/Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+
+        let error = resolve_bin_from_dir(
+            "LOOKBACK_TEST_BIN_PACKAGED",
+            "migrate-memory-kind",
+            "lookback-nonexistent-packaged-bin-zzz",
+            "/Users/example/workspace/migrate-memory-kind",
+            BinResolutionPaths {
+                exe_dir: None,
+                resource_dir: Some(&resources),
+                staged_dir: None,
+                target_triple: "test-target",
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("bundled sidecar migrate-memory-kind is missing")
+        );
+        assert!(!error.to_string().contains("/Users/example"));
+    }
+
+    #[test]
+    fn resolve_bin_uses_a_linux_package_resource_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = dir.path().join("usr/lib/lookback/resources");
+        let package_dir = resources.parent().unwrap();
+        std::fs::create_dir_all(&resources).unwrap();
+        let bundled = package_dir.join("migrate-memory-kind");
+        std::fs::write(&bundled, b"bundled sidecar").unwrap();
+
+        let p = resolve_bin_from_dir(
+            "LOOKBACK_TEST_BIN_LINUX_RESOURCE",
+            "migrate-memory-kind",
+            "lookback-nonexistent-linux-resource-bin-zzz",
+            "fallback",
+            BinResolutionPaths {
+                exe_dir: None,
+                resource_dir: Some(&resources),
+                staged_dir: None,
+                target_triple: "test-target",
+            },
+        )
+        .unwrap();
+
+        assert_eq!(p, bundled);
+    }
+
+    #[test]
+    fn resolve_bin_uses_the_staged_development_external_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        let staged = staged_dir.join("front-test-target");
+        std::fs::write(&staged, b"staged sidecar").unwrap();
+
+        let p = resolve_bin_from_dir(
+            "LOOKBACK_TEST_BIN_STAGED",
+            "front",
+            "lookback-nonexistent-staged-bin-zzz",
+            "fallback",
+            BinResolutionPaths {
+                exe_dir: None,
+                resource_dir: None,
+                staged_dir: Some(&staged_dir),
+                target_triple: "test-target",
+            },
+        )
+        .unwrap();
+
+        assert_eq!(p, staged);
     }
 
     #[test]

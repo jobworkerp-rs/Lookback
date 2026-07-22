@@ -883,6 +883,13 @@
       "title": "Memory data migration is required",
       "body": "This Lookback data has not been migrated to memory_kind. Migration creates a SQLite backup, runs the bundled conversion, and redispatches vectors. Database: {{db_path}}"
     },
+    "preview": {
+      "title": "Review migration",
+      "body": "The SQLite copy was checked. Unresolved warnings: {{warningCount}} (memory: {{unresolvedMemoryCount}}, thread: {{unresolvedThreadCount}}). Total memory/thread records: {{totalRecordCount}}. Planned deletion: {{plannedMemoryDeleteCount}} memories and {{plannedThreadDeleteCount}} threads. Approval dumps and removes any unresolved client records found at execution, then continues the migration.",
+      "related": "Related rows: {{table}} — {{count}}",
+      "confirm": "Dump, remove, and migrate",
+      "cancel": "Cancel"
+    },
     "memoryKindDatabaseSchemaInvalid": {
       "title": "Check the memory database state",
       "body": "The memory database cannot be migrated from its current state. Verify the backup, then follow the migration procedure. Database: {{db_path}}\nDetails: {{reason}}"

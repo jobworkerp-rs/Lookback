@@ -26,8 +26,7 @@ message RedispatchReflectionEmbeddingsRequest {
   // Filter the reflections to redispatch (origin_user_id /
   // origin_thread_id / prompt_version / *_embedding_status / period).
   // Existing MemoryVectorService.RedispatchEmbeddings cannot be reused
-  // because it filters by user_id (which is reflection_user_id=300000
-  // for every reflection memory).
+  // because it cannot filter the reflection-specific index fields.
   optional llm_memory.data.ReflectionSearchFilter filter = 2;
   optional uint32 batch_size = 3;
 }

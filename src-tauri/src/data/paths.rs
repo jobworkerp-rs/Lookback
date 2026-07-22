@@ -16,6 +16,9 @@ pub struct DataPaths {
 }
 
 impl DataPaths {
+    /// Keep every local memories process on one complete SQLite pool config.
+    pub const MEMORIES_SQLITE_MAX_CONNECTIONS: u32 = 5;
+
     /// macOS: `~/Library/Application Support/lookback/`.
     /// Other platforms fall back to the OS data dir + `lookback/`.
     pub fn detect() -> AppResult<Self> {
@@ -197,6 +200,13 @@ impl DataPaths {
     /// path so they cannot create or inspect a parallel empty database.
     pub fn memories_sqlite_path(&self) -> PathBuf {
         self.memories_data_dir().join("default.sqlite3")
+    }
+
+    pub fn memories_sqlite_url(&self) -> String {
+        format!(
+            "sqlite://{}?mode=rwc",
+            self.memories_sqlite_path().display()
+        )
     }
 
     /// `LANCE_LANGUAGE_MODEL_HOME` target. `lance-index` reads the Lindera
@@ -676,6 +686,10 @@ fn bundled_resource_path_from_executable(exe: &Path, relative: &str) -> Option<P
     Some(contents.join("Resources").join(relative))
 }
 
+fn bundled_resource_path_from_manifest(manifest_dir: &Path, relative: &str) -> PathBuf {
+    manifest_dir.join(relative)
+}
+
 /// Resolve a path below the packaged app's `Contents/Resources` directory.
 /// This matches the explicit destination mapping in `tauri.conf.json`.
 pub fn bundled_resource_path(app: &AppHandle, relative: &str) -> Option<PathBuf> {
@@ -685,9 +699,20 @@ pub fn bundled_resource_path(app: &AppHandle, relative: &str) -> Option<PathBuf>
             return Some(candidate);
         }
     }
-    let exe = std::env::current_exe().ok()?;
-    let candidate = bundled_resource_path_from_executable(&exe, relative)?;
-    candidate.exists().then_some(candidate)
+    if let Some(candidate) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| bundled_resource_path_from_executable(&exe, relative))
+        && candidate.exists()
+    {
+        return Some(candidate);
+    }
+    // `tauri dev` does not populate `Contents/Resources`, while migration
+    // recovery still needs the SQL staged beside this crate. The compiled
+    // manifest path is useful only when it exists, so packaged builds never
+    // accidentally depend on a build-machine path.
+    let source =
+        bundled_resource_path_from_manifest(Path::new(env!("CARGO_MANIFEST_DIR")), relative);
+    source.exists().then_some(source)
 }
 
 /// Point `LOOKBACK_WORKERS_DIR` at the Tauri-bundled `workers/` so that
@@ -838,6 +863,15 @@ mod tests {
             Some(PathBuf::from(
                 "/Applications/Lookback.app/Contents/Resources/plugins"
             ))
+        );
+    }
+
+    #[test]
+    fn bundled_resource_path_falls_back_to_the_development_source_tree() {
+        let manifest = PathBuf::from("/workspace/agent-app/src-tauri");
+        assert_eq!(
+            bundled_resource_path_from_manifest(&manifest, "migration-toolkit"),
+            PathBuf::from("/workspace/agent-app/src-tauri/migration-toolkit")
         );
     }
 

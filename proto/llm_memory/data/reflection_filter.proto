@@ -9,9 +9,8 @@ import "llm_memory/data/thread.proto";
 // Common search/filter shape for ReflectionService search, aggregate,
 // export, and redispatch RPCs. All clauses are AND-combined.
 //
-// `origin_user_id` filters on `thread_reflection_index.origin_user_id`
-// (= elucidates the original thread.user_id, never the reflection
-// memory's own user_id which is fixed at reflection_user_id=300000).
+// `origin_user_id` filters on `thread_reflection_index.origin_user_id`,
+// which identifies the owner of the originating thread.
 message ReflectionSearchFilter {
   optional UserId origin_user_id = 1;
   optional string origin_channel = 2;

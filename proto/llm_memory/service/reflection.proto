@@ -40,7 +40,7 @@ message GenerateForThreadResponse {
 // FinalizeReflection is an internal RPC invoked from the
 // thread-reflection-single workflow's `callFinalizeReflection` step.
 // Direct external callers are not supported; deployments restrict it
-// at the ingress / ACL layer to reflection_user_id=300000.
+// at the ingress / ACL layer.
 message FinalizeReflectionRequest {
   llm_memory.data.ThreadId origin_thread_id = 1;
 

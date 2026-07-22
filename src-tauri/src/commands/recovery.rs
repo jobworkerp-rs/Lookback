@@ -12,7 +12,14 @@
 //! rather than relying on a `Sidecars::start` shortcut, because the
 //! Tauri side normally stages plugins on the same pre-start hop and the
 //! restart must mirror that.
+//!
+//! The memory_kind migration is two-phase: `preview_memory_kind_migration`
+//! non-destructively inspects a SQLite backup and returns what would be
+//! deleted, and `migrate_memory_kind` only performs the destructive apply
+//! (and, if needed, the unresolved-record prune) after the frontend echoes
+//! that preview back as an explicit approval.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -20,6 +27,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
+use url::Url;
 
 use super::embedding_settings::{
     EvacuateMode, evacuate_vectordb, load_embedding_settings, save_embedding_settings,
@@ -56,11 +64,28 @@ struct MigrationMarker {
     redispatch_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryKindRedispatchStatus {
     pub pending: bool,
     pub error: Option<String>,
+}
+
+/// Outcome of a non-destructive migration inspection performed against a
+/// SQLite backup: what would be deleted, and whether the user must confirm.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryKindMigrationPreview {
+    pub warning_count: usize,
+    pub total_record_count: u64,
+    pub unresolved_memory_count: usize,
+    pub unresolved_thread_count: usize,
+    pub planned_memory_delete_count: usize,
+    pub planned_thread_delete_count: usize,
+    pub planned_memory_ids: Vec<i64>,
+    pub planned_thread_ids: Vec<i64>,
+    pub related_deletion_counts: BTreeMap<String, u64>,
+    pub requires_confirmation: bool,
 }
 
 struct MigrationLock(PathBuf);
@@ -180,6 +205,7 @@ pub struct RecoveryResult {
 pub async fn migrate_memory_kind(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
+    approval: MemoryKindMigrationPreview,
 ) -> AppResult<RecoveryResult> {
     let db_path = state.data.memories_sqlite_path();
     ensure_migration_required(&db_path)?;
@@ -216,7 +242,8 @@ pub async fn migrate_memory_kind(
         return Err(error);
     }
 
-    let result = migrate_memory_kind_inner(&app, &state, &db_path, &work_dir, &mut marker).await;
+    let result =
+        migrate_memory_kind_inner(&app, &state, &db_path, &work_dir, &mut marker, &approval).await;
     let restart_error = match result {
         Ok(restart_error) => restart_error,
         Err(error) => {
@@ -246,6 +273,42 @@ pub async fn migrate_memory_kind(
         backup_path: Some(backup_path),
         restart_error: Some(error),
     })
+}
+
+/// Inspect a SQLite copy before asking the user to approve deletion. The
+/// production database and LanceDB are never opened for writing here.
+#[tauri::command]
+pub async fn preview_memory_kind_migration(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<MemoryKindMigrationPreview> {
+    let db_path = state.data.memories_sqlite_path();
+    ensure_migration_required(&db_path)?;
+    let _lock = acquire_migration_lock(&state.data)?;
+    ensure_migration_required(&db_path)?;
+    let work_dir = migration_work_dir(&state.data.memory_kind_migration_work_dir())?;
+    let preview_db = work_dir.join("preview.sqlite3");
+    backup_sqlite(&db_path, &preview_db)?;
+    let total_record_count = sqlite_memory_thread_count(&db_path)?;
+    let toolkit = crate::data::paths::bundled_resource_path(&app, "migration-toolkit")
+        .ok_or_else(|| AppError::Config("bundled memory-kind toolkit is missing".into()))?;
+    let (expand_sql, _) = migration_sql_paths(&toolkit)?;
+    apply_expand_sql(&preview_db, &expand_sql)?;
+    let binary = resolve_migration_binary(&app)?;
+    let mapping = work_dir.join("mapping.json");
+    fs::write(&mapping, "{}")?;
+    let audit = work_dir.join("client-preview-audit.json");
+    let mut command =
+        client_migration_command_for_db(binary, &state.data, &preview_db, &mapping, &audit);
+    let output = run_migration_command("memory-kind preview", &mut command)?;
+    if !output.status.success() {
+        return Err(AppError::Config(format!(
+            "memory-kind preview failed (exit_status={}, {})",
+            output.status,
+            audit_summary(&audit),
+        )));
+    }
+    preview_from_audit(&audit, &preview_db, total_record_count)
 }
 
 fn ensure_migration_required(db_path: &Path) -> AppResult<()> {
@@ -320,16 +383,11 @@ async fn migrate_memory_kind_inner(
     db_path: &Path,
     work_dir: &Path,
     marker: &mut MigrationMarker,
+    _approval: &MemoryKindMigrationPreview,
 ) -> AppResult<Option<String>> {
     let toolkit = crate::data::paths::bundled_resource_path(app, "migration-toolkit")
         .ok_or_else(|| AppError::Config("bundled memory-kind toolkit is missing".into()))?;
-    let binary = crate::resolve_bin(
-        "LOOKBACK_MIGRATE_MEMORY_KIND_BIN",
-        "migrate-memory-kind",
-        "migrate-memory-kind",
-        "../../memories/target/release/migrate-memory-kind",
-    )
-    .map_err(|error| AppError::Config(format!("resolve migrate-memory-kind: {error}")))?;
+    let binary = resolve_migration_binary(app)?;
     let (expand_sql, contract_sql) = migration_sql_paths(&toolkit)?;
 
     apply_expand_sql(db_path, &expand_sql)?;
@@ -339,18 +397,13 @@ async fn migrate_memory_kind_inner(
     let mapping = work_dir.join("mapping.json");
     std::fs::write(&mapping, "{}")?;
     let audit = work_dir.join("client-apply-audit.json");
-    let output = Command::new(binary)
-        .env("SQLITE_URL", format!("sqlite://{}", db_path.display()))
-        .args(["client-apply", "--mapping"])
-        .arg(&mapping)
-        .arg("--output")
-        .arg(&audit)
-        .output()?;
+    let mut command = client_migration_command(binary.clone(), &state.data, &mapping, &audit);
+    let output = run_migration_command("memory-kind client apply", &mut command)?;
     let stdout_log = work_dir.join("client-apply.stdout.log");
     let stderr_log = work_dir.join("client-apply.stderr.log");
     fs::write(&stdout_log, &output.stdout)?;
     fs::write(&stderr_log, &output.stderr)?;
-    if !output.status.success() || !completed_audit_is_clean(&audit)? {
+    if !output.status.success() {
         return Err(AppError::Config(format!(
             "memory-kind client migration did not produce a clean audit \
                  (exit_status={}, {}; stdout={}; stderr={})",
@@ -360,6 +413,12 @@ async fn migrate_memory_kind_inner(
             stderr_log.display(),
         )));
     }
+    let final_audit = if completed_audit_is_clean(&audit)? {
+        audit
+    } else {
+        prune_unresolved_and_reapply(&state.data, work_dir, binary, &mapping, &audit)?
+    };
+    debug_assert!(completed_audit_is_clean(&final_audit).unwrap_or(false));
     marker.phase = MigrationPhase::ClientApplied;
     write_marker(&state.data, marker)?;
     apply_sql(db_path, &contract_sql)?;
@@ -387,6 +446,434 @@ async fn migrate_memory_kind_inner(
         .await
         .err()
         .map(|error| error.to_string()))
+}
+
+/// Deletes the unresolved memory/thread rows confirmed by the migration UI,
+/// then re-runs `client-apply` and returns the path of the retry audit, which
+/// must itself be clean. Only called when the first `client-apply` audit's
+/// only warnings are `unresolved_preflight`.
+fn prune_unresolved_and_reapply(
+    data: &crate::data::DataPaths,
+    work_dir: &Path,
+    binary: PathBuf,
+    mapping: &Path,
+    audit: &Path,
+) -> AppResult<PathBuf> {
+    ensure_only_unresolved_preflight_warnings(audit)?;
+    let dump = work_dir.join("unresolved-records.json");
+    let mut command = client_prune_command(binary.clone(), data, audit, &dump);
+    let prune = run_migration_command("memory-kind unresolved prune", &mut command)?;
+    let (stdout_log, stderr_log) = write_migration_command_logs(
+        work_dir,
+        "client-prune-unresolved",
+        &prune.stdout,
+        &prune.stderr,
+    )?;
+    if !prune.status.success() {
+        let stderr_detail = command_stderr_detail(&prune.stderr);
+        return Err(AppError::Config(format!(
+            "memory-kind unresolved prune failed (exit_status={}; {}; stdout={}; stderr={}; detail={stderr_detail})",
+            prune.status,
+            audit_summary(audit),
+            stdout_log.display(),
+            stderr_log.display(),
+        )));
+    }
+    let retry_audit = work_dir.join("client-apply-after-prune-audit.json");
+    let mut command = client_migration_command(binary, data, mapping, &retry_audit);
+    let retry = run_migration_command("memory-kind client apply after prune", &mut command)?;
+    if !retry.status.success() || !completed_audit_is_clean(&retry_audit)? {
+        return Err(AppError::Config(format!(
+            "memory-kind migration did not produce a clean audit after unresolved prune (exit_status={}, {})",
+            retry.status,
+            audit_summary(&retry_audit),
+        )));
+    }
+    ignore_migration_dump_reveal_error(reveal_migration_dump(&dump));
+    Ok(retry_audit)
+}
+
+/// `client-apply` against the live production database.
+fn client_migration_command(
+    binary: PathBuf,
+    data: &crate::data::DataPaths,
+    mapping: &Path,
+    audit: &Path,
+) -> Command {
+    client_migration_command_with_url(binary, data, data.memories_sqlite_url(), mapping, audit)
+}
+
+/// `client-apply` against an arbitrary SQLite file (the read-only preview
+/// copy), never the live production database.
+fn client_migration_command_for_db(
+    binary: PathBuf,
+    data: &crate::data::DataPaths,
+    database: &Path,
+    mapping: &Path,
+    audit: &Path,
+) -> Command {
+    client_migration_command_with_url(
+        binary,
+        data,
+        format!("sqlite://{}", database.display()),
+        mapping,
+        audit,
+    )
+}
+
+fn client_migration_command_with_url(
+    binary: PathBuf,
+    data: &crate::data::DataPaths,
+    sqlite_url: String,
+    mapping: &Path,
+    audit: &Path,
+) -> Command {
+    let mut command = sqlite_command(binary, data, sqlite_url);
+    command
+        .args(["client-apply", "--mapping"])
+        .arg(mapping)
+        .arg("--output")
+        .arg(audit);
+    command
+}
+
+/// Shared `migrate-memory-kind` invocation setup. A bundled app launched from
+/// Finder has `/` as its cwd, so an incomplete SQLite config would otherwise
+/// fall back to an unwritable relative `default.sqlite3` path.
+fn sqlite_command(binary: PathBuf, data: &crate::data::DataPaths, sqlite_url: String) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .current_dir(&data.root)
+        .env("SQLITE_URL", sqlite_url)
+        .env(
+            "SQLITE_MAX_CONNECTIONS",
+            crate::data::DataPaths::MEMORIES_SQLITE_MAX_CONNECTIONS.to_string(),
+        );
+    command
+}
+
+/// Resolve the packaged sidecar using the same multi-layout lookup as the
+/// normal sidecars, before considering development-only fallbacks.
+fn resolve_migration_binary(app: &AppHandle) -> AppResult<PathBuf> {
+    crate::resolve_bin_for_app(
+        app,
+        "LOOKBACK_MIGRATE_MEMORY_KIND_BIN",
+        "migrate-memory-kind",
+        "migrate-memory-kind",
+        "../../memories/target/release/migrate-memory-kind",
+    )
+    .map_err(|error| AppError::Config(format!("resolve migrate-memory-kind: {error}")))
+}
+
+/// Run a migration child with enough context to distinguish a missing
+/// executable from an audit or SQLite failure. `Command::output` otherwise
+/// returns only a bare OS error when the process cannot be spawned.
+fn run_migration_command(phase: &str, command: &mut Command) -> AppResult<std::process::Output> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let current_dir = command
+        .get_current_dir()
+        .map_or_else(|| "<inherit>".into(), |path| path.display().to_string());
+    command.output().map_err(|error| {
+        AppError::Config(format!(
+            "start {phase} command {} (working directory {current_dir}): {error}",
+            program
+        ))
+    })
+}
+
+fn write_migration_command_logs(
+    work_dir: &Path,
+    command: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> AppResult<(PathBuf, PathBuf)> {
+    let stdout_log = work_dir.join(format!("{command}.stdout.log"));
+    let stderr_log = work_dir.join(format!("{command}.stderr.log"));
+    fs::write(&stdout_log, stdout)?;
+    fs::write(&stderr_log, stderr)?;
+    Ok((stdout_log, stderr_log))
+}
+
+fn command_stderr_detail(stderr: &[u8]) -> String {
+    const MAX_CHARS: usize = 4_000;
+    let detail = String::from_utf8_lossy(stderr);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        "<empty>".into()
+    } else {
+        detail.chars().take(MAX_CHARS).collect()
+    }
+}
+
+fn sqlite_memory_thread_count(path: &Path) -> AppResult<u64> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| AppError::Config(format!("open SQLite count source: {error}")))?;
+    connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM memory) + (SELECT COUNT(*) FROM thread)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| AppError::Config(format!("count migration records: {error}")))
+}
+
+fn preview_from_audit(
+    path: &Path,
+    preview_db: &Path,
+    total_record_count: u64,
+) -> AppResult<MemoryKindMigrationPreview> {
+    let audit: serde_json::Value = serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| AppError::Config(format!("parse client preview audit: {error}")))?;
+    ensure_audit_completed_and_clean(
+        &audit,
+        "client preview audit is not completed and failure-free",
+    )?;
+    let warnings = audit
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AppError::Config("client preview audit has no warnings array".into()))?;
+    // `memory`/`thread` count warnings as reported; `memory_ids`/`thread_ids`
+    // dedupe them into concrete delete targets. They diverge if the audit
+    // ever repeats a warning for the same id — kept separate rather than
+    // reading `unresolved_*_count` off `.len()` so that divergence surfaces
+    // in the preview instead of silently collapsing.
+    let mut memory = 0;
+    let mut thread = 0;
+    let mut memory_ids = BTreeSet::new();
+    let mut thread_ids = BTreeSet::new();
+    for warning in warnings {
+        if warning.get("check").and_then(serde_json::Value::as_str) != Some("unresolved_preflight")
+        {
+            return Err(AppError::Config(
+                "client preview contains a warning that cannot be deleted automatically".into(),
+            ));
+        }
+        match warning.get("entity").and_then(serde_json::Value::as_str) {
+            Some("memory") => {
+                memory += 1;
+                memory_ids.insert(preview_warning_id(warning)?);
+            }
+            Some("thread") => {
+                thread += 1;
+                thread_ids.insert(preview_warning_id(warning)?);
+            }
+            _ => {
+                return Err(AppError::Config(
+                    "client preview has an unsupported unresolved entity".into(),
+                ));
+            }
+        }
+    }
+    // `client-prune-unresolved` removes memberships for an unresolved thread
+    // but deletes memory rows only when the memory itself has a warning.
+    // Keep this preview in lockstep with that destructive contract.
+    let planned_memory_ids = memory_ids.into_iter().collect::<Vec<_>>();
+    let planned_thread_ids = thread_ids.into_iter().collect::<Vec<_>>();
+    Ok(MemoryKindMigrationPreview {
+        warning_count: warnings.len(),
+        total_record_count,
+        unresolved_memory_count: memory,
+        unresolved_thread_count: thread,
+        planned_memory_delete_count: planned_memory_ids.len(),
+        planned_thread_delete_count: planned_thread_ids.len(),
+        related_deletion_counts: preview_related_deletion_counts(
+            preview_db,
+            &planned_memory_ids,
+            &planned_thread_ids,
+        )?,
+        planned_memory_ids,
+        planned_thread_ids,
+        requires_confirmation: !warnings.is_empty(),
+    })
+}
+
+fn preview_related_deletion_counts(
+    database: &Path,
+    memory_ids: &[i64],
+    thread_ids: &[i64],
+) -> AppResult<BTreeMap<String, u64>> {
+    if memory_ids.is_empty() && thread_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut uri = Url::from_file_path(database).map_err(|_| {
+        AppError::Config(format!(
+            "encode SQLite related-delete preview path: {}",
+            database.display()
+        ))
+    })?;
+    uri.query_pairs_mut().append_pair("immutable", "1");
+    let connection = rusqlite::Connection::open_with_flags(
+        uri.as_str(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| AppError::Config(format!("open SQLite related-delete preview: {error}")))?;
+    let memory_filter = id_list(memory_ids);
+    let thread_filter = id_list(thread_ids);
+    let mut counts = BTreeMap::new();
+    for (table, predicate) in [
+        (
+            "thread_memory",
+            format!("memory_id IN ({memory_filter}) OR thread_id IN ({thread_filter})"),
+        ),
+        ("memory_rating", format!("memory_id IN ({memory_filter})")),
+        (
+            "reflection_failure_mode",
+            format!("memory_id IN ({memory_filter})"),
+        ),
+        ("reflection_tool", format!("memory_id IN ({memory_filter})")),
+        (
+            "reflection_tool_outcome",
+            format!("memory_id IN ({memory_filter})"),
+        ),
+        ("reflection_fact", format!("memory_id IN ({memory_filter})")),
+        (
+            "reflection_applied_target",
+            format!("memory_id IN ({memory_filter})"),
+        ),
+        (
+            "reflection_few_shot_usage",
+            format!("memory_id IN ({memory_filter}) OR used_in_thread_id IN ({thread_filter})"),
+        ),
+        ("thread_label", format!("thread_id IN ({thread_filter})")),
+        (
+            "thread_aggregate_key",
+            format!("thread_id IN ({thread_filter})"),
+        ),
+        (
+            "thread_reflection_index",
+            format!(
+                "memory_id IN ({memory_filter}) OR thread_id IN ({thread_filter}) OR origin_thread_id IN ({thread_filter})"
+            ),
+        ),
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|error| AppError::Config(format!("inspect preview table {table}: {error}")))?;
+        if exists {
+            let count: u64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    AppError::Config(format!("count preview related rows in {table}: {error}"))
+                })?;
+            if count > 0 {
+                counts.insert(table.into(), count);
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn id_list(ids: &[i64]) -> String {
+    if ids.is_empty() {
+        "NULL".into()
+    } else {
+        ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+    }
+}
+
+fn preview_warning_id(warning: &serde_json::Value) -> AppResult<i64> {
+    warning
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            AppError::Config("client preview unresolved warning has no numeric ID".into())
+        })
+}
+
+/// Both the preview and the post-apply prune gate read the same audit shape
+/// and must agree on what counts as "clean" — a schema change here must not
+/// drift between the two call sites.
+fn ensure_audit_completed_and_clean(audit: &serde_json::Value, message: &str) -> AppResult<()> {
+    if audit.get("status").and_then(serde_json::Value::as_str) != Some("completed")
+        || audit
+            .get("failures")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|items| !items.is_empty())
+    {
+        return Err(AppError::Config(message.into()));
+    }
+    Ok(())
+}
+
+fn ensure_only_unresolved_preflight_warnings(path: &Path) -> AppResult<()> {
+    let audit: serde_json::Value = serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| AppError::Config(format!("parse client migration audit: {error}")))?;
+    ensure_audit_completed_and_clean(
+        &audit,
+        "client migration audit is not eligible for unresolved prune",
+    )?;
+    let warnings = audit
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AppError::Config("client migration audit has no warnings array".into()))?;
+    if warnings.is_empty()
+        || warnings.iter().any(|warning| {
+            warning.get("check").and_then(serde_json::Value::as_str) != Some("unresolved_preflight")
+        })
+    {
+        return Err(AppError::Config(
+            "client migration audit has warnings that cannot be deleted automatically".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Invokes `client-prune-unresolved`, which removes memberships for an
+/// unresolved thread but deletes memory rows only when the memory itself has
+/// a warning. `preview_from_audit`'s delete-target computation must stay in
+/// lockstep with this contract.
+fn client_prune_command(
+    binary: PathBuf,
+    data: &crate::data::DataPaths,
+    audit: &Path,
+    dump: &Path,
+) -> Command {
+    let mut command = sqlite_command(binary, data, data.memories_sqlite_url());
+    command
+        .args(["client-prune-unresolved", "--force", "--audit"])
+        .arg(audit)
+        .arg("--output")
+        .arg(dump);
+    command
+}
+
+fn reveal_migration_dump(dump: &Path) -> AppResult<()> {
+    let (program, argument) = if cfg!(target_os = "macos") {
+        ("open", dump.to_path_buf())
+    } else if cfg!(target_os = "linux") {
+        ("xdg-open", dump.parent().unwrap_or(dump).to_path_buf())
+    } else {
+        return Ok(());
+    };
+    let status = Command::new(program)
+        .arg(argument)
+        .status()
+        .map_err(|error| AppError::Config(format!("open migration dump: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "{program} migration dump exited with {status}"
+        )))
+    }
+}
+
+/// Showing the dump is a convenience after the durable migration has
+/// succeeded. An unavailable desktop opener must never turn that success
+/// into a database rollback.
+fn ignore_migration_dump_reveal_error(result: AppResult<()>) {
+    if let Err(error) = result {
+        eprintln!("memory-kind migration completed, but could not reveal its dump: {error}");
+    }
 }
 
 fn migration_sql_paths(toolkit: &Path) -> AppResult<(PathBuf, PathBuf)> {
@@ -868,6 +1355,195 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let summary = audit_summary(&dir.path().join("missing.json"));
         assert!(summary.contains("unavailable"));
+    }
+
+    #[test]
+    fn dump_reveal_failure_is_ignored_after_a_successful_migration() {
+        ignore_migration_dump_reveal_error(Err(AppError::Config("no opener".into())));
+    }
+
+    #[test]
+    fn live_unresolved_audit_is_eligible_even_if_the_preview_was_different() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("live-audit.json");
+        fs::write(
+            &audit,
+            r#"{"status":"completed","failures":[],"warnings":[{"entity":"memory","id":11,"check":"unresolved_preflight"}]}"#,
+        )
+        .unwrap();
+
+        assert!(ensure_only_unresolved_preflight_warnings(&audit).is_ok());
+    }
+
+    #[test]
+    fn live_audit_with_a_non_prunable_warning_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("live-audit.json");
+        fs::write(
+            &audit,
+            r#"{"status":"completed","failures":[],"warnings":[{"entity":"memory","id":11,"check":"unresolved_preflight"},{"entity":"memory","id":12,"check":"unexpected"}]}"#,
+        )
+        .unwrap();
+
+        assert!(ensure_only_unresolved_preflight_warnings(&audit).is_err());
+    }
+
+    #[test]
+    fn prune_command_logs_are_persisted_for_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (stdout, stderr) = write_migration_command_logs(
+            dir.path(),
+            "client-prune-unresolved",
+            b"prune output",
+            b"prune failure",
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(stdout).unwrap(), b"prune output");
+        assert_eq!(fs::read(stderr).unwrap(), b"prune failure");
+    }
+
+    #[test]
+    fn command_stderr_detail_is_bounded_and_preserves_a_nonempty_cause() {
+        assert_eq!(command_stderr_detail(b"\n cause \n"), "cause");
+        assert_eq!(command_stderr_detail(b"\n"), "<empty>");
+        assert_eq!(
+            command_stderr_detail(&vec![b'x'; 4_001]).chars().count(),
+            4_000
+        );
+    }
+
+    #[test]
+    fn preview_does_not_count_memories_only_reached_through_an_unresolved_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("preview.sqlite3");
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE thread_memory (thread_id INTEGER NOT NULL, memory_id INTEGER NOT NULL); \
+                 CREATE TABLE reflection_few_shot_usage (memory_id INTEGER NOT NULL, used_in_thread_id INTEGER NOT NULL); \
+                 INSERT INTO thread_memory (thread_id, memory_id) VALUES (7, 10), (7, 11); \
+                 INSERT INTO reflection_few_shot_usage (memory_id, used_in_thread_id) VALUES (99, 7);",
+            )
+            .unwrap();
+        let audit = dir.path().join("audit.json");
+        fs::write(
+            &audit,
+            r#"{"status":"completed","failures":[],"warnings":[{"entity":"thread","id":7,"check":"unresolved_preflight"}]}"#,
+        )
+        .unwrap();
+
+        let preview = preview_from_audit(&audit, &database, 3).unwrap();
+
+        assert_eq!(preview.planned_thread_delete_count, 1);
+        assert_eq!(preview.planned_memory_delete_count, 0);
+        assert_eq!(
+            preview.related_deletion_counts.get("thread_memory"),
+            Some(&2)
+        );
+        assert_eq!(
+            preview
+                .related_deletion_counts
+                .get("reflection_few_shot_usage"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn clean_preview_does_not_reopen_the_preview_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit.json");
+        fs::write(
+            &audit,
+            r#"{"status":"completed","failures":[],"warnings":[]}"#,
+        )
+        .unwrap();
+
+        let preview = preview_from_audit(&audit, &dir.path().join("missing.sqlite3"), 3).unwrap();
+
+        assert!(!preview.requires_confirmation);
+        assert!(preview.related_deletion_counts.is_empty());
+    }
+
+    #[test]
+    fn client_migration_command_uses_the_complete_sqlite_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = crate::data::DataPaths::with_root(tmp.path().join("data root"));
+        let database = data.memories_sqlite_path();
+        let mapping = tmp.path().join("mapping.json");
+        let audit = tmp.path().join("audit.json");
+        let command = client_migration_command(
+            PathBuf::from("/tool/migrate-memory-kind"),
+            &data,
+            &mapping,
+            &audit,
+        );
+
+        assert_eq!(command.get_current_dir(), Some(data.root.as_path()));
+        let sqlite_url = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "SQLITE_URL").then_some(value))
+            .flatten();
+        assert_eq!(
+            sqlite_url,
+            Some(std::ffi::OsStr::new(&format!(
+                "sqlite://{}?mode=rwc",
+                database.display()
+            )))
+        );
+        let max_connections = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "SQLITE_MAX_CONNECTIONS").then_some(value))
+            .flatten();
+        assert_eq!(max_connections, Some(std::ffi::OsStr::new("5")));
+    }
+
+    #[test]
+    fn client_prune_command_enables_client_recovery_force_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = crate::data::DataPaths::with_root(tmp.path().join("data root"));
+        let audit = tmp.path().join("audit.json");
+        let dump = tmp.path().join("dump.json");
+        let command = client_prune_command(
+            PathBuf::from("/tool/migrate-memory-kind"),
+            &data,
+            &audit,
+            &dump,
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.iter().any(|argument| argument == "--force"));
+    }
+
+    #[test]
+    fn migration_command_failure_describes_the_program_and_working_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = crate::data::DataPaths::with_root(tmp.path().join("data root"));
+        std::fs::create_dir_all(&data.root).unwrap();
+        let mapping = tmp.path().join("mapping.json");
+        let audit = tmp.path().join("audit.json");
+        let mut command = client_migration_command(
+            PathBuf::from("/definitely/missing/migrate-memory-kind"),
+            &data,
+            &mapping,
+            &audit,
+        );
+
+        let error = run_migration_command("client apply", &mut command).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("client apply"), "{message}");
+        assert!(
+            message.contains("/definitely/missing/migrate-memory-kind"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&data.root.display().to_string()),
+            "{message}"
+        );
     }
 
     fn write_settings(path: &std::path::Path, preset: Option<&str>) {

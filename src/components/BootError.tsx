@@ -5,6 +5,7 @@ import {
   migrateMemoryKind,
   openLogDir,
   openMemoryKindMigrationGuide,
+  previewMemoryKindMigration,
   quitApp,
   recoverEvacuateLancedb,
   recoverPurgeLancedb,
@@ -12,6 +13,7 @@ import {
   startFreshSetup,
 } from "@/api";
 import type {
+  MemoryKindMigrationPreview,
   RecoveryResult,
   SidecarErrorPayload,
   StartupFailure,
@@ -105,7 +107,9 @@ const migrateMemoryKindAction: RecoveryRestartAction = {
   labelKey: "bootError.action.migrateMemoryKind.label",
   intent: "primary",
   pendingLabelKey: "bootError.action.migrateMemoryKind.pending",
-  run: migrateMemoryKind,
+  run: async () => {
+    throw new Error("memory-kind migration requires a preview approval");
+  },
   manualFallbackAction: openMemoryKindMigrationGuideAction,
 };
 const startFreshSetupAction: RecoveryEscapeAction = {
@@ -214,17 +218,7 @@ export const RECOVERY_TABLE: RecoveryTable = {
 export function BootError({ failure }: { failure: SidecarErrorPayload }) {
   const { t } = useTranslation();
   if (failure.kind === "memory_kind_migration_required") {
-    return (
-      <BootErrorShell
-        title={t("bootError.memoryKindMigrationRequired.title")}
-        body={
-          <pre className="boot-error-message">
-            {t("bootError.memoryKindMigrationRequired.body", failure)}
-          </pre>
-        }
-        actions={[migrateMemoryKindAction, openLogAction, quitAction]}
-      />
-    );
+    return <MemoryKindMigrationBootError failure={failure} />;
   }
   if (failure.kind === "memory_kind_database_schema_invalid") {
     return (
@@ -264,6 +258,82 @@ export function BootError({ failure }: { failure: SidecarErrorPayload }) {
     );
   }
   return <StructuredBootError failure={failure.failure} />;
+}
+
+function MemoryKindMigrationBootError({
+  failure,
+}: {
+  failure: Extract<SidecarErrorPayload, { kind: "memory_kind_migration_required" }>;
+}) {
+  const { t } = useTranslation();
+  const [preview, setPreview] = useState<MemoryKindMigrationPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const previewAction: RecoveryEscapeAction = {
+    kind: "escape",
+    id: "migrate_memory_kind",
+    labelKey: "bootError.action.migrateMemoryKind.label",
+    intent: "primary",
+    run: async () => {
+      setPreviewError(null);
+      try {
+        setPreview(await previewMemoryKindMigration());
+      } catch (error) {
+        setPreviewError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  };
+  const runApprovedMigration = () => {
+    if (!preview) {
+      return Promise.reject(new Error("memory-kind migration requires a preview approval"));
+    }
+    return migrateMemoryKind(preview);
+  };
+  const approvedMigrationAction: RecoveryRestartAction = {
+    ...migrateMemoryKindAction,
+    labelKey: preview?.requiresConfirmation
+      ? "bootError.preview.confirm"
+      : migrateMemoryKindAction.labelKey,
+    run: runApprovedMigration,
+  };
+  return (
+    <BootErrorShell
+      title={t(preview ? "bootError.preview.title" : "bootError.memoryKindMigrationRequired.title")}
+      body={
+        preview ? (
+          <>
+            <p>{t("bootError.preview.body", { ...preview })}</p>
+            {Object.keys(preview.relatedDeletionCounts).length > 0 && (
+              <ul>
+                {Object.entries(preview.relatedDeletionCounts).map(([table, count]) => (
+                  <li key={table}>{t("bootError.preview.related", { table, count })}</li>
+                ))}
+              </ul>
+            )}
+            <button className="btn" type="button" onClick={() => setPreview(null)}>
+              {t("bootError.preview.cancel")}
+            </button>
+          </>
+        ) : (
+          <>
+            <pre className="boot-error-message">
+              {t("bootError.memoryKindMigrationRequired.body", failure)}
+            </pre>
+            {previewError && <div className="boot-error-restart">{previewError}</div>}
+          </>
+        )
+      }
+      actions={
+        preview
+          ? [approvedMigrationAction, openLogAction, quitAction]
+          : [
+              previewAction,
+              ...(previewError ? [openMemoryKindMigrationGuideAction] : []),
+              openLogAction,
+              quitAction,
+            ]
+      }
+    />
+  );
 }
 
 /** Per-variant lookup helper. Extracted so we can name the generic

@@ -877,6 +877,13 @@
       "title": "メモリデータの移行が必要です",
       "body": "この Lookback データは memory_kind 形式へ未移行です。移行を実行すると、SQLite のバックアップを作成してから同梱ツールで変換し、ベクトルを再生成します。対象 DB: {{db_path}}"
     },
+    "preview": {
+      "title": "移行内容を確認",
+      "body": "SQLite の複製で確認しました。未解決 warning: {{warningCount}} 件（memory: {{unresolvedMemoryCount}}、thread: {{unresolvedThreadCount}}）。全 memory/thread: {{totalRecordCount}} 件。削除予定: memory {{plannedMemoryDeleteCount}} 件、thread {{plannedThreadDeleteCount}} 件。承認すると、実行時に検出される未解決 client レコードを JSON にダンプして削除し、移行を続行します。",
+      "related": "関連行: {{table}} — {{count}} 件",
+      "confirm": "ダンプして削除・移行を実行",
+      "cancel": "キャンセル"
+    },
     "memoryKindDatabaseSchemaInvalid": {
       "title": "メモリデータベースの状態を確認してください",
       "body": "memory_kind 移行を開始できないデータベース状態です。バックアップを確認してから移行手順に従ってください。対象 DB: {{db_path}}\n詳細: {{reason}}"

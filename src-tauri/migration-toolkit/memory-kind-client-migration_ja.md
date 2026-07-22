@@ -34,6 +34,10 @@
 5. contract DDL を適用する前に、監査結果とアプリの読み取り結果を確認する。
    警告または失敗が残るDBには、共有サーバー用の contract DDL を適用しない。
 
+### 未解決 warning を破棄する場合
+
+`warnings` が `unresolved_preflight` だけで、`failures` が空の場合に限り、明示的な利用者承認後に `client-prune-unresolved` を実行できる。このコマンドは対象 memory/thread と既知の関連行を JSON ダンプへ出力してから削除する。削除後は必ず `client-apply` を再実行し、warning と failure がともに空の completed audit になることを確認する。未知の参照スキーマ、ダンプ作成失敗、許可外 warning ではDBを変更しない。
+
 ## 補完規則
 
 - `--mapping` は server 側の `plan`/`apply` に渡すものと同一のJSONを使用する。

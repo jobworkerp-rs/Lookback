@@ -444,6 +444,20 @@ export interface RecoveryResult {
   restartError: string | null;
 }
 
+/** Read-only result used to obtain explicit consent before destructive migration. */
+export interface MemoryKindMigrationPreview {
+  warningCount: number;
+  totalRecordCount: number;
+  unresolvedMemoryCount: number;
+  unresolvedThreadCount: number;
+  plannedMemoryDeleteCount: number;
+  plannedThreadDeleteCount: number;
+  plannedMemoryIds: number[];
+  plannedThreadIds: number[];
+  relatedDeletionCounts: Record<string, number>;
+  requiresConfirmation: boolean;
+}
+
 /** Durable notice left only when the post-migration vector enqueue failed. */
 export interface MemoryKindRedispatchStatus {
   pending: boolean;

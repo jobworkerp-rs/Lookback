@@ -51,7 +51,19 @@ describe("BootError", () => {
     expect(screen.queryByText(/ベクトル DB をバックアップ/)).not.toBeInTheDocument();
   });
 
-  it("starts the bundled memory-kind migration for an unmigrated database", async () => {
+  it("previews an unmigrated database before the destructive migration is approved", async () => {
+    invokeMock.mockResolvedValueOnce({
+      warningCount: 2,
+      totalRecordCount: 5,
+      unresolvedMemoryCount: 1,
+      unresolvedThreadCount: 1,
+      plannedMemoryDeleteCount: 1,
+      plannedThreadDeleteCount: 1,
+      plannedMemoryIds: [10],
+      plannedThreadIds: [7],
+      relatedDeletionCounts: { thread_memory: 2 },
+      requiresConfirmation: true,
+    });
     renderWithProviders(
       <BootError
         failure={{
@@ -64,12 +76,43 @@ describe("BootError", () => {
     expect(screen.getByText(/SQLite のバックアップ/)).toBeInTheDocument();
     fireEvent.click(screen.getByText("移行を実行"));
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("migrate_memory_kind");
+      expect(invokeMock).toHaveBeenCalledWith("preview_memory_kind_migration");
     });
+    expect(screen.getByText("移行内容を確認")).toBeInTheDocument();
+    expect(screen.getByText(/未解決 warning: 2 件/)).toBeInTheDocument();
+    expect(screen.getByText("関連行: thread_memory — 2 件")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("ダンプして削除・移行を実行"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("migrate_memory_kind", {
+        approval: expect.objectContaining({ plannedMemoryIds: [10], plannedThreadIds: [7] }),
+      }),
+    );
     expect(screen.queryByText("手動移行手順を開く")).not.toBeInTheDocument();
   });
 
-  it("offers the manual migration guide only after automatic migration fails", async () => {
+  it("cancels the destructive confirmation without calling the migration command", async () => {
+    invokeMock.mockResolvedValueOnce({
+      warningCount: 1,
+      totalRecordCount: 1,
+      unresolvedMemoryCount: 1,
+      unresolvedThreadCount: 0,
+      plannedMemoryDeleteCount: 1,
+      plannedThreadDeleteCount: 0,
+      plannedMemoryIds: [1],
+      plannedThreadIds: [],
+      relatedDeletionCounts: {},
+      requiresConfirmation: true,
+    });
+    renderWithProviders(
+      <BootError failure={{ kind: "memory_kind_migration_required", db_path: "/db" }} />,
+    );
+    fireEvent.click(screen.getByText("移行を実行"));
+    await screen.findByText("移行内容を確認");
+    fireEvent.click(screen.getByText("キャンセル"));
+    expect(invokeMock).not.toHaveBeenCalledWith("migrate_memory_kind");
+  });
+
+  it("offers the manual migration guide when preview fails", async () => {
     invokeMock.mockRejectedValueOnce(new Error("bundled migration failed"));
     renderWithProviders(
       <BootError
@@ -83,10 +126,11 @@ describe("BootError", () => {
     expect(screen.queryByText("手動移行手順を開く")).not.toBeInTheDocument();
     fireEvent.click(screen.getByText("移行を実行"));
     await waitFor(() => {
-      expect(screen.getByText("手動移行手順を開く")).toBeInTheDocument();
+      expect(screen.getByText(/bundled migration failed/)).toBeInTheDocument();
     });
     fireEvent.click(screen.getByText("手動移行手順を開く"));
     expect(invokeMock).toHaveBeenCalledWith("open_memory_kind_migration_guide");
+    expect(invokeMock).not.toHaveBeenCalledWith("migrate_memory_kind");
   });
 
   it("refuses automatic migration for unexpected owner evidence", () => {

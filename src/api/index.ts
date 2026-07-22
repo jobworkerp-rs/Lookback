@@ -43,6 +43,7 @@ import type {
   LogTail,
   McpSettingsResponse,
   MemoryEmbeddingStats,
+  MemoryKindMigrationPreview,
   MemoryKindRedispatchStatus,
   MemoryPosition,
   MemoryRow,
@@ -667,8 +668,12 @@ export function openMemoryKindMigrationGuide(): Promise<void> {
 }
 
 /** Run the bundled client migration after the startup gate blocks a legacy DB. */
-export function migrateMemoryKind(): Promise<RecoveryResult> {
-  return invoke<RecoveryResult>("migrate_memory_kind");
+export function migrateMemoryKind(approval: MemoryKindMigrationPreview): Promise<RecoveryResult> {
+  return invoke<RecoveryResult>("migrate_memory_kind", { approval });
+}
+
+export function previewMemoryKindMigration(): Promise<MemoryKindMigrationPreview> {
+  return invoke<MemoryKindMigrationPreview>("preview_memory_kind_migration");
 }
 
 /** Read the durable post-migration vector redispatch notice. */

@@ -119,7 +119,7 @@ pub async fn search_reflections(
 pub struct SearchReflectionsHybridRequest {
     /// Natural-language query searched against reflection backing memories.
     pub query_text: String,
-    /// Backing memory owner, not origin_user_id. Defaults to reflection_user_id.
+    /// Backing memory owner, not origin_user_id. Defaults to the single local user.
     pub user_id: Option<i64>,
     /// Outcome OR-list. Applied after ReflectionService hydration because
     /// MemoryVectorService cannot filter reflection-specific columns.

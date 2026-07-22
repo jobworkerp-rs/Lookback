@@ -376,16 +376,13 @@ fn memories_cache_env_vars() -> [(&'static str, &'static str); 3] {
 
 fn memories_sqlite_env_vars(data: &DataPaths) -> [(&'static str, String); 2] {
     [
-        (
-            "SQLITE_URL",
-            format!(
-                "sqlite://{}?mode=rwc",
-                data.memories_sqlite_path().display()
-            ),
-        ),
+        ("SQLITE_URL", data.memories_sqlite_url()),
         // `front` deserializes both fields of RdbUrlConfigImpl. Supplying the
         // URL alone makes it silently fall back to its default database.
-        ("SQLITE_MAX_CONNECTIONS", "5".to_string()),
+        (
+            "SQLITE_MAX_CONNECTIONS",
+            crate::data::DataPaths::MEMORIES_SQLITE_MAX_CONNECTIONS.to_string(),
+        ),
     ]
 }
 

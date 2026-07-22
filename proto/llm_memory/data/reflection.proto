@@ -301,8 +301,8 @@ message Reflection {
 }
 
 // Search hit. `origin_thread_id` is the trajectory under analysis;
-// `aggregate_thread_id` is the reflection_user_id-owned aggregate
-// thread the memory is attached to. Existing MemorySearchResult is
+// `aggregate_thread_id` is the owner-scoped aggregate thread the
+// memory is attached to. Existing MemorySearchResult is
 // intentionally NOT reused (§3.6.1 representative thread mismatch).
 message ReflectionSearchResult {
   Reflection reflection = 1;

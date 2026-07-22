@@ -180,9 +180,8 @@ do:
   # ============================================================
   # Step 3: fetch the full chat history. Use all message roles so
   # the reflector can see tool calls and system context — the
-  # generic-search exclusion of ROLE_REFLECTION still applies
-  # (reflections live under a different user and never attach to the
-  # origin thread).
+  # generic-search exclusion of ROLE_REFLECTION still applies because
+  # reflections never attach to the origin thread.
   # ============================================================
   - fetchMemoriesAll:
       run:

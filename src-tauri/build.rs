@@ -7,6 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-env-changed=GPU");
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
+    println!(
+        "cargo:rustc-env=LOOKBACK_TARGET_TRIPLE={}",
+        env::var("TARGET")?
+    );
     let embedding_gpu = env::var("GPU").unwrap_or_else(|_| {
         if target_os == "macos" {
             "metal".to_string()
