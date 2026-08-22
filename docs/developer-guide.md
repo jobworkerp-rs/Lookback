@@ -210,8 +210,8 @@ build scripts do not auto-enable NCCL. The step restores those paths with an `EX
 previous `*.disabled-for-build` names, so reruns on a self-hosted runner do not accumulate hidden
 NCCL files.
 The CUDA runner image must provide `jq` to read Atlas pinned-release data while creating the
-`memory-store` SQLite migration bundle, plus `appimagetool`, `patchelf`, and `desktop-file-utils` before
-Tauri runs linuxdeploy. The workflow checks these tools explicitly so a missing runner-image dependency
+`memory-store` SQLite migration bundle, plus `appimagetool`, `patchelf`, `desktop-file-utils`, and
+`xdg-open` (provided by `xdg-utils`) before Tauri runs linuxdeploy. The workflow checks these tools explicitly so a missing runner-image dependency
 fails before the long release build reaches AppImage bundling.
 CUDA plugins link to the host-provided NVIDIA driver (`libcuda.so.1`), which must not be bundled.
 When the build container has no real driver library in `ldconfig`, `scripts/build-release.sh` points

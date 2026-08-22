@@ -163,8 +163,8 @@ CUDA GitHub Actions job は依存 crate の build script が NCCL を自動検�
 `*.disabled-for-build` は対象外にするため、self-hosted runner の再実行で隠し済み NCCL ファイルが
 蓄積しません。
 CUDA runner image には、`memory-store` の SQLite migration bundle 作成時に Atlas の固定リリース情報を読む
-`jq` と、Tauri が linuxdeploy を実行する前提として `appimagetool`、`patchelf`、`desktop-file-utils` が
-必要です。workflow はこれらを明示的に確認し、runner image の依存不足を
+`jq` と、Tauri が linuxdeploy を実行する前提として `appimagetool`、`patchelf`、`desktop-file-utils`、
+`xdg-utils` が提供する `xdg-open` が必要です。workflow はこれらを明示的に確認し、runner image の依存不足を
 長い release build の最後ではなく AppImage bundling 前に失敗させます。
 CUDA plugin はホスト提供の NVIDIA driver である `libcuda.so.1` に link しますが、これは bundle
 してはいけません。build container の `ldconfig` に実 driver library がない場合、
