@@ -57,12 +57,12 @@ Install these on the build host before building:
 - Node.js and `pnpm`.
 - Tauri v2 prerequisites for your OS.
 - Build tools used by the backend repositories and their native dependencies:
-  `git`, `cmake`, `pkg-config`, and `curl` / `unzip` / `tar`. The official `protoc` is downloaded
+  `git`, `cmake`, `pkg-config`, `jq`, and `curl` / `unzip` / `tar`. The official `protoc` is downloaded
   by the build (via `curl` + `unzip`), so the host does not need protoc installed; set `PROTOC` to
   a self-contained protoc to build offline.
   - macOS: Xcode Command Line Tools (`xcode-select --install`) and, via Homebrew,
-    `brew install cmake pkgconf`.
-  - Linux (Debian/Ubuntu): `apt-get install -y cmake pkg-config build-essential`.
+    `brew install cmake pkgconf jq`.
+  - Linux (Debian/Ubuntu): `apt-get install -y cmake pkg-config jq build-essential`.
 - For a CUDA build on Linux: the CUDA toolkit (`nvcc`); `libcudnn` / `libnccl` for the full runtime.
 
 ### Automated build (recommended)

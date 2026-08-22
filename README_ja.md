@@ -56,12 +56,12 @@ Lookback は Tauri が対応するデスクトップ環境を対象にします�
 - Node.js と `pnpm`。
 - 対象 OS 向け Tauri v2 の前提条件。
 - バックエンドの各リポジトリとそのネイティブ依存が必要とするビルドツール:
-  `git`、`cmake`、`pkg-config`、`curl` / `unzip` / `tar`。公式 `protoc` はビルド時に（`curl` + `unzip` で）
+  `git`、`cmake`、`pkg-config`、`jq`、`curl` / `unzip` / `tar`。公式 `protoc` はビルド時に（`curl` + `unzip` で）
   自動取得するため、ホストへの protoc インストールは不要です。オフラインビルド時は自己完結した protoc を
   `PROTOC` に指定してください。
   - macOS: Xcode Command Line Tools（`xcode-select --install`）と、Homebrew で
-    `brew install cmake pkgconf`。
-  - Linux（Debian/Ubuntu）: `apt-get install -y cmake pkg-config build-essential`。
+    `brew install cmake pkgconf jq`。
+  - Linux（Debian/Ubuntu）: `apt-get install -y cmake pkg-config jq build-essential`。
 - Linux で CUDA ビルドを行う場合: CUDA toolkit（`nvcc`）。フルランタイムには `libcudnn` / `libnccl`。
 
 ### 自動ビルド（推奨）

@@ -351,6 +351,7 @@ main() {
   stage_binaries
   stage_plugins
   sign_macos_plugins
+  sign_macos_migration_binaries
   stage_lindera "${LINDERA}"
   build_frontend
   patch_linux_appimages

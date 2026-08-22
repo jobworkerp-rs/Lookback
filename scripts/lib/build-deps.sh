@@ -349,29 +349,52 @@ stage_plugins() {
   fi
 }
 
-# sign_macos_plugins: sign staged plugin dylibs before Tauri packages the app.
-# Tauri signs externalBin sidecars itself, but resource dylibs are safer when
-# they already carry the same hardened-runtime Developer ID signature.
-sign_macos_plugins() {
+# sign_macos_files LABEL FILE...
+# Tauri only signs known executable sidecars; code shipped as resources must
+# carry its own hardened-runtime Developer ID signature before packaging.
+sign_macos_files() {
+  local label=$1
+  shift
   [[ "${PLATFORM}" == "mac" ]] || return 0
-  [[ "${DRY_RUN:-0}" == "1" ]] && { log "DRY_RUN: skip explicit macOS plugin signing"; return 0; }
+  [[ "${DRY_RUN:-0}" == "1" ]] && { log "DRY_RUN: skip explicit macOS ${label} signing"; return 0; }
 
+  (($# > 0)) || { warn "no macOS ${label} staged for signing"; return 0; }
+
+  if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+    warn "skip explicit macOS ${label} signing: APPLE_SIGNING_IDENTITY is not set"
+    return 0
+  fi
+
+  require_cmd codesign
+  log "sign macOS ${label} ($#)"
+  local f
+  for f in "$@"; do
+    run codesign --force --options runtime --timestamp --sign "${APPLE_SIGNING_IDENTITY}" "${f}"
+  done
+}
+
+# sign_macos_plugins: sign staged plugin dylibs before Tauri packages the app.
+sign_macos_plugins() {
   local dylibs=()
   local f
   for f in "${PLUGINS_DIR}"/*.dylib; do
     [[ -f "${f}" ]] || continue
     dylibs+=("${f}")
   done
-  ((${#dylibs[@]} > 0)) || { warn "no macOS plugin dylibs staged for signing"; return 0; }
+  sign_macos_files "plugin dylibs" "${dylibs[@]}"
+}
 
-  if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-    warn "skip explicit macOS plugin signing: APPLE_SIGNING_IDENTITY is not set"
-    return 0
-  fi
+sign_macos_migration_binaries() {
+  [[ "${PLATFORM}" == "mac" ]] || return 0
 
-  require_cmd codesign
-  log "sign macOS plugin dylibs (${#dylibs[@]})"
-  for f in "${dylibs[@]}"; do
-    run codesign --force --options runtime --timestamp --sign "${APPLE_SIGNING_IDENTITY}" "${f}"
+  local root="${AGENT_APP}/src-tauri/migration-bundle"
+  local binaries=(
+    "${root}/memories-db-migrate"
+    "${root}/atlas/bin/atlas"
+  )
+  local binary
+  for binary in "${binaries[@]}"; do
+    [[ -f "${binary}" ]] || die "macOS migration bundle executable is missing: ${binary}"
   done
+  sign_macos_files "migration bundle executables" "${binaries[@]}"
 }

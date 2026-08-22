@@ -209,8 +209,9 @@ The CUDA GitHub Actions job temporarily renames `nccl.h` / `libnccl*` before bui
 build scripts do not auto-enable NCCL. The step restores those paths with an `EXIT` trap and skips
 previous `*.disabled-for-build` names, so reruns on a self-hosted runner do not accumulate hidden
 NCCL files.
-The CUDA runner image must provide `appimagetool`, `patchelf`, and `desktop-file-utils` before Tauri
-runs linuxdeploy. The workflow checks these tools explicitly so a missing runner-image dependency
+The CUDA runner image must provide `jq` to read Atlas pinned-release data while creating the
+`memory-store` SQLite migration bundle, plus `appimagetool`, `patchelf`, and `desktop-file-utils` before
+Tauri runs linuxdeploy. The workflow checks these tools explicitly so a missing runner-image dependency
 fails before the long release build reaches AppImage bundling.
 CUDA plugins link to the host-provided NVIDIA driver (`libcuda.so.1`), which must not be bundled.
 When the build container has no real driver library in `ldconfig`, `scripts/build-release.sh` points
@@ -242,17 +243,19 @@ The public repository's `.github/workflows/release.yml` runs on tag pushes in th
 `build-macos`, `build-cuda`, then the Linux CPU `build`. `build-macos` uses the `self-hosted`,
 `macOS`, `lookback-macos` runner labels to execute `scripts/build-release.sh --profile mac` and
 uploads the generated DMG to the same GitHub Release.
-For the macOS profile, the script explicitly signs `src-tauri/plugins/*.dylib` with
-`APPLE_SIGNING_IDENTITY` before Tauri packaging. This path is macOS-only and does not affect Linux
-`.so` plugins or CUDA runtime staging. Before importing the certificate, the workflow deletes stale
+For the macOS profile, the script explicitly signs `src-tauri/plugins/*.dylib` and the migration bundle
+executables (`memories-db-migrate` and `atlas/bin/atlas`) with `APPLE_SIGNING_IDENTITY` before Tauri
+packaging. This path is macOS-only and does not affect Linux `.so` plugins or CUDA runtime staging. Before
+importing the certificate, the workflow deletes stale
 `signing_temp*.keychain-db` files left by earlier self-hosted runner attempts, then imports the
 `.p12` into a run-scoped keychain with `apple-actions/import-codesign-certs`. It verifies the signing
 identity in the keychain and verifies notarization credentials with `notarytool history` before
 running `scripts/build-release.sh --profile mac`; without these checks, explicit plugin signing can
 fail with `The specified item could not be found in the keychain`, or invalid Apple ID / Team ID /
 app-specific password values can fail only after a long build.
-After Tauri build, the workflow explicitly runs `notarytool submit --wait` and `stapler staple` on the
-DMG, then validates the stapled ticket and Gatekeeper assessment before uploading the release asset.
+After Tauri build, the workflow verifies each migration executable signature, explicitly runs
+`notarytool submit --wait` and `stapler staple` on the DMG, then validates the stapled ticket and
+Gatekeeper assessment before uploading the release asset.
 
 To sign and notarize from the public repository:
 

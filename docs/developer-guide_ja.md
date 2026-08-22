@@ -162,8 +162,9 @@ CUDA GitHub Actions job は依存 crate の build script が NCCL を自動検�
 `nccl.h` / `libnccl*` を一時 rename します。この step は `EXIT` trap で元の名前へ戻し、
 `*.disabled-for-build` は対象外にするため、self-hosted runner の再実行で隠し済み NCCL ファイルが
 蓄積しません。
-CUDA runner image には、Tauri が linuxdeploy を実行する前提として `appimagetool`、`patchelf`、
-`desktop-file-utils` が必要です。workflow はこれらを明示的に確認し、runner image の依存不足を
+CUDA runner image には、`memory-store` の SQLite migration bundle 作成時に Atlas の固定リリース情報を読む
+`jq` と、Tauri が linuxdeploy を実行する前提として `appimagetool`、`patchelf`、`desktop-file-utils` が
+必要です。workflow はこれらを明示的に確認し、runner image の依存不足を
 長い release build の最後ではなく AppImage bundling 前に失敗させます。
 CUDA plugin はホスト提供の NVIDIA driver である `libcuda.so.1` に link しますが、これは bundle
 してはいけません。build container の `ldconfig` に実 driver library がない場合、
@@ -202,16 +203,16 @@ toolcache など、このリリースビルドで使わない大きなプリイ�
 `build-cuda`、Linux CPU の `build` の順に実行します。`build-macos` は `self-hosted`、`macOS`、
 `lookback-macos` label の runner で `scripts/build-release.sh --profile mac` を実行し、生成された
 DMG を同じ GitHub Release に添付します。
-macOS profile では、Tauri packaging の前に `src-tauri/plugins/*.dylib` を
-`APPLE_SIGNING_IDENTITY` で明示的に署名します。この処理は macOS 限定で、Linux の `.so` plugin や
-CUDA runtime staging には影響しません。workflow は証明書 import の前に、self-hosted runner の前回
+macOS profile では、Tauri packaging の前に `src-tauri/plugins/*.dylib` と migration bundle の実行ファイル
+（`memories-db-migrate`、`atlas/bin/atlas`）を `APPLE_SIGNING_IDENTITY` で明示的に署名します。この処理は
+macOS 限定で、Linux の `.so` plugin や CUDA runtime staging には影響しません。workflow は証明書 import の前に、self-hosted runner の前回
 試行で残った `signing_temp*.keychain-db` を削除し、その後 `apple-actions/import-codesign-certs` で
 `.p12` を run ごとの keychain に import します。さらに keychain 内の署名 identity と
 `notarytool history` による notarization 認証を検証します。これを省略すると、plugin `.dylib` の
 明示署名が `The specified item could not be found in the keychain` で失敗したり、長時間ビルド後の
 notarization で Apple ID / Team ID / app-specific password の誤りが判明したりします。
-Tauri build 後は workflow 側で DMG に `notarytool submit --wait` と `stapler staple` を明示的に実行し、
-Release へ添付する前に `stapler validate` と Gatekeeper 判定を行います。
+Tauri build 後は workflow 側で各 migration 実行ファイルの署名を検証し、DMG に `notarytool submit --wait` と
+`stapler staple` を明示的に実行して、Release へ添付する前に `stapler validate` と Gatekeeper 判定を行います。
 
 公開リポジトリで署名と notarization を行う手順:
 
