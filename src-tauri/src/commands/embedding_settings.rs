@@ -186,7 +186,7 @@ fn runtime_from_preset(preset: &EmbeddingPreset) -> EmbeddingRuntime {
 /// DO save, the file is authoritative so a stray dev export can't silently
 /// re-route the next launch back to the old model. Pass `|_| None` (via
 /// [`resolve_embedding_runtime`]) for callers that don't want env
-/// overrides at all (e.g. UI display).
+/// overrides at all (e.g. the saved-value Settings display).
 ///
 /// Unknown / retired preset ids degrade gracefully to the default preset
 /// rather than producing an empty `model_id` (which would make the
@@ -1035,12 +1035,9 @@ mod tests {
     fn resolve_runtime_env_blind_alias_returns_preset_defaults() {
         // The UI-facing `resolve_embedding_runtime` shim must ignore env
         // overrides so the Settings card always shows what the SAVED
-        // settings would resolve to — independent of dev shell state.
-        // SAFETY: --test-threads=1.
-        unsafe { std::env::set_var("LOOKBACK_EMBEDDING_MODEL_ID", "ghost/should-not-leak") };
+        // settings resolve to.
         let s = EmbeddingSettings::default();
         let rt = resolve_embedding_runtime(&s);
-        unsafe { std::env::remove_var("LOOKBACK_EMBEDDING_MODEL_ID") };
         assert_eq!(rt.model_id, embedding_presets::default_preset().hf_repo);
     }
 

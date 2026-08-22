@@ -169,12 +169,16 @@ fn required_llm_files(rt: &super::llm_settings::LocalRuntime) -> Vec<String> {
 /// than the readiness card filters for, and the card stays stuck on
 /// `preparing` even though the right weights are present.
 fn embedding_identity(data: &crate::data::DataPaths) -> ModelIdentity {
+    embedding_identity_with_env(data, super::process_env_lookup)
+}
+
+fn embedding_identity_with_env<F>(data: &crate::data::DataPaths, env_lookup: F) -> ModelIdentity
+where
+    F: Fn(&str) -> Option<String>,
+{
     let settings =
         super::embedding_settings::load_embedding_settings(&data.embedding_settings_path());
-    let rt = super::embedding_settings::resolve_embedding_runtime_with_env(
-        &settings,
-        super::process_env_lookup,
-    );
+    let rt = super::embedding_settings::resolve_embedding_runtime_with_env(&settings, env_lookup);
     let model_id = (!rt.model_id.is_empty()).then_some(rt.model_id);
     ModelIdentity {
         name: model_id.clone(),
@@ -546,24 +550,13 @@ mod tests {
         assert_eq!(id.repo.as_deref(), Some("Anthropic"));
     }
 
-    /// Clear every `LOOKBACK_EMBEDDING_*` env var so an unrelated test
-    /// (or a developer's shell) can't leak through `embedding_identity`'s
-    /// env-aware resolver. SAFETY: relies on the `--test-threads=1`
-    /// invariant documented in CLAUDE.md.
-    fn clear_embedding_env() {
-        for k in super::super::embedding_settings::EMBEDDING_ENV_KEYS {
-            unsafe { std::env::remove_var(k) };
-        }
-    }
-
     #[test]
     fn embedding_identity_defaults_to_default_preset_when_settings_absent() {
         // Fresh install: no `embedding-settings.json` → resolver falls back to
         // the default preset, and the Settings card shows that preset's repo.
-        clear_embedding_env();
         let tmp = tempfile::tempdir().unwrap();
         let data = crate::data::DataPaths::with_root(tmp.path().to_path_buf());
-        let id = embedding_identity(&data);
+        let id = embedding_identity_with_env(&data, |_| None);
         let default_preset = super::super::embedding_presets::default_preset();
         assert_eq!(id.name.as_deref(), Some(default_preset.hf_repo));
         assert_eq!(id.repo.as_deref(), Some(default_preset.hf_repo));
@@ -575,7 +568,6 @@ mod tests {
         // the readiness check reflects what the sidecar will actually load —
         // otherwise an unrelated safetensors file in HF_HOME makes the card
         // mis-report "ready" against an unselected model.
-        clear_embedding_env();
         let tmp = tempfile::tempdir().unwrap();
         let data = crate::data::DataPaths::with_root(tmp.path().to_path_buf());
         let settings = super::super::embedding_settings::EmbeddingSettings {
@@ -587,7 +579,7 @@ mod tests {
             &settings,
         )
         .unwrap();
-        let id = embedding_identity(&data);
+        let id = embedding_identity_with_env(&data, |_| None);
         assert_eq!(id.name.as_deref(), Some("Qwen/Qwen3-Embedding-0.6B"));
     }
 
@@ -598,12 +590,11 @@ mod tests {
         // readiness scan MUST filter for the env-pointed repo too —
         // otherwise the right weights are on disk but the card filters
         // them out and stays stuck on `preparing`.
-        clear_embedding_env();
-        unsafe { std::env::set_var("LOOKBACK_EMBEDDING_MODEL_ID", "dev/dev-model") };
         let tmp = tempfile::tempdir().unwrap();
         let data = crate::data::DataPaths::with_root(tmp.path().to_path_buf());
-        let id = embedding_identity(&data);
-        clear_embedding_env();
+        let id = embedding_identity_with_env(&data, |name| {
+            (name == "LOOKBACK_EMBEDDING_MODEL_ID").then(|| "dev/dev-model".to_string())
+        });
         assert_eq!(id.name.as_deref(), Some("dev/dev-model"));
         assert_eq!(id.repo.as_deref(), Some("dev/dev-model"));
     }
@@ -612,8 +603,6 @@ mod tests {
     fn embedding_identity_ignores_shell_env_when_preset_saved() {
         // Pin the "saved settings are authoritative" contract: a stray
         // dev export must NOT override the user's saved preset choice.
-        clear_embedding_env();
-        unsafe { std::env::set_var("LOOKBACK_EMBEDDING_MODEL_ID", "stale/override") };
         let tmp = tempfile::tempdir().unwrap();
         let data = crate::data::DataPaths::with_root(tmp.path().to_path_buf());
         let settings = super::super::embedding_settings::EmbeddingSettings {
@@ -625,8 +614,9 @@ mod tests {
             &settings,
         )
         .unwrap();
-        let id = embedding_identity(&data);
-        clear_embedding_env();
+        let id = embedding_identity_with_env(&data, |name| {
+            (name == "LOOKBACK_EMBEDDING_MODEL_ID").then(|| "stale/override".to_string())
+        });
         assert_eq!(id.name.as_deref(), Some("Qwen/Qwen3-Embedding-0.6B"));
     }
 

@@ -858,6 +858,18 @@ fn resource_sidecar_candidates(resources: &std::path::Path, name: &str) -> Vec<P
         // resource directory's parent or directly in the resource directory.
         candidates.push(parent.join(name));
     }
+    if let Some(usr) = resources.ancestors().find(|path| {
+        path.file_name().is_some_and(|name| name == "usr")
+            && resources
+                .strip_prefix(path)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .is_some_and(|component| component.as_os_str() == "lib")
+    }) {
+        // AppImage puts externalBin entries in usr/bin while Tauri reports
+        // resources from usr/lib/<product>[/resources].
+        candidates.push(usr.join("bin").join(name));
+    }
     candidates.push(resources.join(name));
     candidates
 }
@@ -1037,6 +1049,62 @@ mod tests {
         .unwrap();
 
         assert_eq!(p, bundled);
+    }
+
+    #[test]
+    fn resolve_bin_uses_an_appimage_usr_bin_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = dir.path().join("usr/lib/Lookback");
+        let bundled = dir.path().join("usr/bin/all-in-one");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"bundled sidecar").unwrap();
+
+        let p = resolve_bin_from_dir(
+            "LOOKBACK_TEST_BIN_APPIMAGE_RESOURCE",
+            "all-in-one",
+            "lookback-nonexistent-appimage-bin-zzz",
+            "fallback",
+            BinResolutionPaths {
+                exe_dir: None,
+                resource_dir: Some(&resources),
+                staged_dir: None,
+                target_triple: "test-target",
+            },
+        )
+        .unwrap();
+
+        assert_eq!(p, bundled);
+    }
+
+    #[test]
+    fn resolve_bin_does_not_treat_a_macos_usr_local_bundle_as_an_appimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = dir.path().join("usr/local/Lookback.app/Contents/Resources");
+        let unrelated = dir.path().join("usr/bin/front");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        std::fs::write(&unrelated, b"not a bundled macOS sidecar").unwrap();
+
+        let error = resolve_bin_from_dir(
+            "LOOKBACK_TEST_BIN_MACOS_USR_LOCAL",
+            "front",
+            "lookback-nonexistent-macos-bin-zzz",
+            "fallback",
+            BinResolutionPaths {
+                exe_dir: None,
+                resource_dir: Some(&resources),
+                staged_dir: None,
+                target_triple: "test-target",
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("bundled sidecar front is missing")
+        );
     }
 
     #[test]

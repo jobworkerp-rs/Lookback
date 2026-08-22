@@ -209,7 +209,7 @@ The CUDA GitHub Actions job temporarily renames `nccl.h` / `libnccl*` before bui
 build scripts do not auto-enable NCCL. The step restores those paths with an `EXIT` trap and skips
 previous `*.disabled-for-build` names, so reruns on a self-hosted runner do not accumulate hidden
 NCCL files.
-The CUDA runner image must provide `jq` to read Atlas pinned-release data while creating the
+Linux release runners (CPU and CUDA) must provide `jq` to read Atlas pinned-release data while creating the
 `memory-store` SQLite migration bundle, plus `appimagetool`, `patchelf`, `desktop-file-utils`, and
 `xdg-open` (provided by `xdg-utils`) before Tauri runs linuxdeploy. The workflow checks these tools explicitly so a missing runner-image dependency
 fails before the long release build reaches AppImage bundling.
