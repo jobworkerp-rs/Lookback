@@ -114,7 +114,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: brew install protobuf cmake pkgconf
+        run: |
+          brew install protobuf cmake pkgconf jq
+          command -v jq >/dev/null || { echo "jq missing" >&2; exit 1; }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -233,6 +235,11 @@ jobs:
             codesign --verify --deep --strict --verbose=2 "$app"
             find "$app/Contents/Resources/plugins" -name '*.dylib' \
               -exec codesign --verify --verbose=2 {} \;
+            for binary in \
+              "$app/Contents/Resources/memories-db-migrate/memories-db-migrate" \
+              "$app/Contents/Resources/memories-db-migrate/atlas/bin/atlas"; do
+              codesign --verify --strict --verbose=2 "$binary"
+            done
           done
           for dmg in "${dmgs[@]}"; do
             codesign --verify --verbose=2 "$dmg"
@@ -338,10 +345,11 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            desktop-file-utils file fuse libfuse2 patchelf
+            desktop-file-utils file fuse libfuse2 patchelf jq
           command -v appimagetool >/dev/null || { echo "appimagetool missing" >&2; exit 1; }
           command -v patchelf >/dev/null || { echo "patchelf missing" >&2; exit 1; }
           command -v desktop-file-validate >/dev/null || { echo "desktop-file-utils missing" >&2; exit 1; }
+          command -v jq >/dev/null || { echo "jq missing" >&2; exit 1; }
 
       - name: Build release AppImage (cuda)
         run: bash scripts/build-release.sh --profile linux-cuda --bundle appimage
