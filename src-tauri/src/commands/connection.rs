@@ -27,6 +27,8 @@ use tonic_reflection::pb::v1::{
 
 use crate::error::{AppError, AppResult};
 use crate::grpc;
+use crate::grpc::proto::llm_memory::service::thread_service_client::ThreadServiceClient;
+use crate::grpc::proto::llm_memory::{data as mem_data, service as mem_svc};
 use crate::sidecar::SidecarEndpoints;
 
 use super::AppState;
@@ -59,6 +61,12 @@ pub struct ResolvedTargets {
     pub memories_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConnection {
+    pub mode: ConnectionMode,
+    pub targets: ResolvedTargets,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConnectionTestReport {
     pub jobworkerp_url: String,
@@ -74,23 +82,229 @@ const REMOTE_REQUIRED_MEMORIES_SERVICES: [&str; 6] = [
     "llm_memory.service.ReflectionVectorService",
 ];
 
-const REMOTE_REQUIRED_MEMORIES_SCHEMA_FIELDS: [(&str, &str, i32); 2] = [
-    (
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredFieldKind {
+    RepeatedMemoryKind,
+    OptionalString,
+    OptionalInt64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequiredSchemaField {
+    message: &'static str,
+    field: &'static str,
+    number: i32,
+    kind: RequiredFieldKind,
+}
+
+const fn required_schema_field(
+    message: &'static str,
+    field: &'static str,
+    number: i32,
+    kind: RequiredFieldKind,
+) -> RequiredSchemaField {
+    RequiredSchemaField {
+        message,
+        field,
+        number,
+        kind,
+    }
+}
+
+const REMOTE_REQUIRED_MEMORIES_SCHEMA_FIELDS: [RequiredSchemaField; 25] = [
+    required_schema_field(
+        "llm_memory.service.SearchReflectionsRequest",
+        "cursor_after_memory_id",
+        8,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindMemoryListRequest",
+        "external_id_prefix",
+        14,
+        RequiredFieldKind::OptionalString,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindMemoryListRequest",
+        "memory_kinds",
+        15,
+        RequiredFieldKind::RepeatedMemoryKind,
+    ),
+    required_schema_field(
+        "llm_memory.service.MemoryCountCondition",
+        "memory_kinds",
+        12,
+        RequiredFieldKind::RepeatedMemoryKind,
+    ),
+    required_schema_field(
+        "llm_memory.service.MemoryCountCondition",
+        "external_id_prefix",
+        11,
+        RequiredFieldKind::OptionalString,
+    ),
+    required_schema_field(
         "llm_memory.service.FindDistinctLabelsRequest",
         "memory_kinds",
         8,
+        RequiredFieldKind::RepeatedMemoryKind,
     ),
-    (
+    required_schema_field(
         "llm_memory.service.FindCoOccurringLabelsRequest",
         "memory_kinds",
         9,
+        RequiredFieldKind::RepeatedMemoryKind,
+    ),
+    required_schema_field(
+        "llm_memory.data.ThreadData",
+        "first_message_at",
+        13,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.data.ThreadData",
+        "last_message_at",
+        14,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByUserIdRequest",
+        "thread_created_after",
+        10,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByUserIdRequest",
+        "thread_created_before",
+        11,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByUserIdRequest",
+        "thread_updated_after",
+        12,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByUserIdRequest",
+        "thread_updated_before",
+        13,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByUserIdRequest",
+        "first_message_after",
+        14,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByUserIdRequest",
+        "first_message_before",
+        15,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByUserIdRequest",
+        "last_message_after",
+        16,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByUserIdRequest",
+        "last_message_before",
+        17,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByLabelsRequest",
+        "thread_created_after",
+        12,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByLabelsRequest",
+        "thread_created_before",
+        13,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByLabelsRequest",
+        "thread_updated_after",
+        14,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByLabelsRequest",
+        "thread_updated_before",
+        15,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByLabelsRequest",
+        "first_message_after",
+        16,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByLabelsRequest",
+        "first_message_before",
+        17,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByLabelsRequest",
+        "last_message_after",
+        18,
+        RequiredFieldKind::OptionalInt64,
+    ),
+    required_schema_field(
+        "llm_memory.service.FindThreadListByLabelsRequest",
+        "last_message_before",
+        19,
+        RequiredFieldKind::OptionalInt64,
     ),
 ];
+
+fn required_memories_schema_fields() -> Vec<RequiredSchemaField> {
+    let mut fields = REMOTE_REQUIRED_MEMORIES_SCHEMA_FIELDS.to_vec();
+    let names = [
+        "thread_created_after",
+        "thread_created_before",
+        "thread_updated_after",
+        "thread_updated_before",
+        "first_message_after",
+        "first_message_before",
+        "last_message_after",
+        "last_message_before",
+    ];
+    for (message, first_number) in [
+        ("llm_memory.service.FindDistinctLabelsRequest", 9),
+        ("llm_memory.service.SearchLabelsRequest", 8),
+        ("llm_memory.service.FindCoOccurringLabelsRequest", 10),
+        ("llm_memory.data.ThreadSearchFilter", 10),
+    ] {
+        fields.extend(names.iter().enumerate().map(|(index, name)| {
+            required_schema_field(
+                message,
+                name,
+                first_number + index as i32,
+                RequiredFieldKind::OptionalInt64,
+            )
+        }));
+    }
+    fields
+}
 
 /// Confirms that a remote memories endpoint exposes the service surface
 /// Lookback needs without introducing a version-maintenance RPC.
 pub async fn validate_remote_memories_services(url: &str) -> AppResult<()> {
     let channel = crate::grpc::connect(url).await?;
+    validate_memories_services(channel, url).await
+}
+
+async fn validate_memories_services(
+    channel: tonic::transport::Channel,
+    url: &str,
+) -> AppResult<()> {
     let request = ServerReflectionRequest {
         host: String::new(),
         message_request: Some(MessageRequest::ListServices(String::new())),
@@ -127,7 +341,11 @@ pub async fn validate_remote_memories_services(url: &str) -> AppResult<()> {
         )))?;
     }
     let mut descriptors = Vec::new();
-    for (message, ..) in REMOTE_REQUIRED_MEMORIES_SCHEMA_FIELDS {
+    let symbols = required_memories_schema_fields()
+        .into_iter()
+        .map(|required| required.message)
+        .collect::<std::collections::BTreeSet<_>>();
+    for message in symbols {
         descriptors.extend(reflect_file_containing_symbol(&mut client, message, url).await?);
     }
     let missing = missing_remote_memories_schema_fields(&descriptors);
@@ -138,6 +356,87 @@ pub async fn validate_remote_memories_services(url: &str) -> AppResult<()> {
             "remote memories at {url} is incompatible; missing reflection fields: {}",
             missing.join(", ")
         )))
+    }
+}
+
+/// Verifies the bundled front immediately after its TCP port opens and before
+/// Lookback advertises readiness. Reflection catches stale protobuf surfaces;
+/// the empty-filter RPC also catches a binary that advertises the fields but
+/// cannot query them against the migrated database.
+pub async fn validate_local_memories_services(url: &str) -> AppResult<()> {
+    let channel = crate::grpc::connect_startup_probe(url).await?;
+    validate_memories_services(channel, url).await?;
+    let mut client = ThreadServiceClient::new(crate::grpc::connect_startup_probe(url).await?);
+    let request = mem_svc::FindThreadListByUserIdRequest {
+        user_id: Some(mem_data::UserId { value: 1 }),
+        limit: Some(100),
+        offset: None,
+        sort: None,
+        memory_kinds: vec![mem_data::MemoryKind::Raw as i32],
+        thread_created_after: None,
+        thread_created_before: None,
+        thread_updated_after: None,
+        thread_updated_before: None,
+        first_message_after: None,
+        first_message_before: None,
+        last_message_after: None,
+        last_message_before: None,
+    };
+    let mut threads = client
+        .find_thread_list_by_user_id(request)
+        .await?
+        .into_inner();
+    while let Some(thread) = tokio_stream::StreamExt::next(&mut threads).await {
+        let thread = thread?;
+        if let Some(data) = thread.data {
+            let has_memory = if data.first_message_at.is_none() && data.last_message_at.is_none() {
+                let thread_id = thread.id.ok_or_else(|| {
+                    AppError::Config("local memories returned a thread without an id".into())
+                })?;
+                let mut memories = client
+                    .find_memories_by_thread_id(mem_svc::FindMemoriesByThreadIdRequest {
+                        thread_id: Some(thread_id),
+                        limit: Some(1),
+                        offset: None,
+                        roles: Vec::new(),
+                        content_types: Vec::new(),
+                    })
+                    .await?
+                    .into_inner();
+                tokio_stream::StreamExt::next(&mut memories)
+                    .await
+                    .transpose()?
+                    .is_some()
+            } else {
+                false
+            };
+            validate_thread_message_extrema(
+                data.first_message_at,
+                data.last_message_at,
+                has_memory,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_thread_message_extrema(
+    first: Option<i64>,
+    last: Option<i64>,
+    has_memory: bool,
+) -> AppResult<()> {
+    match (first, last, has_memory) {
+        (None, None, false) => Ok(()),
+        (None, None, true) => Err(AppError::Config(
+            "local memories returned a non-empty thread without message extrema".into(),
+        )),
+        (Some(first), Some(last), _) if first <= last => Ok(()),
+        (Some(first), Some(last), _) => Err(AppError::Config(format!(
+            "local memories returned invalid message extrema: first_message_at={first} > last_message_at={last}"
+        ))),
+        _ => Err(AppError::Config(
+            "local memories returned only one thread message-extrema field".into(),
+        )),
     }
 }
 
@@ -192,20 +491,16 @@ fn missing_remote_memories_services(
 }
 
 fn missing_remote_memories_schema_fields(files: &[FileDescriptorProto]) -> Vec<String> {
-    REMOTE_REQUIRED_MEMORIES_SCHEMA_FIELDS
-        .iter()
-        .filter(|(message, field, number)| {
-            !descriptor_has_memory_kind_field(files, message, field, *number)
-        })
-        .map(|(message, field, _)| format!("{message}.{field}"))
+    required_memories_schema_fields()
+        .into_iter()
+        .filter(|required| !descriptor_has_required_field(files, *required))
+        .map(|required| format!("{}.{}", required.message, required.field))
         .collect()
 }
 
-fn descriptor_has_memory_kind_field(
+fn descriptor_has_required_field(
     files: &[FileDescriptorProto],
-    target_message: &str,
-    target_field: &str,
-    target_number: i32,
+    required: RequiredSchemaField,
 ) -> bool {
     files.iter().any(|file| {
         let package = file.package.as_deref().unwrap_or_default();
@@ -218,15 +513,36 @@ fn descriptor_has_memory_kind_field(
             } else {
                 format!("{package}.{name}")
             };
-            full_name == target_message
+            full_name == required.message
                 && message.field.iter().any(|field| {
-                    field.name.as_deref() == Some(target_field)
-                        && field.number == Some(target_number)
-                        && field.label
-                            == Some(prost_types::field_descriptor_proto::Label::Repeated as i32)
-                        && field.r#type
-                            == Some(prost_types::field_descriptor_proto::Type::Enum as i32)
-                        && field.type_name.as_deref() == Some(".llm_memory.data.MemoryKind")
+                    if field.name.as_deref() != Some(required.field)
+                        || field.number != Some(required.number)
+                    {
+                        return false;
+                    }
+                    match required.kind {
+                        RequiredFieldKind::RepeatedMemoryKind => {
+                            field.label
+                                == Some(prost_types::field_descriptor_proto::Label::Repeated as i32)
+                                && field.r#type
+                                    == Some(prost_types::field_descriptor_proto::Type::Enum as i32)
+                                && field.type_name.as_deref() == Some(".llm_memory.data.MemoryKind")
+                        }
+                        RequiredFieldKind::OptionalString => {
+                            field.label
+                                == Some(prost_types::field_descriptor_proto::Label::Optional as i32)
+                                && field.r#type
+                                    == Some(
+                                        prost_types::field_descriptor_proto::Type::String as i32,
+                                    )
+                        }
+                        RequiredFieldKind::OptionalInt64 => {
+                            field.label
+                                == Some(prost_types::field_descriptor_proto::Label::Optional as i32)
+                                && field.r#type
+                                    == Some(prost_types::field_descriptor_proto::Type::Int64 as i32)
+                        }
+                    }
                 })
         })
     })
@@ -359,6 +675,19 @@ pub fn resolve_targets(
     }
 }
 
+/// Resolve mode and endpoints from one immutable configuration snapshot.
+/// Callers that use the mode as part of persisted identity must not reload
+/// `connection.json` separately after resolving the URLs.
+pub fn resolve_connection(
+    cfg: &ConnectionConfig,
+    local: Option<&SidecarEndpoints>,
+) -> AppResult<ResolvedConnection> {
+    Ok(ResolvedConnection {
+        mode: cfg.mode,
+        targets: resolve_targets(cfg, local)?,
+    })
+}
+
 fn non_empty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
@@ -372,6 +701,27 @@ pub fn validate_remote_url(url: &str) -> AppResult<()> {
     Endpoint::from_shared(url.to_string())
         .map(|_| ())
         .map_err(|e| AppError::Config(format!("invalid remote URL {url}: {e}")))
+}
+
+/// Validate every URL constraint shared by connection testing and persistence.
+/// Returning the resolved values keeps the live reflection probe aligned with
+/// the exact targets that normal command execution will use.
+fn validate_remote_connection_config(cfg: &ConnectionConfig) -> AppResult<ResolvedTargets> {
+    let jobworkerp_url = non_empty(cfg.remote_jobworkerp_url.as_deref())
+        .ok_or_else(|| AppError::Config("remote jobworkerp URL not configured".into()))?;
+    validate_remote_url(jobworkerp_url)?;
+
+    let memories_url = non_empty(cfg.remote_memories_url.as_deref())
+        .ok_or_else(|| AppError::Config("remote memories URL not configured".into()))?;
+    validate_remote_url(memories_url)?;
+    // Workflow callbacks decompose the memories target independently from
+    // tonic, so reject values they cannot represent before saving them.
+    parse_callback(memories_url)?;
+
+    Ok(ResolvedTargets {
+        jobworkerp_url: jobworkerp_url.to_string(),
+        memories_url: memories_url.to_string(),
+    })
 }
 
 pub fn target_connect_error(
@@ -414,14 +764,7 @@ pub async fn test_connection_config(
     cfg: ConnectionConfig,
 ) -> AppResult<ConnectionTestReport> {
     if cfg.mode == ConnectionMode::Remote {
-        let jobworkerp = non_empty(cfg.remote_jobworkerp_url.as_deref())
-            .ok_or_else(|| AppError::Config("remote jobworkerp URL not configured".into()))?;
-        validate_remote_url(jobworkerp)?;
-
-        let memories = non_empty(cfg.remote_memories_url.as_deref())
-            .ok_or_else(|| AppError::Config("remote memories URL not configured".into()))?;
-        validate_remote_url(memories)?;
-        parse_callback(memories)?;
+        validate_remote_connection_config(&cfg)?;
     }
 
     let local = state.sidecars.current_endpoints();
@@ -466,19 +809,8 @@ pub async fn set_connection_config(
     if cfg.mode == ConnectionMode::Remote {
         // Validate the complete startup contract before persisting so an
         // incompatible remote target cannot lock the app into a failed boot.
-        let jobworkerp = non_empty(cfg.remote_jobworkerp_url.as_deref())
-            .ok_or_else(|| AppError::Config("remote jobworkerp URL not configured".into()))?;
-        validate_remote_url(jobworkerp)?;
-
-        let memories = non_empty(cfg.remote_memories_url.as_deref())
-            .ok_or_else(|| AppError::Config("remote memories URL not configured".into()))?;
-        validate_remote_url(memories)?;
-        // The memories URL is additionally decomposed into host/port/tls for the
-        // workflow callback at dispatch time. Run that same parse here so a URL
-        // that `Endpoint::from_shared` tolerates but `parse_callback` can't
-        // (e.g. an unsupported scheme) is rejected on save, not mid-import.
-        parse_callback(memories)?;
-        validate_remote_memories_services(memories).await?;
+        let targets = validate_remote_connection_config(&cfg)?;
+        validate_remote_memories_services(&targets.memories_url).await?;
     }
     let config_path = state.data.connection_config_path();
     let old_cfg = load_connection_config(&config_path);
@@ -559,62 +891,144 @@ mod tests {
     }
 
     #[test]
-    fn remote_reflection_requires_raw_label_filter_fields() {
-        let legacy = vec![thread_label_request_descriptors(&[])];
-        assert_eq!(
-            missing_remote_memories_schema_fields(&legacy),
-            vec![
-                "llm_memory.service.FindDistinctLabelsRequest.memory_kinds",
-                "llm_memory.service.FindCoOccurringLabelsRequest.memory_kinds",
-            ]
-        );
+    fn local_smoke_accepts_empty_or_ordered_message_extrema() {
+        assert!(validate_thread_message_extrema(None, None, false).is_ok());
+        assert!(validate_thread_message_extrema(None, None, true).is_err());
+        assert!(validate_thread_message_extrema(Some(100), Some(100), true).is_ok());
+        assert!(validate_thread_message_extrema(Some(100), Some(200), true).is_ok());
+        assert!(validate_thread_message_extrema(Some(200), Some(100), true).is_err());
+        assert!(validate_thread_message_extrema(Some(100), None, true).is_err());
+        assert!(validate_thread_message_extrema(None, Some(100), true).is_err());
+    }
 
-        let current = vec![thread_label_request_descriptors(&[
-            "FindDistinctLabelsRequest",
-            "FindCoOccurringLabelsRequest",
-        ])];
+    #[test]
+    fn remote_reflection_requires_all_thread_time_filter_fields() {
+        let legacy = vec![FileDescriptorProto::default()];
+        let missing = missing_remote_memories_schema_fields(&legacy);
+        assert!(missing.contains(&"llm_memory.data.ThreadData.first_message_at".to_string()));
+        assert!(missing.contains(
+            &"llm_memory.service.FindThreadListByUserIdRequest.last_message_after".to_string()
+        ));
+
+        let current = required_schema_descriptors();
         assert!(missing_remote_memories_schema_fields(&current).is_empty());
 
-        let mut malformed = thread_label_request_descriptors(&[
-            "FindDistinctLabelsRequest",
-            "FindCoOccurringLabelsRequest",
-        ]);
-        malformed.message_type[1].field[0].number = Some(8);
+        let mut malformed = current;
+        for file in &mut malformed {
+            for message in &mut file.message_type {
+                for field in &mut message.field {
+                    if field.name.as_deref() == Some("last_message_after") {
+                        field.number = Some(999);
+                        break;
+                    }
+                }
+            }
+        }
         assert_eq!(
-            missing_remote_memories_schema_fields(&[malformed]),
-            vec!["llm_memory.service.FindCoOccurringLabelsRequest.memory_kinds"]
+            missing_remote_memories_schema_fields(&malformed)
+                .into_iter()
+                .filter(|field| field.ends_with(".last_message_after"))
+                .count(),
+            6
         );
     }
 
-    fn thread_label_request_descriptors(with_memory_kinds: &[&str]) -> FileDescriptorProto {
-        let message = |name: &str| DescriptorProto {
-            name: Some(name.to_string()),
-            field: with_memory_kinds
-                .contains(&name)
-                .then(|| FieldDescriptorProto {
-                    name: Some("memory_kinds".to_string()),
-                    number: Some(if name == "FindDistinctLabelsRequest" {
-                        8
-                    } else {
-                        9
-                    }),
-                    label: Some(prost_types::field_descriptor_proto::Label::Repeated as i32),
-                    r#type: Some(prost_types::field_descriptor_proto::Type::Enum as i32),
-                    type_name: Some(".llm_memory.data.MemoryKind".to_string()),
-                    ..Default::default()
-                })
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        };
-        FileDescriptorProto {
-            package: Some("llm_memory.service".to_string()),
-            message_type: vec![
-                message("FindDistinctLabelsRequest"),
-                message("FindCoOccurringLabelsRequest"),
-            ],
-            ..Default::default()
+    #[test]
+    fn remote_reflection_rejects_wrong_summary_filter_field_shapes() {
+        let mut malformed = required_schema_descriptors();
+        for file in &mut malformed {
+            for message in &mut file.message_type {
+                let Some(name) = message.name.as_deref() else {
+                    continue;
+                };
+                if name == "FindMemoryListRequest" || name == "MemoryCountCondition" {
+                    for field in &mut message.field {
+                        if field.name.as_deref() == Some("external_id_prefix") {
+                            field.r#type =
+                                Some(prost_types::field_descriptor_proto::Type::Int64 as i32);
+                        }
+                    }
+                }
+            }
         }
+        let missing = missing_remote_memories_schema_fields(&malformed);
+        assert!(
+            missing.contains(
+                &"llm_memory.service.FindMemoryListRequest.external_id_prefix".to_string()
+            )
+        );
+        assert!(
+            missing.contains(
+                &"llm_memory.service.MemoryCountCondition.external_id_prefix".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn remote_reflection_requires_reflection_memory_cursor_field() {
+        let mut malformed = required_schema_descriptors();
+        for file in &mut malformed {
+            for message in &mut file.message_type {
+                if message.name.as_deref() == Some("SearchReflectionsRequest") {
+                    message
+                        .field
+                        .retain(|field| field.name.as_deref() != Some("cursor_after_memory_id"));
+                }
+            }
+        }
+        let missing = missing_remote_memories_schema_fields(&malformed);
+        assert!(missing.contains(
+            &"llm_memory.service.SearchReflectionsRequest.cursor_after_memory_id".to_string()
+        ));
+    }
+
+    fn required_schema_descriptors() -> Vec<FileDescriptorProto> {
+        let mut files = std::collections::BTreeMap::<
+            String,
+            std::collections::BTreeMap<String, Vec<FieldDescriptorProto>>,
+        >::new();
+        for required in required_memories_schema_fields() {
+            let (package, message) = required.message.rsplit_once('.').unwrap();
+            files
+                .entry(package.to_string())
+                .or_default()
+                .entry(message.to_string())
+                .or_default()
+                .push(FieldDescriptorProto {
+                    name: Some(required.field.to_string()),
+                    number: Some(required.number),
+                    label: Some(if required.kind == RequiredFieldKind::RepeatedMemoryKind {
+                        prost_types::field_descriptor_proto::Label::Repeated as i32
+                    } else {
+                        prost_types::field_descriptor_proto::Label::Optional as i32
+                    }),
+                    r#type: Some(if required.kind == RequiredFieldKind::RepeatedMemoryKind {
+                        prost_types::field_descriptor_proto::Type::Enum as i32
+                    } else if required.kind == RequiredFieldKind::OptionalString {
+                        prost_types::field_descriptor_proto::Type::String as i32
+                    } else {
+                        prost_types::field_descriptor_proto::Type::Int64 as i32
+                    }),
+                    type_name: (required.kind == RequiredFieldKind::RepeatedMemoryKind)
+                        .then(|| ".llm_memory.data.MemoryKind".to_string()),
+                    ..Default::default()
+                });
+        }
+        files
+            .into_iter()
+            .map(|(package, messages)| FileDescriptorProto {
+                package: Some(package),
+                message_type: messages
+                    .into_iter()
+                    .map(|(name, field)| DescriptorProto {
+                        name: Some(name),
+                        field,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect()
     }
 
     fn local_eps() -> SidecarEndpoints {
@@ -654,6 +1068,18 @@ mod tests {
         let t = resolve_targets(&cfg, Some(&eps)).unwrap();
         assert_eq!(t.jobworkerp_url, "http://10.0.0.2:9000");
         assert_eq!(t.memories_url, "http://10.0.0.2:9010");
+    }
+
+    #[test]
+    fn resolved_connection_keeps_mode_and_urls_in_one_snapshot() {
+        let cfg = ConnectionConfig {
+            mode: ConnectionMode::Remote,
+            remote_jobworkerp_url: Some("http://remote-a:9000".into()),
+            remote_memories_url: Some("https://remote-a:9010".into()),
+        };
+        let resolved = resolve_connection(&cfg, Some(&local_eps())).unwrap();
+        assert_eq!(resolved.mode, ConnectionMode::Remote);
+        assert_eq!(resolved.targets.memories_url, "https://remote-a:9010");
     }
 
     #[test]
@@ -873,6 +1299,31 @@ mod tests {
             validate_remote_url(url).unwrap_or_else(|e| panic!("validate {url}: {e}"));
             parse_callback(url).unwrap_or_else(|e| panic!("parse {url}: {e}"));
         }
+    }
+
+    #[test]
+    fn remote_config_validation_requires_and_validates_both_urls() {
+        let valid = ConnectionConfig {
+            mode: ConnectionMode::Remote,
+            remote_jobworkerp_url: Some("http://jobworkerp.example:9000".into()),
+            remote_memories_url: Some("https://[2001:db8::1]".into()),
+        };
+        assert!(validate_remote_connection_config(&valid).is_ok());
+
+        let missing_memories = ConnectionConfig {
+            remote_memories_url: None,
+            ..valid.clone()
+        };
+        assert!(matches!(
+            validate_remote_connection_config(&missing_memories),
+            Err(AppError::Config(message)) if message.contains("remote memories URL not configured")
+        ));
+
+        let invalid_memories = ConnectionConfig {
+            remote_memories_url: Some("ftp://memories.example".into()),
+            ..valid
+        };
+        assert!(validate_remote_connection_config(&invalid_memories).is_err());
     }
 
     #[test]

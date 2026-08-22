@@ -32,7 +32,8 @@ Lookback は Tauri が対応するデスクトップ環境を対象にします�
 このリポジトリにはアプリ UI が含まれますが、デスクトップアプリ全体を動かすには同梱バックエンドバイナリと jobworkerp プラグインが必要です。
 
 - [`jobworkerp`](https://github.com/jobworkerp-rs/jobworkerp-rs): `all-in-one`
-- [`memory-store`](https://github.com/jobworkerp-rs/memory-store): `front` / `memories-import`
+- [`memory-store`](https://github.com/jobworkerp-rs/memory-store): `front` / `memories-import` /
+  公式 SQLite migration bundle（`memories-db-migrate`、Atlas、migration catalog）
 - [`jobworkerp-conductor`](https://github.com/jobworkerp-rs/jobworkerp-conductor): `conductor-main`
 - `protoc`: 自己完結した公式 protobuf コンパイラ。ビルド時に自動取得します（子プロセスが worker 登録時に
   runner スキーマをコンパイルするため実行時必須で、同梱バイナリとして配布します）
@@ -40,6 +41,10 @@ Lookback は Tauri が対応するデスクトップ環境を対象にします�
 - [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner): 埋め込み生成ランナープラグイン
 
 フロントエンドの検査はこれらのバイナリなしでも実行できます。デスクトップアプリ全体の起動、ログインポート、モデルロード、配布パッケージのビルドには必要です。
+
+### 起動時のデータベース移行
+
+ローカルの memories データベースに移行が必要な場合、起動画面に「データベースの移行を確認・実行中」と表示されます。この表示中は処理の完了まで Lookback を終了または再起動しないでください。移行不要な場合も確認処理の間だけ短時間表示され、その後は通常の起動画面へ戻ります。
 
 ## ソースからビルド
 
@@ -62,8 +67,9 @@ Lookback は Tauri が対応するデスクトップ環境を対象にします�
 ### 自動ビルド（推奨）
 
 `scripts/build-release.sh` は、5 つの公開バックエンドリポジトリを clone し、プラットフォームと
-GPU バックエンドに応じた feature でビルドし、バイナリ / プラグイン / lindera 辞書を Tauri が
-期待する場所に配置したうえで `pnpm tauri build` を実行します。
+GPU バックエンドに応じた feature でビルドし、バイナリ / プラグイン / lindera 辞書に加えて
+`front`と同じmemory-store checkoutから公式SQLite migration bundleを生成・配置したうえで
+`pnpm tauri build` を実行します。
 
 ```bash
 # macOS（Metal GPU、DMG + .app）
@@ -117,7 +123,25 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
    src-tauri/bin/protoc-<triple>
    ```
 
-2. ランナープラグイン（`libjobworkerp_llama_cpp_plugin` と `libmm_embedding_runner`）を対象 OS
+2. `front`と`memories-import`をビルドしたものと同じmemory-store checkoutで公式SQLite
+   migration bundleを生成し、`src-tauri/migration-bundle/`へ配置します。生成scriptは既存の
+   出力先を上書きしないため、一時ディレクトリで完成させてから置き換えます。
+
+   ```bash
+   migration_stage="$(mktemp -d)"
+   cd /path/to/memory-store
+   scripts/build-memories-db-migrate-sqlite.sh \
+     "${migration_stage}/migration-bundle"
+   cd /path/to/agent-app
+   rm -rf src-tauri/migration-bundle
+   mv "${migration_stage}/migration-bundle" src-tauri/migration-bundle
+   pnpm verify:migration-bundle
+   ```
+
+   `pnpm tauri:build`もパッケージング前にこの検証を必ず実行し、coordinator、Atlas binary、
+   catalog、およびLookbackのschema契約が揃っていない配布物を拒否します。
+
+3. ランナープラグイン（`libjobworkerp_llama_cpp_plugin` と `libmm_embedding_runner`）を対象 OS
    向けにビルドし、共有ライブラリを `plugins/` に配置します。macOS で Ruri ONNX を使う
    mm runner は、Qwen 用 Metal と ONNX 用 CoreML の両 feature を有効にします。
 
@@ -137,7 +161,7 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
    cp target/release/front \
      /path/to/agent-app/src-tauri/bin/front-aarch64-apple-darwin
    ```
-3. `memory-store` の `front` を Lindera FTS 対応でビルドする場合は、検索用辞書（`metadata.json`
+4. `memory-store` の `front` を Lindera FTS 対応でビルドする場合は、検索用辞書（`metadata.json`
    を含む lindera 3.x 形式）を `dict/lindera/ipadic` に配置します。Lookback はこのディレクトリを
    パッケージに含めて `memory-store` 用に配置しますが、辞書を直接読み込んで解析するわけではありません。
 
@@ -154,7 +178,7 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
      が初期選択されます。既存設定や英語 UI の既定モデルは変更されません。
    - バックエンドとモデル準備状態の検査結果を確認します。
 3. プロバイダー、モデルパス、キャッシュパス、言語、タイムゾーン、MCP 公開設定を変更したい場合は、後から **設定** を開きます。
-   - Connection を **Remote server** にする場合でも **Embedding model** は変更できます。Semantic / Hybrid 検索を使う場合は、ローカルで各記事の embedding は生成されないため、リモートサーバ側の embedding モデル・ベクトル次元と同じ設定に揃えます。Remote server 接続中の変更では、ローカル embedding インデックスのリセットや再生成は行いません。ローカル memories SQLite/LanceDB は起動・参照せず、すべての memories 読み書きはリモート endpoint を使います。接続時には gRPC Server Reflection で必要な memories service とスレッドラベル RPC の schema を検証するため、リモート側は memory_kind 移行済みで、スレッドラベル RPC の `memory_kinds` フィルタを実装し、Reflection v1 を公開している必要があります。対応する更新済み memories バイナリを配布・設定してください。旧バイナリはこのフィールドを無視するため接続時に拒否され、スレッドタブに RAW 以外のラベルは混在しません。
+   - Connection を **Remote server** にする場合でも **Embedding model** は変更できます。Semantic / Hybrid 検索を使う場合は、ローカルで各記事の embedding は生成されないため、リモートサーバ側の embedding モデル・ベクトル次元と同じ設定に揃えます。Remote server 接続中の変更では、ローカル embedding インデックスのリセットや再生成は行いません。ローカル memories SQLite/LanceDB は起動・参照せず、すべての memories 読み書きはリモート endpoint を使います。接続時には gRPC Server Reflection で必要な memories service と一覧・件数 RPC の schema を検証するため、リモート側は summary の `memory_kinds` と `external_id_prefix` フィルタ、スレッドラベル RPC の `memory_kinds` フィルタを実装し、Reflection v1 を公開している必要があります。対応する更新済み memories バイナリを配布・設定してください。旧バイナリはこれらのフィールドを無視するため接続時に拒否され、各要約タブに異なる種別が混在しません。
    - **タイムゾーン** は、要約・インポート・タイムスタンプ表示で使う日付境界を制御します。**自動** はアプリの環境変数または OS のタイムゾーンに従います。明示的なタイムゾーンを保存すると、worker プロセスが起動時に `TZ` を読むため sidecar を再起動します。Connection が **Remote server** の間は、リモート workflow がリモートサーバ側の環境を使うため、この設定は変更できません。
 4. **スレッド** を開き、**インポート** から Claude Code または Codex のセッションログを取り込みます。ディレクトリ内のプレーンテキストを取り込む場合は、**プレーンテキスト (ディレクトリ)** をチェックし、対象ディレクトリを選択して、スレッド分割方法を選びます。
    - **ファイルごと**: 1 ファイル = 1 スレッド。
@@ -162,6 +186,8 @@ notarization には、公開リポジトリの GitHub Secrets に次の値を登
    - **全体で1つ**: ディレクトリ全体を 1 スレッドにする。
 
    プレーンテキストインポートは `.md` / `.txt` を再帰的に読み込みます。任意の **ソース名** (`a-z0-9_-`、32 字以内) を指定すると、インポート済みスレッドの名前空間プレフィックスになります（空の場合はインポーターの既定値を使用）。プレーンテキストは Claude Code / Codex と同じ実行でまとめて取り込めます。
+
+   手動インポートでは `~/.claude/projects` と `~/.codex/sessions` をソースごとに確認し、選択したディレクトリが存在しないソースだけを除外します。選択した自動検出ログのソースが 1 つも利用できない場合も、インポートは成功（対象なし）として完了し、トーストにその旨を表示します。プレーンテキストで指定したディレクトリが存在しない場合は、従来どおりエラーになります。regular の定期タスクもインポート前にソースごとに確認し、利用できない Codex / Claude Code のログルートは除外して `skipped_import_sources` に記録します。要約・生成の後続ステージは、ログルートが欠損していても設定どおり実行されます。
 5. **スレッド** でインポート済みスレッドを閲覧します。まずキーワード検索を使い、埋め込み生成ランナーが利用可能な場合はセマンティック検索とハイブリッド検索も利用できます。
 6. **要約** でスレッド単位・期間単位の要約を生成または確認します。
 7. **自省** と **パーソナリティ** で、インポート済みセッションから高次の観察結果を生成します。

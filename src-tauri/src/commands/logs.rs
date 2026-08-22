@@ -5,7 +5,8 @@
 //! tens of MB on a full import (memories span bodies — see the
 //! `DEFAULT_SIDECAR_LOG` comment), so we only ever return the *tail*: seek to
 //! the end, read the last `max_bytes`, and trim to a line boundary. No live
-//! streaming and no rotation in the MVP (rotation is a separate deferred item).
+//! streaming is exposed here; rotation keeps the fixed active names so this
+//! command remains compatible with the current-file-only UI.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;

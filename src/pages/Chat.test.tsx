@@ -4,7 +4,7 @@ import type { ChatTurn, UseRagChat } from "@/hooks/useRagChat";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
 import type { ChatSource } from "@/types/api";
-import { Chat } from "./Chat";
+import { buildChatMarkdown, Chat, type ChatMarkdownLabels } from "./Chat";
 
 // `findMemoryPosition` is overridden per-test to flip between the
 // success and fallback branches of `resolveThreadHighlight`.
@@ -13,11 +13,17 @@ import { Chat } from "./Chat";
 vi.mock("@/api", () => ({
   findMemoryPosition: vi.fn(),
   findMemoriesByThreadId: vi.fn().mockResolvedValue([]),
+  saveChatMarkdown: vi.fn(),
 }));
 
-import { findMemoryPosition } from "@/api";
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
+
+import { save } from "@tauri-apps/plugin-dialog";
+import { findMemoryPosition, saveChatMarkdown } from "@/api";
 
 const mockFindMemoryPosition = vi.mocked(findMemoryPosition);
+const mockSaveChatMarkdown = vi.mocked(saveChatMarkdown);
+const mockSaveDialog = vi.mocked(save);
 
 beforeAll(() => {
   // ThreadDetail relies on these jsdom-absent APIs.
@@ -58,6 +64,19 @@ function makeRag(turns: ChatTurn[], overrides: Partial<UseRagChat> = {}): UseRag
   };
 }
 
+function markdownLabels(language: "ja" | "en"): ChatMarkdownLabels {
+  const t = i18n.getFixedT(language);
+  return {
+    selectedSummaries: t("chat.export.selectedSummaries"),
+    sources: t("chat.export.sources"),
+    kind: t("chat.export.kind"),
+    memoryId: t("chat.export.memoryId"),
+    memory: (id) => t("chat.export.memory", { id }),
+    selectedKind: (kind) => t(`chat.selectSummary.kind.${kind}`),
+    sourceKind: (kind) => t(`chat.sourceKind.${kind}`),
+  };
+}
+
 interface RenderOpts {
   onNavigate?: ReturnType<typeof vi.fn>;
   onNavigateSummariesFocus?: ReturnType<typeof vi.fn>;
@@ -79,9 +98,12 @@ function renderChat(sources: ChatSource[], opts: RenderOpts = {}) {
 beforeEach(() => {
   i18n.changeLanguage("ja");
   mockFindMemoryPosition.mockReset();
+  mockSaveChatMarkdown.mockReset();
+  mockSaveDialog.mockReset();
   // Default to the fallback branch (memoryId-only highlight); tests
   // that exercise the success path override this.
   mockFindMemoryPosition.mockResolvedValue(null);
+  mockSaveChatMarkdown.mockResolvedValue(undefined);
 });
 
 describe("Chat source click", () => {
@@ -115,6 +137,24 @@ describe("Chat source click", () => {
     await waitFor(() => {
       expect(screen.getByRole("dialog")).toBeTruthy();
     });
+    expect(onNavigate).not.toHaveBeenCalled();
+    expect(onNavigateSummariesFocus).not.toHaveBeenCalled();
+  });
+
+  it("opens the origin thread for reflection sources", async () => {
+    const reflectionSource: ChatSource = {
+      source_kind: "reflection",
+      reflection_id: "102",
+      source_thread_id: "202",
+      snippet: "reflection snippet",
+      score: 0.8,
+    };
+    const { onNavigate, onNavigateSummariesFocus } = renderChat([reflectionSource]);
+    fireEvent.click(screen.getByTitle(/^自省:/));
+    await waitFor(() => {
+      expect(screen.getByRole("dialog")).toBeTruthy();
+    });
+    expect(mockFindMemoryPosition).not.toHaveBeenCalled();
     expect(onNavigate).not.toHaveBeenCalled();
     expect(onNavigateSummariesFocus).not.toHaveBeenCalled();
   });
@@ -285,6 +325,243 @@ describe("Chat terminal status", () => {
   });
 });
 
+describe("Chat selected memory display", () => {
+  it("keeps the selected snapshot visible on the originating turn", () => {
+    const selected = {
+      memory_id: "9007199254740993",
+      kind: "daily" as const,
+      title: "今日の作業",
+      content: "実装と検証を行った",
+      captured_at_ms: 1,
+      source_memory_ids: [],
+      source_thread_ids: [],
+    };
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([turn({ sources: [], selectedMemories: [selected] })])}
+      />,
+    );
+    expect(screen.getByText("使用した要約 (1)")).toBeTruthy();
+    expect(screen.getByText("今日の作業")).toBeTruthy();
+    expect(screen.getByText("実装と検証を行った")).toBeTruthy();
+  });
+
+  it("localizes selected kind and truncation notice", async () => {
+    await i18n.changeLanguage("en");
+    const selected = {
+      memory_id: "1",
+      kind: "daily" as const,
+      content: "work",
+      captured_at_ms: 1,
+      source_memory_ids: [],
+      source_thread_ids: [],
+    };
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([
+          turn({ sources: [], selectedMemories: [selected], selectedContentTruncated: true }),
+        ])}
+      />,
+    );
+    expect(screen.getByText("Daily")).toBeTruthy();
+    expect(
+      screen.getByText("Some selected materials were omitted to fit the context capacity."),
+    ).toBeTruthy();
+  });
+
+  it("renders reflection selections with the dedicated kind label", () => {
+    const selected = {
+      memory_id: "8",
+      kind: "reflection" as const,
+      content: "自省本文",
+      captured_at_ms: 1,
+    };
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([turn({ sources: [], selectedMemories: [selected] })])}
+      />,
+    );
+    expect(screen.getByText("自省")).toBeInTheDocument();
+  });
+
+  it("offers the include sources option when only selected summaries were used", () => {
+    const selected = {
+      memory_id: "9007199254740993",
+      kind: "daily" as const,
+      content: "実装と検証を行った",
+      captured_at_ms: 1,
+      source_memory_ids: [],
+      source_thread_ids: [],
+    };
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([turn({ sources: [], selectedMemories: [selected] })])}
+      />,
+    );
+
+    expect(screen.getByRole("checkbox", { name: "出典を含める" })).toBeTruthy();
+  });
+
+  it("reports a successful Markdown copy on the same turn", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([turn({ sources: [] })])}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Markdownをコピー" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("コピーしました");
+    expect(writeText).toHaveBeenCalledWith("test answer");
+  });
+
+  it("does not report success when the save dialog is cancelled", async () => {
+    mockSaveDialog.mockResolvedValue(null);
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([turn({ sources: [] })])}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Markdownとして保存" }));
+
+    await waitFor(() => expect(mockSaveDialog).toHaveBeenCalledTimes(1));
+    expect(mockSaveChatMarkdown).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("reports success after saving Markdown to the selected path", async () => {
+    mockSaveDialog.mockResolvedValue("/tmp/lookback.md");
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([turn({ sources: [] })])}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Markdownとして保存" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("保存しました");
+    expect(mockSaveChatMarkdown).toHaveBeenCalledWith("/tmp/lookback.md", "test answer");
+  });
+
+  it("copies the same source-inclusive Markdown selected for export", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([
+          turn({
+            sources: [
+              {
+                source_kind: "raw_memory",
+                memory_id: "2",
+                source_thread_id: "3",
+                snippet: "retrieved detail",
+                score: 1,
+              },
+            ],
+          }),
+        ])}
+      />,
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "出典を含める" }));
+    fireEvent.click(screen.getByRole("button", { name: "Markdownをコピー" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringContaining("## 出典")));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("retrieved detail"));
+  });
+
+  it("does not offer copy or save for a cancelled partial answer", () => {
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([turn({ sources: [], answer: "partial", cancelled: true })])}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Markdownをコピー" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Markdownとして保存" })).toBeNull();
+  });
+
+  it("exports selected summaries separately from retrieved sources", () => {
+    const selected = {
+      memory_id: "1",
+      kind: "daily" as const,
+      content: "selected work",
+      captured_at_ms: 1,
+    };
+    const markdown = buildChatMarkdown(
+      turn({
+        sources: [
+          {
+            source_kind: "raw_memory",
+            memory_id: "2",
+            source_thread_id: "3",
+            snippet: "retrieved detail",
+            score: 1,
+          },
+        ],
+        selectedMemories: [selected],
+      }),
+      true,
+      markdownLabels("en"),
+    );
+    expect(markdown).toContain("## Selected summaries");
+    expect(markdown).toContain("- Kind: Daily");
+    expect(markdown).not.toContain("selected work");
+    expect(markdown).toContain("## Sources");
+    expect(markdown).toContain("- Raw: retrieved detail");
+    expect(markdown).toContain("retrieved detail");
+  });
+
+  it("exports Japanese labels instead of raw kind values", () => {
+    const markdown = buildChatMarkdown(
+      turn({
+        sources: [
+          {
+            source_kind: "thread_summary",
+            memory_id: "2",
+            source_thread_id: "3",
+            snippet: "取得した詳細",
+            score: 1,
+          },
+        ],
+        selectedMemories: [
+          {
+            memory_id: "1",
+            kind: "weekly",
+            content: "選択した内容",
+            captured_at_ms: 1,
+            source_memory_ids: [],
+            source_thread_ids: [],
+          },
+        ],
+      }),
+      true,
+      markdownLabels("ja"),
+    );
+    expect(markdown).toContain("## 選択した要約");
+    expect(markdown).toContain("- 種別: 週次");
+    expect(markdown).toContain("- スレッド要約: 取得した詳細");
+    expect(markdown).not.toContain("thread_summary");
+  });
+});
+
 describe("Chat source list collapse", () => {
   // Prefix the memory_id with the kind so concatenating breakdowns
   // doesn't accidentally produce duplicate React keys. ChatSource is a
@@ -304,6 +581,15 @@ describe("Chat source list collapse", () => {
           memory_id,
           period_key: `2026-05-${String(i % 28).padStart(2, "0")}`,
           scope_key: "_all",
+          snippet,
+          score,
+        };
+      }
+      if (kind === "reflection") {
+        return {
+          source_kind: "reflection",
+          reflection_id: memory_id,
+          source_thread_id: `t-${kind}-${i}`,
           snippet,
           score,
         };

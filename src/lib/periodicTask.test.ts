@@ -230,19 +230,30 @@ describe("periodicTask form logic", () => {
     expect(draftFromTask(task).source).toBe(PERIODIC_COMBINED_SOURCE);
   });
 
-  it("validates missing source, invalid lookback, and monthly boundary", () => {
+  it("accepts zero lookback for the current day and rejects negative values", () => {
+    expect(
+      validatePeriodicDraft({
+        ...DEFAULT_PERIODIC_DRAFT,
+        lookback_days: 0,
+      }),
+    ).not.toContain("periodic.validation.lookbackRange");
+
+    expect(
+      validatePeriodicDraft({
+        ...DEFAULT_PERIODIC_DRAFT,
+        lookback_days: -1,
+      }),
+    ).toContain("periodic.validation.lookbackRange");
+  });
+
+  it("validates missing source and monthly boundary", () => {
     expect(
       validatePeriodicDraft({
         ...DEFAULT_PERIODIC_DRAFT,
         name: "",
         source: "",
-        lookback_days: 0,
       }),
-    ).toEqual([
-      "periodic.validation.nameRequired",
-      "periodic.validation.sourceRequired",
-      "periodic.validation.lookbackRange",
-    ]);
+    ).toEqual(["periodic.validation.nameRequired", "periodic.validation.sourceRequired"]);
 
     expect(
       validatePeriodicDraft({

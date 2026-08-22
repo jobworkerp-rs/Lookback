@@ -6,24 +6,52 @@
 //! `run_personality` / `run_reflection`); an unselected step is emitted
 //! as a skipped `Waiting` rather than dispatched.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use sha2::{Digest, Sha256};
+use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use super::connection::{MemoriesCallback, ResolvedTargets};
+use super::connection::{ConnectionMode, MemoriesCallback, ResolvedTargets};
 use super::{
-    AppState, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner, emit_event,
-    emit_generated_refresh, thread_reflection_single_completed, thread_summary_single_completed,
+    AppState, StepOutcome, StepStatus, cancel_dispatch_inner, emit_event, emit_generated_refresh,
+    generated_refresh_scopes_from_position, json_as_i64,
 };
 use crate::error::{AppError, AppResult};
+use crate::grpc::proto::llm_memory::data as mem_data;
+use crate::grpc::proto::llm_memory::service as mem_svc;
+use crate::grpc::proto::llm_memory::service::thread_service_client::ThreadServiceClient;
 use crate::jobworkerp::{JobworkerpHandle, StreamEvent, run_cancellable_named_stream};
+
+/// Completes the single maintenance scope after every source and selected
+/// downstream generation step reaches a terminal outcome, including cancel
+/// and early failure paths in the detached import driver.
+struct ImportMaintenanceGuard {
+    app: AppHandle,
+    registered: bool,
+}
+
+impl Drop for ImportMaintenanceGuard {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(state) = app.try_state::<AppState>()
+                && let Err(error) = super::finish_search_index_write(&state, true).await
+            {
+                tracing::warn!(%error, "import terminal maintenance reconcile failed");
+            }
+        });
+    }
+}
 
 /// Single source of truth for the reflection `prompt_version`. Bumping this
 /// string makes regeneration produce fresh reflections: the tuple
@@ -35,8 +63,40 @@ use crate::jobworkerp::{JobworkerpHandle, StreamEvent, run_cancellable_named_str
 pub(super) const REFLECTION_PROMPT_VERSION: &str = "20260525-reflexion";
 const PERSONALITY_MAX_CONTEXT_CHARS: i64 = 150_000;
 const PERSONALITY_MERGE_MAX_SIGNALS: i64 = 100;
+static IMPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+struct ImportExecutionGuard;
+
+impl ImportExecutionGuard {
+    fn acquire() -> AppResult<Self> {
+        IMPORT_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AppError::Config("another import is already running".into()))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ImportExecutionGuard {
+    fn drop(&mut self) {
+        IMPORT_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+/// Closes the native child-log scope after the detached import driver has
+/// finished, including cancellation and early-return paths. Retention only
+/// considers scopes marked closed, so this guard prevents deleting a running
+/// import's native file.
+struct NativeImportLogGuard(PathBuf);
+
+impl Drop for NativeImportLogGuard {
+    fn drop(&mut self) {
+        if let Err(error) = crate::log_rotation::mark_native_log_dir_closed(&self.0) {
+            tracing::debug!(path = %self.0.display(), %error, "could not mark native import log closed");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImportSource {
     ClaudeCode,
@@ -52,6 +112,479 @@ impl ImportSource {
             ImportSource::Plain => "plain",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingImportSession {
+    memories_endpoint_id: String,
+    user_id: i64,
+    source: ImportSource,
+    session_key: String,
+    thread_id: String,
+}
+
+const PENDING_IMPORT_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingImportScope {
+    memories_endpoint_id: String,
+    user_id: i64,
+}
+
+impl PendingImportScope {
+    fn new(mode: ConnectionMode, memories_url: &str, user_id: i64) -> AppResult<Self> {
+        Ok(Self {
+            memories_endpoint_id: pending_memories_endpoint_id(mode, memories_url)?,
+            user_id,
+        })
+    }
+
+    fn contains(&self, session: &PendingImportSession) -> bool {
+        session.memories_endpoint_id == self.memories_endpoint_id && session.user_id == self.user_id
+    }
+}
+
+fn pending_memories_endpoint_id(mode: ConnectionMode, memories_url: &str) -> AppResult<String> {
+    if mode == ConnectionMode::Local {
+        return Ok("local".into());
+    }
+    let url = url::Url::parse(memories_url)
+        .map_err(|error| AppError::Config(format!("invalid memories URL: {error}")))?;
+    let scheme = match url.scheme() {
+        "http" | "https" => url.scheme(),
+        other => {
+            return Err(AppError::Config(format!(
+                "memories URL must be http or https, got {other}"
+            )));
+        }
+    };
+    let host = match url.host() {
+        Some(url::Host::Domain(host)) => host.to_ascii_lowercase(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Ipv6(host)) => format!("[{host}]"),
+        None => return Err(AppError::Config("memories URL has no host".into())),
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| AppError::Config("memories URL has no effective port".into()))?;
+    let digest = Sha256::digest(format!("{scheme}://{host}:{port}").as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(format!("remote-sha256:{encoded}"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingImportState {
+    format_version: u32,
+    sessions: Vec<PendingImportSession>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedImportThread {
+    thread_id: String,
+    user_id: i64,
+    memory_kind: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconciledImportTargets {
+    target_thread_ids: Vec<String>,
+    candidate_intersection: Vec<String>,
+    supplemented_ids: Vec<String>,
+}
+
+fn reconcile_import_targets(
+    emitted_ids: &[String],
+    candidate_ids: &[String],
+    verified: &[VerifiedImportThread],
+    expected_user_id: i64,
+) -> AppResult<ReconciledImportTargets> {
+    let candidates = candidate_ids
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let verified_by_id = verified
+        .iter()
+        .map(|thread| (&thread.thread_id, thread))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut target_thread_ids = emitted_ids.to_vec();
+    target_thread_ids.sort();
+    target_thread_ids.dedup();
+    let mut candidate_intersection = Vec::new();
+    let mut supplemented_ids = Vec::new();
+    for thread_id in &target_thread_ids {
+        let thread = verified_by_id.get(thread_id).ok_or_else(|| {
+            AppError::Config(format!("import target thread {thread_id} was not found"))
+        })?;
+        if thread.user_id != expected_user_id
+            || thread.memory_kind != mem_data::MemoryKind::Raw as i32
+        {
+            return Err(AppError::Config(format!(
+                "import target thread {thread_id} is not owned RAW data"
+            )));
+        }
+        if candidates.contains(thread_id) {
+            candidate_intersection.push(thread_id.clone());
+        } else {
+            supplemented_ids.push(thread_id.clone());
+        }
+    }
+    Ok(ReconciledImportTargets {
+        target_thread_ids,
+        candidate_intersection,
+        supplemented_ids,
+    })
+}
+
+async fn verify_import_threads(
+    memories_url: &str,
+    thread_ids: &[String],
+) -> AppResult<Vec<VerifiedImportThread>> {
+    let mut client = ThreadServiceClient::new(crate::grpc::connect(memories_url).await?);
+    let mut verified = Vec::with_capacity(thread_ids.len());
+    for thread_id in thread_ids {
+        let numeric_id = thread_id.parse::<i64>().map_err(|_| {
+            AppError::Config(format!("invalid pending import thread id {thread_id}"))
+        })?;
+        let response = client
+            .find(mem_data::ThreadId { value: numeric_id })
+            .await?
+            .into_inner();
+        let thread = response.data.ok_or_else(|| {
+            AppError::Config(format!("import target thread {thread_id} is absent"))
+        })?;
+        let data = thread.data.ok_or_else(|| {
+            AppError::Config(format!("import target thread {thread_id} has no data"))
+        })?;
+        verified.push(VerifiedImportThread {
+            thread_id: thread_id.clone(),
+            user_id: data.user_id.map(|id| id.value).unwrap_or_default(),
+            memory_kind: data.memory_kind,
+        });
+    }
+    Ok(verified)
+}
+
+async fn find_import_window_candidates(
+    memories_url: &str,
+    user_id: i64,
+    after: i64,
+    before: i64,
+) -> AppResult<Vec<String>> {
+    if before <= after {
+        return Ok(Vec::new());
+    }
+    let mut client = ThreadServiceClient::new(crate::grpc::connect(memories_url).await?);
+    let request = mem_svc::FindThreadListByUserIdRequest {
+        user_id: Some(mem_data::UserId { value: user_id }),
+        limit: None,
+        offset: None,
+        sort: None,
+        memory_kinds: vec![mem_data::MemoryKind::Raw as i32],
+        thread_created_after: Some(after),
+        thread_created_before: Some(before),
+        thread_updated_after: None,
+        thread_updated_before: None,
+        first_message_after: None,
+        first_message_before: None,
+        last_message_after: None,
+        last_message_before: None,
+    };
+    let mut stream = client
+        .find_thread_list_by_user_id(request)
+        .await?
+        .into_inner();
+    let mut ids = Vec::new();
+    while let Some(thread) = tokio_stream::StreamExt::next(&mut stream).await {
+        if let Some(id) = thread?.id {
+            ids.push(id.value.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+impl Default for PendingImportState {
+    fn default() -> Self {
+        Self {
+            format_version: PENDING_IMPORT_FORMAT_VERSION,
+            sessions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ImportCreationEventWire {
+    version: u32,
+    event: String,
+    source: ImportSource,
+    session_key: String,
+    thread_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ImportSessionCompletedEvent {
+    source: ImportSource,
+    session_key: String,
+    thread_id: String,
+    imported_count: u64,
+    success: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ImportStdoutLine {
+    Creation(ImportCreationEventWire),
+    SessionCompleted(ImportSessionCompletedEvent),
+    Text(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionDisposition {
+    TrackPending,
+    IgnoreExisting,
+}
+
+fn classify_session_completion(
+    pending: &PendingImportState,
+    scope: &PendingImportScope,
+    completed: &ImportSessionCompletedEvent,
+) -> AppResult<CompletionDisposition> {
+    if !completed.success {
+        return Err(AppError::Config(format!(
+            "memories-import session failed: {}/{}",
+            completed.source.cli_subcommand(),
+            completed.session_key
+        )));
+    }
+    let pending_for_key = pending.sessions.iter().find(|session| {
+        scope.contains(session)
+            && session.source == completed.source
+            && session.session_key == completed.session_key
+    });
+    match pending_for_key {
+        Some(session) if session.thread_id == completed.thread_id => {
+            Ok(CompletionDisposition::TrackPending)
+        }
+        Some(_) => Err(AppError::Config(format!(
+            "memories-import changed thread_id for pending session {}",
+            completed.session_key
+        ))),
+        None => Ok(CompletionDisposition::IgnoreExisting),
+    }
+}
+
+fn parse_import_stdout_line(line: &str) -> AppResult<ImportStdoutLine> {
+    let value = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(value) => value,
+        Err(error) if line.contains("memories-import-event") => {
+            return Err(AppError::Config(format!(
+                "malformed memories-import event: {error}"
+            )));
+        }
+        Err(_) => return Ok(ImportStdoutLine::Text(line.to_string())),
+    };
+    if value.get("schema").and_then(|value| value.as_str()) != Some("memories-import-event") {
+        return Ok(ImportStdoutLine::Text(line.to_string()));
+    }
+    let version = value.get("version").and_then(|value| value.as_u64());
+    let event_name = value.get("event").and_then(|value| value.as_str());
+    if version != Some(1) {
+        return Err(AppError::Config(format!(
+            "unsupported memories-import event version {:?}",
+            version
+        )));
+    }
+    if event_name == Some("session_completed") {
+        let event: ImportSessionCompletedEvent = serde_json::from_value(value)
+            .map_err(|error| AppError::Config(format!("invalid memories-import event: {error}")))?;
+        validate_import_event_identity(&event.session_key, &event.thread_id)?;
+        return Ok(ImportStdoutLine::SessionCompleted(event));
+    }
+    let event: ImportCreationEventWire = serde_json::from_value(value)
+        .map_err(|error| AppError::Config(format!("invalid memories-import event: {error}")))?;
+    if event.event != "thread_created" {
+        return Err(AppError::Config(format!(
+            "unsupported memories-import event {}@{}",
+            event.event, event.version
+        )));
+    }
+    validate_import_event_identity(&event.session_key, &event.thread_id)?;
+    Ok(ImportStdoutLine::Creation(event))
+}
+
+fn reported_imported_count(lines: &[String]) -> Option<usize> {
+    lines.iter().find_map(|line| {
+        line.trim()
+            .strip_prefix("Memories imported:")
+            .and_then(|count| count.trim().parse().ok())
+    })
+}
+
+fn validate_import_event_identity(session_key: &str, thread_id: &str) -> AppResult<()> {
+    if session_key.trim().is_empty() {
+        return Err(AppError::Config(
+            "memories-import event session_key must not be empty".into(),
+        ));
+    }
+    let parsed_id = thread_id.parse::<i64>().map_err(|_| {
+        AppError::Config("memories-import event thread_id must be a decimal i64 string".into())
+    })?;
+    if parsed_id <= 0 || thread_id != parsed_id.to_string() {
+        return Err(AppError::Config(
+            "memories-import event thread_id must be a canonical positive decimal string".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_import_event_source(
+    expected_source: ImportSource,
+    event_source: ImportSource,
+) -> AppResult<()> {
+    if event_source == expected_source {
+        return Ok(());
+    }
+    Err(AppError::Config(format!(
+        "memories-import lifecycle event source mismatch: expected {}, got {}",
+        expected_source.cli_subcommand(),
+        event_source.cli_subcommand()
+    )))
+}
+
+fn load_pending_imports(path: &Path) -> AppResult<PendingImportState> {
+    match std::fs::read(path) {
+        Ok(raw) => {
+            let value: serde_json::Value = serde_json::from_slice(&raw)
+                .map_err(|error| AppError::Config(format!("read import pending state: {error}")))?;
+            let format_version = value
+                .get("format_version")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    AppError::Config("import pending state format_version is missing".into())
+                })?;
+            if format_version == 1 {
+                let sessions = value
+                    .get("sessions")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| {
+                        AppError::Config("legacy import pending state sessions is invalid".into())
+                    })?;
+                if sessions.is_empty() {
+                    return Ok(PendingImportState::default());
+                }
+                return Err(AppError::Config(format!(
+                    "import pending state format_version=1 contains sessions without a Memories endpoint or user scope; inspect and move aside {} before importing",
+                    path.display()
+                )));
+            }
+            if format_version != u64::from(PENDING_IMPORT_FORMAT_VERSION) {
+                return Err(AppError::Config(format!(
+                    "unsupported import pending state format_version: {format_version}"
+                )));
+            }
+            serde_json::from_value(value)
+                .map_err(|error| AppError::Config(format!("read import pending state: {error}")))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(PendingImportState::default())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_pending_imports(path: &Path, state: &PendingImportState) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Config("import pending path has no parent".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".import-pending-{}.tmp", std::process::id()));
+    let raw = serde_json::to_vec_pretty(state)
+        .map_err(|error| AppError::Config(format!("serialize import pending state: {error}")))?;
+    let mut file = std::fs::File::create(&tmp)?;
+    use std::io::Write;
+    file.write_all(&raw)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn record_pending_import(
+    path: &Path,
+    state: &mut PendingImportState,
+    session: PendingImportSession,
+) -> AppResult<()> {
+    if let Some(existing) = state.sessions.iter_mut().find(|existing| {
+        existing.memories_endpoint_id == session.memories_endpoint_id
+            && existing.user_id == session.user_id
+            && existing.source == session.source
+            && existing.session_key == session.session_key
+    }) {
+        if existing.thread_id != session.thread_id {
+            return Err(AppError::Config(format!(
+                "memories-import changed thread_id for stable session key {}",
+                session.session_key
+            )));
+        }
+    } else {
+        state.sessions.push(session);
+    }
+    state.sessions.sort_by(|left, right| {
+        (
+            &left.memories_endpoint_id,
+            left.user_id,
+            &left.source,
+            &left.session_key,
+        )
+            .cmp(&(
+                &right.memories_endpoint_id,
+                right.user_id,
+                &right.source,
+                &right.session_key,
+            ))
+    });
+    save_pending_imports(path, state)
+}
+
+fn completed_pending_state(
+    current: &PendingImportState,
+    targeted: &[PendingImportSession],
+    downstream_completed: bool,
+) -> PendingImportState {
+    if !downstream_completed {
+        return current.clone();
+    }
+    let mut next = current.clone();
+    next.sessions.retain(|session| !targeted.contains(session));
+    next
+}
+
+fn select_targeted_sessions(
+    pending: &PendingImportState,
+    scope: &PendingImportScope,
+    completions: &[ImportSessionCompletedEvent],
+    selected_sources: &[ImportSource],
+) -> Vec<PendingImportSession> {
+    pending
+        .sessions
+        .iter()
+        .filter(|session| {
+            scope.contains(session)
+                && selected_sources.contains(&session.source)
+                && completions.iter().any(|completed| {
+                    completed.success
+                        && completed.source == session.source
+                        && completed.session_key == session.session_key
+                        && completed.thread_id == session.thread_id
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+fn should_dispatch_import_targets(target_thread_ids: &[String]) -> bool {
+    !target_thread_ids.is_empty()
 }
 
 /// How `memories-import plain` groups discovered files into threads. Mirrors
@@ -154,12 +687,40 @@ impl DownstreamPlan {
     }
 }
 
+/// Return downstream steps in their execution order with their selection state.
+/// Keeping this table in one place prevents terminal no-op paths from drifting
+/// away from the normal import pipeline.
+fn downstream_steps(plan: DownstreamPlan) -> [(ImportStep, bool); 3] {
+    [
+        (ImportStep::ThreadSummary, plan.summary),
+        (ImportStep::ThreadPersonality, plan.personality),
+        (ImportStep::Reflection, plan.reflection),
+    ]
+}
+
+/// Decide the terminal state for each downstream step when no import targets
+/// exist. This pure table keeps the no-op behavior testable independently of
+/// Tauri event emission.
+fn no_target_downstream_decisions(
+    plan: DownstreamPlan,
+) -> [(ImportStep, StepStatus, &'static str); 3] {
+    downstream_steps(plan).map(|(step, selected)| {
+        if selected {
+            (step, StepStatus::Done, "対象スレッドなし")
+        } else {
+            (step, StepStatus::Waiting, "スキップ")
+        }
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportStepUpdate {
     pub job_id: String,
     pub step: ImportStep,
     pub status: StepStatus,
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice_code: Option<ImportNoticeCode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -169,6 +730,64 @@ pub enum ImportStep {
     ThreadSummary,
     ThreadPersonality,
     Reflection,
+}
+
+/// Stable machine-readable notices attached to an import step. Optional
+/// serialization keeps older event consumers compatible with the original
+/// `ImportStepUpdate` shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportNoticeCode {
+    NoImportableLogSources,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManualImportSourceSelection {
+    sources: Vec<ImportSource>,
+    no_importable_log_sources: bool,
+}
+
+/// Filter only the well-known Claude Code / Codex roots for the manual import
+/// command. Plain imports intentionally pass through untouched: their root is
+/// validated by `validate_plain`, and periodic imports do not use this path.
+fn filter_manual_import_sources(
+    requested: &[ImportSource],
+    home_dir: Option<&Path>,
+) -> ManualImportSourceSelection {
+    let mut sources = Vec::with_capacity(requested.len());
+    for source in requested {
+        let root = match source {
+            ImportSource::ClaudeCode => home_dir.map(|home| home.join(".claude/projects")),
+            ImportSource::Codex => home_dir.map(|home| home.join(".codex/sessions")),
+            ImportSource::Plain => None,
+        };
+        let importable = match source {
+            ImportSource::Plain => true,
+            ImportSource::ClaudeCode | ImportSource::Codex => {
+                root.as_ref().map(|path| path.is_dir()).unwrap_or(false)
+            }
+        };
+        if importable {
+            sources.push(*source);
+        } else {
+            match root {
+                Some(path) => warn!(
+                    source = source.cli_subcommand(),
+                    path = %path.display(),
+                    "manual import source root is missing; skipping source"
+                ),
+                None => warn!(
+                    source = source.cli_subcommand(),
+                    "manual import source root is unavailable; skipping source"
+                ),
+            }
+        }
+    }
+    let no_importable_log_sources = !requested.is_empty() && sources.is_empty();
+    ManualImportSourceSelection {
+        sources,
+        no_importable_log_sources,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,9 +901,22 @@ pub async fn start_import(
     state: State<'_, AppState>,
     req: StartImportRequest,
 ) -> AppResult<StartImportResponse> {
+    let import_execution = ImportExecutionGuard::acquire()?;
     // Validate up front so a half-spawned set of children can't be left
     // behind when an invalid source slips into the middle of the list.
     validate_plain(&req)?;
+    let job_id = req
+        .dispatch_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("import-{}", chrono::Utc::now().timestamp_millis()));
+    let source_selection = filter_manual_import_sources(&req.sources, dirs::home_dir().as_deref());
+    let sources = source_selection.sources;
+    let downstream = DownstreamPlan::from_request(&req);
+    if source_selection.no_importable_log_sources {
+        emit_no_importable_log_sources(&app, &job_id, downstream);
+        return Ok(StartImportResponse { job_id });
+    }
 
     // Import writes memory embeddings into the local LanceDB; refuse when it
     // is degraded (local mode only — a remote import writes to the remote
@@ -294,14 +926,15 @@ pub async fn start_import(
     // Honor the connection override: import targets the same
     // memories / jobworkerp the browse clients use — local sidecar by default,
     // or a remote server (incl. HTTPS) when configured.
-    let targets = state.resolve_targets()?;
+    let resolved_connection = state.resolve_connection()?;
+    let connection_mode = resolved_connection.mode;
+    let targets = resolved_connection.targets;
+    let memories_url_for_validation = targets.memories_url.clone();
+    let use_local_candidate_window = connection_mode == ConnectionMode::Local;
+    let import_started_after = chrono::Utc::now().timestamp_millis().saturating_sub(1);
     let callback = targets.memories_callback()?;
     let user_id = req.user_id.unwrap_or(1);
-    let job_id = req
-        .dispatch_id
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("import-{}", chrono::Utc::now().timestamp_millis()));
+    let pending_scope = PendingImportScope::new(connection_mode, &targets.memories_url, user_id)?;
 
     emit_step(
         &app,
@@ -318,11 +951,10 @@ pub async fn start_import(
     let dispatch_ctx = if req.dry_run {
         None
     } else {
-        let since_ms = parse_since_millis(req.since.as_deref())?;
         let d = BatchDispatch::resolve(
             &callback,
             user_id,
-            since_ms,
+            None,
             state.active_llm_worker_name().to_string(),
             state.active_output_language(),
         )?;
@@ -330,6 +962,39 @@ pub async fn start_import(
         Some((d, h))
     };
 
+    let selected_sources = sources.clone();
+    let pending_path = state.data.import_pending_path();
+    let pending_imports = Arc::new(parking_lot::Mutex::new(load_pending_imports(
+        &pending_path,
+    )?));
+    let completed_sessions = Arc::new(parking_lot::Mutex::new(
+        Vec::<ImportSessionCompletedEvent>::new(),
+    ));
+    let app_for_task = app.clone();
+    let job_id_for_task = job_id.clone();
+    let aggregator = Arc::new(ImportAggregator::new(sources.len()));
+    let dry_run = req.dry_run;
+    // Persist the conservative dirty generation before the import process is
+    // dispatched. Dry-runs do not create a scope because they cannot write.
+    let maintenance_registered = if dry_run {
+        false
+    } else {
+        super::begin_search_index_write(
+            &state,
+            &[
+                crate::search_index_maintenance::MaintenanceTable::Memory,
+                crate::search_index_maintenance::MaintenanceTable::Thread,
+            ],
+        )
+        .await?
+    };
+    let log_dir = state.data.log_dir();
+    let native_log_dir = crate::log_rotation::native_log_dir(&log_dir, &format!("import-{job_id}"))
+        .map_err(|error| {
+            AppError::Config(format!(
+                "could not create native import log directory: {error}"
+            ))
+        })?;
     let plan = ImportPlan::new(
         req.memories_import_bin.clone(),
         user_id,
@@ -337,18 +1002,19 @@ pub async fn start_import(
         req.since.clone(),
         req.dry_run,
         req.labels.clone(),
-        state.data.log_dir(),
+        native_log_dir,
         req.plain.clone(),
     );
-    let sources = req.sources.clone();
-    let app_for_task = app.clone();
-    let job_id_for_task = job_id.clone();
-    let aggregator = Arc::new(ImportAggregator::new(req.sources.len()));
-    let dry_run = req.dry_run;
-    let downstream = DownstreamPlan::from_request(&req);
     let entry = state.dispatch_register(&job_id).await;
+    let native_log_dir_for_task = plan.native_log_dir.clone();
 
     tokio::spawn(async move {
+        let _import_execution = import_execution;
+        let _native_import_log = NativeImportLogGuard(native_log_dir_for_task);
+        let _maintenance = ImportMaintenanceGuard {
+            app: app_for_task.clone(),
+            registered: maintenance_registered,
+        };
         let cancel = entry.token.clone();
         let current_job_id = entry.current_job_id.clone();
         let current_step = entry.current_step.clone();
@@ -365,22 +1031,32 @@ pub async fn start_import(
         let mut import_state: Option<AggregatedState> = None;
         let mut cancelled_mid_import = false;
         for source in sources {
+            if cancel.is_cancelled() {
+                cancelled_mid_import = true;
+                break;
+            }
             let cmd = plan.build_command(source);
-            // Race the CLI against the cancel token so an in-flight
-            // `memories-import` child stops within the kill_on_drop
-            // window instead of running to natural completion. The
-            // child inherits `kill_on_drop(true)` from `build_command`,
-            // so dropping the spawn future here SIGTERMs it.
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    cancelled_mid_import = true;
-                    break;
-                }
-                outcome = run_one_source(cmd, &aggregator) => {
-                    if let Some(state) = outcome {
-                        import_state = Some(state);
-                    }
-                }
+            let outcome = run_one_source(
+                cmd,
+                ImportLogContext {
+                    aggregator: aggregator.clone(),
+                    pending_path: pending_path.clone(),
+                    pending_imports: pending_imports.clone(),
+                    completed_sessions: completed_sessions.clone(),
+                    pending_scope: pending_scope.clone(),
+                    expected_source: source,
+                    dry_run,
+                    cancel: cancel.clone(),
+                    native_log_dir: Some(plan.native_log_dir.clone()),
+                },
+            )
+            .await;
+            if cancel.is_cancelled() {
+                cancelled_mid_import = true;
+                break;
+            }
+            if let Some(state) = outcome {
+                import_state = Some(state);
             }
         }
         if cancelled_mid_import {
@@ -398,7 +1074,7 @@ pub async fn start_import(
         let succeeded = matches!(import_state, AggregatedState::AllSucceeded { .. });
         emit_thread_import_terminal(&app_for_task, &job_id_for_task, import_state, dry_run);
 
-        let Some((dispatch, handle)) = dispatch_ctx else {
+        let Some((mut dispatch, handle)) = dispatch_ctx else {
             mark_downstream(
                 &app_for_task,
                 &job_id_for_task,
@@ -416,6 +1092,86 @@ pub async fn start_import(
             );
             return;
         }
+        let current_completions = completed_sessions.lock().clone();
+        let targeted_sessions = select_targeted_sessions(
+            &pending_imports.lock(),
+            &pending_scope,
+            &current_completions,
+            &selected_sources,
+        );
+        let mut target_thread_ids = targeted_sessions
+            .iter()
+            .map(|session| session.thread_id.clone())
+            .collect::<Vec<_>>();
+        target_thread_ids.sort();
+        target_thread_ids.dedup();
+        let candidate_ids = if use_local_candidate_window {
+            match find_import_window_candidates(
+                &memories_url_for_validation,
+                user_id,
+                import_started_after,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            {
+                Ok(ids) => ids,
+                Err(error) => {
+                    mark_downstream(
+                        &app_for_task,
+                        &job_id_for_task,
+                        StepStatus::Failed,
+                        &error.to_string(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let verified =
+            match verify_import_threads(&memories_url_for_validation, &target_thread_ids).await {
+                Ok(verified) => verified,
+                Err(error) => {
+                    mark_downstream(
+                        &app_for_task,
+                        &job_id_for_task,
+                        StepStatus::Failed,
+                        &error.to_string(),
+                    );
+                    return;
+                }
+            };
+        let targets = match reconcile_import_targets(
+            &target_thread_ids,
+            &candidate_ids,
+            &verified,
+            user_id,
+        ) {
+            Ok(targets) => targets,
+            Err(error) => {
+                mark_downstream(
+                    &app_for_task,
+                    &job_id_for_task,
+                    StepStatus::Failed,
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+        info!(
+            target_count = targets.target_thread_ids.len(),
+            candidate_intersection_count = targets.candidate_intersection.len(),
+            supplemented_count = targets.supplemented_ids.len(),
+            unrelated_candidate_count = candidate_ids
+                .len()
+                .saturating_sub(targets.candidate_intersection.len()),
+            "resolved import generation target IDs"
+        );
+        if !should_dispatch_import_targets(&targets.target_thread_ids) {
+            emit_no_target_downstream(&app_for_task, &job_id_for_task, downstream);
+            return;
+        }
+        dispatch.target_thread_ids = Some(targets.target_thread_ids);
 
         // Step 2-4 run sequentially; each step's stream
         // blocks until the worker's stream closes. They're independent
@@ -427,6 +1183,7 @@ pub async fn start_import(
         // remaining ones to `Failed` + "中断によりスキップ" via the
         // `downstream_after_cancel` decision table — see
         // `decide_after_cancel` for the pure logic + tests.
+        let mut downstream_completed = true;
         for (step, run, worker, input) in [
             (
                 ImportStep::ThreadSummary,
@@ -448,6 +1205,7 @@ pub async fn start_import(
             ),
         ] {
             if cancel.is_cancelled() {
+                downstream_completed = false;
                 emit_step(
                     &app_for_task,
                     &job_id_for_task,
@@ -462,7 +1220,7 @@ pub async fn start_import(
                 continue;
             }
             *current_step.lock().await = Some(step_label(step).into());
-            run_cancellable_step(
+            let completed = run_cancellable_step(
                 &app_for_task,
                 &job_id_for_task,
                 step,
@@ -473,6 +1231,16 @@ pub async fn start_import(
                 current_job_id.clone(),
             )
             .await;
+            downstream_completed &= completed;
+        }
+        if downstream_completed {
+            let mut guard = pending_imports.lock();
+            let next = completed_pending_state(&guard, &targeted_sessions, true);
+            if let Err(error) = save_pending_imports(&pending_path, &next) {
+                warn!(error = %error, "could not clear completed import pending state");
+            } else {
+                *guard = next;
+            }
         }
     });
 
@@ -584,13 +1352,9 @@ struct ImportPlan {
     since: Option<String>,
     dry_run: bool,
     labels: Vec<String>,
-    /// Where the `memories-import` child should drop its tracing log file.
-    /// command-utils' tracing init defaults the log directory to
-    /// `current_dir()`; a bundled `.app` launched from Finder inherits `/`
-    /// as its cwd, so the child panics trying to create the log at the
-    /// (unwritable) filesystem root. Pointing `LOG_FILE_DIR` at the data
-    /// root's `log/` keeps the import log next to the sidecar logs.
-    log_dir: PathBuf,
+    /// Dedicated directory for this import's native tracing output. The
+    /// parent-captured stdout/stderr files remain the canonical logs.
+    native_log_dir: PathBuf,
     /// Plain-source parameters, consumed by `build_command`'s plain arm.
     /// `None` for a request that doesn't select the plain source.
     plain: Option<PlainImportConfig>,
@@ -605,7 +1369,7 @@ impl ImportPlan {
         since: Option<String>,
         dry_run: bool,
         labels: Vec<String>,
-        log_dir: PathBuf,
+        native_log_dir: PathBuf,
         plain: Option<PlainImportConfig>,
     ) -> Self {
         Self {
@@ -616,7 +1380,7 @@ impl ImportPlan {
             since,
             dry_run,
             labels,
-            log_dir,
+            native_log_dir,
             plain,
         }
     }
@@ -626,7 +1390,8 @@ impl ImportPlan {
         cmd.arg("--user-id")
             .arg(self.user_id.to_string())
             .arg("--server-url")
-            .arg(&self.memories_url);
+            .arg(&self.memories_url)
+            .arg("--events-jsonl");
 
         if let Some(since) = self.since.as_deref() {
             cmd.arg("--since").arg(since);
@@ -668,9 +1433,9 @@ impl ImportPlan {
 
         cmd.env("JOBWORKERP_ADDR", &self.jobworkerp_addr)
             .env("RUST_LOG", "info")
-            // Force the child's tracing log under the data root; otherwise it
-            // defaults to cwd, which is `/` for a Finder-launched .app and
-            // panics on the unwritable root (command-utils tracing.rs).
+            // Force the child's native tracing log into this import's isolated
+            // data-root scope; otherwise it defaults to cwd, which is `/` for
+            // a Finder-launched .app and panics on the unwritable root.
             //
             // The child reads its log config via `envy::prefixed("LOG_")` into
             // a struct whose `use_json` / `use_stdout` are plain `bool` (no
@@ -678,7 +1443,7 @@ impl ImportPlan {
             // makes the whole deserialize fail and the importer silently falls
             // back to `current_dir()` — which is exactly why LOG_FILE_DIR alone
             // had no effect. We must set all three for the dir to take.
-            .env("LOG_FILE_DIR", &self.log_dir)
+            .env("LOG_FILE_DIR", &self.native_log_dir)
             .env("LOG_USE_JSON", "true")
             .env("LOG_APP_NAME", "Lookback")
             .env("LOG_USE_STDOUT", "true")
@@ -768,9 +1533,13 @@ pub struct GenerateSummariesRequest {
     pub run_daily: bool,
     pub run_weekly: bool,
     pub run_monthly: bool,
+    /// Abort the staged pipeline on the first observed stage failure.
+    /// Absent clients retain the legacy best-effort behaviour.
+    #[serde(default)]
+    pub stop_on_error: bool,
     /// Per-thread window (epoch ms). `None` = unbounded.
-    pub updated_after_ms: Option<i64>,
-    pub updated_before_ms: Option<i64>,
+    pub last_message_after_ms: Option<i64>,
+    pub last_message_before_ms: Option<i64>,
     /// Period range tokens; empty string = no range (batch falls back).
     #[serde(default)]
     pub daily_start: String,
@@ -824,16 +1593,16 @@ pub(super) struct BatchDispatch {
     /// into the workflow input, not just into the app's own gRPC clients.
     callback: MemoriesCallback,
     workflows_dir: PathBuf,
-    /// Forwarded into every batch's `updated_after_ms` so the downstream
-    /// summary/personality/reflection windows match the importer's
-    /// `--since`. Omitting this would let each batch reprocess every
-    /// thread in user history on every import — far too expensive for
-    /// the UI's 30-day default.
-    updated_after_ms: Option<i64>,
+    /// Optional conversation-time lower bound for manual batch dispatch.
+    /// Import dispatch instead fills the thread-created window below.
+    last_message_after_ms: Option<i64>,
     /// Optional inclusive upper bound forwarded into the per-thread
-    /// summary batch's `updated_before_ms`. Set only by the range-mode
+    /// summary batch's `last_message_before_ms`. Set only by the range-mode
     /// generate dialog; `None` keeps the legacy "no upper bound" behaviour.
-    updated_before_ms: Option<i64>,
+    last_message_before_ms: Option<i64>,
+    thread_created_after_ms: Option<i64>,
+    thread_created_before_ms: Option<i64>,
+    target_thread_ids: Option<Vec<String>>,
     /// Named worker that handles LLM completion. Defaults to `memories-llm`
     /// (local) or `memories-llm-external` (genai) based on the active LLM
     /// settings. Propagated to every workflow input as `llm_worker_name`.
@@ -848,14 +1617,14 @@ impl BatchDispatch {
     pub(super) fn resolve(
         callback: &MemoriesCallback,
         user_id: i64,
-        updated_after_ms: Option<i64>,
+        last_message_after_ms: Option<i64>,
         llm_worker_name: String,
         output_language: String,
     ) -> AppResult<Self> {
         Self::resolve_with_window(
             callback,
             user_id,
-            updated_after_ms,
+            last_message_after_ms,
             None,
             llm_worker_name,
             output_language,
@@ -865,8 +1634,8 @@ impl BatchDispatch {
     pub(super) fn resolve_with_window(
         callback: &MemoriesCallback,
         user_id: i64,
-        updated_after_ms: Option<i64>,
-        updated_before_ms: Option<i64>,
+        last_message_after_ms: Option<i64>,
+        last_message_before_ms: Option<i64>,
         llm_worker_name: String,
         output_language: String,
     ) -> AppResult<Self> {
@@ -875,8 +1644,11 @@ impl BatchDispatch {
             user_id,
             callback: callback.clone(),
             workflows_dir: dir,
-            updated_after_ms,
-            updated_before_ms,
+            last_message_after_ms,
+            last_message_before_ms,
+            thread_created_after_ms: None,
+            thread_created_before_ms: None,
+            target_thread_ids: None,
             llm_worker_name,
             output_language,
         })
@@ -932,8 +1704,10 @@ impl BatchDispatch {
             "max_context_chars": 200_000,
         });
         self.merge_callback(&mut v);
-        self.inject_updated_after_ms(&mut v);
-        self.inject_updated_before_ms(&mut v);
+        self.inject_last_message_after_ms(&mut v);
+        self.inject_last_message_before_ms(&mut v);
+        self.inject_thread_created_window(&mut v);
+        self.inject_target_thread_ids(&mut v);
         self.inject_llm_worker_name(&mut v);
         self.inject_output_language(&mut v);
         v
@@ -966,7 +1740,9 @@ impl BatchDispatch {
             "max_context_chars": PERSONALITY_MAX_CONTEXT_CHARS,
         });
         self.merge_callback(&mut v);
-        self.inject_updated_after_ms(&mut v);
+        self.inject_last_message_after_ms(&mut v);
+        self.inject_thread_created_window(&mut v);
+        self.inject_target_thread_ids(&mut v);
         self.inject_llm_worker_name(&mut v);
         self.inject_output_language(&mut v);
         v
@@ -1007,7 +1783,9 @@ impl BatchDispatch {
             "prompt_version": REFLECTION_PROMPT_VERSION,
         });
         self.merge_callback(&mut v);
-        self.inject_updated_after_ms(&mut v);
+        self.inject_last_message_after_ms(&mut v);
+        self.inject_thread_created_window(&mut v);
+        self.inject_target_thread_ids(&mut v);
         self.inject_llm_worker_name(&mut v);
         self.inject_output_language(&mut v);
         v
@@ -1044,6 +1822,7 @@ impl BatchDispatch {
             "run_daily": req.run_daily,
             "run_weekly": req.run_weekly,
             "run_monthly": req.run_monthly,
+            "stop_on_error": req.stop_on_error,
             "daily_start": req.daily_start,
             "daily_end": req.daily_end,
             "weekly_start": req.weekly_start,
@@ -1059,11 +1838,11 @@ impl BatchDispatch {
         });
         // Omit absent epoch bounds so the pipeline's `== null` guards keep
         // the per-thread batch unbounded.
-        if let Some(ms) = req.updated_after_ms {
-            v["updated_after_ms"] = serde_json::Value::from(ms);
+        if let Some(ms) = req.last_message_after_ms {
+            v["last_message_after_ms"] = serde_json::Value::from(ms);
         }
-        if let Some(ms) = req.updated_before_ms {
-            v["updated_before_ms"] = serde_json::Value::from(ms);
+        if let Some(ms) = req.last_message_before_ms {
+            v["last_message_before_ms"] = serde_json::Value::from(ms);
         }
         self.merge_callback(&mut v);
         self.inject_llm_worker_name(&mut v);
@@ -1079,27 +1858,32 @@ impl BatchDispatch {
         }
     }
 
-    fn inject_updated_after_ms(&self, v: &mut serde_json::Value) {
-        if let Some(ms) = self.updated_after_ms {
-            v["updated_after_ms"] = serde_json::Value::from(ms);
+    fn inject_last_message_after_ms(&self, v: &mut serde_json::Value) {
+        if let Some(ms) = self.last_message_after_ms {
+            v["last_message_after_ms"] = serde_json::Value::from(ms);
         }
     }
 
-    fn inject_updated_before_ms(&self, v: &mut serde_json::Value) {
-        if let Some(ms) = self.updated_before_ms {
-            v["updated_before_ms"] = serde_json::Value::from(ms);
+    fn inject_last_message_before_ms(&self, v: &mut serde_json::Value) {
+        if let Some(ms) = self.last_message_before_ms {
+            v["last_message_before_ms"] = serde_json::Value::from(ms);
         }
     }
-}
 
-/// Parse the dialog's ISO 8601 `--since` string into epoch milliseconds.
-/// Mirrors `memories/agent-chat-import/src/cli.rs::since_millis` so the
-/// dispatch window matches what the CLI's `--since` used to produce.
-fn parse_since_millis(since: Option<&str>) -> AppResult<Option<i64>> {
-    let Some(s) = since else { return Ok(None) };
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| Some(dt.timestamp_millis()))
-        .map_err(|e| AppError::Config(format!("parse since '{s}': {e}")))
+    fn inject_thread_created_window(&self, v: &mut serde_json::Value) {
+        if let Some(ms) = self.thread_created_after_ms {
+            v["thread_created_after_ms"] = serde_json::Value::from(ms);
+        }
+        if let Some(ms) = self.thread_created_before_ms {
+            v["thread_created_before_ms"] = serde_json::Value::from(ms);
+        }
+    }
+
+    fn inject_target_thread_ids(&self, value: &mut serde_json::Value) {
+        if let Some(ids) = &self.target_thread_ids {
+            value["target_thread_ids"] = serde_json::json!(ids);
+        }
+    }
 }
 
 /// Condense a WORKFLOW chunk for the toast, carrying the last-seen progress
@@ -1169,12 +1953,6 @@ fn extract_progress(output_json: &str) -> Option<(i64, i64)> {
 ///
 /// Pure so unit tests can pin each branch (all-failed / partial / no-counts
 /// / all-success) without spinning up a workflow.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct WorkflowOutcome {
-    pub status: StepStatus,
-    pub message: Option<String>,
-}
-
 /// Read a batch workflow's terminal `WorkflowResult` JSON and classify it
 /// into Done / Warning / Failed based on the `failed_count` / `processed_*`
 /// counters the batch YAMLs export.
@@ -1194,15 +1972,15 @@ pub(super) struct WorkflowOutcome {
 /// fall back to Done so a YAML drift doesn't downgrade a successful run to
 /// Warning. `last_error` (when present) gets appended to the message so the
 /// detail dialog surfaces the underlying failure cause.
-pub(super) fn summarize_workflow_outcome(raw: Option<&str>) -> WorkflowOutcome {
+pub(super) fn summarize_workflow_outcome(raw: Option<&str>) -> StepOutcome {
     let Some(raw) = raw else {
-        return WorkflowOutcome {
+        return StepOutcome {
             status: StepStatus::Done,
             message: None,
         };
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return WorkflowOutcome {
+        return StepOutcome {
             status: StepStatus::Done,
             message: Some(raw.to_string()),
         };
@@ -1216,7 +1994,7 @@ pub(super) fn summarize_workflow_outcome(raw: Option<&str>) -> WorkflowOutcome {
         .and_then(|o| o.as_str())
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
     let Some(output) = output_obj else {
-        return WorkflowOutcome {
+        return StepOutcome {
             status: StepStatus::Done,
             message: None,
         };
@@ -1251,7 +2029,7 @@ pub(super) fn summarize_workflow_outcome(raw: Option<&str>) -> WorkflowOutcome {
     // the toast instead of bare 完了 (the YAML guard intentionally left
     // some threads alone, and that fact is worth surfacing).
     if failed <= 0 {
-        return WorkflowOutcome {
+        return StepOutcome {
             status: StepStatus::Done,
             message: skipped.map(|n| format!("中略 {n} 件 (既存シグナル充足)")),
         };
@@ -1283,14 +2061,7 @@ pub(super) fn summarize_workflow_outcome(raw: Option<&str>) -> WorkflowOutcome {
         Some(p) if p > 0 && failed >= p => StepStatus::Failed,
         _ => StepStatus::Warning,
     };
-    WorkflowOutcome { status, message }
-}
-
-/// Coerce a JSON number or numeric string to i64. jq `set` results can arrive
-/// as either depending on how the workflow engine serializes the context.
-fn json_as_i64(v: &serde_json::Value) -> Option<i64> {
-    v.as_i64()
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    StepOutcome { status, message }
 }
 
 /// Turn a workflow `position` JSON pointer into a short Japanese label for the
@@ -1338,7 +2109,7 @@ fn step_description(step: &str) -> Option<&'static str> {
         "fetchByLabels" | "fetchByUser" => "対象スレッドを取得中",
         "filterThreads" => "対象スレッドを絞り込み中",
         "sortTargetThreadsNewestFirst" => "対象スレッドを並べ替え中",
-        "resolveUpdatedAfter" => "対象期間を解決中",
+        "resolveLastMessageAfter" | "resolveLastMessageBefore" => "対象期間を解決中",
         "summarizeEach" => "スレッドを要約中",
         "personalityEach" => "パーソナリティを抽出中",
         // ---- personality batch budget bookkeeping (early-break path) ----
@@ -1479,7 +2250,7 @@ async fn run_cancellable_step(
     current_job_id: std::sync::Arc<
         tokio::sync::Mutex<Option<jobworkerp_client::jobworkerp::data::JobId>>,
     >,
-) {
+) -> bool {
     // WORKFLOW runner exposes `create` + `run`; we always want `run`
     // (execute the pre-defined workflow). Omitting `using` makes the
     // server raise "Multiple methods available, 'using' required".
@@ -1490,11 +2261,14 @@ async fn run_cancellable_step(
     let mut last_progress: Option<(i64, i64)> = None;
     let park_job_id = current_job_id.clone();
     let cancel_for_emit = cancel.clone();
+    let completed = Arc::new(AtomicBool::new(false));
+    let completed_for_event = completed.clone();
     run_cancellable_named_stream(
         handle,
         worker_name,
         args,
         Some("run"),
+        None,
         cancel.clone(),
         // Async park: `blocking_lock` panics on a tokio runtime worker
         // ("Cannot block the current thread from within a runtime").
@@ -1510,22 +2284,11 @@ async fn run_cancellable_step(
                 StreamEvent::Active(msg) => {
                     if let Some(raw) = msg {
                         tracing::debug!(target: "import", step = ?step, "{raw}");
-                        if step == ImportStep::ThreadSummary && thread_summary_single_completed(raw)
-                        {
-                            emit_generated_refresh(
-                                app,
-                                job_id,
-                                vec![GeneratedRefreshScope::ThreadSummary],
-                            );
-                        }
-                        if step == ImportStep::Reflection && thread_reflection_single_completed(raw)
-                        {
-                            emit_generated_refresh(
-                                app,
-                                job_id,
-                                vec![GeneratedRefreshScope::Reflection],
-                            );
-                        }
+                        emit_generated_refresh(
+                            app,
+                            job_id,
+                            generated_refresh_scopes_from_position(raw),
+                        );
                     }
                     let digest = msg.map(|raw| {
                         let (d, p) = summarize_workflow_chunk(raw, last_progress);
@@ -1538,12 +2301,15 @@ async fn run_cancellable_step(
                     if let Some(raw) = msg {
                         tracing::info!(target: "import", step = ?step, "workflow done: {raw}");
                     }
+                    emit_import_terminal_refresh(app, job_id, step);
                     // The batch ended without a workflow-level error, but a
                     // per-item failure (e.g. a Gemini 429 storm) can still leave
                     // `failed_count > 0` in the exported output. Branch on
                     // those counters so a partially-failed run renders Warning
                     // / Failed instead of unconditional 緑.
                     let outcome = summarize_workflow_outcome(msg);
+                    completed_for_event
+                        .store(outcome.status == StepStatus::Done, Ordering::Release);
                     let digest = match &outcome.message {
                         Some(m) => Some(m.clone()),
                         None => msg.map(|raw| summarize_workflow_chunk(raw, last_progress).0),
@@ -1552,6 +2318,7 @@ async fn run_cancellable_step(
                 }
                 StreamEvent::Failed(msg) => {
                     tracing::error!(target: "import", step = ?step, "workflow failed: {msg}");
+                    emit_import_terminal_refresh(app, job_id, step);
                     // Distinguish user-triggered cancel from a real
                     // worker failure: once the token is cancelled, the
                     // server's stream close is the expected shape, not
@@ -1571,6 +2338,22 @@ async fn run_cancellable_step(
     // Clear the parking slot so a (late) cancel after this step has
     // already finished doesn't try to Delete its now-stale JobId.
     *current_job_id.lock().await = None;
+    completed.load(Ordering::Acquire)
+}
+
+fn emit_import_terminal_refresh(app: &AppHandle, job_id: &str, step: ImportStep) {
+    if let Some(scope) = import_terminal_refresh_scope(step) {
+        emit_generated_refresh(app, job_id, vec![scope]);
+    }
+}
+
+fn import_terminal_refresh_scope(step: ImportStep) -> Option<super::GeneratedRefreshScope> {
+    match step {
+        ImportStep::ThreadSummary => Some(super::GeneratedRefreshScope::ThreadSummary),
+        ImportStep::ThreadPersonality => Some(super::GeneratedRefreshScope::Personality),
+        ImportStep::Reflection => Some(super::GeneratedRefreshScope::Reflection),
+        ImportStep::ThreadImport => None,
+    }
 }
 
 /// Emit a single downstream step as intentionally skipped. Used when the
@@ -1597,36 +2380,178 @@ fn mark_downstream(app: &AppHandle, job_id: &str, status: StepStatus, msg: &str)
     }
 }
 
-async fn run_one_source(
-    mut cmd: Command,
-    aggregator: &Arc<ImportAggregator>,
-) -> Option<AggregatedState> {
+/// Finish a manual import without touching sidecars when every selected
+/// auto-discovered log root is absent. This is a successful no-op, while the
+/// notice code lets the toast explain why no child process was started.
+fn emit_no_importable_log_sources(app: &AppHandle, job_id: &str, downstream: DownstreamPlan) {
+    emit_step_with_notice(
+        app,
+        job_id,
+        ImportStep::ThreadImport,
+        StepStatus::Done,
+        None,
+        Some(ImportNoticeCode::NoImportableLogSources),
+    );
+    emit_no_target_downstream(app, job_id, downstream);
+}
+
+/// Complete selected downstream steps when the import produced no target
+/// threads; unselected steps retain the normal explicit skip state.
+fn emit_no_target_downstream(app: &AppHandle, job_id: &str, downstream: DownstreamPlan) {
+    for (step, status, message) in no_target_downstream_decisions(downstream) {
+        emit_step(app, job_id, step, status, Some(message.into()));
+    }
+}
+
+#[derive(Clone)]
+struct ImportLogContext {
+    aggregator: Arc<ImportAggregator>,
+    pending_path: PathBuf,
+    pending_imports: Arc<parking_lot::Mutex<PendingImportState>>,
+    completed_sessions: Arc<parking_lot::Mutex<Vec<ImportSessionCompletedEvent>>>,
+    pending_scope: PendingImportScope,
+    expected_source: ImportSource,
+    dry_run: bool,
+    cancel: tokio_util::sync::CancellationToken,
+    /// Native tracing scope shared by the sequential source children.
+    native_log_dir: Option<PathBuf>,
+}
+
+async fn run_one_source(mut cmd: Command, context: ImportLogContext) -> Option<AggregatedState> {
+    if context.cancel.is_cancelled() {
+        return None;
+    }
     let bin_for_msg = cmd.as_std().get_program().to_string_lossy().into_owned();
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let outcome = ChildOutcome::Failure(format!("spawn {bin_for_msg} failed: {e}"));
-            return aggregator.record(outcome);
+            return context.aggregator.record(outcome);
         }
     };
-    forward_import_logs(child, aggregator.clone()).await
+    if let Some(pid) = child.id()
+        && let Some(path) = context.native_log_dir.as_deref()
+        && let Err(error) = crate::log_rotation::mark_native_log_dir_pid(path, pid)
+    {
+        tracing::debug!(%error, pid, path = %path.display(), "could not record native import child PID");
+    }
+    forward_import_logs(child, context).await
 }
+
+const DRY_RUN_LIFECYCLE_EVENT_ERROR: &str =
+    "memories-import emitted lifecycle event during dry-run";
 
 /// Pipe CLI output to tracing, await child, and feed the per-child outcome
 /// into the aggregator. Terminal `thread-import` step is emitted from the
 /// caller after the source loop finishes (see `start_import`).
 async fn forward_import_logs(
     mut child: tokio::process::Child,
-    aggregator: Arc<ImportAggregator>,
+    context: ImportLogContext,
 ) -> Option<AggregatedState> {
     let stdout_lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
-    let stdout_reader = child.stdout.take().map(|stdout| {
+    let event_error = Arc::new(parking_lot::Mutex::new(None::<String>));
+    let created_sessions = Arc::new(parking_lot::Mutex::new(Vec::<PendingImportSession>::new()));
+    let completed_in_child = Arc::new(parking_lot::Mutex::new(
+        Vec::<ImportSessionCompletedEvent>::new(),
+    ));
+    let session_event_count = Arc::new(AtomicUsize::new(0));
+    let event_ingestion = Arc::new(tokio::sync::Mutex::new(()));
+    let pending_path = context.pending_path.clone();
+    let pending_imports = context.pending_imports.clone();
+    let completed_sessions = context.completed_sessions.clone();
+    let pending_scope = context.pending_scope.clone();
+    let expected_source = context.expected_source;
+    let dry_run = context.dry_run;
+    let cancel = context.cancel.clone();
+    let mut stdout_reader = child.stdout.take().map(|stdout| {
         let lines = stdout_lines.clone();
+        let event_error = event_error.clone();
+        let created_sessions = created_sessions.clone();
+        let completed_in_child = completed_in_child.clone();
+        let session_event_count = session_event_count.clone();
+        let pending_scope = pending_scope.clone();
+        let event_ingestion = event_ingestion.clone();
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                info!(target: "memories-import", "{line}");
-                lines.lock().push(line);
+                match parse_import_stdout_line(&line) {
+                    Ok(ImportStdoutLine::Creation(event)) => {
+                        if dry_run {
+                            *event_error.lock() = Some(DRY_RUN_LIFECYCLE_EVENT_ERROR.into());
+                            continue;
+                        }
+                        if let Err(error) = validate_import_event_source(expected_source, event.source)
+                        {
+                            *event_error.lock() = Some(error.to_string());
+                            continue;
+                        }
+                        let _ingestion = event_ingestion.lock().await;
+                        if cancel.is_cancelled() {
+                            continue;
+                        }
+                        let session = PendingImportSession {
+                            memories_endpoint_id: pending_scope.memories_endpoint_id.clone(),
+                            user_id: pending_scope.user_id,
+                            source: event.source,
+                            session_key: event.session_key,
+                            thread_id: event.thread_id,
+                        };
+                        let result = record_pending_import(
+                            &pending_path,
+                            &mut pending_imports.lock(),
+                            session.clone(),
+                        );
+                        if let Err(error) = result {
+                            *event_error.lock() = Some(error.to_string());
+                            continue;
+                        }
+                        created_sessions.lock().push(session);
+                    }
+                    Ok(ImportStdoutLine::SessionCompleted(completed)) => {
+                        if dry_run {
+                            *event_error.lock() = Some(DRY_RUN_LIFECYCLE_EVENT_ERROR.into());
+                            continue;
+                        }
+                        if let Err(error) =
+                            validate_import_event_source(expected_source, completed.source)
+                        {
+                            *event_error.lock() = Some(error.to_string());
+                            continue;
+                        }
+                        let _ingestion = event_ingestion.lock().await;
+                        if cancel.is_cancelled() {
+                            continue;
+                        }
+                        session_event_count.fetch_add(1, Ordering::AcqRel);
+                        match classify_session_completion(
+                            &pending_imports.lock(),
+                            &pending_scope,
+                            &completed,
+                        ) {
+                            Ok(CompletionDisposition::TrackPending) => {
+                                completed_in_child.lock().push(completed.clone());
+                                completed_sessions.lock().push(completed);
+                            }
+                            Ok(CompletionDisposition::IgnoreExisting) => {
+                                info!(
+                                    target: "memories-import",
+                                    source = completed.source.cli_subcommand(),
+                                    session_key = completed.session_key,
+                                    "existing non-pending session completed; excluding it from generation"
+                                );
+                            }
+                            Err(error) => *event_error.lock() = Some(error.to_string()),
+                        }
+                    }
+                    Ok(ImportStdoutLine::Text(line)) => {
+                        info!(target: "memories-import", "{line}");
+                        lines.lock().push(line);
+                    }
+                    Err(error) => {
+                        *event_error.lock() = Some(error.to_string());
+                    }
+                }
             }
         })
     });
@@ -1634,7 +2559,7 @@ async fn forward_import_logs(
     // (e.g. a TLS handshake error against a remote server). Without this the
     // UI only ever saw `exit status: 1` and the cause lived in stderr alone.
     let stderr_lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
-    let stderr_reader = child.stderr.take().map(|stderr| {
+    let mut stderr_reader = child.stderr.take().map(|stderr| {
         let lines = stderr_lines.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
@@ -1645,7 +2570,24 @@ async fn forward_import_logs(
         })
     });
 
-    let status = child.wait().await;
+    let status = tokio::select! {
+        status = child.wait() => Some(status),
+        _ = cancel.cancelled() => {
+            // Serializing cancellation with event ingestion prevents a buffered
+            // lifecycle line from mutating pending state after this import ends.
+            let _ingestion = event_ingestion.lock().await;
+            abort_and_join_output_reader(&mut stdout_reader).await;
+            abort_and_join_output_reader(&mut stderr_reader).await;
+            if let Err(error) = child.start_kill() {
+                warn!(?error, "failed to kill cancelled memories-import child");
+            }
+            if let Err(error) = child.wait().await {
+                warn!(?error, "failed to wait for cancelled memories-import child");
+            }
+            None
+        }
+    };
+    let status = status?;
     if let Some(handle) = stdout_reader {
         let _ = handle.await;
     }
@@ -1653,23 +2595,57 @@ async fn forward_import_logs(
         let _ = handle.await;
     }
 
-    let outcome = match status {
-        Ok(s) if s.success() => {
+    let event_failure = event_error.lock().clone();
+    let missing_completion = created_sessions
+        .lock()
+        .iter()
+        .find(|created| {
+            !completed_in_child.lock().iter().any(|completed| {
+                completed.source == created.source
+                    && completed.session_key == created.session_key
+                    && completed.thread_id == created.thread_id
+            })
+        })
+        .cloned();
+    let event_failure = event_failure.or_else(|| {
+        missing_completion.map(|missing| {
+            format!(
+                "memories-import omitted session_completed for {}/{}",
+                missing.source.cli_subcommand(),
+                missing.session_key
+            )
+        })
+    });
+    let event_failure = event_failure.or_else(|| {
+        let reported = reported_imported_count(&stdout_lines.lock()).unwrap_or_default();
+        (!dry_run && reported > 0 && session_event_count.load(Ordering::Acquire) == 0)
+            .then(|| "memories-import wrote memories without versioned session events".to_string())
+    });
+    let outcome = match (status, event_failure) {
+        (_, Some(error)) => ChildOutcome::Failure(error),
+        (Ok(s), None) if s.success() => {
             info!("memories-import succeeded");
             let summary = extract_summary_block(&stdout_lines.lock());
             ChildOutcome::Success { summary }
         }
-        Ok(s) => {
+        (Ok(s), None) => {
             warn!(?s, "memories-import exited non-zero");
             ChildOutcome::Failure(failure_message(&format!("exit {s}"), &stderr_lines.lock()))
         }
-        Err(e) => {
+        (Err(e), None) => {
             warn!(error = ?e, "memories-import wait failed");
             ChildOutcome::Failure(format!("wait: {e}"))
         }
     };
 
-    aggregator.record(outcome)
+    context.aggregator.record(outcome)
+}
+
+async fn abort_and_join_output_reader(reader: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = reader.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 /// Number of trailing stderr lines folded into a failure message. Enough to
@@ -1750,6 +2726,17 @@ fn emit_step(
     status: StepStatus,
     message: Option<String>,
 ) {
+    emit_step_with_notice(app, job_id, step, status, message, None);
+}
+
+fn emit_step_with_notice(
+    app: &AppHandle,
+    job_id: &str,
+    step: ImportStep,
+    status: StepStatus,
+    message: Option<String>,
+    notice_code: Option<ImportNoticeCode>,
+) {
     emit_event(
         app,
         "import://step",
@@ -1758,6 +2745,7 @@ fn emit_step(
             step,
             status,
             message,
+            notice_code,
         },
     );
 }
@@ -1765,7 +2753,66 @@ fn emit_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_terminal_refresh_scope_covers_each_generation_step_only() {
+        assert_eq!(
+            import_terminal_refresh_scope(ImportStep::ThreadSummary),
+            Some(super::super::GeneratedRefreshScope::ThreadSummary)
+        );
+        assert_eq!(
+            import_terminal_refresh_scope(ImportStep::ThreadPersonality),
+            Some(super::super::GeneratedRefreshScope::Personality)
+        );
+        assert_eq!(
+            import_terminal_refresh_scope(ImportStep::Reflection),
+            Some(super::super::GeneratedRefreshScope::Reflection)
+        );
+        assert_eq!(
+            import_terminal_refresh_scope(ImportStep::ThreadImport),
+            None
+        );
+    }
     use std::ffi::OsStr;
+
+    fn local_scope(user_id: i64) -> PendingImportScope {
+        PendingImportScope::new(ConnectionMode::Local, "http://127.0.0.1:9010", user_id).unwrap()
+    }
+
+    fn import_log_context(
+        aggregator: Arc<ImportAggregator>,
+        pending_path: PathBuf,
+        pending_imports: Arc<parking_lot::Mutex<PendingImportState>>,
+        completed_sessions: Arc<parking_lot::Mutex<Vec<ImportSessionCompletedEvent>>>,
+        pending_scope: PendingImportScope,
+    ) -> ImportLogContext {
+        ImportLogContext {
+            aggregator,
+            pending_path,
+            pending_imports,
+            completed_sessions,
+            pending_scope,
+            expected_source: ImportSource::ClaudeCode,
+            dry_run: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            native_log_dir: None,
+        }
+    }
+
+    fn pending_session(
+        scope: &PendingImportScope,
+        source: ImportSource,
+        session_key: &str,
+        thread_id: &str,
+    ) -> PendingImportSession {
+        PendingImportSession {
+            memories_endpoint_id: scope.memories_endpoint_id.clone(),
+            user_id: scope.user_id,
+            source,
+            session_key: session_key.into(),
+            thread_id: thread_id.into(),
+        }
+    }
 
     fn dummy_targets() -> ResolvedTargets {
         ResolvedTargets {
@@ -1794,9 +2841,21 @@ mod tests {
             Some("2026-05-01T00:00:00Z".into()),
             false,
             vec!["lookback".into()],
-            PathBuf::from("/tmp/lookback-log"),
+            PathBuf::from("/tmp/lookback-log/native/import-test"),
             plain,
         )
+    }
+
+    #[test]
+    fn native_import_log_guard_marks_scope_closed_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let path = crate::log_rotation::native_log_dir(root.path(), "import-test").unwrap();
+        {
+            let _guard = NativeImportLogGuard(path.clone());
+            assert!(path.join(".active").is_file());
+        }
+        assert!(!path.join(".active").exists());
+        assert!(path.join(".closed").is_file());
     }
 
     fn plan_dry_run() -> ImportPlan {
@@ -1807,9 +2866,131 @@ mod tests {
             Some("2026-05-01T00:00:00Z".into()),
             true,
             vec!["lookback".into()],
-            PathBuf::from("/tmp/lookback-log"),
+            PathBuf::from("/tmp/lookback-log/native/import-test"),
             None,
         )
+    }
+
+    #[test]
+    fn manual_source_filter_skips_only_missing_log_roots() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude/projects")).unwrap();
+
+        let selection = filter_manual_import_sources(
+            &[
+                ImportSource::ClaudeCode,
+                ImportSource::Codex,
+                ImportSource::Plain,
+            ],
+            Some(home.path()),
+        );
+
+        assert_eq!(
+            selection.sources,
+            vec![ImportSource::ClaudeCode, ImportSource::Plain]
+        );
+        assert!(!selection.no_importable_log_sources);
+    }
+
+    #[test]
+    fn manual_source_filter_preserves_requested_order_when_all_roots_exist() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude/projects")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex/sessions")).unwrap();
+
+        let selection = filter_manual_import_sources(
+            &[
+                ImportSource::Codex,
+                ImportSource::Plain,
+                ImportSource::ClaudeCode,
+            ],
+            Some(home.path()),
+        );
+
+        assert_eq!(
+            selection.sources,
+            vec![
+                ImportSource::Codex,
+                ImportSource::Plain,
+                ImportSource::ClaudeCode
+            ]
+        );
+        assert!(!selection.no_importable_log_sources);
+    }
+
+    #[test]
+    fn manual_source_filter_keeps_codex_when_it_is_the_only_existing_log_root() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex/sessions")).unwrap();
+
+        let selection = filter_manual_import_sources(
+            &[ImportSource::ClaudeCode, ImportSource::Codex],
+            Some(home.path()),
+        );
+
+        assert_eq!(selection.sources, vec![ImportSource::Codex]);
+        assert!(!selection.no_importable_log_sources);
+    }
+
+    #[test]
+    fn manual_source_filter_marks_notice_when_all_log_roots_are_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let selection = filter_manual_import_sources(
+            &[ImportSource::ClaudeCode, ImportSource::Codex],
+            Some(home.path()),
+        );
+
+        assert!(selection.sources.is_empty());
+        assert!(selection.no_importable_log_sources);
+    }
+
+    #[test]
+    fn manual_source_filter_keeps_plain_and_does_not_notice_when_only_plain_is_selected() {
+        let home = tempfile::tempdir().unwrap();
+        let selection = filter_manual_import_sources(&[ImportSource::Plain], Some(home.path()));
+
+        assert_eq!(selection.sources, vec![ImportSource::Plain]);
+        assert!(!selection.no_importable_log_sources);
+    }
+
+    #[test]
+    fn manual_source_filter_handles_missing_home_without_affecting_plain() {
+        let selection = filter_manual_import_sources(
+            &[
+                ImportSource::ClaudeCode,
+                ImportSource::Codex,
+                ImportSource::Plain,
+            ],
+            None,
+        );
+
+        assert_eq!(selection.sources, vec![ImportSource::Plain]);
+        assert!(!selection.no_importable_log_sources);
+    }
+
+    #[test]
+    fn import_step_notice_code_is_optional_for_backward_compatibility() {
+        let without_notice = ImportStepUpdate {
+            job_id: "job".into(),
+            step: ImportStep::ThreadImport,
+            status: StepStatus::Done,
+            message: None,
+            notice_code: None,
+        };
+        let value = serde_json::to_value(without_notice).unwrap();
+        assert!(value.get("notice_code").is_none());
+
+        let with_notice = ImportStepUpdate {
+            job_id: "job".into(),
+            step: ImportStep::ThreadImport,
+            status: StepStatus::Done,
+            message: None,
+            notice_code: Some(ImportNoticeCode::NoImportableLogSources),
+        };
+        assert_eq!(
+            serde_json::to_value(with_notice).unwrap()["notice_code"],
+            "no-importable-log-sources"
+        );
     }
 
     fn make_request(
@@ -1876,6 +3057,54 @@ mod tests {
     }
 
     #[test]
+    fn downstream_steps_preserve_pipeline_order_and_selection() {
+        let plan = DownstreamPlan::from_request(&make_request(true, false, true));
+        assert_eq!(
+            downstream_steps(plan),
+            [
+                (ImportStep::ThreadSummary, true),
+                (ImportStep::ThreadPersonality, false),
+                (ImportStep::Reflection, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_target_downstream_decisions_cover_all_selection_combinations() {
+        let cases = [
+            (false, false, false),
+            (false, false, true),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ];
+
+        for (summary, personality, reflection) in cases {
+            let plan = DownstreamPlan {
+                summary,
+                personality,
+                reflection,
+            };
+            let expected_state = |step, selected| {
+                if selected {
+                    (step, StepStatus::Done, "対象スレッドなし")
+                } else {
+                    (step, StepStatus::Waiting, "スキップ")
+                }
+            };
+            let expected = [
+                expected_state(ImportStep::ThreadSummary, summary),
+                expected_state(ImportStep::ThreadPersonality, personality),
+                expected_state(ImportStep::Reflection, reflection),
+            ];
+            assert_eq!(no_target_downstream_decisions(plan), expected);
+        }
+    }
+
+    #[test]
     fn build_command_passes_user_id_server_url_since_and_subcommand() {
         let plan = make_plan();
         let cmd = plan.build_command(ImportSource::ClaudeCode);
@@ -1895,6 +3124,23 @@ mod tests {
             args.windows(2)
                 .any(|w| w[0] == "--labels" && w[1] == "lookback")
         );
+    }
+
+    #[test]
+    fn build_command_enables_versioned_events_for_every_import_source() {
+        let plain = make_plan_with_plain(Some(plain_cfg(Some("notes"), ThreadStrategy::PerFile)));
+        for (plan, source) in [
+            (make_plan(), ImportSource::ClaudeCode),
+            (make_plan(), ImportSource::Codex),
+            (plain, ImportSource::Plain),
+        ] {
+            let command = plan.build_command(source);
+            let args = command.as_std().get_args().collect::<Vec<_>>();
+            assert!(
+                args.iter().any(|arg| *arg == "--events-jsonl"),
+                "missing event flag for {source:?}"
+            );
+        }
     }
 
     #[test]
@@ -2130,10 +3376,10 @@ mod tests {
     }
 
     #[test]
-    fn build_command_pins_log_file_dir_to_data_root() {
+    fn build_command_pins_native_log_file_dir_to_import_scope() {
         // Regression: a Finder-launched .app inherits cwd `/`, where the
         // child's command-utils tracing init panics creating its log file.
-        // LOG_FILE_DIR must point at the data log dir instead — and because
+        // LOG_FILE_DIR must point at this import's isolated native log dir — and because
         // envy treats the config's `use_json`/`use_stdout` bools as required,
         // LOG_USE_JSON/LOG_USE_STDOUT must accompany it or the whole config
         // deserialize fails and the dir is silently dropped.
@@ -2148,7 +3394,7 @@ mod tests {
         };
         assert_eq!(
             env_of("LOG_FILE_DIR").as_deref(),
-            Some(OsStr::new("/tmp/lookback-log"))
+            Some(OsStr::new("/tmp/lookback-log/native/import-test"))
         );
         assert_eq!(env_of("LOG_USE_JSON").as_deref(), Some(OsStr::new("true")));
         assert_eq!(
@@ -2161,20 +3407,23 @@ mod tests {
         dispatch_with(None)
     }
 
-    fn dispatch_with(updated_after_ms: Option<i64>) -> BatchDispatch {
-        dispatch_with_window(updated_after_ms, None)
+    fn dispatch_with(last_message_after_ms: Option<i64>) -> BatchDispatch {
+        dispatch_with_window(last_message_after_ms, None)
     }
 
     fn dispatch_with_window(
-        updated_after_ms: Option<i64>,
-        updated_before_ms: Option<i64>,
+        last_message_after_ms: Option<i64>,
+        last_message_before_ms: Option<i64>,
     ) -> BatchDispatch {
         BatchDispatch {
             user_id: 1,
             callback: dummy_callback(),
             workflows_dir: PathBuf::from("/x/workflows"),
-            updated_after_ms,
-            updated_before_ms,
+            last_message_after_ms,
+            last_message_before_ms,
+            thread_created_after_ms: None,
+            thread_created_before_ms: None,
+            target_thread_ids: None,
             llm_worker_name: "memories-llm".to_string(),
             output_language: "ja".to_string(),
         }
@@ -2193,6 +3442,794 @@ mod tests {
         assert_eq!(v["output_language"], "ja");
         assert!(v.get("summary_user_id").is_none());
         assert_eq!(v["max_context_chars"], 200_000);
+    }
+
+    #[test]
+    fn import_dispatch_uses_only_the_authoritative_thread_ids() {
+        let mut dispatch = dispatch();
+        dispatch.target_thread_ids = Some(vec!["9007199254740993".into(), "42".into()]);
+
+        for input in [
+            dispatch.summarize_input(),
+            dispatch.personality_input(),
+            dispatch.reflection_input(),
+        ] {
+            assert_eq!(
+                input["target_thread_ids"],
+                serde_json::json!(["9007199254740993", "42"])
+            );
+            assert!(input.get("thread_created_after_ms").is_none());
+            assert!(input.get("thread_created_before_ms").is_none());
+            assert!(input.get("last_message_after_ms").is_none());
+            assert!(input.get("last_message_before_ms").is_none());
+        }
+    }
+
+    #[test]
+    fn importer_jsonl_parser_separates_events_from_text_and_preserves_large_ids() {
+        let line = r#"{"schema":"memories-import-event","version":1,"event":"thread_created","source":"codex","session_key":"session/a","thread_id":"9007199254740993"}"#;
+        assert_eq!(
+            parse_import_stdout_line(line).unwrap(),
+            ImportStdoutLine::Creation(ImportCreationEventWire {
+                version: 1,
+                event: "thread_created".into(),
+                source: ImportSource::Codex,
+                session_key: "session/a".into(),
+                thread_id: "9007199254740993".into(),
+            })
+        );
+        assert_eq!(
+            parse_import_stdout_line("codex summary:").unwrap(),
+            ImportStdoutLine::Text("codex summary:".into())
+        );
+    }
+
+    #[test]
+    fn importer_summary_exposes_missing_event_protocol_without_parsing_event_lines_as_text() {
+        assert_eq!(
+            reported_imported_count(&["codex summary:".into(), "  Memories imported: 3".into(),]),
+            Some(3)
+        );
+        assert_eq!(reported_imported_count(&["unrelated".into()]), None);
+    }
+
+    #[test]
+    fn importer_session_completion_is_versioned_and_typed() {
+        let line = r#"{"schema":"memories-import-event","version":1,"event":"session_completed","source":"claude-code","session_key":"project/session","thread_id":"42","imported_count":3,"success":true}"#;
+        assert_eq!(
+            parse_import_stdout_line(line).unwrap(),
+            ImportStdoutLine::SessionCompleted(ImportSessionCompletedEvent {
+                source: ImportSource::ClaudeCode,
+                session_key: "project/session".into(),
+                thread_id: "42".into(),
+                imported_count: 3,
+                success: true,
+            })
+        );
+        assert!(parse_import_stdout_line(&line.replace("\"42\"", "42")).is_err());
+        assert!(
+            parse_import_stdout_line(
+                r#"{"schema":"memories-import-event","version":1,"event":"thread_created""#
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_importer_events_drive_pending_target_and_clear_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending_path = tmp.path().join("import-pending.json");
+        let pending = Arc::new(parking_lot::Mutex::new(PendingImportState::default()));
+        let completions = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let scope = local_scope(1);
+        let aggregator = Arc::new(ImportAggregator::new(1));
+        let script = concat!(
+            "printf '%s\\n' '",
+            "{\"schema\":\"memories-import-event\",\"version\":1,\"event\":\"thread_created\",\"source\":\"claude-code\",\"session_key\":\"claude_code:session\",\"thread_id\":\"9007199254740993\"}",
+            "' '",
+            "{\"schema\":\"memories-import-event\",\"version\":1,\"event\":\"session_completed\",\"source\":\"claude-code\",\"session_key\":\"claude_code:session\",\"thread_id\":\"9007199254740993\",\"imported_count\":3,\"success\":true}",
+            "' 'claude-code summary:' '  Memories imported: 3'"
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+
+        let state = forward_import_logs(
+            child,
+            import_log_context(
+                aggregator,
+                pending_path.clone(),
+                pending.clone(),
+                completions.clone(),
+                scope.clone(),
+            ),
+        )
+        .await;
+        assert!(matches!(state, Some(AggregatedState::AllSucceeded { .. })));
+        let targeted = select_targeted_sessions(
+            &pending.lock(),
+            &scope,
+            &completions.lock(),
+            &[ImportSource::ClaudeCode],
+        );
+        assert_eq!(targeted.len(), 1);
+        assert_eq!(targeted[0].thread_id, "9007199254740993");
+        assert_eq!(
+            load_pending_imports(&pending_path).unwrap().sessions,
+            targeted
+        );
+
+        let cleared = completed_pending_state(&pending.lock(), &targeted, true);
+        save_pending_imports(&pending_path, &cleared).unwrap();
+        assert!(
+            load_pending_imports(&pending_path)
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dry_run_summary_without_lifecycle_events_succeeds_without_state_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending_path = tmp.path().join("import-pending.json");
+        let pending = Arc::new(parking_lot::Mutex::new(PendingImportState::default()));
+        let completions = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let aggregator = Arc::new(ImportAggregator::new(1));
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' '[dry-run] claude-code summary:' '  Memories imported: 3'")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let state = forward_import_logs(
+            command.spawn().unwrap(),
+            ImportLogContext {
+                dry_run: true,
+                ..import_log_context(
+                    aggregator,
+                    pending_path.clone(),
+                    pending.clone(),
+                    completions.clone(),
+                    local_scope(1),
+                )
+            },
+        )
+        .await;
+
+        assert!(matches!(state, Some(AggregatedState::AllSucceeded { .. })));
+        assert!(pending.lock().sessions.is_empty());
+        assert!(completions.lock().is_empty());
+        assert!(!pending_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_import_summary_without_lifecycle_events_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending_path = tmp.path().join("import-pending.json");
+        let pending = Arc::new(parking_lot::Mutex::new(PendingImportState::default()));
+        let completions = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let aggregator = Arc::new(ImportAggregator::new(1));
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' 'claude-code summary:' '  Memories imported: 3'")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let state = forward_import_logs(
+            command.spawn().unwrap(),
+            import_log_context(
+                aggregator,
+                pending_path,
+                pending,
+                completions,
+                local_scope(1),
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            state,
+            Some(AggregatedState::AnyFailed(errors))
+                if errors == ["memories-import wrote memories without versioned session events"]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dry_run_lifecycle_event_fails_before_pending_state_is_mutated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending_path = tmp.path().join("import-pending.json");
+        let pending = Arc::new(parking_lot::Mutex::new(PendingImportState::default()));
+        let completions = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let aggregator = Arc::new(ImportAggregator::new(1));
+        let event = concat!(
+            "{\"schema\":\"memories-import-event\",\"version\":1,",
+            "\"event\":\"thread_created\",\"source\":\"claude-code\",",
+            "\"session_key\":\"claude_code:session\",",
+            "\"thread_id\":\"9007199254740993\"}"
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("printf '%s\\n' '{event}'"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let state = forward_import_logs(
+            command.spawn().unwrap(),
+            ImportLogContext {
+                dry_run: true,
+                ..import_log_context(
+                    aggregator,
+                    pending_path.clone(),
+                    pending.clone(),
+                    completions.clone(),
+                    local_scope(1),
+                )
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            state,
+            Some(AggregatedState::AnyFailed(errors))
+                if errors == ["memories-import emitted lifecycle event during dry-run"]
+        ));
+        assert!(pending.lock().sessions.is_empty());
+        assert!(completions.lock().is_empty());
+        assert!(!pending_path.exists());
+    }
+
+    #[test]
+    fn existing_non_pending_completion_is_success_but_not_a_generation_target() {
+        let scope = local_scope(1);
+        let completion = ImportSessionCompletedEvent {
+            source: ImportSource::Codex,
+            session_key: "existing".into(),
+            thread_id: "42".into(),
+            imported_count: 3,
+            success: true,
+        };
+        assert_eq!(
+            classify_session_completion(&PendingImportState::default(), &scope, &completion)
+                .unwrap(),
+            CompletionDisposition::IgnoreExisting
+        );
+        let pending = PendingImportState {
+            format_version: PENDING_IMPORT_FORMAT_VERSION,
+            sessions: vec![pending_session(
+                &scope,
+                ImportSource::Codex,
+                "existing",
+                "42",
+            )],
+        };
+        assert_eq!(
+            classify_session_completion(&pending, &scope, &completion).unwrap(),
+            CompletionDisposition::TrackPending
+        );
+        let mismatched = ImportSessionCompletedEvent {
+            thread_id: "43".into(),
+            ..completion
+        };
+        assert!(classify_session_completion(&pending, &scope, &mismatched).is_err());
+    }
+
+    #[test]
+    fn pending_success_completion_targets_retry_regardless_of_imported_count() {
+        let scope = local_scope(1);
+        let session = pending_session(&scope, ImportSource::Codex, "codex:partial", "42");
+        let pending = PendingImportState {
+            format_version: PENDING_IMPORT_FORMAT_VERSION,
+            sessions: vec![session.clone()],
+        };
+        let zero = ImportSessionCompletedEvent {
+            source: session.source,
+            session_key: session.session_key.clone(),
+            thread_id: session.thread_id.clone(),
+            imported_count: 0,
+            success: true,
+        };
+
+        assert_eq!(
+            classify_session_completion(&pending, &scope, &zero).unwrap(),
+            CompletionDisposition::TrackPending
+        );
+        assert_eq!(
+            select_targeted_sessions(
+                &pending,
+                &scope,
+                std::slice::from_ref(&zero),
+                &[ImportSource::Codex],
+            ),
+            vec![session.clone()]
+        );
+
+        let failed = ImportSessionCompletedEvent {
+            success: false,
+            ..zero.clone()
+        };
+        assert!(
+            select_targeted_sessions(&pending, &scope, &[failed], &[ImportSource::Codex])
+                .is_empty()
+        );
+
+        let wrong_source = ImportSessionCompletedEvent {
+            source: ImportSource::ClaudeCode,
+            ..zero.clone()
+        };
+        assert!(
+            select_targeted_sessions(
+                &pending,
+                &scope,
+                &[wrong_source],
+                &[ImportSource::Codex, ImportSource::ClaudeCode],
+            )
+            .is_empty()
+        );
+
+        assert!(
+            select_targeted_sessions(&pending, &local_scope(2), &[zero], &[ImportSource::Codex],)
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mismatched_lifecycle_event_source_fails_before_pending_state_is_mutated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending_path = tmp.path().join("import-pending.json");
+        let pending = Arc::new(parking_lot::Mutex::new(PendingImportState::default()));
+        let completions = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let aggregator = Arc::new(ImportAggregator::new(1));
+        let event = concat!(
+            "{\"schema\":\"memories-import-event\",\"version\":1,",
+            "\"event\":\"thread_created\",\"source\":\"codex\",",
+            "\"session_key\":\"codex:session\",\"thread_id\":\"42\"}"
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("printf '%s\\n' '{event}'"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let state = forward_import_logs(
+            command.spawn().unwrap(),
+            import_log_context(
+                aggregator,
+                pending_path.clone(),
+                pending.clone(),
+                completions.clone(),
+                local_scope(1),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                state,
+                Some(AggregatedState::AnyFailed(ref errors))
+                    if errors.as_slice() == ["config: memories-import lifecycle event source mismatch: expected claude-code, got codex"]
+            ),
+            "unexpected importer state: {state:?}"
+        );
+        assert!(pending.lock().sessions.is_empty());
+        assert!(completions.lock().is_empty());
+        assert!(!pending_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_joins_output_readers_before_the_next_import_updates_pending_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending_path = tmp.path().join("import-pending.json");
+        let pending = Arc::new(parking_lot::Mutex::new(PendingImportState::default()));
+        let completions = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let aggregator = Arc::new(ImportAggregator::new(1));
+        let old_event = concat!(
+            "{\"schema\":\"memories-import-event\",\"version\":1,",
+            "\"event\":\"thread_created\",\"source\":\"claude-code\",",
+            "\"session_key\":\"old-session\",\"thread_id\":\"42\"}"
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("printf '%s\\n' '{old_event}'; sleep 5"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(forward_import_logs(
+            command.spawn().unwrap(),
+            ImportLogContext {
+                cancel: cancel.clone(),
+                ..import_log_context(
+                    aggregator,
+                    pending_path.clone(),
+                    pending.clone(),
+                    completions,
+                    local_scope(1),
+                )
+            },
+        ));
+
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancellation must wait for reader shutdown")
+            .unwrap();
+        assert_eq!(outcome, None);
+
+        let new_session =
+            pending_session(&local_scope(1), ImportSource::Codex, "new-session", "43");
+        record_pending_import(&pending_path, &mut pending.lock(), new_session.clone()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            load_pending_imports(&pending_path).unwrap().sessions,
+            vec![new_session]
+        );
+    }
+
+    #[test]
+    fn pending_state_is_atomic_deduplicated_and_rejects_id_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pending.json");
+        let scope = local_scope(1);
+        let session = pending_session(&scope, ImportSource::Codex, "stable", "9007199254740993");
+        let mut state = PendingImportState::default();
+        record_pending_import(&path, &mut state, session.clone()).unwrap();
+        record_pending_import(&path, &mut state, session.clone()).unwrap();
+        assert_eq!(
+            load_pending_imports(&path).unwrap().sessions,
+            vec![session.clone()]
+        );
+        assert!(
+            record_pending_import(
+                &path,
+                &mut state,
+                PendingImportSession {
+                    thread_id: "43".into(),
+                    ..session
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_databases_keep_same_session_with_different_thread_ids_separate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pending.json");
+        let mut state = PendingImportState::default();
+        let remote_a =
+            PendingImportScope::new(ConnectionMode::Remote, "https://remote-a.example:443", 7)
+                .unwrap();
+        let remote_b =
+            PendingImportScope::new(ConnectionMode::Remote, "https://remote-b.example:443", 7)
+                .unwrap();
+        record_pending_import(
+            &path,
+            &mut state,
+            pending_session(&remote_a, ImportSource::Codex, "codex:same-session", "42"),
+        )
+        .unwrap();
+
+        let recorded_b = record_pending_import(
+            &path,
+            &mut state,
+            pending_session(&remote_b, ImportSource::Codex, "codex:same-session", "43"),
+        );
+
+        assert!(
+            recorded_b.is_ok(),
+            "a different Memories DB is a separate key"
+        );
+        assert_eq!(state.sessions.len(), 2);
+        let completion_b = ImportSessionCompletedEvent {
+            source: ImportSource::Codex,
+            session_key: "codex:same-session".into(),
+            thread_id: "43".into(),
+            imported_count: 1,
+            success: true,
+        };
+        assert_eq!(
+            classify_session_completion(&state, &remote_b, &completion_b).unwrap(),
+            CompletionDisposition::TrackPending
+        );
+        let targeted_b =
+            select_targeted_sessions(&state, &remote_b, &[completion_b], &[ImportSource::Codex]);
+        assert_eq!(
+            targeted_b,
+            vec![pending_session(
+                &remote_b,
+                ImportSource::Codex,
+                "codex:same-session",
+                "43",
+            )]
+        );
+        let after_b_completed = completed_pending_state(&state, &targeted_b, true);
+        assert_eq!(after_b_completed.sessions.len(), 1);
+        assert!(
+            after_b_completed
+                .sessions
+                .iter()
+                .any(|session| remote_a.contains(session))
+        );
+    }
+
+    #[test]
+    fn pending_state_loader_upgrades_empty_format_version_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pending.json");
+        std::fs::write(&path, r#"{"format_version":1,"sessions":[]}"#).unwrap();
+
+        let state = load_pending_imports(&path).unwrap();
+        assert_eq!(state, PendingImportState::default());
+    }
+
+    #[test]
+    fn pending_state_loader_fails_closed_for_unscoped_format_version_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("import-pending.json");
+        std::fs::write(
+            &path,
+            r#"{"format_version":1,"sessions":[{"source":"codex","session_key":"stable","thread_id":"42"}]}"#,
+        )
+        .unwrap();
+
+        let error = load_pending_imports(&path).unwrap_err().to_string();
+        assert!(error.contains("without a Memories endpoint or user scope"));
+        assert!(error.contains("inspect and move aside"));
+        assert!(error.contains("import-pending.json"));
+    }
+
+    #[test]
+    fn pending_state_loader_rejects_unknown_format_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pending.json");
+        std::fs::write(&path, r#"{"format_version":3,"sessions":[]}"#).unwrap();
+
+        let error = load_pending_imports(&path).unwrap_err().to_string();
+        assert!(error.contains("unsupported import pending state format_version"));
+    }
+
+    #[test]
+    fn pending_state_loader_rejects_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pending.json");
+        std::fs::write(&path, r#"{"format_version":1,"sessions":"#).unwrap();
+
+        let error = load_pending_imports(&path).unwrap_err().to_string();
+        assert!(error.contains("read import pending state"));
+    }
+
+    #[test]
+    fn pending_endpoint_identity_normalizes_remote_authority_without_secrets() {
+        let variants = [
+            "https://EXAMPLE.com",
+            "https://example.com:443/tenant/path?token=secret#fragment",
+            "https://user:password@example.com/other",
+        ];
+        let identities =
+            variants.map(|url| pending_memories_endpoint_id(ConnectionMode::Remote, url).unwrap());
+        assert_eq!(identities[0], identities[1]);
+        assert_eq!(identities[1], identities[2]);
+        assert!(identities[0].starts_with("remote-sha256:"));
+        assert!(!identities[0].contains("example"));
+        assert!(!identities[0].contains("user"));
+        assert!(!identities[0].contains("password"));
+        assert!(!identities[0].contains("secret"));
+        assert_ne!(
+            identities[0],
+            pending_memories_endpoint_id(ConnectionMode::Remote, "http://example.com:443").unwrap()
+        );
+    }
+
+    #[test]
+    fn pending_state_persists_only_the_remote_endpoint_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("import-pending.json");
+        let scope = PendingImportScope::new(
+            ConnectionMode::Remote,
+            "https://alice:private-token@Secret-Host.example/path?api_key=hidden",
+            1,
+        )
+        .unwrap();
+        let mut state = PendingImportState::default();
+        record_pending_import(
+            &path,
+            &mut state,
+            pending_session(&scope, ImportSource::Codex, "session", "42"),
+        )
+        .unwrap();
+
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert!(persisted.contains("remote-sha256:"));
+        for secret in ["alice", "private-token", "Secret-Host", "api_key", "hidden"] {
+            assert!(!persisted.contains(secret));
+        }
+    }
+
+    #[test]
+    fn pending_endpoint_identity_normalizes_ipv6_and_default_port() {
+        let compact =
+            pending_memories_endpoint_id(ConnectionMode::Remote, "https://[2001:db8::1]/path")
+                .unwrap();
+        let expanded = pending_memories_endpoint_id(
+            ConnectionMode::Remote,
+            "https://[2001:0db8:0:0:0:0:0:1]:443",
+        )
+        .unwrap();
+        assert_eq!(compact, expanded);
+        assert_ne!(
+            compact,
+            pending_memories_endpoint_id(ConnectionMode::Remote, "https://[2001:db8::1]:444",)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn local_pending_endpoint_identity_ignores_dynamic_sidecar_port() {
+        assert_eq!(
+            pending_memories_endpoint_id(ConnectionMode::Local, "http://127.0.0.1:49152").unwrap(),
+            pending_memories_endpoint_id(ConnectionMode::Local, "http://127.0.0.1:61000").unwrap()
+        );
+    }
+
+    #[test]
+    fn same_remote_database_separates_pending_sessions_by_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pending.json");
+        let user_a =
+            PendingImportScope::new(ConnectionMode::Remote, "https://example.com", 1).unwrap();
+        let user_b =
+            PendingImportScope::new(ConnectionMode::Remote, "https://example.com:443/path", 2)
+                .unwrap();
+        let mut state = PendingImportState::default();
+        record_pending_import(
+            &path,
+            &mut state,
+            pending_session(&user_a, ImportSource::Codex, "same", "42"),
+        )
+        .unwrap();
+        record_pending_import(
+            &path,
+            &mut state,
+            pending_session(&user_b, ImportSource::Codex, "same", "43"),
+        )
+        .unwrap();
+        assert_eq!(state.sessions.len(), 2);
+    }
+
+    #[test]
+    fn target_reconciliation_deduplicates_intersects_and_supplements() {
+        let emitted = vec!["42".into(), "9007199254740993".into(), "42".into()];
+        let candidates = vec!["42".into(), "999".into()];
+        let verified = vec![
+            VerifiedImportThread {
+                thread_id: "42".into(),
+                user_id: 1,
+                memory_kind: mem_data::MemoryKind::Raw as i32,
+            },
+            VerifiedImportThread {
+                thread_id: "9007199254740993".into(),
+                user_id: 1,
+                memory_kind: mem_data::MemoryKind::Raw as i32,
+            },
+        ];
+        let result = reconcile_import_targets(&emitted, &candidates, &verified, 1).unwrap();
+        assert_eq!(result.target_thread_ids, vec!["42", "9007199254740993"]);
+        assert_eq!(result.candidate_intersection, vec!["42"]);
+        assert_eq!(result.supplemented_ids, vec!["9007199254740993"]);
+    }
+
+    #[test]
+    fn target_reconciliation_fails_closed_on_owner_kind_or_missing_id() {
+        let emitted = vec!["42".into()];
+        for verified in [
+            Vec::new(),
+            vec![VerifiedImportThread {
+                thread_id: "42".into(),
+                user_id: 2,
+                memory_kind: mem_data::MemoryKind::Raw as i32,
+            }],
+            vec![VerifiedImportThread {
+                thread_id: "42".into(),
+                user_id: 1,
+                memory_kind: mem_data::MemoryKind::ThreadSummary as i32,
+            }],
+        ] {
+            assert!(reconcile_import_targets(&emitted, &[], &verified, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn clock_reversal_does_not_drop_authoritative_emitted_ids() {
+        let emitted = vec!["42".into()];
+        let verified = vec![VerifiedImportThread {
+            thread_id: "42".into(),
+            user_id: 1,
+            memory_kind: mem_data::MemoryKind::Raw as i32,
+        }];
+        let result = reconcile_import_targets(&emitted, &[], &verified, 1).unwrap();
+        assert_eq!(result.supplemented_ids, vec!["42"]);
+    }
+
+    #[test]
+    fn pending_is_kept_on_partial_failure_or_cancel_and_cleared_after_retry_success() {
+        let scope = local_scope(1);
+        let session = pending_session(&scope, ImportSource::Plain, "file", "42");
+        let state = PendingImportState {
+            format_version: PENDING_IMPORT_FORMAT_VERSION,
+            sessions: vec![session.clone()],
+        };
+        assert_eq!(
+            completed_pending_state(&state, std::slice::from_ref(&session), false),
+            state
+        );
+        assert!(
+            completed_pending_state(&state, &[session], true)
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn downstream_failure_then_app_restart_targets_duplicate_retry_with_positive_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("import-pending.json");
+        let scope = local_scope(1);
+        let session = pending_session(&scope, ImportSource::Codex, "codex:partial", "42");
+        let mut initial = PendingImportState::default();
+        record_pending_import(&path, &mut initial, session.clone()).unwrap();
+
+        let retained = completed_pending_state(&initial, std::slice::from_ref(&session), false);
+        save_pending_imports(&path, &retained).unwrap();
+        let after_restart = load_pending_imports(&path).unwrap();
+        let duplicate_retry = ImportSessionCompletedEvent {
+            source: ImportSource::Codex,
+            session_key: "codex:partial".into(),
+            thread_id: "42".into(),
+            // Memories counts duplicate AddMemoriesBatch outcomes in the
+            // cumulative completion count on a retry.
+            imported_count: 1,
+            success: true,
+        };
+
+        assert_eq!(
+            select_targeted_sessions(
+                &after_restart,
+                &scope,
+                &[duplicate_retry],
+                &[ImportSource::Codex],
+            ),
+            vec![session]
+        );
+    }
+
+    #[test]
+    fn concurrent_import_guard_rejects_second_start_before_work() {
+        let first = ImportExecutionGuard::acquire().unwrap();
+        assert!(ImportExecutionGuard::acquire().is_err());
+        drop(first);
+        assert!(ImportExecutionGuard::acquire().is_ok());
+    }
+
+    #[test]
+    fn empty_authoritative_target_set_dispatches_no_generation_jobs() {
+        assert!(!should_dispatch_import_targets(&[]));
+        assert!(should_dispatch_import_targets(&["42".into()]));
     }
 
     #[test]
@@ -2395,6 +4432,22 @@ mod tests {
         assert!(msg.contains("成功 9"));
         assert!(msg.contains("失敗 3"));
         assert!(msg.contains("429"));
+    }
+
+    #[test]
+    fn summarize_workflow_outcome_accepts_numeric_and_string_failed_counts() {
+        for failed_count in [serde_json::json!(3), serde_json::json!("3")] {
+            let raw = done_chunk(&serde_json::json!({
+                "succeeded_count": 9,
+                "failed_count": failed_count,
+                "processed_threads": 12,
+            }));
+
+            assert_eq!(
+                summarize_workflow_outcome(Some(&raw)).status,
+                StepStatus::Warning
+            );
+        }
     }
 
     #[test]
@@ -2623,19 +4676,19 @@ mod tests {
     }
 
     #[test]
-    fn batch_dispatch_summarize_input_includes_updated_before_ms_when_set() {
+    fn batch_dispatch_summarize_input_includes_last_message_before_ms_when_set() {
         let d = dispatch_with_window(Some(1_746_057_600_000), Some(1_748_735_999_999));
         let v = d.summarize_input();
-        assert_eq!(v["updated_after_ms"], 1_746_057_600_000_i64);
-        assert_eq!(v["updated_before_ms"], 1_748_735_999_999_i64);
+        assert_eq!(v["last_message_after_ms"], 1_746_057_600_000_i64);
+        assert_eq!(v["last_message_before_ms"], 1_748_735_999_999_i64);
     }
 
     #[test]
-    fn batch_dispatch_summarize_input_omits_updated_before_ms_when_none() {
+    fn batch_dispatch_summarize_input_omits_last_message_before_ms_when_none() {
         let v = dispatch_with_window(Some(1), None).summarize_input();
         assert!(
-            v.get("updated_before_ms").is_none(),
-            "must omit updated_before_ms when None: {v}"
+            v.get("last_message_before_ms").is_none(),
+            "must omit last_message_before_ms when None: {v}"
         );
     }
 
@@ -2646,8 +4699,9 @@ mod tests {
             run_daily: true,
             run_weekly: true,
             run_monthly: false,
-            updated_after_ms: Some(1_746_057_600_000),
-            updated_before_ms: Some(1_748_735_999_999),
+            stop_on_error: false,
+            last_message_after_ms: Some(1_746_057_600_000),
+            last_message_before_ms: Some(1_748_735_999_999),
             daily_start: "2026-03-01".into(),
             daily_end: "2026-05-31".into(),
             weekly_start: "2026-W09".into(),
@@ -2667,6 +4721,7 @@ mod tests {
         assert_eq!(v["run_daily"], true);
         assert_eq!(v["run_weekly"], true);
         assert_eq!(v["run_monthly"], false);
+        assert_eq!(v["stop_on_error"], false);
         // Period tokens are forwarded as-is — NO conversion in Rust.
         assert_eq!(v["daily_start"], "2026-03-01");
         assert_eq!(v["daily_end"], "2026-05-31");
@@ -2675,11 +4730,37 @@ mod tests {
         assert_eq!(v["monthly_start"], "2026-03");
         assert_eq!(v["monthly_end"], "2026-05");
         // Per-thread epoch bounds forwarded as-is.
-        assert_eq!(v["updated_after_ms"], 1_746_057_600_000_i64);
-        assert_eq!(v["updated_before_ms"], 1_748_735_999_999_i64);
+        assert_eq!(v["last_message_after_ms"], 1_746_057_600_000_i64);
+        assert_eq!(v["last_message_before_ms"], 1_748_735_999_999_i64);
         assert_eq!(v["timezone_offset_hours"], 9);
         assert_eq!(v["user_id"], 1);
         assert!(v.get("summary_user_id").is_none());
+    }
+
+    #[test]
+    fn generate_summaries_request_defaults_stop_on_error_to_false_and_forwards_true() {
+        let defaulted: GenerateSummariesRequest = serde_json::from_str(
+            r#"{"run_per_thread":false,"run_daily":false,"run_weekly":false,"run_monthly":false,"timezone_offset_hours":9}"#,
+        )
+        .unwrap();
+        assert!(!defaulted.stop_on_error);
+
+        let req: GenerateSummariesRequest = serde_json::from_str(
+            r#"{"run_per_thread":false,"run_daily":false,"run_weekly":false,"run_monthly":false,"timezone_offset_hours":9,"stop_on_error":true}"#,
+        )
+        .unwrap();
+        assert_eq!(dispatch().pipeline_input(&req)["stop_on_error"], true);
+    }
+
+    #[test]
+    fn summaries_pipeline_schema_exposes_best_effort_stop_switch_and_failure_output() {
+        let yaml =
+            include_str!("../../../workers/workflows/summaries-pipeline/summaries-pipeline.yaml");
+        assert!(yaml.contains("stop_on_error: { type: boolean, default: false }"));
+        assert!(yaml.contains("per_day_failed_dates: \"${ $per_day_failed_dates }\""));
+        assert!(yaml.contains("per_thread_execution_failed"));
+        assert!(yaml.contains("daily_execution_failed"));
+        assert!(yaml.contains("execution_failures: \"${ $execution_failures }\""));
     }
 
     #[test]
@@ -2719,18 +4800,18 @@ mod tests {
         // batch stays unbounded (mirrors enqueueSummaryJob({})).
         let req = GenerateSummariesRequest {
             run_per_thread: true,
-            updated_after_ms: None,
-            updated_before_ms: None,
+            last_message_after_ms: None,
+            last_message_before_ms: None,
             ..Default::default()
         };
         let v = dispatch().pipeline_input(&req);
         assert!(
-            v.get("updated_after_ms").is_none(),
-            "unbounded run must omit updated_after_ms: {v}"
+            v.get("last_message_after_ms").is_none(),
+            "unbounded run must omit last_message_after_ms: {v}"
         );
         assert!(
-            v.get("updated_before_ms").is_none(),
-            "unbounded run must omit updated_before_ms: {v}"
+            v.get("last_message_before_ms").is_none(),
+            "unbounded run must omit last_message_before_ms: {v}"
         );
         // Empty period tokens are still forwarded (the batch treats "" as
         // "no range" and falls back).
@@ -2777,8 +4858,11 @@ mod tests {
                 tls: true,
             },
             workflows_dir: PathBuf::from("/x/workflows"),
-            updated_after_ms: None,
-            updated_before_ms: None,
+            last_message_after_ms: None,
+            last_message_before_ms: None,
+            thread_created_after_ms: None,
+            thread_created_before_ms: None,
+            target_thread_ids: None,
             llm_worker_name: "memories-llm".to_string(),
             output_language: "ja".to_string(),
         };
@@ -2882,7 +4966,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_dispatch_inputs_include_updated_after_ms_when_set() {
+    fn batch_dispatch_inputs_include_last_message_after_ms_when_set() {
         let d = dispatch_with(Some(1_746_057_600_000));
         for v in [
             d.summarize_input(),
@@ -2890,14 +4974,14 @@ mod tests {
             d.reflection_input(),
         ] {
             assert_eq!(
-                v["updated_after_ms"], 1_746_057_600_000_i64,
-                "input missing updated_after_ms: {v}"
+                v["last_message_after_ms"], 1_746_057_600_000_i64,
+                "input missing last_message_after_ms: {v}"
             );
         }
     }
 
     #[test]
-    fn batch_dispatch_inputs_omit_updated_after_ms_when_none() {
+    fn batch_dispatch_inputs_omit_last_message_after_ms_when_none() {
         let d = dispatch_with(None);
         for v in [
             d.summarize_input(),
@@ -2905,31 +4989,9 @@ mod tests {
             d.reflection_input(),
         ] {
             assert!(
-                v.get("updated_after_ms").is_none(),
-                "input must omit updated_after_ms when None: {v}"
+                v.get("last_message_after_ms").is_none(),
+                "input must omit last_message_after_ms when None: {v}"
             );
-        }
-    }
-
-    #[test]
-    fn parse_since_millis_returns_none_for_none() {
-        assert_eq!(parse_since_millis(None).unwrap(), None);
-    }
-
-    #[test]
-    fn parse_since_millis_parses_rfc3339_with_z() {
-        // 2026-05-01T00:00:00Z → epoch ms. Matches what the UI's
-        // `${sinceDate}T00:00:00Z` constructor emits for "from 2026-05-01".
-        let ms = parse_since_millis(Some("2026-05-01T00:00:00Z")).unwrap();
-        assert_eq!(ms, Some(1_777_593_600_000));
-    }
-
-    #[test]
-    fn parse_since_millis_errors_on_invalid_string() {
-        let err = parse_since_millis(Some("not-a-date")).unwrap_err();
-        match err {
-            AppError::Config(msg) => assert!(msg.contains("parse since")),
-            other => panic!("expected AppError::Config, got {other:?}"),
         }
     }
 

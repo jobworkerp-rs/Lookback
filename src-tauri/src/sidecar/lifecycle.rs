@@ -8,13 +8,16 @@
 //! succeeds (poor man's health check; gRPC `tonic_health` Check is the
 //! follow-up once we know what services are registered).
 
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep, timeout};
@@ -25,33 +28,17 @@ use crate::error::{AppError, AppResult};
 use crate::sidecar::ports;
 use crate::sidecar::reaper::{self, PidEntry};
 
-/// `RUST_LOG` baseline applied to both sidecars.
+/// Default `RUST_LOG` filters for the resident sidecars.
 ///
-/// `info` would be reasonable on its own, but memories' `#[tracing::instrument]`
-/// on the gRPC handlers inlines the full request payload into the span body.
-/// For `AddMemoriesBatch` that means megabytes of base64-ish JSON per call,
-/// and on a full claude-code import the log file ballooned to several hundred
-/// MB. Suppressing the `app` (memories core) and `worker_app` (jobworkerp)
-/// targets to `warn` keeps the noisy span bodies out while preserving the
-/// real progress / error lines.
-///
-/// `lance=warn` is suppressed for the same reason: LanceDB emits an INFO line
-/// per file-audit / dataset commit / query plan (`lance::file_audit`,
-/// `lance::dataset_events`, `lance::execution`), and a single import's vector
-/// writes drove the log to multiple GB. `lance=warn` covers all sub-targets.
-///
-/// `LOOKBACK_RUST_LOG` (set by the user) overrides this — see
-/// `effective_rust_log()` below.
-const DEFAULT_SIDECAR_LOG: &str = "info,app=warn,worker_app=warn,lance=warn";
-
-/// `RUST_LOG` for the jobworkerp sidecar only. Raised to `debug` so workflow
-/// execution and the LLM runner (constrained-decoding / grammar setup) emit
-/// the detail needed to diagnose reflection generation. The chatty transport /
-/// async-runtime crates are pinned back to `info`/`warn` so the debug signal
-/// stays readable. memories keeps `DEFAULT_SIDECAR_LOG` because its
-/// `#[tracing::instrument]` handlers inline full payloads at debug — see the
-/// note above. Overridable via `LOOKBACK_RUST_LOG`.
-const DEFAULT_JOBWORKERP_LOG: &str = "debug,hyper=info,hyper_util=info,tonic=info,h2=info,tower=info,reqwest=info,sqlx=warn,tokio=info,runtime=info,lance=warn";
+/// Development builds use an `info` baseline. Release bundles use `warn` so a
+/// packaged app does not write routine progress and request
+/// details to the user's log directory. The `app`, `worker_app`, and `lance`
+/// target suppressions apply in both profiles: memories' instrumented gRPC
+/// handlers can inline full request payloads, jobworkerp's application target
+/// is similarly noisy, and LanceDB emits an INFO line for many internal
+/// operations. `LOOKBACK_RUST_LOG` overrides the selected profile.
+const DEFAULT_SIDECAR_LOG_DEV: &str = "info,app=warn,worker_app=warn,lance=warn";
+const DEFAULT_SIDECAR_LOG_RELEASE: &str = "warn,app=warn,worker_app=warn,lance=warn";
 const MEMORIES_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The document prefix is consumed while expanding Lookback's jobworkerp
@@ -60,6 +47,70 @@ const MEMORIES_START_TIMEOUT: Duration = Duration::from_secs(60);
 /// prepending text. The query prefix remains valid because it does not alter
 /// persisted document chunks.
 const MEMORIES_UNSUPPORTED_DOCUMENT_PREFIX_ENV_KEY: &str = "MEMORY_EMBEDDING_DOCUMENT_PREFIX";
+
+/// Environment that makes index maintenance explicitly Lookback-driven.
+/// Kept as a pure projector so spawn policy is covered without a child.
+pub(crate) fn search_index_maintenance_env_vars(grpc_addr: &str) -> [(&'static str, String); 16] {
+    [
+        ("SEARCH_INDEX_MAINTENANCE_GRPC_ADDR", grpc_addr.to_string()),
+        ("MEMORY_INDEX_UPDATE_INTERVAL_SECS", "0".into()),
+        ("THREAD_INDEX_UPDATE_INTERVAL_SECS", "0".into()),
+        ("MEMORY_COMPACTION_INTERVAL_SECS", "0".into()),
+        ("THREAD_COMPACTION_INTERVAL_SECS", "0".into()),
+        ("MEMORY_PRUNE_INTERVAL_SECS", "0".into()),
+        ("THREAD_PRUNE_INTERVAL_SECS", "0".into()),
+        ("MEMORY_INDEX_UPDATE_UNINDEXED_ROWS", "1000".into()),
+        ("THREAD_INDEX_UPDATE_UNINDEXED_ROWS", "1000".into()),
+        ("MEMORY_PRUNE_OLDER_THAN_SECS", "300".into()),
+        ("THREAD_PRUNE_OLDER_THAN_SECS", "300".into()),
+        ("SEARCH_INDEX_MAINTENANCE_CHECK_DEADLINE_SECS", "30".into()),
+        ("SEARCH_INDEX_MAINTENANCE_BACKOFF_INITIAL_SECS", "5".into()),
+        ("SEARCH_INDEX_MAINTENANCE_BACKOFF_MULTIPLIER", "2".into()),
+        ("SEARCH_INDEX_MAINTENANCE_BACKOFF_MAX_SECS", "300".into()),
+        ("SEARCH_INDEX_MAINTENANCE_TASK_HISTORY_LIMIT", "256".into()),
+    ]
+}
+
+fn validate_search_index_maintenance_listener(
+    grpc_addr: &str,
+    maintenance_addr: &str,
+) -> AppResult<()> {
+    let grpc: SocketAddr = grpc_addr.parse().map_err(|_| {
+        AppError::Config("GRPC_ADDR は loopback address である必要があります".into())
+    })?;
+    let maintenance: SocketAddr = maintenance_addr
+        .parse()
+        .map_err(|_| AppError::Config("SEARCH_INDEX_MAINTENANCE_GRPC_ADDR が不正です".into()))?;
+    if !grpc.ip().is_loopback() || grpc != maintenance {
+        return Err(AppError::Config(
+            "maintenance listener は GRPC_ADDR と同一の loopback address である必要があります"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_legacy_maintenance_env(key: &str) -> bool {
+    matches!(
+        key,
+        "MEMORY_AUTO_OPTIMIZE_INTERVAL" | "THREAD_AUTO_OPTIMIZE_INTERVAL"
+    ) || ((key.starts_with("MEMORY_") || key.starts_with("THREAD_")) && key.contains("_OPTIMIZE_"))
+}
+
+fn validate_no_legacy_maintenance_env<I>(entries: I) -> AppResult<()>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    if let Some((key, _)) = entries
+        .into_iter()
+        .find(|(key, _)| is_legacy_maintenance_env(key))
+    {
+        return Err(AppError::Config(format!(
+            "旧 index maintenance 環境変数 {key} は Local sidecar で使用できません"
+        )));
+    }
+    Ok(())
+}
 
 /// TCP health-check budget for the in-process MCP HTTP server. Much shorter
 /// than the per-sidecar 30s because by the time we check it the jobworkerp
@@ -222,6 +273,9 @@ fn apply_memories_vector_env(
 ) {
     if vector_on {
         cmd.env("MEMORY_VECTOR_ENABLED", "true")
+            // ThreadVectorDBConfig deliberately inherits its size and URI
+            // from MEMORY_*; this flag is the only separate prerequisite.
+            .env("THREAD_VECTOR_ENABLED", "true")
             .env("MEMORY_VECTOR_SIZE", vector_size.to_string())
             .env(
                 "MEMORY_LANCEDB_URI",
@@ -236,6 +290,7 @@ fn apply_memories_vector_env(
         // Degraded restart must win over env_file / inherited env; otherwise a
         // template with vectors enabled reopens the mismatched LanceDB.
         cmd.env("MEMORY_VECTOR_ENABLED", "false")
+            .env("THREAD_VECTOR_ENABLED", "false")
             .env("REFLECTION_INTENT_VECTOR_ENABLED", "false")
             .env_remove("MEMORY_VECTOR_SIZE")
             .env_remove("MEMORY_LANCEDB_URI")
@@ -253,6 +308,12 @@ pub struct SidecarConfig {
 
     /// Path to the memories `memories-front` binary.
     pub memories_bin: PathBuf,
+
+    /// Memories-owned coordinator from the official SQLite migration bundle.
+    pub memories_db_migrate_bin: PathBuf,
+
+    /// Release-owned switch; it is never loaded from user settings.
+    pub startup_database_migration_enabled: bool,
 
     /// Path to the conductor `conductor-main` binary.
     pub conductor_bin: PathBuf,
@@ -273,8 +334,8 @@ pub struct SidecarConfig {
     pub function_set_yaml_paths: Vec<PathBuf>,
 
     /// Sets `MEMORY_REFLECTION_DISPATCH_ENABLED` on the memories child.
-    /// Toggling this off keeps the reflection branch in
-    /// `agent-chat-pipeline.yaml` from firing even if it is wired.
+    /// Toggling this off keeps the Rust import driver and manual reflection
+    /// dispatch from invoking reflection generation.
     pub reflection_dispatch_enabled: bool,
 
     /// Sets `MEMORY_AUTO_EMBEDDING_ENABLED` on the memories child. When
@@ -282,8 +343,9 @@ pub struct SidecarConfig {
     /// reflection intent dispatcher) so Hybrid / Semantic / intent search
     /// have vectors to query. Requires the `embedding` / `embedding_workflow`
     /// jobworkerp channels and the Metal embedding plugin. Also gates the
-    /// vector-store env (`MEMORY_VECTOR_ENABLED` / `MEMORY_VECTOR_SIZE` /
-    /// `MEMORY_LANCEDB_URI` / `REFLECTION_INTENT_VECTOR_ENABLED`).
+    /// vector-store env (`MEMORY_VECTOR_ENABLED` / `THREAD_VECTOR_ENABLED` /
+    /// `MEMORY_VECTOR_SIZE` / `MEMORY_LANCEDB_URI` /
+    /// `REFLECTION_INTENT_VECTOR_ENABLED`).
     pub auto_embedding_enabled: bool,
 
     /// Bundled worker/workflow YAML directory (the agent-app copies with
@@ -384,6 +446,25 @@ fn memories_sqlite_env_vars(data: &DataPaths) -> [(&'static str, String); 2] {
             crate::data::DataPaths::MEMORIES_SQLITE_MAX_CONNECTIONS.to_string(),
         ),
     ]
+}
+
+fn effective_memory_fts_tokenizer(
+    env_file: Option<&Path>,
+    lindera_dict_staged: bool,
+    process_env: impl Fn(&str) -> Option<String>,
+) -> String {
+    if !lindera_dict_staged {
+        return "ngram".into();
+    }
+    let from_file = env_file
+        .and_then(|path| dotenvy::from_path_iter(path).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .find_map(|(key, value)| (key == "MEMORY_FTS_TOKENIZER").then_some(value));
+    from_file
+        .or_else(|| process_env("MEMORY_FTS_TOKENIZER"))
+        .unwrap_or_else(|| "lindera/ipadic".into())
 }
 
 /// Keep jobworkerp's envy-based worker config complete. Supplying channels
@@ -514,8 +595,19 @@ struct Process {
     port: u16,
 }
 
+type OutputTask = (&'static str, tokio::task::JoinHandle<()>);
+
 pub struct Sidecars {
     config: SidecarConfig,
+    /// Serializes lifecycle operations on this instance. The migration gate,
+    /// child spawning, and lock release all inspect and mutate shared state,
+    /// so checking `current_endpoints` alone cannot make concurrent starts or
+    /// stops safe.
+    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Exposed through the startup snapshot while the local database
+    /// migration gate owns the database. Kept independent of lifecycle_lock
+    /// so the UI can observe progress without waiting for startup to finish.
+    database_migration_in_progress: Arc<AtomicBool>,
     /// Resolved `HF_HOME` precedence (app-settings.json → shell env →
     /// `.env` template → `<data>/models` fallback). Updated at every
     /// `start_inner` so a `set_hf_home`-triggered restart picks up the
@@ -524,6 +616,13 @@ pub struct Sidecars {
     /// whichever cache the sidecar was last spawned with.
     effective_hf_home: Arc<Mutex<PathBuf>>,
     state: Arc<Mutex<Option<Vec<Process>>>>,
+    /// Handles for stdout/stderr pumps. They are joined after children exit
+    /// so the final buffered lines are flushed before a restart or shutdown.
+    output_tasks: Arc<Mutex<Vec<OutputTask>>>,
+    /// Native log directories allocated for resident sidecars. They remain
+    /// active while a child is running and are marked closed only after the
+    /// child/output pump has stopped, allowing retention to prune safely.
+    native_log_dirs: Arc<Mutex<Vec<(String, PathBuf)>>>,
     /// Last successful start report, kept so `get_sidecar_status` can hand
     /// the frontend an immediate snapshot (endpoints + warnings) instead of
     /// racing the one-shot `sidecar://ready` event on mount.
@@ -545,11 +644,12 @@ pub struct Sidecars {
     /// the listener attached would leave the UI stuck on the boot
     /// spinner.
     last_start_failure: Arc<Mutex<Option<crate::sidecar::startup_error::SidecarErrorPayload>>>,
-    /// Per-instance advisory lock (over `<root>/sidecar.lock`), held for as long
-    /// as this instance has sidecars up. A concurrent launch can only reap
-    /// recorded orphans if it can take this lock — so we never SIGKILL another
-    /// live instance's children. Acquired in `start_inner` (via
-    /// `reaper::reap_recorded`) and released on `stop` / `stop_blocking` / Drop.
+    /// Per-instance advisory lock (over `<root>/sidecar.lock`), held while this
+    /// instance has sidecars up or performs an exclusive maintenance action.
+    /// A concurrent launch can only reap recorded orphans if it can take this
+    /// lock — so we never SIGKILL another live instance's children. Acquired in
+    /// `start_inner` (via `reaper::reap_recorded`) and normally released on
+    /// `stop` / `stop_blocking` / Drop.
     instance_lock: Arc<Mutex<Option<reaper::InstanceLock>>>,
     /// Structured startup failure parsed out of the memories child's
     /// stdout (via `parse_stdout_line`) or, fallback, its stderr panic
@@ -588,13 +688,39 @@ pub struct Sidecars {
     degraded: Arc<Mutex<Option<DegradedInfo>>>,
 }
 
+/// Clears the migration activity signal even if the startup future is dropped
+/// while the coordinator is still running.
+struct DatabaseMigrationActivity {
+    in_progress: Arc<AtomicBool>,
+}
+
+impl DatabaseMigrationActivity {
+    fn start(in_progress: Arc<AtomicBool>) -> Self {
+        in_progress.store(true, Ordering::Release);
+        Self { in_progress }
+    }
+}
+
+impl Drop for DatabaseMigrationActivity {
+    fn drop(&mut self) {
+        self.in_progress.store(false, Ordering::Release);
+    }
+}
+
 impl Sidecars {
+    pub(crate) fn owns_instance_lock(&self) -> bool {
+        self.instance_lock.lock().is_some()
+    }
     pub fn new(config: SidecarConfig) -> Self {
         let effective_hf_home = resolve_effective_hf_home(&config);
         Self {
             config,
+            lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            database_migration_in_progress: Arc::new(AtomicBool::new(false)),
             effective_hf_home: Arc::new(Mutex::new(effective_hf_home)),
             state: Arc::new(Mutex::new(None)),
+            output_tasks: Arc::new(Mutex::new(Vec::new())),
+            native_log_dirs: Arc::new(Mutex::new(Vec::new())),
             last_report: Arc::new(Mutex::new(None)),
             last_start_error: Arc::new(Mutex::new(None)),
             last_start_failure: Arc::new(Mutex::new(None)),
@@ -668,6 +794,23 @@ impl Sidecars {
         self.last_start_failure.lock().clone()
     }
 
+    /// Whether the local startup migration gate is currently checking or
+    /// migrating the memories database.
+    pub fn database_migration_in_progress(&self) -> bool {
+        self.database_migration_in_progress.load(Ordering::Acquire)
+    }
+
+    fn database_migration_activity(&self) -> DatabaseMigrationActivity {
+        DatabaseMigrationActivity::start(Arc::clone(&self.database_migration_in_progress))
+    }
+
+    fn database_migration_activity_if_enabled(
+        &self,
+        enabled: bool,
+    ) -> Option<DatabaseMigrationActivity> {
+        enabled.then(|| self.database_migration_activity())
+    }
+
     /// The reason the LLM model can never finish preparing, or `None` if no
     /// such blocking condition is known. Folds the two failure sources
     /// (fatal first) so callers like `get_model_status` don't reach into the
@@ -712,6 +855,11 @@ impl Sidecars {
         &self,
         warnings: Vec<SidecarWarning>,
     ) -> AppResult<SidecarStartReport> {
+        // Hold the lifecycle lock across the running-state check and every
+        // startup side effect. Otherwise two callers can both pass the
+        // idempotency check before either migration or spawn has published
+        // state, executing the coordinator and children twice.
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let was_running = self.current_endpoints().is_some();
         let result = self.start_inner(warnings).await;
         match &result {
@@ -781,19 +929,53 @@ impl Sidecars {
         } else {
             None
         };
-        let memory_db = self.config.data.memories_sqlite_path();
-        if !remote_memories {
-            // An interrupted migration is examined before `ensure()`: creating
-            // the LanceDB directory here would destroy the evidence needed to
-            // restore its paired SQLite backup.
-            if let Some(reason) =
-                crate::commands::recovery::migration_startup_blocker(&self.config.data)?
-            {
-                return Err(AppError::MemoryKindDatabaseSchemaInvalid {
-                    db_path: memory_db.display().to_string(),
-                    reason,
-                });
+        // Reap any sidecars stranded by a previous crash (no PR_SET_PDEATHSIG
+        // on macOS) BEFORE picking ports, so this launch can reclaim 9000/9010
+        // instead of falling back to random ports behind the orphans. The reap
+        // is gated on the per-instance advisory lock: if another live instance
+        // holds it, `lock` comes back `None`.
+        let pids_path = self.config.data.sidecar_pids_path();
+        let lock_path = self.config.data.sidecar_lock_path();
+        if self.instance_lock.lock().is_none() {
+            let outcome = reaper::reap_recorded(&pids_path, &lock_path);
+
+            // No lock means another live instance owns this data root. We must NOT
+            // spawn a second set of sidecars or modify its database.
+            let Some(lock) = outcome.lock else {
+                return Err(AppError::AnotherInstanceRunning);
+            };
+            if outcome.reaped > 0 {
+                info!(
+                    reaped = outcome.reaped,
+                    "reaped orphaned sidecars from a previous launch"
+                );
             }
+            *self.instance_lock.lock() = Some(lock);
+        }
+
+        // After reaping recorded children, reconcile only native scopes whose
+        // recorded child PID is no longer alive. Unrecorded or live scopes
+        // remain active so an orphan cannot be pruned while still writing.
+        match crate::log_rotation::reconcile_native_log_dirs_after_reap(&self.config.data.log_dir())
+        {
+            Ok(reconciled) if reconciled > 0 => {
+                info!(reconciled, "closed stale native log directories");
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "could not reconcile stale native log directories"),
+        }
+        match crate::log_rotation::reconcile_migration_logs(&self.config.data.log_dir()) {
+            Ok(reconciled) if reconciled > 0 => {
+                info!(reconciled, "closed stale migration log markers");
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "could not reconcile stale migration logs"),
+        }
+
+        if remote_memories {
+            self.config.data.ensure_runtime()?;
+        } else {
+            let memory_db = self.config.data.memories_sqlite_path();
             match crate::sidecar::memory_kind_gate::inspect(&memory_db) {
                 Ok(crate::sidecar::memory_kind_gate::GateState::Fresh)
                 | Ok(crate::sidecar::memory_kind_gate::GateState::ContractReady) => {}
@@ -802,62 +984,59 @@ impl Sidecars {
                         db_path: memory_db.display().to_string(),
                     });
                 }
-                Ok(crate::sidecar::memory_kind_gate::GateState::UnexpectedMemoryData {
-                    reason,
-                }) => {
-                    return Err(AppError::UnexpectedMemoryData {
-                        db_path: memory_db.display().to_string(),
-                        reason,
-                    });
-                }
                 Ok(crate::sidecar::memory_kind_gate::GateState::DatabaseSchemaInvalid) => {
                     return Err(AppError::MemoryKindDatabaseSchemaInvalid {
                         db_path: memory_db.display().to_string(),
-                        reason: "memory and thread tables are incomplete".into(),
+                        reason: "memory and thread tables must both have the memory_kind column"
+                            .into(),
                     });
                 }
                 Err(reason) => {
-                    return Err(AppError::MemoryKindDatabaseSchemaInvalid {
-                        db_path: memory_db.display().to_string(),
-                        reason,
-                    });
+                    return Err(memory_kind_gate_error(&memory_db, reason));
                 }
             }
-        }
-
-        if remote_memories {
-            self.config.data.ensure_runtime()?;
-        } else {
             self.config.data.ensure()?;
         }
 
-        // Reap any sidecars stranded by a previous crash (no PR_SET_PDEATHSIG
-        // on macOS) BEFORE picking ports, so this launch can reclaim 9000/9010
-        // instead of falling back to random ports behind the orphans. The reap
-        // is gated on the per-instance advisory lock: if another live instance
-        // holds it, `lock` comes back `None`.
-        let pids_path = self.config.data.sidecar_pids_path();
-        let lock_path = self.config.data.sidecar_lock_path();
-        let outcome = reaper::reap_recorded(&pids_path, &lock_path);
-
-        // No lock means another live instance owns this data root. We must NOT
-        // spawn a second set of sidecars: they'd contend for the SQLite/LanceDB
-        // files and ports, and `record_pids` below would overwrite the shared
-        // `sidecar.pids` with our PIDs — so a later launch (after the first
-        // instance exits) could acquire the lock and mistake the OTHER live
-        // instance's children for crash orphans and kill them. Bail before any
-        // spawn; the error is surfaced via `sidecar://error` while the app
-        // window stays open so the user learns what happened.
-        let Some(lock) = outcome.lock else {
-            return Err(AppError::AnotherInstanceRunning);
-        };
-        if outcome.reaped > 0 {
-            info!(
-                reaped = outcome.reaped,
-                "reaped orphaned sidecars from a previous launch"
+        if !remote_memories {
+            let embedding_settings = crate::commands::embedding_settings::load_embedding_settings(
+                &self.config.data.embedding_settings_path(),
             );
+            let embedding_runtime =
+                crate::commands::embedding_settings::resolve_embedding_runtime_with_env(
+                    &embedding_settings,
+                    crate::commands::process_env_lookup,
+                );
+            let migration_env = crate::sidecar::migration_gate::MigrationEnvironment {
+                database_url: self.config.data.memories_sqlite_url(),
+                thread_vector_enabled: self.config.auto_embedding_enabled,
+                thread_lancedb_uri: self.config.data.lancedb_dir().join("memories.lancedb"),
+                thread_lancedb_table: "threads".into(),
+                thread_vector_size: embedding_runtime.vector_size,
+                memory_fts_tokenizer: effective_memory_fts_tokenizer(
+                    self.config.env_file.as_deref(),
+                    self.config.lindera_dict_staged,
+                    crate::commands::process_env_lookup,
+                ),
+                lance_language_model_home: self.config.lance_language_model_home.clone(),
+            };
+            let release = crate::sidecar::migration_gate::MigrationRelease {
+                enabled: self.config.startup_database_migration_enabled,
+                ..crate::sidecar::migration_gate::STARTUP_MIGRATION
+            };
+            // Keep this alive across every return from an enabled gate. Its
+            // Drop implementation also clears the UI signal if startup is
+            // aborted. Disabled releases still call the gate for its normal
+            // no-op path, but must never claim migration is active.
+            let _migration_activity = self.database_migration_activity_if_enabled(release.enabled);
+            crate::sidecar::migration_gate::run_startup_gate(
+                &self.config.data,
+                &self.config.memories_db_migrate_bin,
+                release,
+                &migration_env,
+            )
+            .await?;
         }
-        *self.instance_lock.lock() = Some(lock);
 
         let jw_port = ports::pick(9000)?;
         let mem_port = (!remote_memories).then(|| ports::pick(9010)).transpose()?;
@@ -869,13 +1048,11 @@ impl Sidecars {
         // be configured against; `ports::pick` falls back to an OS-assigned
         // port if it is already taken.
         let mcp_server_port = ports::pick(crate::commands::mcp_settings::MCP_DEFAULT_PORT)?;
-        // Evaluate once so the two sidecars get a stable value even when
-        // LOOKBACK_RUST_LOG is mid-flight modified by a test harness. The
-        // jobworkerp sidecar runs at debug (workflow / LLM diagnostics) while
-        // memories stays at the info baseline (its instrument spans are huge
-        // at debug); an explicit LOOKBACK_RUST_LOG overrides both.
+        // Evaluate once so every resident sidecar gets a stable value even
+        // when LOOKBACK_RUST_LOG is mid-flight modified by a test harness.
+        // The selected profile is info for dev builds and warn for release
+        // bundles; an explicit LOOKBACK_RUST_LOG overrides it.
         let rust_log = effective_rust_log();
-        let jobworkerp_log = effective_jobworkerp_log();
 
         info!(
             jobworkerp_port = jw_port,
@@ -981,7 +1158,7 @@ impl Sidecars {
             jw_port,
             mcp_server_port,
             &mcp_runtime,
-            &jobworkerp_log,
+            &rust_log,
             &llm_settings,
             llm_model.as_deref(),
             llm_hf_repo.as_deref(),
@@ -1217,7 +1394,7 @@ impl Sidecars {
                 // are already registered) and clear the structured-failure slot:
                 // otherwise the re-spawn's TCP wait would short-circuit on the
                 // stale failure.
-                self.kill_memories_child();
+                self.kill_memories_child().await;
                 *self.startup_failure.lock() = None;
 
                 self.spawn_and_register_memories(
@@ -1245,6 +1422,15 @@ impl Sidecars {
 
                 *self.degraded.lock() = Some(info.clone());
                 warnings.push(info.into_warning());
+            }
+
+            if let Err(error) = crate::commands::connection::validate_local_memories_services(
+                &format!("http://127.0.0.1:{mem_port}"),
+            )
+            .await
+            {
+                self.stop_blocking();
+                return Err(error);
             }
         }
 
@@ -1356,6 +1542,43 @@ impl Sidecars {
     }
 
     pub async fn stop(&self) -> AppResult<()> {
+        self.stop_inner(true).await
+    }
+
+    /// Stop every child while retaining the data-root lock for an immediate
+    /// in-process maintenance action followed by `start_inner`.
+    #[allow(dead_code)]
+    pub(crate) async fn stop_for_maintenance(&self) -> AppResult<()> {
+        self.stop_inner(false).await
+    }
+
+    /// Stop the sidecars for an exclusive maintenance operation and keep the
+    /// lifecycle lock held until that operation completes. Database restore
+    /// must not leave a window where a concurrent start can reopen the live
+    /// database before the restored files are installed.
+    pub(crate) async fn with_maintenance_lock<F, Fut, T>(&self, operation: F) -> AppResult<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = AppResult<T>>,
+    {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        if !self.owns_instance_lock() {
+            return Err(AppError::AnotherInstanceRunning);
+        }
+        self.stop_inner_locked(false).await?;
+        operation().await
+    }
+
+    async fn stop_inner(&self, release_lock: bool) -> AppResult<()> {
+        // Startup may hold the instance lock before child state is published
+        // (for example while the migration coordinator is running). Serialize
+        // stop with startup so the empty-state branch below cannot release
+        // that lock while the startup operation is still in flight.
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.stop_inner_locked(release_lock).await
+    }
+
+    async fn stop_inner_locked(&self, release_lock: bool) -> AppResult<()> {
         // Invalidate the snapshot in lockstep with the process list, so a
         // `get_sidecar_status` after stop (or after purge_all_data) can't
         // hand the frontend stale endpoints and promote it back to ready.
@@ -1372,9 +1595,16 @@ impl Sidecars {
         // dispatches after a stop / purge.
         *self.degraded.lock() = None;
         let Some(mut procs) = self.state.lock().take() else {
-            // Nothing was running; still release the lock/PID record in case a
-            // prior partial start left them behind.
-            self.release_instance_lock();
+            if self.join_output_tasks().await {
+                self.close_native_log_dirs(None);
+            } else {
+                warn!("sidecar output pumps did not finish; leaving native logs active");
+            }
+            if release_lock {
+                self.release_instance_lock();
+            } else {
+                reaper::clear_pids(&self.config.data.sidecar_pids_path());
+            }
             return Ok(());
         };
         // Stop the children FIRST, then release the lock + PID record. Doing it
@@ -1386,7 +1616,16 @@ impl Sidecars {
         for proc in procs.iter_mut() {
             stop_child(&mut proc.child, proc.name).await;
         }
-        self.release_instance_lock();
+        if self.join_output_tasks().await {
+            self.close_native_log_dirs(None);
+        } else {
+            warn!("sidecar output pumps did not finish; leaving native logs active");
+        }
+        if release_lock {
+            self.release_instance_lock();
+        } else {
+            reaper::clear_pids(&self.config.data.sidecar_pids_path());
+        }
         Ok(())
     }
 
@@ -1394,20 +1633,89 @@ impl Sidecars {
     /// leaving jobworkerp (and its already-registered workers) running.
     /// Used by the degraded-restart path so a dimension-mismatched memories
     /// child can be replaced without tearing the whole sidecar set down.
-    /// Best-effort: `start_kill` just sends SIGKILL on Unix.
-    fn kill_memories_child(&self) {
-        let mut guard = self.state.lock();
-        let Some(procs) = guard.as_mut() else {
-            return;
-        };
-        procs.retain_mut(|proc| {
-            if proc.name == "memories" {
-                let _ = proc.child.start_kill();
-                false
-            } else {
-                true
-            }
+    /// Waits for the child and its output pumps so native logs are marked
+    /// closed only after their final bytes have been drained.
+    async fn kill_memories_child(&self) {
+        let child = self.state.lock().as_mut().and_then(|procs| {
+            procs
+                .iter()
+                .position(|proc| proc.name == "memories")
+                .map(|index| procs.remove(index).child)
         });
+        if let Some(mut child) = child {
+            stop_child(&mut child, "memories").await;
+        }
+        if self.join_output_tasks_for(Some("memories")).await {
+            self.close_native_log_dirs(Some("memories"));
+        } else {
+            warn!("memories output pumps did not finish; leaving native logs active");
+        }
+    }
+
+    async fn join_output_tasks(&self) -> bool {
+        self.join_output_tasks_for(None).await
+    }
+
+    async fn join_output_tasks_for(&self, scope_filter: Option<&str>) -> bool {
+        let tasks = std::mem::take(&mut *self.output_tasks.lock());
+        let mut selected = Vec::new();
+        let mut keep = Vec::new();
+        for (name, task) in tasks {
+            if scope_filter.is_none_or(|filter| name.contains(filter)) {
+                selected.push((name, task));
+            } else {
+                keep.push((name, task));
+            }
+        }
+        *self.output_tasks.lock() = keep;
+        let mut complete = true;
+        for (_, mut task) in selected {
+            match timeout(Duration::from_secs(5), &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    complete = false;
+                    warn!(?error, "sidecar output pump failed while stopping");
+                }
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    warn!("sidecar output pump timed out; aborted and joined");
+                }
+            }
+        }
+        complete
+    }
+
+    fn close_native_log_dirs(&self, scope_filter: Option<&str>) {
+        let mut dirs = self.native_log_dirs.lock();
+        let mut keep = Vec::with_capacity(dirs.len());
+        for (scope, path) in dirs.drain(..) {
+            if scope_filter.is_none_or(|filter| scope.contains(filter)) {
+                let _ = crate::log_rotation::mark_native_log_dir_closed(&path);
+            } else {
+                keep.push((scope, path));
+            }
+        }
+        *dirs = keep;
+    }
+
+    /// Attach the actual child PID to the newest active native-log scope for
+    /// this executable. The scope is allocated before spawn so it can be
+    /// passed in the child's environment; only a successful spawn can provide
+    /// the PID used by crash reconciliation.
+    fn mark_native_log_dir_pid(&self, scope: &str, pid: u32) {
+        let path = self
+            .native_log_dirs
+            .lock()
+            .iter()
+            .rev()
+            .find(|(candidate, path)| candidate == scope && path.join(".active").is_file())
+            .map(|(_, path)| path.clone());
+        if let Some(path) = path
+            && let Err(error) = crate::log_rotation::mark_native_log_dir_pid(&path, pid)
+        {
+            warn!(%error, path = %path.display(), pid, "could not record native child PID");
+        }
     }
 
     /// Drop the crash-recovery PID record and the per-instance advisory lock.
@@ -1468,6 +1776,11 @@ impl Sidecars {
             // Tokio's Child::start_kill is sync and just sends SIGKILL on Unix.
             let _ = proc.child.start_kill();
         }
+        for (_, task) in self.output_tasks.lock().drain(..) {
+            task.abort();
+        }
+        // SIGKILL + task abort does not prove that the final native bytes were
+        // drained; leave `.active` markers for next-launch reconciliation.
         self.release_instance_lock();
     }
 
@@ -1500,10 +1813,23 @@ impl Sidecars {
     fn base_cmd(&self, bin: &std::path::Path, cwd: &std::path::Path, rust_log: &str) -> Command {
         let mut cmd = Command::new(bin);
         self.apply_env_file(&mut cmd);
+        let native_scope = bin
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("sidecar")
+            .to_string();
+        let native_log_dir =
+            crate::log_rotation::native_log_dir(&self.config.data.log_dir(), &native_scope)
+                .inspect(|path| {
+                    self.native_log_dirs
+                        .lock()
+                        .push((native_scope.clone(), path.clone()));
+                })
+                .unwrap_or_else(|_| self.config.data.log_dir());
         cmd.current_dir(cwd)
             .env("RUST_LOG", rust_log)
             .env("LOG_APP_NAME", "Lookback")
-            .env("LOG_FILE_DIR", self.config.data.log_dir())
+            .env("LOG_FILE_DIR", native_log_dir)
             .env("LOG_USE_JSON", "true")
             .env("LOG_USE_STDOUT", "true")
             .env("USE_GRPC_WEB", "true") // for debug ui
@@ -1733,14 +2059,38 @@ impl Sidecars {
         // be pushed to a running child — env is fixed at spawn).
         *self.spawned_external_key_env.lock() = injected_key_env;
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| spawn_err("jobworkerp", &self.config.jobworkerp_bin, e))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let scope = self
+                    .config
+                    .jobworkerp_bin
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("sidecar");
+                self.close_native_log_dirs(Some(scope));
+                return Err(spawn_err("jobworkerp", &self.config.jobworkerp_bin, error));
+            }
+        };
+        if let Some(pid) = child.id() {
+            let scope = self
+                .config
+                .jobworkerp_bin
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("sidecar");
+            self.mark_native_log_dir_pid(scope, pid);
+        }
         // jobworkerp does not (yet) emit structured startup-error rows on
         // the `app::startup_error` target, so the per-line scanner is a
         // no-op. Pass `None` to make that invariant explicit rather than
         // wiring the slot only to be ignored.
-        forward_output(&mut child, "jobworkerp", &self.config.data.log_dir(), None);
+        self.output_tasks.lock().extend(forward_output(
+            &mut child,
+            "jobworkerp",
+            &self.config.data.log_dir(),
+            None,
+        ));
         Ok(child)
     }
 
@@ -1758,6 +2108,16 @@ impl Sidecars {
         staged_embedding_workers_yaml: Option<&std::path::Path>,
         auto_embedding_override: Option<bool>,
     ) -> AppResult<Child> {
+        let env_entries = std::env::vars().chain(
+            self.config
+                .env_file
+                .as_ref()
+                .and_then(|path| dotenvy::from_path_iter(path).ok())
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok),
+        );
+        validate_no_legacy_maintenance_env(env_entries)?;
         let auto_embedding_on =
             auto_embedding_override.unwrap_or(self.config.auto_embedding_enabled);
         // memories' gRPC frontend reads `GRPC_ADDR` as its *listen* address.
@@ -1772,7 +2132,9 @@ impl Sidecars {
             rust_log,
         );
         let auto_embedding = if auto_embedding_on { "true" } else { "false" };
-        cmd.env("GRPC_ADDR", format!("127.0.0.1:{port}"))
+        let grpc_addr = format!("127.0.0.1:{port}");
+        validate_search_index_maintenance_listener(&grpc_addr, &grpc_addr)?;
+        cmd.env("GRPC_ADDR", &grpc_addr)
             .env("MEMORY_AUTO_EMBEDDING_ENABLED", auto_embedding)
             .env("MEMORY_GRPC_HOST", "127.0.0.1")
             .env("MEMORY_GRPC_PORT", port.to_string())
@@ -1793,6 +2155,9 @@ impl Sidecars {
                 "LANCE_LANGUAGE_MODEL_HOME",
                 self.config.lance_language_model_home.as_os_str(),
             );
+        for (key, value) in search_index_maintenance_env_vars(&grpc_addr) {
+            cmd.env(key, value);
+        }
         for (key, value) in memories_sqlite_env_vars(&self.config.data) {
             cmd.env(key, value);
         }
@@ -1800,8 +2165,8 @@ impl Sidecars {
             cmd.env(key, value);
         }
 
-        // Vector store (LanceDB) wiring. Required for ALL vector search paths
-        // — Semantic / Hybrid (memory_vector) and the reflection intent store.
+        // Vector store (LanceDB) wiring. Required for all local vector paths:
+        // memory, thread, and the reflection intent store.
         // memories reads `MEMORY_LANCEDB_URI` (NOT the unused `LANCEDB_PATH`),
         // defaulting to a cwd-relative path; we pin it under the app data
         // root. `REFLECTION_LANCEDB_URI` defaults to
@@ -1857,23 +2222,47 @@ impl Sidecars {
         // Without a staged Lindera dictionary, a lindera-feature build would
         // fail FTS index creation. Fall back to the ngram tokenizer so
         // Japanese 2-gram search still works dictionary-free (spec §3.R3).
-        if !self.config.lindera_dict_staged {
-            cmd.env("MEMORY_FTS_TOKENIZER", "ngram");
-        }
+        cmd.env(
+            "MEMORY_FTS_TOKENIZER",
+            effective_memory_fts_tokenizer(
+                self.config.env_file.as_deref(),
+                self.config.lindera_dict_staged,
+                crate::commands::process_env_lookup,
+            ),
+        );
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| spawn_err("memories", &self.config.memories_bin, e))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let scope = self
+                    .config
+                    .memories_bin
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("sidecar");
+                self.close_native_log_dirs(Some(scope));
+                return Err(spawn_err("memories", &self.config.memories_bin, error));
+            }
+        };
+        if let Some(pid) = child.id() {
+            let scope = self
+                .config
+                .memories_bin
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("sidecar");
+            self.mark_native_log_dir_pid(scope, pid);
+        }
         // The memories sidecar emits structured startup-error rows on
         // its tracing stdout (target `app::startup_error`); wire the
         // shared slot so `wait_for_tcp_or_failure` can short-circuit
         // the 30 s TCP wait the moment a row arrives.
-        forward_output(
+        self.output_tasks.lock().extend(forward_output(
             &mut child,
             "memories",
             &self.config.data.log_dir(),
             Some(self.startup_failure.clone()),
-        );
+        ));
         Ok(child)
     }
 
@@ -1914,10 +2303,34 @@ impl Sidecars {
         }
         cmd.env("USE_GRPC_WEB", "true");
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| spawn_err("conductor", &self.config.conductor_bin, e))?;
-        forward_output(&mut child, "conductor", &self.config.data.log_dir(), None);
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let scope = self
+                    .config
+                    .conductor_bin
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("sidecar");
+                self.close_native_log_dirs(Some(scope));
+                return Err(spawn_err("conductor", &self.config.conductor_bin, error));
+            }
+        };
+        if let Some(pid) = child.id() {
+            let scope = self
+                .config
+                .conductor_bin
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("sidecar");
+            self.mark_native_log_dir_pid(scope, pid);
+        }
+        self.output_tasks.lock().extend(forward_output(
+            &mut child,
+            "conductor",
+            &self.config.data.log_dir(),
+            None,
+        ));
         Ok(child)
     }
 }
@@ -2101,14 +2514,42 @@ fn strip_memories_document_embedding_prefix(cmd: &mut Command) {
     cmd.env_remove(MEMORIES_UNSUPPORTED_DOCUMENT_PREFIX_ENV_KEY);
 }
 
-fn effective_rust_log() -> String {
-    std::env::var("LOOKBACK_RUST_LOG").unwrap_or_else(|_| DEFAULT_SIDECAR_LOG.to_string())
+/// Select the default filter for a resident sidecar profile.
+///
+/// Keeping the profile decision in a pure function makes the dev/release
+/// policy testable without spawning any of the external binaries.
+fn default_sidecar_log(debug_assertions: bool) -> &'static str {
+    if debug_assertions {
+        DEFAULT_SIDECAR_LOG_DEV
+    } else {
+        DEFAULT_SIDECAR_LOG_RELEASE
+    }
 }
 
-/// jobworkerp's `RUST_LOG`: `LOOKBACK_RUST_LOG` when the user sets it (applies
-/// to both sidecars), otherwise the jobworkerp-only debug baseline.
-fn effective_jobworkerp_log() -> String {
-    std::env::var("LOOKBACK_RUST_LOG").unwrap_or_else(|_| DEFAULT_JOBWORKERP_LOG.to_string())
+/// Resolve a sidecar filter from an optional explicit override and build
+/// profile. `LOOKBACK_RUST_LOG` is intentionally handled by the caller so the
+/// policy itself remains pure and can be tested for both profiles.
+fn effective_rust_log_for(lookback_override: Option<&str>, debug_assertions: bool) -> String {
+    lookback_override
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_sidecar_log(debug_assertions).to_owned())
+}
+
+fn effective_rust_log() -> String {
+    effective_rust_log_for(
+        std::env::var("LOOKBACK_RUST_LOG").ok().as_deref(),
+        cfg!(debug_assertions),
+    )
+}
+
+/// Preserve the database location and SQLite's original diagnostic when the
+/// preflight gate cannot complete inspection. This is not evidence that the
+/// schema contract itself is invalid.
+fn memory_kind_gate_error(db_path: &Path, reason: String) -> AppError {
+    AppError::MemoryKindDatabaseCheckFailed {
+        db_path: db_path.display().to_string(),
+        reason,
+    }
 }
 
 /// Surface the binary path that failed to spawn — the raw `io::Error` only
@@ -2217,9 +2658,10 @@ fn forward_output(
     name: &'static str,
     log_dir: &std::path::Path,
     structured_failure_sink: Option<crate::sidecar::startup_error::StartupFailureSlot>,
-) {
+) -> Vec<OutputTask> {
     let log_dir = log_dir.to_path_buf();
     let _ = std::fs::create_dir_all(&log_dir);
+    let mut tasks = Vec::with_capacity(2);
     if let Some(stdout) = child.stdout.take() {
         let path = log_dir.join(format!("{name}.stdout.log"));
         let sink = structured_failure_sink.clone();
@@ -2229,7 +2671,10 @@ fn forward_output(
                 crate::sidecar::startup_error::parse_stdout_line as StartupFailureParser,
             )
         });
-        tokio::spawn(pipe_lines(stdout, path, name, Level::DEBUG, parser));
+        tasks.push((
+            name,
+            tokio::spawn(pipe_lines(stdout, path, name, Level::DEBUG, parser)),
+        ));
     }
     if let Some(stderr) = child.stderr.take() {
         let path = log_dir.join(format!("{name}.stderr.log"));
@@ -2239,8 +2684,12 @@ fn forward_output(
                 crate::sidecar::startup_error::parse_stderr_panic_line as StartupFailureParser,
             )
         });
-        tokio::spawn(pipe_lines(stderr, path, name, Level::WARN, parser));
+        tasks.push((
+            name,
+            tokio::spawn(pipe_lines(stderr, path, name, Level::WARN, parser)),
+        ));
     }
+    tasks
 }
 
 async fn pipe_lines<R>(
@@ -2256,19 +2705,14 @@ async fn pipe_lines<R>(
     R: AsyncRead + Unpin + Send + 'static,
 {
     let mut reader = BufReader::new(stream).lines();
-    let file = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-    {
-        Ok(f) => f,
+    let file = match crate::log_rotation::RotatingFile::new(path.clone()) {
+        Ok(file) => file,
         Err(e) => {
             warn!(?path, error = ?e, "open log file failed");
             return;
         }
     };
-    let mut file = BufWriter::new(file);
+    let file = Arc::new(std::sync::Mutex::new(file));
     // Once the slot is filled the wait loop bails out on its next 200 ms
     // tick, but child stdout keeps streaming for the rest of the process
     // lifetime. Cache the "scanning is still useful" verdict locally so
@@ -2323,9 +2767,33 @@ async fn pipe_lines<R>(
 
         let mut buf = line.into_bytes();
         buf.push(b'\n');
-        let _ = file.write_all(&buf).await;
+        let file_for_write = Arc::clone(&file);
+        let write_result = tokio::task::spawn_blocking(move || {
+            let mut file = file_for_write
+                .lock()
+                .map_err(|_| std::io::Error::other("rotating log writer lock poisoned"))?;
+            std::io::Write::write_all(&mut *file, &buf)
+        })
+        .await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(?path, ?error, "sidecar log write task failed");
+                break;
+            }
+            Err(error) => {
+                warn!(?path, ?error, "sidecar log write task panicked");
+                break;
+            }
+        }
     }
-    let _ = file.flush().await;
+    let file_for_flush = Arc::clone(&file);
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(mut file) = file_for_flush.lock() {
+            let _ = std::io::Write::flush(&mut *file);
+        }
+    })
+    .await;
 }
 
 /// Leading substring of every Rust panic preamble (`thread 'main' (123)
@@ -2390,11 +2858,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn memory_kind_gate_error_preserves_database_path_and_reason() {
+        let db_path = Path::new("/tmp/lookback/default.sqlite3");
+        let error = memory_kind_gate_error(db_path, "unable to open database file".into());
+
+        let AppError::MemoryKindDatabaseCheckFailed {
+            db_path: actual_path,
+            reason,
+        } = error
+        else {
+            panic!("memory_kind gate I/O failures must use the dedicated error variant");
+        };
+        assert_eq!(actual_path, db_path.to_string_lossy());
+        assert_eq!(reason, "unable to open database file");
+    }
+
     fn app_settings_with_tz(tz: Option<&str>) -> crate::data::paths::AppSettings {
         crate::data::paths::AppSettings {
             timezone: tz.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn search_index_maintenance_env_uses_the_same_loopback_listener() {
+        let env = search_index_maintenance_env_vars("127.0.0.1:9010");
+        assert!(env.iter().any(|(key, value)| {
+            *key == "SEARCH_INDEX_MAINTENANCE_GRPC_ADDR" && value == "127.0.0.1:9010"
+        }));
+        assert!(
+            env.iter()
+                .any(|(key, value)| { *key == "MEMORY_COMPACTION_INTERVAL_SECS" && value == "0" })
+        );
+    }
+
+    #[test]
+    fn maintenance_listener_rejects_non_loopback_or_mismatch() {
+        assert!(
+            validate_search_index_maintenance_listener("127.0.0.1:9010", "127.0.0.1:9010").is_ok()
+        );
+        assert!(
+            validate_search_index_maintenance_listener("0.0.0.0:9010", "0.0.0.0:9010").is_err()
+        );
+        assert!(
+            validate_search_index_maintenance_listener("127.0.0.1:9010", "127.0.0.1:9011").is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_maintenance_environment_is_rejected() {
+        assert!(
+            validate_no_legacy_maintenance_env(vec![(
+                "MEMORY_AUTO_OPTIMIZE_INTERVAL".into(),
+                "10".into()
+            )])
+            .is_err()
+        );
+        assert!(
+            validate_no_legacy_maintenance_env(vec![(
+                "MEMORY_INDEX_UPDATE_INTERVAL_SECS".into(),
+                "0".into()
+            )])
+            .is_ok()
+        );
     }
 
     // Env-touching: relies on `--test-threads=1` (repo-wide convention).
@@ -2572,6 +3099,29 @@ mod tests {
         assert_eq!(
             envs.get("SQLITE_MAX_CONNECTIONS").map(String::as_str),
             Some("5")
+        );
+    }
+
+    #[test]
+    fn migration_and_front_share_effective_fts_tokenizer_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join("lookback.env");
+        std::fs::write(&env_file, "MEMORY_FTS_TOKENIZER=simple\n").unwrap();
+        assert_eq!(
+            effective_memory_fts_tokenizer(Some(&env_file), true, |_| Some("ngram".into())),
+            "simple"
+        );
+        assert_eq!(
+            effective_memory_fts_tokenizer(None, true, |_| Some("simple".into())),
+            "simple"
+        );
+        assert_eq!(
+            effective_memory_fts_tokenizer(None, true, |_| None),
+            "lindera/ipadic"
+        );
+        assert_eq!(
+            effective_memory_fts_tokenizer(Some(&env_file), false, |_| Some("simple".into())),
+            "ngram"
         );
     }
 
@@ -2765,11 +3315,16 @@ mod tests {
     }
 
     fn test_sidecars() -> Sidecars {
-        let data = DataPaths::with_root("/tmp/lookback-lifecycle-test");
+        test_sidecars_with_data(DataPaths::with_root("/tmp/lookback-lifecycle-test"))
+    }
+
+    fn test_sidecars_with_data(data: DataPaths) -> Sidecars {
         let lance_home = data.lance_language_model_home();
         Sidecars::new(SidecarConfig {
             jobworkerp_bin: PathBuf::from("/bin/true"),
             memories_bin: PathBuf::from("/bin/true"),
+            memories_db_migrate_bin: PathBuf::from("/bin/true"),
+            startup_database_migration_enabled: false,
             conductor_bin: PathBuf::from("/bin/true"),
             data,
             worker_yaml_paths: Vec::new(),
@@ -2785,6 +3340,256 @@ mod tests {
             llm_kv_cache_type: None,
             env_file: None,
         })
+    }
+
+    #[test]
+    fn database_migration_activity_is_visible_only_for_an_enabled_local_gate() {
+        let sidecars = test_sidecars();
+        assert!(!sidecars.database_migration_in_progress());
+
+        let disabled = sidecars.database_migration_activity_if_enabled(false);
+        assert!(disabled.is_none());
+        assert!(!sidecars.database_migration_in_progress());
+
+        {
+            let _activity = sidecars
+                .database_migration_activity_if_enabled(true)
+                .expect("enabled local gate must report migration activity");
+            assert!(sidecars.database_migration_in_progress());
+        }
+        assert!(!sidecars.database_migration_in_progress());
+    }
+
+    #[cfg(unix)]
+    fn test_sidecars_with_migration(data: DataPaths, coordinator: PathBuf) -> Sidecars {
+        let lance_home = data.lance_language_model_home();
+        Sidecars::new(SidecarConfig {
+            jobworkerp_bin: PathBuf::from("/definitely/missing/jobworkerp"),
+            memories_bin: PathBuf::from("/definitely/missing/front"),
+            memories_db_migrate_bin: coordinator,
+            startup_database_migration_enabled: true,
+            conductor_bin: PathBuf::from("/definitely/missing/conductor"),
+            data,
+            worker_yaml_paths: Vec::new(),
+            function_set_yaml_paths: Vec::new(),
+            reflection_dispatch_enabled: false,
+            auto_embedding_enabled: false,
+            workflows_dir: None,
+            lance_language_model_home: lance_home,
+            lindera_dict_staged: false,
+            llm_model: None,
+            llm_hf_repo: None,
+            llm_ctx_size: None,
+            llm_kv_cache_type: None,
+            env_file: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn maintenance_stop_retains_instance_lock_until_normal_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path());
+        data.ensure().unwrap();
+        let sidecars = test_sidecars_with_data(data.clone());
+        let outcome = reaper::reap_recorded(&data.sidecar_pids_path(), &data.sidecar_lock_path());
+        *sidecars.instance_lock.lock() = outcome.lock;
+        assert!(sidecars.owns_instance_lock());
+
+        sidecars.stop_for_maintenance().await.unwrap();
+        assert!(sidecars.owns_instance_lock());
+
+        sidecars.stop().await.unwrap();
+        assert!(!sidecars.owns_instance_lock());
+    }
+
+    #[tokio::test]
+    async fn maintenance_operation_blocks_start_until_restore_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path());
+        data.ensure().unwrap();
+        let mut sidecars = test_sidecars_with_data(data.clone());
+        // Keep the post-maintenance start fast and deterministic: the test
+        // only needs to observe that it waits for the maintenance operation.
+        sidecars.config.jobworkerp_bin = PathBuf::from("/definitely/missing/jobworkerp");
+        let outcome = reaper::reap_recorded(&data.sidecar_pids_path(), &data.sidecar_lock_path());
+        *sidecars.instance_lock.lock() = outcome.lock;
+        assert!(sidecars.owns_instance_lock());
+
+        let sidecars = std::sync::Arc::new(sidecars);
+        let operation_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let maintenance = {
+            let sidecars = std::sync::Arc::clone(&sidecars);
+            let operation_started = std::sync::Arc::clone(&operation_started);
+            tokio::spawn(async move {
+                sidecars
+                    .with_maintenance_lock(|| async move {
+                        operation_started.notify_one();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        operation_started.notified().await;
+
+        let mut start = {
+            let sidecars = std::sync::Arc::clone(&sidecars);
+            tokio::spawn(async move { sidecars.start().await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut start)
+                .await
+                .is_err(),
+            "start must wait for an in-flight database restore"
+        );
+
+        assert!(maintenance.await.unwrap().is_ok());
+        assert!(start.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn maintenance_operation_releases_lifecycle_lock_after_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path());
+        data.ensure().unwrap();
+        let mut sidecars = test_sidecars_with_data(data.clone());
+        sidecars.config.jobworkerp_bin = PathBuf::from("/definitely/missing/jobworkerp");
+        let outcome = reaper::reap_recorded(&data.sidecar_pids_path(), &data.sidecar_lock_path());
+        *sidecars.instance_lock.lock() = outcome.lock;
+
+        let result = sidecars
+            .with_maintenance_lock(|| async {
+                Err::<(), _>(AppError::Config("restore failed".into()))
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(sidecars.lifecycle_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn migration_failure_prevents_the_first_sidecar_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path());
+        let lance_home = data.lance_language_model_home();
+        let sidecars = Sidecars::new(SidecarConfig {
+            jobworkerp_bin: PathBuf::from("/definitely/missing/jobworkerp"),
+            memories_bin: PathBuf::from("/definitely/missing/front"),
+            memories_db_migrate_bin: PathBuf::from("/definitely/missing/memories-db-migrate"),
+            startup_database_migration_enabled: true,
+            conductor_bin: PathBuf::from("/definitely/missing/conductor"),
+            data,
+            worker_yaml_paths: Vec::new(),
+            function_set_yaml_paths: Vec::new(),
+            reflection_dispatch_enabled: false,
+            auto_embedding_enabled: false,
+            workflows_dir: None,
+            lance_language_model_home: lance_home,
+            lindera_dict_staged: false,
+            llm_model: None,
+            llm_hf_repo: None,
+            llm_ctx_size: None,
+            llm_kv_cache_type: None,
+            env_file: None,
+        });
+        assert!(matches!(
+            sidecars.start().await,
+            Err(AppError::DatabaseMigrationFailed { phase, .. }) if phase == "schema validate"
+        ));
+        assert!(
+            !sidecars.database_migration_in_progress(),
+            "a failed migration gate must clear the startup UI signal"
+        );
+        assert!(sidecars.current_endpoints().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_start_runs_database_migration_gate_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path().join("data"));
+        data.ensure().unwrap();
+        let command_log = tmp.path().join("migration-commands.log");
+        let coordinator = tmp.path().join("memories-db-migrate");
+        std::fs::write(
+            &coordinator,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nsleep 0.02\nif [ \"$1 $2\" = 'schema status' ]; then echo 'schema_status status=managed pending_count=0'; fi\n",
+                command_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&coordinator).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&coordinator, permissions).unwrap();
+
+        // Fail after the migration gate so both callers finish promptly;
+        // the command log still records every coordinator invocation.
+        let sidecars = test_sidecars_with_migration(data, coordinator);
+
+        let (first, second) = tokio::join!(sidecars.start(), sidecars.start());
+        assert!(first.is_err());
+        assert!(second.is_err());
+        let invocations = std::fs::read_to_string(command_log)
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(invocations, 11, "migration coordinator must run once");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_waits_for_start_before_releasing_instance_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path().join("data"));
+        data.ensure().unwrap();
+        let started_marker = tmp.path().join("migration-started");
+        let coordinator = tmp.path().join("memories-db-migrate");
+        std::fs::write(
+            &coordinator,
+            format!(
+                "#!/bin/sh\nif [ ! -f '{}' ]; then : > '{}'; sleep 0.5; fi\nif [ \"$1 $2\" = 'schema status' ]; then echo 'schema_status status=managed pending_count=0'; fi\n",
+                started_marker.display(),
+                started_marker.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&coordinator).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&coordinator, permissions).unwrap();
+
+        let sidecars = std::sync::Arc::new(test_sidecars_with_migration(data, coordinator));
+
+        let start_task = {
+            let sidecars = std::sync::Arc::clone(&sidecars);
+            tokio::spawn(async move { sidecars.start().await })
+        };
+        for _ in 0..200 {
+            if started_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(started_marker.exists(), "startup gate did not begin");
+        assert!(sidecars.owns_instance_lock());
+
+        let mut stop_task = {
+            let sidecars = std::sync::Arc::clone(&sidecars);
+            tokio::spawn(async move { sidecars.stop().await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut stop_task)
+                .await
+                .is_err(),
+            "stop must wait for an in-flight start"
+        );
+
+        assert!(start_task.await.unwrap().is_err());
+        assert!(stop_task.await.unwrap().is_ok());
+        assert!(!sidecars.owns_instance_lock());
     }
 
     #[tokio::test]
@@ -2806,6 +3611,43 @@ mod tests {
         // can't promote a re-mounted frontend back to ready.
         sidecars.stop().await.unwrap();
         assert!(sidecars.last_report().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_start_cleanup_keeps_the_completed_migration_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataPaths::with_root(tmp.path());
+        std::fs::create_dir_all(data.database_migration_receipt_path().parent().unwrap()).unwrap();
+        std::fs::write(
+            data.database_migration_receipt_path(),
+            br#"{"format_version":1,"migration_id":"thread-message-times-v1"}"#,
+        )
+        .unwrap();
+        let lance_home = data.lance_language_model_home();
+        let sidecars = Sidecars::new(SidecarConfig {
+            jobworkerp_bin: PathBuf::from("/bin/true"),
+            memories_bin: PathBuf::from("/bin/true"),
+            memories_db_migrate_bin: PathBuf::from("/bin/true"),
+            startup_database_migration_enabled: false,
+            conductor_bin: PathBuf::from("/bin/true"),
+            data: data.clone(),
+            worker_yaml_paths: Vec::new(),
+            function_set_yaml_paths: Vec::new(),
+            reflection_dispatch_enabled: false,
+            auto_embedding_enabled: false,
+            workflows_dir: None,
+            lance_language_model_home: lance_home,
+            lindera_dict_staged: false,
+            llm_model: None,
+            llm_hf_repo: None,
+            llm_ctx_size: None,
+            llm_kv_cache_type: None,
+            env_file: None,
+        });
+
+        sidecars.stop().await.unwrap();
+
+        assert!(data.database_migration_receipt_path().is_file());
     }
 
     #[test]
@@ -2846,6 +3688,8 @@ mod tests {
             // TCP health check, taking the early `?`-return path.
             jobworkerp_bin: PathBuf::from("/nonexistent/jobworkerp-bin"),
             memories_bin: PathBuf::from("/bin/true"),
+            memories_db_migrate_bin: PathBuf::from("/bin/true"),
+            startup_database_migration_enabled: false,
             conductor_bin: PathBuf::from("/bin/true"),
             data,
             worker_yaml_paths: Vec::new(),
@@ -2970,6 +3814,7 @@ mod tests {
     fn degraded_vector_env_overrides_env_file_enabling_vectors() {
         let mut cmd = Command::new("/bin/true");
         cmd.env("MEMORY_VECTOR_ENABLED", "true")
+            .env("THREAD_VECTOR_ENABLED", "true")
             .env("REFLECTION_INTENT_VECTOR_ENABLED", "true")
             .env("MEMORY_VECTOR_SIZE", "2048");
 
@@ -2988,8 +3833,37 @@ mod tests {
             Some(&Some(std::ffi::OsStr::new("false")))
         );
         assert_eq!(
+            env.get(std::ffi::OsStr::new("THREAD_VECTOR_ENABLED")),
+            Some(&Some(std::ffi::OsStr::new("false")))
+        );
+        assert_eq!(
             env.get(std::ffi::OsStr::new("MEMORY_VECTOR_SIZE")),
             Some(&None)
+        );
+    }
+
+    #[test]
+    fn enabled_vector_env_also_enables_thread_repository() {
+        let mut cmd = Command::new("/bin/true");
+        cmd.env("THREAD_VECTOR_ENABLED", "false");
+
+        apply_memories_vector_env(&mut cmd, true, 768, Path::new("/tmp/memories.lancedb"));
+
+        let env = cmd
+            .as_std()
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("THREAD_VECTOR_ENABLED")),
+            Some(&Some(std::ffi::OsStr::new("true")))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("MEMORY_VECTOR_SIZE")),
+            Some(&Some(std::ffi::OsStr::new("768")))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("MEMORY_LANCEDB_URI")),
+            Some(&Some(std::ffi::OsStr::new("/tmp/memories.lancedb")))
         );
     }
 
@@ -3122,21 +3996,36 @@ mod tests {
     }
 
     #[test]
-    fn jobworkerp_log_defaults_to_debug_while_memories_stays_info() {
-        // Env-touching: relies on `--test-threads=1` (see CLAUDE.md). Restore
-        // the var so neighbouring tests see the original environment.
-        let saved = std::env::var("LOOKBACK_RUST_LOG").ok();
-        unsafe { std::env::remove_var("LOOKBACK_RUST_LOG") };
+    fn sidecar_log_profile_uses_info_for_dev_and_warn_for_release() {
+        let dev = default_sidecar_log(true);
+        let release = default_sidecar_log(false);
 
-        let jw = effective_jobworkerp_log();
-        let mem = effective_rust_log();
-        assert!(jw.starts_with("debug"), "jobworkerp should be debug: {jw}");
-        assert!(mem.starts_with("info"), "memories should stay info: {mem}");
-        // The noisy transport crates must be pinned back so debug is readable.
-        assert!(jw.contains("hyper=info"));
+        assert!(
+            dev.starts_with("info,"),
+            "dev sidecars should use info: {dev}"
+        );
+        assert!(
+            release.starts_with("warn,"),
+            "release sidecars should use warn: {release}"
+        );
+    }
 
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("LOOKBACK_RUST_LOG", v) };
+    #[test]
+    fn sidecar_log_profiles_keep_noisy_target_suppressions() {
+        for profile in [default_sidecar_log(true), default_sidecar_log(false)] {
+            for target in ["app=warn", "worker_app=warn", "lance=warn"] {
+                assert!(profile.contains(target), "{target} missing from {profile}");
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_log_override_applies_to_both_profiles() {
+        for debug_assertions in [true, false] {
+            assert_eq!(
+                effective_rust_log_for(Some("trace"), debug_assertions),
+                "trace"
+            );
         }
     }
 
@@ -3145,7 +4034,6 @@ mod tests {
         let saved = std::env::var("LOOKBACK_RUST_LOG").ok();
         unsafe { std::env::set_var("LOOKBACK_RUST_LOG", "trace") };
 
-        assert_eq!(effective_jobworkerp_log(), "trace");
         assert_eq!(effective_rust_log(), "trace");
 
         match saved {
@@ -3378,6 +4266,8 @@ mod tests {
         let sidecars = Sidecars::new(SidecarConfig {
             jobworkerp_bin: PathBuf::from("/nonexistent/all-in-one-xyz"),
             memories_bin: PathBuf::from("/nonexistent/front-xyz"),
+            memories_db_migrate_bin: PathBuf::from("/bin/true"),
+            startup_database_migration_enabled: false,
             conductor_bin: PathBuf::from("/nonexistent/conductor-main-xyz"),
             data: data.clone(),
             worker_yaml_paths: Vec::new(),
@@ -3402,6 +4292,26 @@ mod tests {
         );
         // last_report stays None on a hard failure (no successful endpoints).
         assert!(sidecars.last_report().is_none());
+
+        let native_root = data.log_dir().join("native");
+        let native_dirs = std::fs::read_dir(native_root)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        assert!(
+            native_dirs
+                .iter()
+                .any(|path| path.join(".closed").is_file()),
+            "spawn failure must close its native scope"
+        );
+        assert!(
+            native_dirs
+                .iter()
+                .all(|path| !path.join(".active").exists())
+        );
 
         let _ = std::fs::remove_dir_all(&data.root);
     }

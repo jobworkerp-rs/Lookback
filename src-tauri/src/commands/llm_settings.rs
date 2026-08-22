@@ -61,10 +61,10 @@ pub struct LlmSettings {
     /// `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`.
     #[serde(default)]
     pub local_hf_repo: Option<String>,
-    /// User override for `ctx_size`. `None` = use the preset's
-    /// recommended value (or the historical 262144 for the custom path).
+    /// User override for the chat context size. `None` = use the local
+    /// preset recommendation or the external conservative fallback.
     /// Range-checked at save time against [`LOCAL_CTX_SIZE_MIN`] /
-    /// [`LOCAL_CTX_SIZE_MAX`].
+    /// [`LOCAL_CTX_SIZE_MAX`] in both modes.
     #[serde(default)]
     pub local_ctx_size: Option<u32>,
     /// User override for llama.cpp KV cache quantization. `None` keeps the
@@ -691,8 +691,8 @@ pub fn get_llm_settings(state: tauri::State<'_, AppState>) -> AppResult<LlmSetti
 /// Validate an LLM settings request WITHOUT persisting anything. Split out
 /// so the unified `apply_settings` can validate the whole batch before any
 /// file is written (a later card's validation failure must not leave an
-/// earlier card's change half-saved). Validation is only meaningful in
-/// Local mode — External mode ignores the local_* fields.
+/// earlier card's change half-saved). Context size applies to the chat
+/// request in both modes; the remaining local_* fields apply only locally.
 pub fn validate_llm_request(req: &SetLlmSettingsRequest) -> AppResult<()> {
     if req.mode == LlmMode::Local {
         if req.local_preset_id.as_deref() == Some(llm_presets::CUSTOM_PRESET_ID) {
@@ -704,8 +704,8 @@ pub fn validate_llm_request(req: &SetLlmSettingsRequest) -> AppResult<()> {
                 "unknown local_preset_id {id:?}: not in the curated preset list"
             )));
         }
-        validate_ctx_size(req.local_ctx_size).map_err(AppError::Config)?;
     }
+    validate_ctx_size(req.local_ctx_size).map_err(AppError::Config)?;
     Ok(())
 }
 
@@ -2164,6 +2164,15 @@ mod tests {
             local_ctx_size: None,
             local_kv_cache_type: None,
         }
+    }
+
+    #[test]
+    fn external_context_size_uses_the_same_bounds_validation() {
+        let mut request = external_req("gpt-4o");
+        request.local_ctx_size = Some(1);
+        assert!(validate_llm_request(&request).is_err());
+        request.local_ctx_size = Some(4_096);
+        assert!(validate_llm_request(&request).is_ok());
     }
 
     /// Build an outcome with explicit modes, key-change flag, and the new

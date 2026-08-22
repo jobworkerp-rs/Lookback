@@ -8,6 +8,7 @@
     "core:window:allow-close",
     "core:window:allow-minimize",
     "core:event:default",
-    "dialog:default"
+    "dialog:default",
+    "shell:allow-open"
   ]
 }

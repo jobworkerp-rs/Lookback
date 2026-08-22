@@ -151,7 +151,16 @@ export function App() {
   });
 
   if (sidecar.phase === "starting") {
-    return <BootScreen title="Lookback" detail={t("boot.startingSidecar")} />;
+    return (
+      <BootScreen
+        title="Lookback"
+        detail={
+          sidecar.databaseMigrationInProgress
+            ? t("boot.databaseMigrationInProgress")
+            : t("boot.startingSidecar")
+        }
+      />
+    );
   }
 
   // Boot-time recovery surface. A `sidecar://error` (lancedb schema

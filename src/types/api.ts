@@ -16,6 +16,38 @@ export interface PlainImportConfig {
   thread_strategy: ThreadStrategy;
 }
 
+export interface SearchIndexMaintenanceTableStatus {
+  write_generation: number;
+  dirty: boolean;
+  ready_runtime_secs: number;
+  last_result: string | null;
+}
+
+export interface SearchIndexMaintenanceSchedule {
+  enabled: boolean;
+  start: string | null;
+  end: string | null;
+}
+
+export interface ActiveSearchIndexOptimization {
+  table: "memory" | "thread";
+  task_id: string | null;
+  state: "attempting" | "accepted";
+}
+
+export interface SearchIndexMaintenanceStatus {
+  memory: SearchIndexMaintenanceTableStatus;
+  thread: SearchIndexMaintenanceTableStatus;
+  reconcile_pending: boolean;
+  writing: boolean;
+  optimizing: boolean;
+  active_optimizations: ActiveSearchIndexOptimization[];
+  memory_eligible: boolean;
+  thread_eligible: boolean;
+  recovery_required: string | null;
+  schedule: SearchIndexMaintenanceSchedule;
+}
+
 // memories' thread/memory ids are i64 snowflakes that exceed
 // Number.MAX_SAFE_INTEGER; they are serialized as strings across the IPC
 // boundary (see src-tauri/src/serde_id.rs).
@@ -27,6 +59,8 @@ export interface ThreadSummary {
   labels: string[];
   created_at_ms: number;
   updated_at_ms: number;
+  first_message_at_ms?: number;
+  last_message_at_ms?: number;
 }
 
 export interface MemoryRow {
@@ -45,8 +79,14 @@ export interface ListThreadsRequest {
   user_id?: number;
   limit?: number;
   offset?: number;
-  created_after_ms?: number;
-  created_before_ms?: number;
+  thread_created_after_ms?: number;
+  thread_created_before_ms?: number;
+  thread_updated_after_ms?: number;
+  thread_updated_before_ms?: number;
+  first_message_after_ms?: number;
+  first_message_before_ms?: number;
+  last_message_after_ms?: number;
+  last_message_before_ms?: number;
   labels_any?: string[];
   label_match?: LabelMatch;
 }
@@ -55,8 +95,14 @@ export interface FindDistinctLabelsRequest {
   user_id?: number;
   limit?: number;
   offset?: number;
-  created_after_ms?: number;
-  created_before_ms?: number;
+  thread_created_after_ms?: number;
+  thread_created_before_ms?: number;
+  thread_updated_after_ms?: number;
+  thread_updated_before_ms?: number;
+  first_message_after_ms?: number;
+  first_message_before_ms?: number;
+  last_message_after_ms?: number;
+  last_message_before_ms?: number;
 }
 
 export interface FindCoOccurringLabelsRequest {
@@ -64,8 +110,14 @@ export interface FindCoOccurringLabelsRequest {
   labels: string[];
   limit?: number;
   offset?: number;
-  created_after_ms?: number;
-  created_before_ms?: number;
+  thread_created_after_ms?: number;
+  thread_created_before_ms?: number;
+  thread_updated_after_ms?: number;
+  thread_updated_before_ms?: number;
+  first_message_after_ms?: number;
+  first_message_before_ms?: number;
+  last_message_after_ms?: number;
+  last_message_before_ms?: number;
 }
 
 export interface LabelWithCount {
@@ -103,6 +155,11 @@ export interface MemoryThreadPosition extends MemoryPosition {
  *  daily/weekly/monthly are the periodic work-summary rollups. Kept in
  *  manual correspondence with the Rust `SummaryKind` (kebab-case serde). */
 export type SummaryKind = "per-thread" | "daily" | "weekly" | "monthly";
+
+/** Kinds that can be attached to a chat selection. Keep this separate from
+ *  SummaryKind because reflections are not summaries and are not valid input
+ *  to summary-generation/calendar APIs. */
+export type SelectableMemoryKind = SummaryKind | "reflection";
 
 export type GeneratedRefreshScope =
   | "thread_summary"
@@ -258,6 +315,19 @@ export interface ListSummariesRequest {
   labels_any?: string[];
 }
 
+/** Cursor-like offset page used by the selection modal. The dedicated
+ * endpoint returns a continuation even when malformed rows are filtered. */
+export interface ListSummariesForSelectionRequest {
+  kind: SummaryKind;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ListSummariesForSelectionResponse {
+  entries: SummaryEntry[];
+  next_offset: number | null;
+}
+
 export interface CountSummariesRequest {
   kind?: SummaryKind;
 }
@@ -310,11 +380,16 @@ export type ImportStep = "thread-import" | "thread-summary" | "thread-personalit
 
 export type StepStatus = "waiting" | "active" | "done" | "warning" | "failed";
 
+/** Stable non-error notices emitted alongside an import step update. */
+export type ImportNoticeCode = "no-importable-log-sources";
+
 export interface ImportStepUpdate {
   job_id: string;
   step: ImportStep;
   status: StepStatus;
   message: string | null;
+  /** Optional for compatibility with older Tauri event payloads. */
+  notice_code?: ImportNoticeCode;
 }
 
 export interface SidecarEndpoints {
@@ -365,12 +440,15 @@ export interface SidecarStartReport extends SidecarEndpoints {
  * the two one-shot lifecycle events (`sidecar://ready` /
  * `sidecar://error`) most recently fired, so a React tree that mounts
  * after the event already fired can still reach the matching UI state
- * via the snapshot. Both fields are `null` while a fresh start is still
- * in flight (the boot spinner stays).
+ * via the snapshot. Both lifecycle fields are `null` while a fresh start is
+ * still in flight; `database_migration_in_progress` identifies its local
+ * migration-gate portion (the boot spinner stays).
  */
 export interface SidecarStatusSnapshot {
   ready: SidecarStartReport | null;
   failure: SidecarErrorPayload | null;
+  /** True only while the local startup migration gate is checking or migrating the memories DB. */
+  database_migration_in_progress: boolean;
 }
 
 /**
@@ -424,17 +502,22 @@ export type StartupFailure =
 
 /**
  * Payload of `sidecar://error`. The Rust side lifts an `AppError` into
- * this tagged union via `SidecarErrorPayload::from_app_error`: only the
- * `SidecarStartupFailed` AppError variant carries a structured failure,
- * everything else collapses to a raw message. The BootError UI branches
- * on `kind` (then on `failure.code`) — it must NOT parse the human
- * `message` text.
+ * this tagged union via `SidecarErrorPayload::from_app_error`: known startup
+ * and database-gate failures preserve their structured fields, while other
+ * errors collapse to a raw message. The BootError UI branches on `kind`
+ * (then on `failure.code`) — it must NOT parse the human `message` text.
  */
 export type SidecarErrorPayload =
   | { kind: "structured"; failure: StartupFailure }
   | { kind: "memory_kind_migration_required"; db_path: string }
-  | { kind: "unexpected_memory_data"; db_path: string; reason: string }
   | { kind: "memory_kind_database_schema_invalid"; db_path: string; reason: string }
+  | { kind: "memory_kind_database_check_failed"; db_path: string; reason: string }
+  | {
+      kind: "database_migration_failed";
+      phase: string;
+      reason: string;
+      backup_path: string;
+    }
   | { kind: "raw"; message: string };
 
 /** Response of every `recover_*` command. */
@@ -444,24 +527,9 @@ export interface RecoveryResult {
   restartError: string | null;
 }
 
-/** Read-only result used to obtain explicit consent before destructive migration. */
-export interface MemoryKindMigrationPreview {
-  warningCount: number;
-  totalRecordCount: number;
-  unresolvedMemoryCount: number;
-  unresolvedThreadCount: number;
-  plannedMemoryDeleteCount: number;
-  plannedThreadDeleteCount: number;
-  plannedMemoryIds: number[];
-  plannedThreadIds: number[];
-  relatedDeletionCounts: Record<string, number>;
-  requiresConfirmation: boolean;
-}
-
-/** Durable notice left only when the post-migration vector enqueue failed. */
-export interface MemoryKindRedispatchStatus {
-  pending: boolean;
-  error: string | null;
+export interface DatabaseRestoreResult {
+  state: "safeStopped";
+  backupPath: string;
 }
 
 export interface SettingsSnapshot {
@@ -870,6 +938,35 @@ export interface ReflectionEntry {
   updated_at_ms: number;
 }
 
+/** Canonical structured reflection content used by the selection modal. The
+ *  server serializes this as JSON so selected-memory projection can safely
+ *  extract only validated source IDs instead of exposing raw protobuf data. */
+export interface ReflectionSelectionContent {
+  memory_id: string;
+  origin_thread_id: string | null;
+  content_json: string;
+  source_thread_ids: string[];
+  source_memory_ids: string[];
+}
+
+/** Compact row returned by the dedicated reflection-selection listing. */
+export interface ReflectionSelectionEntry {
+  memory_id: string;
+  origin_thread_id: string | null;
+  summary: string;
+  content_json: string;
+  source_thread_ids: string[];
+  source_memory_ids: string[];
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+/** Cursor-aware response for reflection selection listing. */
+export interface ListReflectionSelectionResponse {
+  entries: ReflectionSelectionEntry[];
+  next_cursor_after_memory_id: string | null;
+}
+
 export interface ListReflectionsByThreadRequest {
   thread_id: string;
   include_history?: boolean;
@@ -882,6 +979,12 @@ export interface SearchReflectionsRequest {
   created_after_ms?: number;
   created_before_ms?: number;
   limit?: number;
+}
+
+/** Request for the selection modal's chronological reflection list. */
+export interface ListReflectionSelectionRequest {
+  limit?: number;
+  cursor_after_memory_id?: string;
 }
 
 export interface SearchReflectionsHybridRequest {
@@ -980,7 +1083,7 @@ export interface RedispatchMemoryEmbeddingsRequest {
 
 export interface EnqueueReflectionJobRequest {
   user_id?: number;
-  updated_after_ms?: number;
+  last_message_after_ms?: number;
   prompt_version?: string;
   /** Cancel-key. The frontend generates a UUID and the Stop button
    *  forwards it to `reflection_cancel`. */
@@ -1007,9 +1110,9 @@ export interface ReflectionStepUpdate {
 /** Mirrors the reflection manual-dispatch request shape. */
 export interface EnqueueSummaryJobRequest {
   user_id?: number;
-  updated_after_ms?: number;
+  last_message_after_ms?: number;
   /** Inclusive epoch-ms upper bound; omit for no upper bound. */
-  updated_before_ms?: number;
+  last_message_before_ms?: number;
   /** Cancel-key. The backend uses this verbatim as the in-flight map
    *  key, so a Stop click that calls `analysis_cancel(dispatch_id)`
    *  hits the same entry. */
@@ -1018,7 +1121,7 @@ export interface EnqueueSummaryJobRequest {
 
 export interface EnqueuePersonalityJobRequest {
   user_id?: number;
-  updated_after_ms?: number;
+  last_message_after_ms?: number;
   /** When true, re-run extraction on every eligible thread (ignores the
    *  per-thread `existing_signal` skip and the batch's `target_signal_count`
    *  short-circuit). Used by the Personality tab's Force checkbox so a
@@ -1061,9 +1164,10 @@ export interface GenerateSummariesRequest {
   run_daily: boolean;
   run_weekly: boolean;
   run_monthly: boolean;
+  stop_on_error: boolean;
   /** Per-thread window (epoch ms); omit both for unbounded. */
-  updated_after_ms?: number;
-  updated_before_ms?: number;
+  last_message_after_ms?: number;
+  last_message_before_ms?: number;
   daily_start: string;
   daily_end: string;
   weekly_start: string;
@@ -1325,6 +1429,34 @@ export interface ChatMessage {
   content: string;
 }
 
+export type RetrievalMode = "selected_only" | "source_details" | "related_memories";
+
+/** Immutable content captured when the user confirms a summary selection. */
+export interface SelectedMemorySnapshot {
+  memory_id: string;
+  kind: SelectableMemoryKind;
+  content: string;
+  title?: string;
+  period_key?: string;
+  scope_key?: string;
+  source_thread_ids?: string[];
+  source_memory_ids?: string[];
+  source_ids_truncated?: boolean;
+  captured_at_ms: number;
+}
+
+export interface SelectedMemoryLimits {
+  max_selected: number;
+  max_direct_ids_per_memory: number;
+  max_direct_ids_total: number;
+  max_tool_ids_per_call: number;
+  default_max_items_per_thread: number;
+  max_items_per_thread: number;
+  default_retrieval_hops: number;
+  max_retrieval_hops: number;
+  min_selected_tokens: number;
+}
+
 export interface ChatAskRequest {
   messages: ChatMessage[];
   /** Correlation key chosen by the caller. Must be unique per chat
@@ -1333,11 +1465,15 @@ export interface ChatAskRequest {
    *  command (closing the early-event-drop race where a Start emitted
    *  synchronously during dispatch could hit an unregistered turn). */
   job_id: string;
+  selected_memories?: SelectedMemorySnapshot[];
+  retrieval_mode?: RetrievalMode;
 }
 
 export interface ChatAskResponse {
   /** Echo of `ChatAskRequest.job_id`. */
   job_id: string;
+  /** True when the model received a capacity-limited projection. */
+  selected_content_truncated: boolean;
 }
 
 /** Minimum-contract chat phases. Kebab-case mirrors the Rust
@@ -1369,6 +1505,13 @@ export type ChatSource =
       scope_key: string;
       snippet: string;
       score: number;
+    }
+  | {
+      source_kind: "reflection";
+      reflection_id: string;
+      source_thread_id: string;
+      snippet: string;
+      score: number;
     };
 
 /** One `chat://step` event payload. Phase-irrelevant fields are
@@ -1380,4 +1523,5 @@ export interface ChatStepUpdate {
   token_delta?: string | null;
   sources?: ChatSource[] | null;
   message?: string | null;
+  cancelled?: boolean | null;
 }

@@ -66,7 +66,7 @@ describe("refreshGeneratedCaches", () => {
     refreshGeneratedCaches(client, ["reflection"]);
 
     expect(invalidatedKeys(invalidate)).toEqual(
-      expect.arrayContaining([["reflections"], ["memories"]]),
+      expect.arrayContaining([["reflections"], ["reflection-hybrid-search"], ["memories"]]),
     );
   });
 });

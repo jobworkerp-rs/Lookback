@@ -2,7 +2,7 @@ import type { TFunction } from "i18next";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { IMPORT_STEPS, type ImportSnapshot, isImportBusy } from "@/hooks/useImportProgress";
-import type { ImportStep, StepStatus } from "@/types/api";
+import type { ImportNoticeCode, ImportStep, StepStatus } from "@/types/api";
 import { Modal } from "./Modal";
 
 // Mock (specs/tauri-mvp-mock.html toast section) uses the raw stage names
@@ -62,7 +62,9 @@ export function ImportToast({
               <div className="toast-step-head">
                 <span className="dot" />
                 <span className="step-name">{STEP_LABEL[step]}</span>
-                <span className="step-status">{statusLabel(s.status, s.message, t)}</span>
+                <span className="step-status">
+                  {statusLabel(s.status, s.message, s.notice_code, t)}
+                </span>
                 {hasDetail && (
                   <button
                     type="button"
@@ -128,7 +130,15 @@ export function ImportToast({
   );
 }
 
-function statusLabel(status: StepStatus, message: string | null, t: TFunction): string {
+function statusLabel(
+  status: StepStatus,
+  message: string | null,
+  noticeCode: ImportNoticeCode | undefined,
+  t: TFunction,
+): string {
+  if (noticeCode === "no-importable-log-sources") {
+    return t("importToast.noticeNoImportableLogSources");
+  }
   // Active steps surface the (already server-condensed) progress digest;
   // terminal/failed steps use a fixed label and push detail to the dialog.
   if (status === "active" && message) {

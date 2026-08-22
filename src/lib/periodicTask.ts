@@ -147,7 +147,7 @@ export function validatePeriodicDraft(draft: PeriodicTaskDraft): string[] {
   }
   if (draft.hour < 0 || draft.hour > 23) errors.push("periodic.validation.hourRange");
   if (draft.minute < 0 || draft.minute > 59) errors.push("periodic.validation.minuteRange");
-  if (draft.lookback_days <= 0) errors.push("periodic.validation.lookbackRange");
+  if (draft.lookback_days < 0) errors.push("periodic.validation.lookbackRange");
   if (draft.task_kind === "regular" && draft.interval_value <= 0) {
     errors.push("periodic.validation.intervalRange");
   }

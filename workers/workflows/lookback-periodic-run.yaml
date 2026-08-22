@@ -31,7 +31,7 @@ input:
             interval_days: { type: [integer, "null"], minimum: 1 }
             weekly_day: { type: [integer, "null"], minimum: 0, maximum: 6 }
             monthly_day: { type: [integer, "null"], minimum: 1, maximum: 28 }
-            lookback_days: { type: integer, minimum: 1 }
+            lookback_days: { type: integer, minimum: 0 }
             force_thread_summary: { type: boolean, default: true }
             run_summary_daily: { type: boolean, default: true }
             run_personality: { type: boolean, default: false }
@@ -70,7 +70,7 @@ input:
 
 timeout:
   after:
-    hours: 24
+    days: 72
 
 do:
   - initResults:
@@ -83,6 +83,9 @@ do:
         reflection_result: "${ null }"
         import_codex_result: "${ null }"
         import_claude_code_result: "${ null }"
+        codex_import_root_status: "not-selected"
+        claude_code_import_root_status: "not-selected"
+        skipped_import_sources: "${ [] }"
 
   - resolveSourceFilterSources:
       set:
@@ -169,8 +172,54 @@ do:
                "--since", $regular_import_since_iso
              ] }
 
-  - runImportCodex:
+  # Missing auto-discovered log roots are a normal first-run condition. Probe
+  # each selected source independently, always exiting successfully so an
+  # absent optional source cannot prevent the subsequent generation stages.
+  - probeCodexImportRoot:
       if: "${ $workflow.input.task.task_kind == \"regular\" and (($source_filter_sources | index(\"codex\")) != null) }"
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args:
+              - "-c"
+              - 'if [ -d "$HOME/.codex/sessions" ]; then printf present; else printf missing; fi; exit 0'
+            treat_nonzero_as_error: true
+      export:
+        as:
+          codex_import_root_status: "${ .stdout }"
+
+  - probeClaudeCodeImportRoot:
+      if: "${ $workflow.input.task.task_kind == \"regular\" and (($source_filter_sources | index(\"claude-code\")) != null) }"
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args:
+              - "-c"
+              - 'if [ -d "$HOME/.claude/projects" ]; then printf present; else printf missing; fi; exit 0'
+            treat_nonzero_as_error: true
+      export:
+        as:
+          claude_code_import_root_status: "${ .stdout }"
+
+  - collectSkippedImportSources:
+      if: "${ $workflow.input.task.task_kind == \"regular\" }"
+      set:
+        skipped_import_sources: >-
+          ${ (if (($source_filter_sources | index("codex")) != null
+                  and (($codex_import_root_status // "") == "missing"))
+              then ["codex"] else [] end)
+             + (if (($source_filter_sources | index("claude-code")) != null
+                    and (($claude_code_import_root_status // "") == "missing"))
+                then ["claude-code"] else [] end) }
+
+  - runImportCodex:
+      if: '${ $workflow.input.task.task_kind == "regular" and (($source_filter_sources | index("codex")) != null) and (($codex_import_root_status // "") == "present") }'
       timeout:
         after:
           hours: 2
@@ -187,7 +236,7 @@ do:
           import_codex_result: "${ .output }"
 
   - runImportClaudeCode:
-      if: "${ $workflow.input.task.task_kind == \"regular\" and (($source_filter_sources | index(\"claude-code\")) != null) }"
+      if: '${ $workflow.input.task.task_kind == "regular" and (($source_filter_sources | index("claude-code")) != null) and (($claude_code_import_root_status // "") == "present") }'
       timeout:
         after:
           hours: 2
@@ -204,6 +253,9 @@ do:
           import_claude_code_result: "${ .output }"
 
   - threadSummaryForRegular:
+      timeout:
+        after:
+          hours: 24
       if: "${ $workflow.input.task.task_kind == \"regular\" and ($workflow.input.task.force_thread_summary // true) }"
       do:
         - runThreadBatch:
@@ -230,6 +282,9 @@ do:
                 thread_result: "${ .output | fromjson }"
 
   - dailyForRegular:
+      timeout:
+        after:
+          days: 31
       if: "${ $workflow.input.task.task_kind == \"regular\" and ($workflow.input.task.run_summary_daily // true) }"
       do:
         - runDailyBatch:
@@ -240,8 +295,14 @@ do:
               function:
                 workerName: memories-daily-summary-batch
                 arguments:
+                  # A zero-day lookback is the current local day. The daily batch's
+                  # last-N mode intentionally ends yesterday, so use its explicit
+                  # range mode for this distinct case.
                   input: >-
                     ${ {
+                      user_id: 1,
+                      start_date: (if $workflow.input.task.lookback_days == 0 then $regular_import_start_date else "" end),
+                      end_date: (if $workflow.input.task.lookback_days == 0 then $regular_import_start_date else "" end),
                       last_n_days: $workflow.input.task.lookback_days,
                       memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
@@ -314,20 +375,130 @@ do:
               as:
                 reflection_result: "${ .output | fromjson }"
 
+  # Resolve the exact previous completed ISO week before running either
+  # dependency. These calendar tokens, rather than a run-relative last-N
+  # window, keep a Wednesday (or any other weekday) run aligned with the
+  # week the weekly rollup will actually read.
+  - resolvePeriodicWeekTarget:
+      if: "${ $workflow.input.task.task_kind == \"weekly\" }"
+      set:
+        periodic_week_target: >-
+          ${ if (env.TZ // "") != ""
+             then ((now | strflocaltime("%Y-%m-%d")) as $today
+                   | (($today + "T12:00:00Z") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $noon
+                   | ($noon | strftime("%u") | tonumber) as $wday
+                   | (($noon - (($wday - 1) * 86400) - 7 * 86400)
+                      | strftime("%G-W%V")))
+             else ((now + (9 * 3600)) as $local
+                   | ($local | strftime("%u") | tonumber) as $wday
+                   | (($local - (($wday - 1) * 86400) - 7 * 86400)
+                      | strftime("%G-W%V")))
+             end }
+
+  - resolvePeriodicWeekDateRange:
+      if: "${ $workflow.input.task.task_kind == \"weekly\" }"
+      set:
+        periodic_week_start_date: >-
+          ${ (($periodic_week_target + "-1")
+              | strptime("%G-W%V-%u") | mktime | strftime("%Y-%m-%d")) }
+        periodic_week_end_date: >-
+          ${ (($periodic_week_target + "-1")
+              | strptime("%G-W%V-%u") | mktime | (. + 6 * 86400)
+              | strftime("%Y-%m-%d")) }
+
+  # Monthly dependencies must cover the previous calendar month and every ISO
+  # week touching it. The target is resolved on the worker's IANA TZ calendar
+  # so a task scheduled on any day of the current month has identical input.
+  - resolvePeriodicMonthTarget:
+      if: "${ $workflow.input.task.task_kind == \"monthly\" }"
+      set:
+        periodic_month_target: >-
+          ${ (if (env.TZ // "") != ""
+              then (now | strflocaltime("%Y-%m"))
+              else ((now + (9 * 3600)) | strftime("%Y-%m"))
+              end) as $current_month
+             | ($current_month | split("-")) as $parts
+             | ($parts[0] | tonumber) as $year
+             | ($parts[1] | tonumber) as $month
+             | (if $month == 1 then $year - 1 else $year end) as $target_year
+             | (if $month == 1 then 12 else $month - 1 end) as $target_month
+             | ($target_year | tostring) + "-"
+               + ($target_month | tostring
+                  | if length == 1 then "0" + . else . end) }
+
+  - resolvePeriodicMonthDateRange:
+      if: "${ $workflow.input.task.task_kind == \"monthly\" }"
+      set:
+        periodic_month_calendar_start_date: "${ $periodic_month_target + \"-01\" }"
+        periodic_month_end_date: >-
+          ${ (($periodic_month_target + "-01T12:00:00Z")
+              | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime
+              | (. + 32 * 86400) | strftime("%Y-%m-01T00:00:00Z")
+              | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime | (. - 86400)
+              | strftime("%Y-%m-%d")) }
+
+  - resolvePeriodicMonthWeekRange:
+      if: "${ $workflow.input.task.task_kind == \"monthly\" }"
+      set:
+        periodic_month_start_week: >-
+          ${ (($periodic_month_calendar_start_date + "T00:00:00Z")
+              | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime | strftime("%G-W%V")) }
+        periodic_month_end_week: >-
+          ${ (($periodic_month_end_date + "T00:00:00Z")
+              | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime | strftime("%G-W%V")) }
+
+  # Rebuild the leading ISO week's daily inputs before deriving its weekly summary.
+  - resolvePeriodicMonthDependencyDateRange:
+      if: "${ $workflow.input.task.task_kind == \"monthly\" }"
+      set:
+        periodic_month_start_date: >-
+          ${ (($periodic_month_start_week + "-1")
+              | strptime("%G-W%V-%u") | mktime | strftime("%Y-%m-%d")) }
+
   - weeklyStage:
+      timeout:
+        after:
+          days: 15
       if: "${ $workflow.input.task.task_kind == \"weekly\" }"
       do:
+        - runDailyBatch:
+            timeout:
+              after:
+                days: 7
+            run:
+              function:
+                workerName: memories-daily-summary-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      user_id: 1,
+                      start_date: $periodic_week_start_date,
+                      end_date: $periodic_week_end_date,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      extra_labels_filter: $source_filter_labels,
+                      extra_labels_match_mode: $source_filter_match_mode,
+                      force_resummarize: true
+                    } | tojson }
+            export:
+              as:
+                daily_result: "${ .output | fromjson }"
         - runWeeklyBatch:
             timeout:
               after:
-                hours: 24
+                days: 7
             run:
               function:
                 workerName: memories-weekly-summary-batch
                 arguments:
                   input: >-
                     ${ {
-                      last_n_weeks: 1,
+                      user_id: 1,
+                      start_week: $periodic_week_target,
+                      end_week: $periodic_week_target,
                       memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
@@ -342,19 +513,74 @@ do:
                 weekly_result: "${ .output | fromjson }"
 
   - monthlyStage:
+      timeout:
+        after:
+          days: 72
       if: "${ $workflow.input.task.task_kind == \"monthly\" }"
       do:
+        - runDailyBatch:
+            timeout:
+              after:
+                days: 31
+            run:
+              function:
+                workerName: memories-daily-summary-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      user_id: 1,
+                      start_date: $periodic_month_start_date,
+                      end_date: $periodic_month_end_date,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      extra_labels_filter: $source_filter_labels,
+                      extra_labels_match_mode: $source_filter_match_mode,
+                      force_resummarize: true
+                    } | tojson }
+            export:
+              as:
+                daily_result: "${ .output | fromjson }"
+        - runWeeklyBatch:
+            timeout:
+              after:
+                days: 7
+            run:
+              function:
+                workerName: memories-weekly-summary-batch
+                arguments:
+                  input: >-
+                    ${ {
+                      user_id: 1,
+                      start_week: $periodic_month_start_week,
+                      end_week: $periodic_month_end_week,
+                      memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                      extra_labels_filter: $source_filter_labels,
+                      extra_labels_match_mode: $source_filter_match_mode,
+                      force_resummarize: true
+                    } | tojson }
+            export:
+              as:
+                weekly_result: "${ .output | fromjson }"
         - runMonthlyBatch:
             timeout:
               after:
-                hours: 24
+                days: 31
             run:
               function:
                 workerName: memories-monthly-summary-batch
                 arguments:
                   input: >-
                     ${ {
-                      last_n_months: 1,
+                      user_id: 1,
+                      start_month: $periodic_month_target,
+                      end_month: $periodic_month_target,
                       memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
@@ -378,3 +604,4 @@ output:
     monthly: "${ $monthly_result }"
     personality: "${ $personality_result }"
     reflection: "${ $reflection_result }"
+    skipped_import_sources: "${ $skipped_import_sources }"

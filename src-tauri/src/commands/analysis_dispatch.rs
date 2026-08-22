@@ -20,8 +20,9 @@ use super::import::{
     summarize_workflow_error,
 };
 use super::{
-    AppState, DispatchCancelEntry, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner,
-    emit_event, emit_generated_refresh, thread_summary_single_completed,
+    AppState, DispatchCancelEntry, GeneratedRefreshScope, StepOutcome, StepStatus,
+    cancel_dispatch_inner, emit_event, emit_generated_refresh,
+    generated_refresh_scopes_from_position, json_as_i64,
 };
 
 // Worker names must match what the import pipeline dispatches
@@ -41,6 +42,13 @@ pub(crate) const PERSONALITY_MERGE_WORKER_BASE: &str = "memories-user-personalit
 /// Staged pipeline parent (per-thread → daily → weekly → monthly). Must
 /// match the `name:` in workers/llm-workers.yaml.
 pub(crate) const SUMMARIES_PIPELINE_WORKER_NAME: &str = "memories-summaries-pipeline";
+/// A bounded operational guardrail: jobs that cannot keep up with normal
+/// real-time summary volume must be retried as smaller backfill ranges.
+const SUMMARIES_PIPELINE_JOB_TIMEOUT_SEC: u64 = 72 * 24 * 60 * 60;
+
+fn summaries_pipeline_request_timeout_sec() -> u64 {
+    SUMMARIES_PIPELINE_JOB_TIMEOUT_SEC
+}
 
 const SUMMARY_EVENT: &str = "summary://step";
 const PERSONALITY_EVENT: &str = "personality://step";
@@ -48,12 +56,12 @@ const PERSONALITY_EVENT: &str = "personality://step";
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EnqueueSummaryJobRequest {
     pub user_id: Option<i64>,
-    /// Optional epoch-ms lower bound mirroring the import `--since` window.
+    /// Optional epoch-ms lower bound on the source thread's last message.
     /// Unset = all threads for the user (subject to single-workflow
     /// eligibility checks).
-    pub updated_after_ms: Option<i64>,
+    pub last_message_after_ms: Option<i64>,
     /// Optional inclusive epoch-ms upper bound. Unset = no upper bound.
-    pub updated_before_ms: Option<i64>,
+    pub last_message_before_ms: Option<i64>,
     /// Optional client-supplied dispatch id used as the cancel key. Older
     /// callers (the legacy frontend before cancel landed) omit it; we
     /// then synthesize a timestamp-shaped one as before.
@@ -63,7 +71,7 @@ pub struct EnqueueSummaryJobRequest {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EnqueuePersonalityJobRequest {
     pub user_id: Option<i64>,
-    pub updated_after_ms: Option<i64>,
+    pub last_message_after_ms: Option<i64>,
     /// When true, ignore both `existing_signal` skips in
     /// thread-personality-single AND the target_signal_count short-circuit
     /// in thread-personality-batch, re-extracting every eligible source
@@ -133,15 +141,28 @@ pub async fn enqueue_summary_job(
     let dispatch = BatchDispatch::resolve_with_window(
         &callback,
         user_id,
-        req.updated_after_ms,
-        req.updated_before_ms,
+        req.last_message_after_ms,
+        req.last_message_before_ms,
         state.active_llm_worker_name().to_string(),
         state.active_output_language(),
     )?;
     let args = super::wrap_workflow_run_args(&dispatch.summarize_input());
 
-    let handle = state.jobworkerp().await?;
+    let target = state.resolve_targets()?;
+    let handle = JobworkerpHandle::connect_with_timeout(
+        &target.jobworkerp_url,
+        SUMMARIES_PIPELINE_JOB_TIMEOUT_SEC,
+    )
+    .await?;
     let job_id = resolve_dispatch_id(req.dispatch_id.as_deref(), "summary");
+    let maintenance_registered = super::begin_search_index_write(
+        &state,
+        &[
+            crate::search_index_maintenance::MaintenanceTable::Memory,
+            crate::search_index_maintenance::MaintenanceTable::Thread,
+        ],
+    )
+    .await?;
     let entry = state.dispatch_register(&job_id).await;
     spawn_step_stream(
         app,
@@ -152,6 +173,8 @@ pub async fn enqueue_summary_job(
         SUMMARY_EVENT,
         entry,
         RefreshMode::Terminal(vec![GeneratedRefreshScope::ThreadSummary]),
+        None,
+        maintenance_registered,
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -173,7 +196,7 @@ pub async fn enqueue_personality_job(
     let dispatch = BatchDispatch::resolve(
         &callback,
         user_id,
-        req.updated_after_ms,
+        req.last_message_after_ms,
         state.active_llm_worker_name().to_string(),
         state.active_output_language(),
     )?;
@@ -183,6 +206,14 @@ pub async fn enqueue_personality_job(
 
     let handle = state.jobworkerp().await?;
     let job_id = resolve_dispatch_id(req.dispatch_id.as_deref(), "personality");
+    let maintenance_registered = super::begin_search_index_write(
+        &state,
+        &[
+            crate::search_index_maintenance::MaintenanceTable::Memory,
+            crate::search_index_maintenance::MaintenanceTable::Thread,
+        ],
+    )
+    .await?;
     let entry = state.dispatch_register(&job_id).await;
     spawn_step_stream(
         app,
@@ -193,6 +224,8 @@ pub async fn enqueue_personality_job(
         PERSONALITY_EVENT,
         entry,
         RefreshMode::Terminal(vec![GeneratedRefreshScope::Personality]),
+        None,
+        maintenance_registered,
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -238,6 +271,14 @@ pub async fn enqueue_personality_merge_job(
 
     let handle = state.jobworkerp().await?;
     let job_id = resolve_dispatch_id(req.dispatch_id.as_deref(), "personality-merge");
+    let maintenance_registered = super::begin_search_index_write(
+        &state,
+        &[
+            crate::search_index_maintenance::MaintenanceTable::Memory,
+            crate::search_index_maintenance::MaintenanceTable::Thread,
+        ],
+    )
+    .await?;
     let entry = state.dispatch_register(&job_id).await;
     spawn_step_stream(
         app,
@@ -248,6 +289,8 @@ pub async fn enqueue_personality_merge_job(
         PERSONALITY_EVENT,
         entry,
         RefreshMode::Terminal(vec![GeneratedRefreshScope::Personality]),
+        None,
+        maintenance_registered,
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -287,6 +330,14 @@ pub async fn enqueue_period_summary_job(
 
     let handle = state.jobworkerp().await?;
     let job_id = resolve_dispatch_id(req.dispatch_id.as_deref(), req.kind.job_prefix());
+    let maintenance_registered = super::begin_search_index_write(
+        &state,
+        &[
+            crate::search_index_maintenance::MaintenanceTable::Memory,
+            crate::search_index_maintenance::MaintenanceTable::Thread,
+        ],
+    )
+    .await?;
     let entry = state.dispatch_register(&job_id).await;
     spawn_step_stream(
         app,
@@ -297,6 +348,8 @@ pub async fn enqueue_period_summary_job(
         SUMMARY_EVENT,
         entry,
         RefreshMode::Terminal(vec![period_refresh_scope(req.kind)]),
+        None,
+        maintenance_registered,
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -316,6 +369,20 @@ pub async fn generate_summaries(
     // Generation writes summary / personality embeddings into the local
     // LanceDB; refuse when it is degraded (local mode only).
     state.ensure_local_embedding_available()?;
+    tracing::info!(
+        user_id = req.user_id.unwrap_or(1),
+        run_per_thread = req.run_per_thread,
+        run_daily = req.run_daily,
+        run_weekly = req.run_weekly,
+        run_monthly = req.run_monthly,
+        daily_start = %req.daily_start,
+        daily_end = %req.daily_end,
+        weekly_start = %req.weekly_start,
+        weekly_end = %req.weekly_end,
+        monthly_start = %req.monthly_start,
+        monthly_end = %req.monthly_end,
+        "received summaries generation request"
+    );
     let callback = state.resolve_targets()?.memories_callback()?;
     let user_id = req.user_id.unwrap_or(1);
     // The per-thread epoch bounds ride on the request (forwarded by
@@ -329,8 +396,24 @@ pub async fn generate_summaries(
     )?;
     let args = super::wrap_workflow_run_args(&dispatch.pipeline_input(&req));
 
-    let handle = state.jobworkerp().await?;
+    // This pipeline can run for days. Do not reuse AppState's shared
+    // three-hour client, or its stream deadline will expire while the
+    // server-side job is still running.
+    let target = state.resolve_targets()?;
+    let handle = JobworkerpHandle::connect_with_timeout(
+        &target.jobworkerp_url,
+        summaries_pipeline_request_timeout_sec(),
+    )
+    .await?;
     let job_id = resolve_dispatch_id(req.dispatch_id.as_deref(), "summaries");
+    let maintenance_registered = super::begin_search_index_write(
+        &state,
+        &[
+            crate::search_index_maintenance::MaintenanceTable::Memory,
+            crate::search_index_maintenance::MaintenanceTable::Thread,
+        ],
+    )
+    .await?;
     let entry = state.dispatch_register(&job_id).await;
     spawn_step_stream(
         app,
@@ -341,6 +424,8 @@ pub async fn generate_summaries(
         SUMMARY_EVENT,
         entry,
         RefreshMode::SummariesPipeline,
+        Some(SUMMARIES_PIPELINE_JOB_TIMEOUT_SEC),
+        maintenance_registered,
     );
 
     Ok(EnqueueAnalysisJobResponse {
@@ -398,6 +483,8 @@ fn spawn_step_stream(
     event_name: &'static str,
     entry: DispatchCancelEntry,
     refresh_mode: RefreshMode,
+    job_timeout_sec: Option<u64>,
+    maintenance_registered: bool,
 ) {
     let job_id = job_id.to_string();
     tokio::spawn(async move {
@@ -424,6 +511,7 @@ fn spawn_step_stream(
             &worker_name,
             args,
             Some("run"),
+            job_timeout_sec,
             cancel.clone(),
             // Async park: `blocking_lock` from a runtime worker panics
             // ("Cannot block the current thread from within a runtime"),
@@ -445,13 +533,11 @@ fn spawn_step_stream(
                                     pipeline_refresh_scopes(raw),
                                 );
                             }
-                            if thread_summary_single_completed(raw) {
-                                emit_generated_refresh(
-                                    &app_for_emit,
-                                    &job_id_for_emit,
-                                    vec![GeneratedRefreshScope::ThreadSummary],
-                                );
-                            }
+                            emit_generated_refresh(
+                                &app_for_emit,
+                                &job_id_for_emit,
+                                generated_refresh_scopes_from_position(raw),
+                            );
                             let (d, p) = summarize_workflow_chunk(raw, last_progress);
                             last_progress = p;
                             d
@@ -460,28 +546,35 @@ fn spawn_step_stream(
                     }
                     StreamEvent::Done(msg) => {
                         if let RefreshMode::Terminal(scopes) = &refresh_mode {
-                            emit_new_refresh_scopes(
-                                &app_for_emit,
-                                &job_id_for_emit,
-                                &mut emitted_refresh_scopes,
-                                scopes.clone(),
-                            );
+                            // A terminal refresh is intentionally not deduplicated
+                            // against an Active chunk: it closes the race where the
+                            // last persisted result arrives after the final chunk.
+                            emit_generated_refresh(&app_for_emit, &job_id_for_emit, scopes.clone());
                         }
-                        let digest = msg.map(|raw| {
-                            match &refresh_mode {
-                                RefreshMode::SummariesPipeline => emit_new_refresh_scopes(
-                                    &app_for_emit,
-                                    &job_id_for_emit,
-                                    &mut emitted_refresh_scopes,
-                                    pipeline_refresh_scopes(raw),
-                                ),
-                                RefreshMode::Terminal(_) => {}
+                        match (&refresh_mode, msg) {
+                            (RefreshMode::SummariesPipeline, Some(raw)) => {
+                                // Re-emit the terminal stage scopes even when Active
+                                // chunks already refreshed them.
+                                let (scopes, outcome) = pipeline_terminal_update(raw);
+                                emit_generated_refresh(&app_for_emit, &job_id_for_emit, scopes);
+                                (outcome.status, outcome.message)
                             }
-                            summarize_workflow_chunk(raw, last_progress).0
-                        });
-                        (StepStatus::Done, digest)
+                            (RefreshMode::SummariesPipeline, None) => (
+                                StepStatus::Failed,
+                                Some("パイプラインの終端出力がありません".to_string()),
+                            ),
+                            (RefreshMode::Terminal(_), raw) => (
+                                StepStatus::Done,
+                                raw.map(|chunk| summarize_workflow_chunk(chunk, last_progress).0),
+                            ),
+                        }
                     }
                     StreamEvent::Failed(msg) => {
+                        emit_generated_refresh(
+                            &app_for_emit,
+                            &job_id_for_emit,
+                            failed_stream_refresh_scopes(&refresh_mode, &emitted_refresh_scopes),
+                        );
                         // Distinguish user-triggered cancel from a genuine
                         // worker failure: `analysis_cancel` flips the token
                         // first and then `JobService/Delete`s the live job,
@@ -515,8 +608,25 @@ fn spawn_step_stream(
         *current_job_id.lock().await = None;
         if let Some(state) = app.try_state::<AppState>() {
             state.dispatch_take(&job_id).await;
+            if let Err(error) =
+                super::finish_search_index_write(&state, maintenance_registered).await
+            {
+                tracing::warn!(%error, "analysis terminal maintenance reconcile failed");
+            }
         }
     });
+}
+
+fn failed_stream_refresh_scopes(
+    refresh_mode: &RefreshMode,
+    emitted_refresh_scopes: &HashSet<GeneratedRefreshScope>,
+) -> Vec<GeneratedRefreshScope> {
+    match refresh_mode {
+        RefreshMode::Terminal(scopes) => scopes.clone(),
+        // The staged pipeline has no fixed output set. Re-notify precisely
+        // the scopes whose persisted output was observed before failure.
+        RefreshMode::SummariesPipeline => emitted_refresh_scopes.iter().copied().collect(),
+    }
 }
 
 fn emit_new_refresh_scopes(
@@ -532,34 +642,45 @@ fn emit_new_refresh_scopes(
     emit_generated_refresh(app, job_id, fresh);
 }
 
-fn pipeline_refresh_scopes(raw: &str) -> Vec<GeneratedRefreshScope> {
-    let Some(output) = pipeline_output_value(raw) else {
-        return Vec::new();
-    };
+const PIPELINE_STAGE_SCOPE_KEYS: [(&str, GeneratedRefreshScope); 12] = [
+    ("per_thread_result", GeneratedRefreshScope::ThreadSummary),
+    ("per_thread", GeneratedRefreshScope::ThreadSummary),
+    ("daily_result", GeneratedRefreshScope::DailySummary),
+    ("daily", GeneratedRefreshScope::DailySummary),
+    // A per-day result is emitted only after its thread and daily
+    // dependencies have both run, so refresh both derived views.
+    ("per_day_result", GeneratedRefreshScope::ThreadSummary),
+    ("per_day_result", GeneratedRefreshScope::DailySummary),
+    ("per_day", GeneratedRefreshScope::ThreadSummary),
+    ("per_day", GeneratedRefreshScope::DailySummary),
+    ("weekly_result", GeneratedRefreshScope::WeeklySummary),
+    ("weekly", GeneratedRefreshScope::WeeklySummary),
+    ("monthly_result", GeneratedRefreshScope::MonthlySummary),
+    ("monthly", GeneratedRefreshScope::MonthlySummary),
+];
 
-    [
-        ("per_thread_result", GeneratedRefreshScope::ThreadSummary),
-        ("per_thread", GeneratedRefreshScope::ThreadSummary),
-        ("daily_result", GeneratedRefreshScope::DailySummary),
-        ("daily", GeneratedRefreshScope::DailySummary),
-        ("weekly_result", GeneratedRefreshScope::WeeklySummary),
-        ("weekly", GeneratedRefreshScope::WeeklySummary),
-        ("monthly_result", GeneratedRefreshScope::MonthlySummary),
-        ("monthly", GeneratedRefreshScope::MonthlySummary),
-    ]
-    .into_iter()
-    .filter_map(|(key, scope)| pipeline_stage_result_present(&output, key).then_some(scope))
-    .fold(Vec::new(), |mut acc, scope| {
-        if !acc.contains(&scope) {
-            acc.push(scope);
-        }
-        acc
-    })
+fn pipeline_refresh_scopes(raw: &str) -> Vec<GeneratedRefreshScope> {
+    pipeline_output_value(raw)
+        .as_ref()
+        .map_or_else(Vec::new, pipeline_refresh_scopes_from_output)
+}
+
+fn pipeline_refresh_scopes_from_output(output: &serde_json::Value) -> Vec<GeneratedRefreshScope> {
+    PIPELINE_STAGE_SCOPE_KEYS
+        .iter()
+        .copied()
+        .filter_map(|(key, scope)| pipeline_stage_result_present(output, key).then_some(scope))
+        .fold(Vec::new(), |mut acc, scope| {
+            if !acc.contains(&scope) {
+                acc.push(scope);
+            }
+            acc
+        })
 }
 
 fn pipeline_output_value(raw: &str) -> Option<serde_json::Value> {
     let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-    if pipeline_has_stage_keys(&v) {
+    if pipeline_has_stage_keys(&v) || pipeline_has_terminal_contract(&v) {
         return Some(v);
     }
     match v.get("output") {
@@ -571,19 +692,90 @@ fn pipeline_output_value(raw: &str) -> Option<serde_json::Value> {
     }
 }
 
+fn pipeline_has_terminal_contract(v: &serde_json::Value) -> bool {
+    v.get("completed").is_some() || v.get("outcome").is_some()
+}
+
+/// Classify the pipeline's explicit terminal contract. Unlike ordinary batch
+/// workers, a completed parent workflow can intentionally carry partial
+/// failures, so its `completed`/`outcome` pair is authoritative.
+fn pipeline_terminal_update(raw: &str) -> (Vec<GeneratedRefreshScope>, StepOutcome) {
+    let Some(output) = pipeline_output_value(raw) else {
+        return (Vec::new(), invalid_pipeline_terminal_output());
+    };
+    (
+        pipeline_refresh_scopes_from_output(&output),
+        summarize_pipeline_terminal_outcome_from_output(&output),
+    )
+}
+
+fn invalid_pipeline_terminal_output() -> StepOutcome {
+    StepOutcome {
+        status: StepStatus::Failed,
+        message: Some("パイプラインの終端出力を解釈できません".to_string()),
+    }
+}
+
+fn summarize_pipeline_terminal_outcome_from_output(output: &serde_json::Value) -> StepOutcome {
+    match (
+        output.get("completed").and_then(serde_json::Value::as_bool),
+        output.get("outcome").and_then(serde_json::Value::as_str),
+    ) {
+        (Some(true), Some("succeeded")) => StepOutcome {
+            status: StepStatus::Done,
+            message: None,
+        },
+        (Some(false), Some("partial")) => {
+            let per_day_failures = output
+                .get("per_day_failed_dates")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let stage_failures: i64 = ["per_thread", "daily", "weekly", "monthly"]
+                .into_iter()
+                .filter_map(|key| output.get(key))
+                .filter_map(|stage| stage.get("failed_count"))
+                .filter_map(json_as_i64)
+                .sum();
+            let execution_failures = output
+                .get("execution_failures")
+                .and_then(serde_json::Value::as_array)
+                .map(|failures| {
+                    failures
+                        .iter()
+                        .filter_map(|failure| {
+                            let stage = failure.get("stage")?.as_str()?;
+                            let detail = failure
+                                .get("detail")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("実行エラー");
+                            Some(format!("{stage}: {detail}"))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let execution_line = if execution_failures.is_empty() {
+                String::new()
+            } else {
+                format!("\n実行失敗: {}", execution_failures.join("、"))
+            };
+            StepOutcome {
+                status: StepStatus::Warning,
+                message: Some(format!(
+                    "一部失敗（stage {stage_failures} 件、日別 {per_day_failures} 件）{execution_line}"
+                )),
+            }
+        }
+        _ => StepOutcome {
+            status: StepStatus::Failed,
+            message: Some("パイプラインの終端出力が不正です".to_string()),
+        },
+    }
+}
+
 fn pipeline_has_stage_keys(v: &serde_json::Value) -> bool {
-    [
-        "per_thread_result",
-        "per_thread",
-        "daily_result",
-        "daily",
-        "weekly_result",
-        "weekly",
-        "monthly_result",
-        "monthly",
-    ]
-    .into_iter()
-    .any(|key| v.get(key).is_some())
+    PIPELINE_STAGE_SCOPE_KEYS
+        .iter()
+        .any(|(key, _)| v.get(key).is_some())
 }
 
 fn pipeline_stage_result_present(output: &serde_json::Value, key: &str) -> bool {
@@ -864,6 +1056,30 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_refresh_scopes_reads_per_day_results_as_both_dependencies() {
+        let chunk = serde_json::json!({
+            "status": "Completed",
+            "output": serde_json::json!({
+                "completed": true,
+                "per_thread": null,
+                "daily": null,
+                "per_day": { "processed_dates": 1, "succeeded_count": 1 },
+                "weekly": null,
+                "monthly": null
+            }).to_string()
+        })
+        .to_string();
+
+        assert_eq!(
+            pipeline_refresh_scopes(&chunk),
+            vec![
+                GeneratedRefreshScope::ThreadSummary,
+                GeneratedRefreshScope::DailySummary,
+            ]
+        );
+    }
+
+    #[test]
     fn pipeline_refresh_scopes_reads_direct_terminal_output() {
         let raw = serde_json::json!({
             "completed": true,
@@ -900,51 +1116,74 @@ mod tests {
     }
 
     #[test]
-    fn thread_summary_single_completed_detects_record_success_chunk() {
-        let chunk = serde_json::json!({
-            "status": "Running",
-            "position": "/ROOT/do/4/summarizeEach/for/do/1/invokeSingleWithRetry/try/do/1/recordSuccess",
-            "output": "{}"
-        })
-        .to_string();
+    fn pipeline_terminal_update_derives_scopes_and_outcome_from_one_output() {
+        let raw = r#"{"status":"Completed","output":"{\"completed\":false,\"outcome\":\"partial\",\"per_thread\":{\"failed_count\":1}}"}"#;
 
-        assert!(thread_summary_single_completed(&chunk));
+        let (scopes, outcome) = pipeline_terminal_update(raw);
+
+        assert_eq!(scopes, vec![GeneratedRefreshScope::ThreadSummary]);
+        assert_eq!(outcome.status, StepStatus::Warning);
+        assert!(outcome.message.unwrap().contains("stage 1 件"));
     }
 
     #[test]
-    fn thread_summary_single_completed_ignores_progress_chunk() {
-        let chunk = serde_json::json!({
-            "status": "Running",
-            "position": "/ROOT/do/4/summarizeEach/for/do/0/reportProgress",
-            "output": "{}"
-        })
-        .to_string();
+    fn pipeline_terminal_outcome_distinguishes_success_partial_and_invalid_output() {
+        let succeeded =
+            r#"{"status":"Completed","output":"{\"completed\":true,\"outcome\":\"succeeded\"}"}"#;
+        assert_eq!(
+            pipeline_terminal_update(succeeded).1.status,
+            StepStatus::Done
+        );
 
-        assert!(!thread_summary_single_completed(&chunk));
+        let partial = r#"{"status":"Completed","output":"{\"completed\":false,\"outcome\":\"partial\",\"per_day_failed_dates\":[\"2026-08-01\"],\"execution_failures\":[{\"stage\":\"weekly\",\"detail\":\"worker timeout\"}]}"}"#;
+        let partial_outcome = pipeline_terminal_update(partial).1;
+        assert_eq!(partial_outcome.status, StepStatus::Warning);
+        let message = partial_outcome.message.unwrap();
+        assert!(message.contains("一部失敗"));
+        assert!(message.contains("weekly: worker timeout"));
+
+        let malformed = r#"{"status":"Completed","output":"{\"outcome\":\"unexpected\"}"}"#;
+        assert_eq!(
+            pipeline_terminal_update(malformed).1.status,
+            StepStatus::Failed
+        );
+
+        let direct = r#"{"completed":true,"outcome":"succeeded"}"#;
+        assert_eq!(pipeline_terminal_update(direct).1.status, StepStatus::Done);
     }
 
     #[test]
-    fn thread_reflection_single_completed_detects_record_success_chunk() {
-        let chunk = serde_json::json!({
-            "status": "Running",
-            "position": "/ROOT/do/3/reflectEach/for/do/1/invokeSingleWithRetry/try/do/1/recordSuccess",
-            "output": "{}"
-        })
-        .to_string();
+    fn pipeline_terminal_outcome_accepts_numeric_and_string_failed_counts() {
+        for failed_count in [serde_json::json!(2), serde_json::json!("2")] {
+            let raw = serde_json::json!({
+                "completed": false,
+                "outcome": "partial",
+                "per_thread": { "failed_count": failed_count },
+            })
+            .to_string();
 
-        assert!(crate::commands::thread_reflection_single_completed(&chunk));
+            let outcome = pipeline_terminal_update(&raw).1;
+            assert_eq!(outcome.status, StepStatus::Warning);
+            assert!(outcome.message.unwrap().contains("stage 2 件"));
+        }
     }
 
     #[test]
-    fn thread_reflection_single_completed_ignores_progress_chunk() {
-        let chunk = serde_json::json!({
-            "status": "Running",
-            "position": "/ROOT/do/3/reflectEach/for/do/0/reportProgress",
-            "output": "{}"
-        })
-        .to_string();
+    fn failed_stream_refresh_scopes_reissues_known_persisted_scopes() {
+        let terminal = RefreshMode::Terminal(vec![GeneratedRefreshScope::Personality]);
+        assert_eq!(
+            failed_stream_refresh_scopes(&terminal, &HashSet::new()),
+            vec![GeneratedRefreshScope::Personality]
+        );
 
-        assert!(!crate::commands::thread_reflection_single_completed(&chunk));
+        let observed = HashSet::from([
+            GeneratedRefreshScope::ThreadSummary,
+            GeneratedRefreshScope::WeeklySummary,
+        ]);
+        let scopes = failed_stream_refresh_scopes(&RefreshMode::SummariesPipeline, &observed);
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.contains(&GeneratedRefreshScope::ThreadSummary));
+        assert!(scopes.contains(&GeneratedRefreshScope::WeeklySummary));
     }
 
     #[test]
@@ -968,6 +1207,19 @@ mod tests {
         assert!(
             !digest.contains('{'),
             "raw JSON must not leak into the digest"
+        );
+    }
+
+    #[test]
+    fn summaries_pipeline_job_timeout_covers_all_stage_budgets() {
+        assert_eq!(SUMMARIES_PIPELINE_JOB_TIMEOUT_SEC, 72 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn summaries_pipeline_client_deadline_matches_its_job_deadline() {
+        assert_eq!(
+            summaries_pipeline_request_timeout_sec(),
+            SUMMARIES_PIPELINE_JOB_TIMEOUT_SEC
         );
     }
 }

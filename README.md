@@ -32,7 +32,8 @@ Local LLM execution currently supports only Qwen 3.5/3.6-family and Gemma 4-fami
 The app UI lives in this repository, but running the complete desktop app also needs bundled backend binaries and jobworkerp plugins:
 
 - [`jobworkerp`](https://github.com/jobworkerp-rs/jobworkerp-rs): `all-in-one`
-- [`memory-store`](https://github.com/jobworkerp-rs/memory-store): `front`, `memories-import`, and `migrate-memory-kind`
+- [`memory-store`](https://github.com/jobworkerp-rs/memory-store): `front`, `memories-import`, and
+  the official SQLite migration bundle (`memories-db-migrate`, Atlas, and the migration catalog)
 - [`jobworkerp-conductor`](https://github.com/jobworkerp-rs/jobworkerp-conductor): `conductor-main`
 - `protoc`: the official self-contained protobuf compiler, fetched automatically by the build
   (children run it to compile runner schemas at worker-registration time, so it is shipped as a
@@ -41,6 +42,10 @@ The app UI lives in this repository, but running the complete desktop app also n
 - [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner): embedding runner plugin
 
 Frontend checks can run without these binaries. Running the complete app, importing logs, loading models, and building distributable packages require them.
+
+### Database migration at startup
+
+If the local memories database needs migration, the startup screen says that Lookback is checking or migrating the database. Do not quit or restart Lookback until it finishes. The same indication may appear briefly while the migration check completes even when no migration is needed, then the normal startup screen returns.
 
 ## Build From Source
 
@@ -64,7 +69,8 @@ Install these on the build host before building:
 
 `scripts/build-release.sh` clones the five public backend repositories, builds them with the
 right features for your platform and GPU backend, stages the binaries / plugins / lindera
-dictionary where Tauri expects them, and runs `pnpm tauri build`:
+dictionary, generates the official SQLite migration bundle from the same memory-store checkout
+as `front`, and runs `pnpm tauri build`:
 
 ```bash
 # macOS (Metal GPU, DMG + .app)
@@ -96,22 +102,30 @@ If you build the backend components yourself, place the outputs as follows and r
    src-tauri/bin/front-<triple>
    src-tauri/bin/conductor-main-<triple>
    src-tauri/bin/memories-import-<triple>
-   src-tauri/bin/migrate-memory-kind-<triple>
    src-tauri/bin/protoc-<triple>
    ```
 
-2. Build the runner plugins (`libjobworkerp_llama_cpp_plugin` and `libmm_embedding_runner`) for
-   your target OS and place the shared libraries under `plugins/`.
-3. Stage the migration toolkit from the **same `memories` checkout and revision** that produced
-   `front`, `memories-import`, and `migrate-memory-kind`:
+2. Generate the official SQLite migration bundle from the same memory-store checkout used to
+   build `front` and `memories-import`, then stage it under `src-tauri/migration-bundle/`. The
+   upstream script refuses to overwrite an existing output, so complete it in a temporary
+   directory before replacing the staged bundle:
 
    ```bash
-   scripts/stage-memory-kind-toolkit.sh /absolute/path/to/memories
+   migration_stage="$(mktemp -d)"
+   cd /path/to/memory-store
+   scripts/build-memories-db-migrate-sqlite.sh \
+     "${migration_stage}/migration-bundle"
+   cd /path/to/agent-app
+   rm -rf src-tauri/migration-bundle
+   mv "${migration_stage}/migration-bundle" src-tauri/migration-bundle
+   pnpm verify:migration-bundle
    ```
 
-   This fills `src-tauri/migration-toolkit/` with the client-apply runbook and SQL. Do not bundle
-   the CI placeholder files; an existing database blocked for migration needs this real guide for
-   recovery.
+   `pnpm tauri:build` runs this verification again before packaging and rejects a bundle missing
+   the coordinator, Atlas binary, catalog, or Lookback's expected schema contract.
+
+3. Build the runner plugins (`libjobworkerp_llama_cpp_plugin` and `libmm_embedding_runner`) for
+   your target OS and place the shared libraries under `plugins/`.
 4. If your `memory-store` `front` build uses Lindera FTS, place the search dictionary under
    `dict/lindera/ipadic` (lindera 3.x format with `metadata.json`). Lookback packages and stages
    this directory for `memory-store`; it does not load the dictionary directly.
@@ -128,7 +142,7 @@ For development launch commands and path overrides, see [docs/developer-guide.md
    - Choose the embedding model.
    - Confirm the backend and model readiness checks.
 3. Open **Settings** later if you need to change providers, model paths, cache paths, language, timezone, or MCP exposure.
-   - **Embedding model** remains editable when Connection is **Remote server**. For semantic or hybrid search, local article embeddings are not generated, so match the local query embedding model and vector dimension to the remote server embeddings. Remote-server changes do not reset or regenerate the local embedding index. Local memories SQLite/LanceDB is neither started nor read; all memories reads and writes use the remote endpoint. Startup verifies required memories services and thread-label RPC schemas through gRPC Server Reflection, so the remote must be memory_kind-migrated, support the `memory_kinds` filters for thread-label RPCs, and expose Reflection v1. Deploy a matching updated memories binary; older binaries are rejected because they ignore this field and can mix non-RAW labels into the Threads tab.
+   - **Embedding model** remains editable when Connection is **Remote server**. For semantic or hybrid search, local article embeddings are not generated, so match the local query embedding model and vector dimension to the remote server embeddings. Remote-server changes do not reset or regenerate the local embedding index. Local memories SQLite/LanceDB is neither started nor read; all memories reads and writes use the remote endpoint. Startup verifies required memories services and list/count schemas through gRPC Server Reflection: the remote must support the `memory_kinds` filters and `external_id_prefix` fields on memory summary list/count requests, the `memory_kinds` filters for thread-label RPCs, and expose Reflection v1. Deploy a matching updated memories binary; older binaries are rejected because they can mix non-RAW labels or different summary kinds into a tab.
    - **Timezone** controls the wall-clock boundaries used by summaries, imports, and timestamp display. **Auto** follows the app environment / OS timezone; saving an explicit timezone restarts the sidecar because worker processes read `TZ` at startup. This setting is disabled while Connection is **Remote server** because the remote workflows use the remote server environment.
 4. Open **Threads** and click **Import** to import Claude Code or Codex session logs. To import a directory of plain text instead, check **Plain text (directory)**, choose the target directory, and pick a thread split strategy:
    - **Per file**: one thread per file.
@@ -136,6 +150,8 @@ For development launch commands and path overrides, see [docs/developer-guide.md
    - **Single thread**: the whole directory becomes one thread.
 
    Plain import reads `.md` / `.txt` files recursively. An optional **Source name** (`a-z0-9_-`, up to 32 chars) namespaces the imported threads; leave it empty to use the importer default. Plain text can be imported together with Claude Code / Codex in the same run.
+
+   Manual imports check `~/.claude/projects` and `~/.codex/sessions` independently and skip a selected source whose directory is absent. If no selected auto-discovered log source is available, the import is still reported as a successful no-op and the toast explains the condition. A missing directory selected for Plain text remains an error. Periodic regular tasks perform the same per-source check before importing: unavailable Codex or Claude Code roots are skipped and listed in `skipped_import_sources`, while the configured summary and generation stages still run.
 5. Browse imported threads from **Threads**. Use keyword search first; use semantic or hybrid search when the embedding runner is ready.
 6. Open **Summaries** to generate or inspect thread and period summaries.
 7. Open **Reflections** and **Personality** to generate higher-level observations from imported sessions.

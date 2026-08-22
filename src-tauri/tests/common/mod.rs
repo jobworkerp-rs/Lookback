@@ -73,6 +73,8 @@ pub async fn start_chat_e2e_sidecars(label: &str) -> (PathBuf, Arc<Sidecars>, Si
     let config = SidecarConfig {
         jobworkerp_bin: require_env("LOOKBACK_JOBWORKERP_BIN"),
         memories_bin: require_env("LOOKBACK_MEMORIES_BIN"),
+        memories_db_migrate_bin: require_env("LOOKBACK_MEMORIES_DB_MIGRATE_BIN"),
+        startup_database_migration_enabled: true,
         conductor_bin: require_env("LOOKBACK_CONDUCTOR_BIN"),
         data: data.clone(),
         worker_yaml_paths: vec![

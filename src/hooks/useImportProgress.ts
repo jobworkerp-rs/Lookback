@@ -1,13 +1,28 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { startImportCancel } from "@/api";
-import type { ImportStep, ImportStepUpdate, StepStatus } from "@/types/api";
+import { isTerminalStepStatus } from "@/lib/stepStatus";
+import type { ImportNoticeCode, ImportStep, ImportStepUpdate, StepStatus } from "@/types/api";
 import { useTauriEvent } from "./useTauriEvent";
 
 const STEPS: ImportStep[] = ["thread-import", "thread-summary", "thread-personality", "reflection"];
 
+interface ImportStepState {
+  status: StepStatus;
+  message: string | null;
+  notice_code?: ImportNoticeCode;
+}
+
+function toImportStepState(update: ImportStepUpdate): ImportStepState {
+  return {
+    status: update.status,
+    message: update.message,
+    ...(update.notice_code ? { notice_code: update.notice_code } : {}),
+  };
+}
+
 export interface ImportSnapshot {
   job_id: string;
-  steps: Record<ImportStep, { status: StepStatus; message: string | null }>;
+  steps: Record<ImportStep, ImportStepState>;
 }
 
 export function defaultSnapshot(jobId: string): ImportSnapshot {
@@ -35,34 +50,48 @@ export function useImportProgress(): {
   cancel: () => Promise<void>;
 } {
   const [snapshot, setSnapshot] = useState<ImportSnapshot | null>(null);
+  const snapshotsByJobId = useRef(new Map<string, ImportSnapshot>());
 
   useTauriEvent<ImportStepUpdate>("import://step", (update) => {
     setSnapshot((current) => {
-      if (!current || current.job_id !== update.job_id) {
-        const next = defaultSnapshot(update.job_id);
-        next.steps[update.step] = {
-          status: update.status,
-          message: update.message,
-        };
-        return next;
-      }
-      // Same status + same message arrives for every keep-alive chunk
-      // during streaming; short-circuit so downstream consumers don't
+      const cached = snapshotsByJobId.current.get(update.job_id);
+      const base = cached ?? defaultSnapshot(update.job_id);
+      // The same status, message, and notice can arrive for every keep-alive
+      // chunk during streaming; short-circuit so downstream consumers do not
       // re-render on no-op updates.
-      const prev = current.steps[update.step];
-      if (prev.status === update.status && prev.message === update.message) {
+      const prev = base.steps[update.step];
+      // Tauri event delivery can race with command responses. Once a step has
+      // reached a terminal state, a delayed progress event cannot represent a
+      // new execution of that same step, so keep the terminal result visible.
+      if (isTerminalStepStatus(prev.status) && !isTerminalStepStatus(update.status)) {
         return current;
       }
-      return {
-        ...current,
+      if (
+        prev.status === update.status &&
+        prev.message === update.message &&
+        prev.notice_code === update.notice_code
+      ) {
+        // The first event can legitimately equal the optimistic default. It
+        // still establishes a snapshot for this dispatch.
+        if (!cached) {
+          snapshotsByJobId.current.set(update.job_id, base);
+          return !current || current.job_id === update.job_id ? base : current;
+        }
+        return current;
+      }
+      const nextStep = toImportStepState(update);
+      const next = {
+        ...base,
         steps: {
-          ...current.steps,
-          [update.step]: {
-            status: update.status,
-            message: update.message,
-          },
+          ...base.steps,
+          [update.step]: nextStep,
         },
       };
+      snapshotsByJobId.current.set(update.job_id, next);
+      // The command response can arrive after this event. Keep a background
+      // snapshot until reset associates it with the toast, without allowing a
+      // late event from another dispatch to replace the visible job.
+      return !current || current.job_id === update.job_id ? next : current;
     });
   });
 
@@ -74,8 +103,16 @@ export function useImportProgress(): {
     // `startImport` promise (dry-run / immediate failure) and we'd clobber a
     // terminal `done` / `failed` with `active` here.
     reset: (jobId: string) =>
-      setSnapshot((current) => (current?.job_id === jobId ? current : defaultSnapshot(jobId))),
-    clear: () => setSnapshot(null),
+      setSnapshot((current) => {
+        if (current?.job_id === jobId) return current;
+        const next = snapshotsByJobId.current.get(jobId) ?? defaultSnapshot(jobId);
+        snapshotsByJobId.current.set(jobId, next);
+        return next;
+      }),
+    clear: () => {
+      snapshotsByJobId.current.clear();
+      setSnapshot(null);
+    },
     /** Fire-and-forget cancel against the dispatch id parked in the
      *  snapshot. Idempotent server-side: a no-op if the run already
      *  finished, so calling it on a settled toast is harmless. */

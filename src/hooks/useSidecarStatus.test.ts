@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getSidecarStatus } from "@/api";
 import type { SidecarErrorPayload, SidecarStartReport, SidecarStatusSnapshot } from "@/types/api";
 import {
   applySnapshot,
@@ -7,7 +9,13 @@ import {
   isVectorDegraded,
   readyStatusFrom,
   type SidecarStatus,
+  useSidecarStatus,
 } from "./useSidecarStatus";
+
+vi.mock("@/api", () => ({ getSidecarStatus: vi.fn() }));
+vi.mock("./useTauriEvent", () => ({ useTauriEvent: vi.fn() }));
+
+const mockedGetSidecarStatus = vi.mocked(getSidecarStatus);
 
 const report: SidecarStartReport = {
   jobworkerp_port: 9000,
@@ -17,8 +25,16 @@ const report: SidecarStartReport = {
   warnings: [],
 };
 
-const readySnapshot: SidecarStatusSnapshot = { ready: report, failure: null };
-const emptySnapshot: SidecarStatusSnapshot = { ready: null, failure: null };
+const readySnapshot: SidecarStatusSnapshot = {
+  ready: report,
+  failure: null,
+  database_migration_in_progress: false,
+};
+const emptySnapshot: SidecarStatusSnapshot = {
+  ready: null,
+  failure: null,
+  database_migration_in_progress: false,
+};
 
 describe("readyStatusFrom", () => {
   it("splits the flattened endpoints out of the report", () => {
@@ -122,7 +138,11 @@ describe("applySnapshot", () => {
         actual_fingerprint: "",
       },
     };
-    const next = applySnapshot(starting, { ready: null, failure });
+    const next = applySnapshot(starting, {
+      ready: null,
+      failure,
+      database_migration_in_progress: true,
+    });
     expect(next.phase).toBe("error");
     expect(next.failure).toEqual(failure);
   });
@@ -132,7 +152,11 @@ describe("applySnapshot", () => {
     // failure leaves both fields populated; BootError must win so the
     // user is not handed a stale endpoints view of an unhealthy sidecar.
     const failure: SidecarErrorPayload = { kind: "raw", message: "swap failed" };
-    const next = applySnapshot(starting, { ready: report, failure });
+    const next = applySnapshot(starting, {
+      ready: report,
+      failure,
+      database_migration_in_progress: true,
+    });
     expect(next.phase).toBe("error");
     expect(next.failure).toEqual(failure);
   });
@@ -143,6 +167,31 @@ describe("applySnapshot", () => {
 
   it("stays starting when both snapshot fields are null", () => {
     expect(applySnapshot(starting, emptySnapshot)).toBe(starting);
+  });
+
+  it("marks only the starting screen while the database migration gate runs", () => {
+    const next = applySnapshot(starting, {
+      ready: null,
+      failure: null,
+      database_migration_in_progress: true,
+    });
+    expect(next).toEqual({
+      phase: "starting",
+      warnings: [],
+      databaseMigrationInProgress: true,
+    });
+  });
+
+  it("clears the migration indication once the gate snapshot completes", () => {
+    const migrating: SidecarStatus = {
+      phase: "starting",
+      warnings: [],
+      databaseMigrationInProgress: true,
+    };
+    expect(applySnapshot(migrating, emptySnapshot)).toEqual({
+      ...migrating,
+      databaseMigrationInProgress: false,
+    });
   });
 
   it("does not override an already-ready status (event won the race)", () => {
@@ -183,5 +232,67 @@ describe("errorStatusFrom", () => {
     const payload: SidecarErrorPayload = { kind: "raw", message: "oops" };
     const status = errorStatusFrom(payload);
     expect(status.failure).toEqual(payload);
+  });
+});
+
+describe("useSidecarStatus polling", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it("polls serially while starting and stops after ready", async () => {
+    vi.useFakeTimers();
+    mockedGetSidecarStatus
+      .mockResolvedValueOnce(emptySnapshot)
+      .mockResolvedValueOnce(readySnapshot);
+
+    const { result } = renderHook(() => useSidecarStatus());
+    await act(async () => {});
+    expect(mockedGetSidecarStatus).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(mockedGetSidecarStatus).toHaveBeenCalledTimes(2);
+    expect(result.current.phase).toBe("ready");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(mockedGetSidecarStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops polling after an error snapshot", async () => {
+    vi.useFakeTimers();
+    const failure: SidecarErrorPayload = { kind: "raw", message: "boom" };
+    mockedGetSidecarStatus.mockResolvedValue({
+      ready: null,
+      failure,
+      database_migration_in_progress: false,
+    });
+
+    const { result } = renderHook(() => useSidecarStatus());
+    await act(async () => {});
+    expect(result.current.phase).toBe("error");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(mockedGetSidecarStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels the pending poll when unmounted", async () => {
+    vi.useFakeTimers();
+    mockedGetSidecarStatus.mockResolvedValue(emptySnapshot);
+
+    const { unmount } = renderHook(() => useSidecarStatus());
+    await act(async () => {});
+    unmount();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(mockedGetSidecarStatus).toHaveBeenCalledTimes(1);
   });
 });

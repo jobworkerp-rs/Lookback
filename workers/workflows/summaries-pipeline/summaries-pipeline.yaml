@@ -8,14 +8,15 @@ document:
 # each gated by a `run_<kind>` flag. Stages are sequential (not forked)
 # because they all funnel into the single-slot `memories-llm` channel, so a
 # fork would only serialize on the LLM slot while inflating timeout risk.
+# Parent and child timeouts are operational latency caps for normal real-time
+# summary volume. A child's cap is a failure guard, not a promise that every
+# iteration consumes it, so parent caps intentionally do not sum every
+# possible child maximum. Long backfills must be split into smaller ranges.
 #
-# Failure handling per stage: the child batch never raises (it catches
-# per-item failures and returns counts). The WORKFLOW runner returns the
-# child's `output.as` JSON as a string in WorkflowResult.output, so the parent
-# parses it once into `<kind>_result`. FATAL (every attempted item failed:
-# processed > 0, succeeded == 0) raises to fault the pipeline and stop the
-# chain; PARTIAL (some succeeded) and SKIP (nothing to do) fall through to the
-# next stage so produced summaries are kept.
+# Failure handling per stage: child batches report per-item failures in their
+# output. Best-effort is the default: failures are retained in the terminal
+# output and later stages still run. `stop_on_error: true` makes the first
+# observed failure raise and stop the chain.
 
 input:
   schema:
@@ -40,12 +41,15 @@ input:
         run_daily: { type: boolean, default: false }
         run_weekly: { type: boolean, default: false }
         run_monthly: { type: boolean, default: false }
+        # False keeps the pipeline best-effort and reports partial failures in
+        # its output. True aborts after the first failed stage or day unit.
+        stop_on_error: { type: boolean, default: false }
 
         # ---- per-thread range (epoch ms; omit = unbounded) ----
         # No `default`: an absent field stays null so the `== null` guards
         # below drop it from the child input (parity with thread-summary-batch).
-        updated_after_ms: { type: integer, minimum: 0 }
-        updated_before_ms: { type: integer, minimum: 0 }
+        last_message_after_ms: { type: integer, minimum: 0 }
+        last_message_before_ms: { type: integer, minimum: 0 }
 
         # ---- period ranges (granularity tokens; "" = no range / fallback) ----
         daily_start: { type: string, default: "" }
@@ -83,7 +87,7 @@ input:
 
 timeout:
   after:
-    hours: 24
+    days: 72
 
 do:
   # Initialize the per-stage results so `output.as` can reference them even
@@ -97,185 +101,466 @@ do:
         daily_result: "${ null }"
         weekly_result: "${ null }"
         monthly_result: "${ null }"
+        per_day_result: "${ null }"
+        per_day_failed_dates: "${ [] }"
+        per_thread_execution_failed: "${ false }"
+        daily_execution_failed: "${ false }"
+        weekly_execution_failed: "${ false }"
+        monthly_execution_failed: "${ false }"
+        execution_failures: "${ [] }"
+
+  # When both lower layers are selected, resolve the requested dates once and
+  # process each date as an atomic dependency unit.  A thread-summary failure
+  # returned by its batch is recorded there; it must not prevent the daily
+  # batch from consuming summaries already available for the same date. Empty
+  # legacy ranges keep using the standalone batches, whose own defaults define
+  # their processing window.
+  - resolveDailyDateList:
+      set:
+        has_explicit_daily_range: "${ $workflow.input.daily_start != \"\" and $workflow.input.daily_end != \"\" }"
+        daily_date_list: >-
+          ${ if $workflow.input.run_per_thread and $workflow.input.run_daily
+                and $workflow.input.daily_start != "" and $workflow.input.daily_end != ""
+             then ((($workflow.input.daily_start + "T00:00:00Z")
+                    | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $start
+                   | (($workflow.input.daily_end + "T00:00:00Z")
+                      | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $end
+                   | [range($start; $end + 1; 86400)]
+                   | map(strftime("%Y-%m-%d")))
+             else []
+             end }
 
   # ===================== Stage 1: per-thread summary =====================
   - perThreadStage:
-      if: "${ $workflow.input.run_per_thread }"
+      timeout:
+        after:
+          hours: 24
+      if: "${ $workflow.input.run_per_thread and ((($workflow.input.run_daily) | not) or ($has_explicit_daily_range | not)) }"
       do:
         - runPerThreadBatch:
             timeout:
               after:
                 hours: 24
-            run:
-              function:
-                runnerName: WORKFLOW
-                settings:
-                  workflow_url: "${ $workflow.input.per_thread_batch_yaml }"
-                options:
-                  channel: llm_batch
-                arguments:
-                  input: >-
-                    ${ ({
-                      user_id: $workflow.input.user_id,
-                      memories_grpc_host: $workflow.input.memories_grpc_host,
-                      memories_grpc_port: $workflow.input.memories_grpc_port,
-                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
-                      llm_worker_name: $workflow.input.llm_worker_name,
-                      output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
-                      updated_after_ms: $workflow.input.updated_after_ms,
-                      updated_before_ms: $workflow.input.updated_before_ms
-                    }
-                    | if $workflow.input.updated_after_ms == null then del(.updated_after_ms) else . end
-                    | if $workflow.input.updated_before_ms == null then del(.updated_before_ms) else . end
-                    | tojson) }
-            export:
-              as:
-                per_thread_result: "${ .output | fromjson }"
+            try:
+              - invokePerThreadBatch:
+                  run:
+                    function:
+                      runnerName: WORKFLOW
+                      settings:
+                        workflow_url: "${ $workflow.input.per_thread_batch_yaml }"
+                      options:
+                        channel: llm_batch
+                      arguments:
+                        input: >-
+                          ${ ({
+                            user_id: $workflow.input.user_id,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name,
+                            output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                            last_message_after_ms: $workflow.input.last_message_after_ms,
+                            last_message_before_ms: $workflow.input.last_message_before_ms
+                          }
+                          | if $workflow.input.last_message_after_ms == null then del(.last_message_after_ms) else . end
+                          | if $workflow.input.last_message_before_ms == null then del(.last_message_before_ms) else . end
+                          | tojson) }
+                  export:
+                    as:
+                      per_thread_result: "${ .output | fromjson }"
+            catch:
+              as: error
+              do:
+                - recordPerThreadExecutionFailure:
+                    set:
+                      per_thread_execution_failed: "${ true }"
+                      execution_failures: >-
+                        ${ $execution_failures + [{
+                          stage: "per_thread",
+                          detail: ($error | tostring | .[0:400])
+                        }] }
         - perThreadFatalCheck:
             if: >-
-              ${ ($per_thread_result.processed_threads // 0) > 0
-                 and ($per_thread_result.succeeded_count // 0) == 0
-                 and ($per_thread_result.failed_count // 0) > 0 }
+              ${ $workflow.input.stop_on_error
+                 and ($per_thread_execution_failed
+                      or (($per_thread_result.failed_count // 0) > 0)) }
             raise:
               error:
                 type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
                 status: 500
-                title: "per-thread summary stage failed entirely"
-                detail: "all per-thread summaries failed; aborting before daily"
+                title: "per-thread summary stage failed"
+                detail: "a per-thread batch failure was detected; aborting before daily"
+
+  # =================== Stage 1.5: per-day dependency units ==============
+  - perDayDependencyStage:
+      timeout:
+        after:
+          days: 31
+      if: "${ $workflow.input.run_per_thread and $workflow.input.run_daily and $has_explicit_daily_range }"
+      for:
+        each: target_date
+        in: "${ $daily_date_list }"
+      do:
+        - initializePerDayResult:
+            set:
+              per_day_thread_result: "${ null }"
+              per_day_result: "${ null }"
+              per_day_execution_failed: "${ false }"
+        - runPerThreadBatchForDate:
+            # `try` itself is a task and otherwise inherits jobworkerp's
+            # one-hour default. Give the wrapper the same budget as its child
+            # so its catch block can receive a real child result.
+            timeout:
+              after:
+                hours: 24
+            try:
+              - invokePerThreadBatchForDate:
+                  timeout:
+                    after:
+                      hours: 24
+                  run:
+                    function:
+                      runnerName: WORKFLOW
+                      settings:
+                        workflow_url: "${ $workflow.input.per_thread_batch_yaml }"
+                      options:
+                        channel: llm_batch
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name,
+                            output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                            last_message_after_ms: ((if (env.TZ // "") != ""
+                              then (($target_date + "T00:00:00")
+                                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                                   | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                                   | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                                   | if ($candidate_epoch | strflocaltime("%Y-%m-%d")) == $target_date
+                                     then $candidate_epoch
+                                     else (($candidate_epoch | localtime | mktime) as $candidate_local_epoch
+                                           | ($wall_epoch - ($candidate_local_epoch - $candidate_epoch)))
+                                     end
+                              else ((($target_date + "T00:00:00Z")
+                                     | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                                    - ($workflow.input.timezone_offset_hours * 3600))
+                              end) * 1000 - 1),
+                            last_message_before_ms: ((if (env.TZ // "") != ""
+                              then ((($target_date + "T12:00:00Z")
+                                     | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime
+                                     | (. + 86400) | strftime("%Y-%m-%d")) as $next_day
+                                   | (($next_day + "T00:00:00")
+                                      | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                                   | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                                   | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                                   | if ($candidate_epoch | strflocaltime("%Y-%m-%d")) == $next_day
+                                     then $candidate_epoch
+                                     else (($candidate_epoch | localtime | mktime) as $candidate_local_epoch
+                                           | ($wall_epoch - ($candidate_local_epoch - $candidate_epoch)))
+                                     end)
+                              else ((($target_date + "T00:00:00Z")
+                                     | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                                    + 86400 - ($workflow.input.timezone_offset_hours * 3600))
+                              end) * 1000 - 1)
+                            } | tojson }
+                  export:
+                    as:
+                      per_day_thread_result: "${ .output | fromjson }"
+            catch:
+              as: error
+              do:
+                - recordPerDayThreadExecutionFailure:
+                    set:
+                      per_day_execution_failed: "${ true }"
+                      execution_failures: >-
+                        ${ $execution_failures + [{
+                          stage: "per_day_thread",
+                          detail: ($target_date + ": " + ($error | tostring | .[0:400]))
+                        }] }
+        - perDayThreadFailureCheck:
+            if: >-
+              ${ $workflow.input.stop_on_error
+                 and ($per_day_execution_failed
+                      or (($per_day_thread_result.failed_count // 0) > 0)) }
+            raise:
+              error:
+                type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+                status: 500
+                title: "per-day thread summary failed"
+                detail: "the per-day thread batch failed; aborting before daily because stop_on_error is enabled"
+        - runDailyBatchForDate:
+            try:
+              - invokeDailyBatchForDate:
+                  timeout:
+                    after:
+                      hours: 24
+                  run:
+                    function:
+                      runnerName: WORKFLOW
+                      settings:
+                        workflow_url: "${ $workflow.input.daily_batch_yaml }"
+                      options:
+                        channel: llm_batch
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                            start_date: $target_date,
+                            end_date: $target_date,
+                            timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name
+                            } | tojson }
+                  export:
+                    as:
+                      per_day_result: "${ .output | fromjson }"
+            catch:
+              as: error
+              do:
+                - recordPerDayDailyExecutionFailure:
+                    set:
+                      per_day_execution_failed: "${ true }"
+                      execution_failures: >-
+                        ${ $execution_failures + [{
+                          stage: "per_day_daily",
+                          detail: ($target_date + ": " + ($error | tostring | .[0:400]))
+                        }] }
+        - recordPerDayFailure:
+            if: >-
+              ${ $per_day_execution_failed
+                 or (($per_day_thread_result.failed_count // 0) > 0)
+                 or (($per_day_result.failed_count // 0) > 0) }
+            set:
+              per_day_failed_dates: "${ $per_day_failed_dates + [$target_date] }"
+        - perDayFailureCheck:
+            if: >-
+              ${ $workflow.input.stop_on_error
+                 and ($per_day_execution_failed
+                      or (($per_day_thread_result.failed_count // 0) > 0)
+                      or (($per_day_result.failed_count // 0) > 0)) }
+            raise:
+              error:
+                type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+                status: 500
+                title: "per-day summary dependency unit failed"
+                detail: "a per-day dependency unit failed; aborting because stop_on_error is enabled"
 
   # ========================= Stage 2: daily =============================
   - dailyStage:
-      if: "${ $workflow.input.run_daily }"
+      timeout:
+        after:
+          days: 31
+      if: "${ $workflow.input.run_daily and ((($workflow.input.run_per_thread) | not) or ($has_explicit_daily_range | not)) }"
       do:
         - runDailyBatch:
             timeout:
               after:
-                hours: 24
-            run:
-              function:
-                runnerName: WORKFLOW
-                settings:
-                  workflow_url: "${ $workflow.input.daily_batch_yaml }"
-                options:
-                  channel: llm_batch
-                arguments:
-                  input: >-
-                    ${ {
-                      user_id: $workflow.input.user_id,
-                      output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
-                      start_date: $workflow.input.daily_start,
-                      end_date: $workflow.input.daily_end,
-                      timezone_offset_hours: $workflow.input.timezone_offset_hours,
-                      memories_grpc_host: $workflow.input.memories_grpc_host,
-                      memories_grpc_port: $workflow.input.memories_grpc_port,
-                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
-                      llm_worker_name: $workflow.input.llm_worker_name
-                    } | tojson }
-            export:
-              as:
-                daily_result: "${ .output | fromjson }"
+                days: 31
+            try:
+              - invokeDailyBatch:
+                  run:
+                    function:
+                      runnerName: WORKFLOW
+                      settings:
+                        workflow_url: "${ $workflow.input.daily_batch_yaml }"
+                      options:
+                        channel: llm_batch
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                            start_date: $workflow.input.daily_start,
+                            end_date: $workflow.input.daily_end,
+                            timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name
+                          } | tojson }
+                  export:
+                    as:
+                      daily_result: "${ .output | fromjson }"
+            catch:
+              as: error
+              do:
+                - recordDailyExecutionFailure:
+                    set:
+                      daily_execution_failed: "${ true }"
+                      execution_failures: >-
+                        ${ $execution_failures + [{
+                          stage: "daily",
+                          detail: ($error | tostring | .[0:400])
+                        }] }
         - dailyFatalCheck:
             if: >-
-              ${ ($daily_result.processed_dates // 0) > 0
-                 and ($daily_result.succeeded_count // 0) == 0
-                 and ($daily_result.failed_count // 0) > 0 }
+              ${ $workflow.input.stop_on_error
+                 and ($daily_execution_failed
+                      or (($daily_result.failed_count // 0) > 0)) }
             raise:
               error:
                 type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
                 status: 500
-                title: "daily summary stage failed entirely"
-                detail: "all daily summaries failed; aborting before weekly"
+                title: "daily summary stage failed"
+                detail: "a daily batch failure was detected; aborting before weekly"
 
   # ========================= Stage 3: weekly ============================
   - weeklyStage:
+      timeout:
+        after:
+          days: 7
       if: "${ $workflow.input.run_weekly }"
       do:
         - runWeeklyBatch:
             timeout:
               after:
-                hours: 24
-            run:
-              function:
-                runnerName: WORKFLOW
-                settings:
-                  workflow_url: "${ $workflow.input.weekly_batch_yaml }"
-                options:
-                  channel: llm_batch
-                arguments:
-                  input: >-
-                    ${ {
-                      user_id: $workflow.input.user_id,
-                      output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
-                      start_week: $workflow.input.weekly_start,
-                      end_week: $workflow.input.weekly_end,
-                      timezone_offset_hours: $workflow.input.timezone_offset_hours,
-                      memories_grpc_host: $workflow.input.memories_grpc_host,
-                      memories_grpc_port: $workflow.input.memories_grpc_port,
-                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
-                      llm_worker_name: $workflow.input.llm_worker_name
-                    } | tojson }
-            export:
-              as:
-                weekly_result: "${ .output | fromjson }"
+                days: 7
+            try:
+              - invokeWeeklyBatch:
+                  run:
+                    function:
+                      runnerName: WORKFLOW
+                      settings:
+                        workflow_url: "${ $workflow.input.weekly_batch_yaml }"
+                      options:
+                        channel: llm_batch
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                            start_week: $workflow.input.weekly_start,
+                            end_week: $workflow.input.weekly_end,
+                            timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name
+                          } | tojson }
+                  export:
+                    as:
+                      weekly_result: "${ .output | fromjson }"
+            catch:
+              as: error
+              do:
+                - recordWeeklyExecutionFailure:
+                    set:
+                      weekly_execution_failed: "${ true }"
+                      execution_failures: >-
+                        ${ $execution_failures + [{
+                          stage: "weekly",
+                          detail: ($error | tostring | .[0:400])
+                        }] }
         - weeklyFatalCheck:
             if: >-
-              ${ ($weekly_result.processed_weeks // 0) > 0
-                 and ($weekly_result.succeeded_count // 0) == 0
-                 and ($weekly_result.failed_count // 0) > 0 }
+              ${ $workflow.input.stop_on_error
+                 and ($weekly_execution_failed
+                      or (($weekly_result.failed_count // 0) > 0)) }
             raise:
               error:
                 type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
                 status: 500
-                title: "weekly summary stage failed entirely"
-                detail: "all weekly summaries failed; aborting before monthly"
+                title: "weekly summary stage failed"
+                detail: "a weekly batch failure was detected; aborting before monthly"
 
   # ========================= Stage 4: monthly ===========================
   - monthlyStage:
+      timeout:
+        after:
+          days: 31
       if: "${ $workflow.input.run_monthly }"
       do:
         - runMonthlyBatch:
             timeout:
               after:
-                hours: 24
-            run:
-              function:
-                runnerName: WORKFLOW
-                settings:
-                  workflow_url: "${ $workflow.input.monthly_batch_yaml }"
-                options:
-                  channel: llm_batch
-                arguments:
-                  input: >-
-                    ${ {
-                      user_id: $workflow.input.user_id,
-                      output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
-                      start_month: $workflow.input.monthly_start,
-                      end_month: $workflow.input.monthly_end,
-                      timezone_offset_hours: $workflow.input.timezone_offset_hours,
-                      memories_grpc_host: $workflow.input.memories_grpc_host,
-                      memories_grpc_port: $workflow.input.memories_grpc_port,
-                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
-                      llm_worker_name: $workflow.input.llm_worker_name
-                    } | tojson }
-            export:
-              as:
-                monthly_result: "${ .output | fromjson }"
+                days: 31
+            try:
+              - invokeMonthlyBatch:
+                  run:
+                    function:
+                      runnerName: WORKFLOW
+                      settings:
+                        workflow_url: "${ $workflow.input.monthly_batch_yaml }"
+                      options:
+                        channel: llm_batch
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            output_language: (if (($workflow.input.output_language // "") == "") then "ja" else $workflow.input.output_language end),
+                            start_month: $workflow.input.monthly_start,
+                            end_month: $workflow.input.monthly_end,
+                            timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name
+                          } | tojson }
+                  export:
+                    as:
+                      monthly_result: "${ .output | fromjson }"
+            catch:
+              as: error
+              do:
+                - recordMonthlyExecutionFailure:
+                    set:
+                      monthly_execution_failed: "${ true }"
+                      execution_failures: >-
+                        ${ $execution_failures + [{
+                          stage: "monthly",
+                          detail: ($error | tostring | .[0:400])
+                        }] }
         - monthlyFatalCheck:
             if: >-
-              ${ ($monthly_result.processed_months // 0) > 0
-                 and ($monthly_result.succeeded_count // 0) == 0
-                 and ($monthly_result.failed_count // 0) > 0 }
+              ${ $workflow.input.stop_on_error
+                 and ($monthly_execution_failed
+                      or (($monthly_result.failed_count // 0) > 0)) }
             raise:
               error:
                 type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
                 status: 500
-                title: "monthly summary stage failed entirely"
-                detail: "all monthly summaries failed"
+                title: "monthly summary stage failed"
+                detail: "a monthly batch failure was detected"
 
 output:
   as:
-    completed: true
+    completed: >-
+      ${ (($per_day_failed_dates | length) == 0)
+         and ($per_thread_execution_failed | not)
+         and ($daily_execution_failed | not)
+         and ($weekly_execution_failed | not)
+         and ($monthly_execution_failed | not)
+         and (($per_thread_result.failed_count // 0) == 0)
+         and (($daily_result.failed_count // 0) == 0)
+         and (($weekly_result.failed_count // 0) == 0)
+         and (($monthly_result.failed_count // 0) == 0) }
+    outcome: >-
+      ${ if (($per_day_failed_dates | length) > 0)
+             or $per_thread_execution_failed
+             or $daily_execution_failed
+             or $weekly_execution_failed
+             or $monthly_execution_failed
+             or (($per_thread_result.failed_count // 0) > 0)
+             or (($daily_result.failed_count // 0) > 0)
+             or (($weekly_result.failed_count // 0) > 0)
+             or (($monthly_result.failed_count // 0) > 0)
+         then "partial"
+         else "succeeded"
+         end }
     per_thread: "${ $per_thread_result }"
     daily: "${ $daily_result }"
+    per_day: "${ $per_day_result }"
+    per_day_failed_dates: "${ $per_day_failed_dates }"
     weekly: "${ $weekly_result }"
     monthly: "${ $monthly_result }"
+    per_thread_execution_failed: "${ $per_thread_execution_failed }"
+    daily_execution_failed: "${ $daily_execution_failed }"
+    weekly_execution_failed: "${ $weekly_execution_failed }"
+    monthly_execution_failed: "${ $monthly_execution_failed }"
+    execution_failures: "${ $execution_failures }"

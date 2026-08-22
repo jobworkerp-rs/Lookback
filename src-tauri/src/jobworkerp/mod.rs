@@ -44,6 +44,16 @@ pub mod maintenance;
 /// chat UI sits at "generating…" forever.
 const STREAM_ERROR_META_KEY: &str = "jobworkerp.stream.error";
 
+/// `JobworkerpClientWrapper` takes seconds as `u32`, while job execution
+/// timeout is represented as `u64` milliseconds on the wire.
+fn grpc_request_timeout_sec(job_timeout_sec: u64) -> AppResult<u32> {
+    u32::try_from(job_timeout_sec).map_err(|_| {
+        AppError::Jobworkerp(format!(
+            "gRPC request timeout {job_timeout_sec}s exceeds client limit"
+        ))
+    })
+}
+
 /// Inspect an `Item::End` trailer for a stream-level failure and lift it
 /// into an `AppError::Jobworkerp` so the drain returns `Err`. Returns
 /// `Ok(())` for a clean trailer (no error key, or an empty value).
@@ -52,6 +62,13 @@ fn check_stream_trailer(trailer: &jobworkerp_client::jobworkerp::data::Trailer) 
         Some(msg) if !msg.is_empty() => Err(AppError::Jobworkerp(msg.clone())),
         _ => Ok(()),
     }
+}
+
+/// A streaming dispatch is successful only when jobworkerp sends an explicit
+/// `End` or `FinalCollected` item. A bare transport close can mean that the
+/// server-side subscription expired before it delivered the workflow failure.
+fn unexpected_dispatch_stream_close() -> AppError {
+    AppError::Jobworkerp("dispatch stream closed without a terminal result".to_owned())
 }
 
 /// Owned wrapper around `JobworkerpClientWrapper` so we can hide the
@@ -66,12 +83,19 @@ impl JobworkerpHandle {
     /// on local LLMs. The per-call timeout doubles as `request_timeout` on
     /// the underlying tonic channel, so this must be at least as long as the
     /// slowest user-facing generation step.
-    const DEFAULT_JOB_TIMEOUT_SEC: u32 = 3 * 60 * 60;
+    const DEFAULT_JOB_TIMEOUT_SEC: u64 = 3 * 60 * 60;
 
     pub async fn connect(jw_url: &str) -> AppResult<Self> {
-        let inner = JobworkerpClientWrapper::new(jw_url, Some(Self::DEFAULT_JOB_TIMEOUT_SEC))
-            .await
-            .map_err(|e| AppError::Jobworkerp(format!("connect {jw_url}: {e}")))?;
+        Self::connect_with_timeout(jw_url, Self::DEFAULT_JOB_TIMEOUT_SEC).await
+    }
+
+    /// Create a client with a request deadline matching a long-running
+    /// workflow. The job deadline itself is sent separately as `u64`.
+    pub async fn connect_with_timeout(jw_url: &str, timeout_sec: u64) -> AppResult<Self> {
+        let inner =
+            JobworkerpClientWrapper::new(jw_url, Some(grpc_request_timeout_sec(timeout_sec)?))
+                .await
+                .map_err(|e| AppError::Jobworkerp(format!("connect {jw_url}: {e}")))?;
         Ok(Self { inner })
     }
 
@@ -229,6 +253,25 @@ impl JobworkerpHandle {
         input_json: serde_json::Value,
         using: Option<&str>,
     ) -> AppResult<DispatchStream> {
+        self.dispatch_stream_with_timeout(
+            worker_name,
+            input_json,
+            Self::DEFAULT_JOB_TIMEOUT_SEC,
+            using,
+        )
+        .await
+    }
+
+    /// Streaming dispatch with a caller-selected server-side job deadline.
+    /// Long-running batch workflows must opt in explicitly; ordinary UI
+    /// operations retain [`Self::DEFAULT_JOB_TIMEOUT_SEC`].
+    pub async fn dispatch_stream_with_timeout(
+        &self,
+        worker_name: &str,
+        input_json: serde_json::Value,
+        timeout_sec: u64,
+        using: Option<&str>,
+    ) -> AppResult<DispatchStream> {
         let (_worker_id, worker_data) = self
             .inner
             .find_worker_by_name(None, Arc::new(HashMap::new()), worker_name)
@@ -242,7 +285,7 @@ impl JobworkerpHandle {
                 Arc::new(HashMap::new()),
                 &worker_data,
                 input_json,
-                Self::DEFAULT_JOB_TIMEOUT_SEC,
+                timeout_sec,
                 using,
             )
             .await
@@ -547,6 +590,7 @@ pub async fn run_named_stream<F>(
         worker_name,
         input,
         using,
+        None,
         cancel,
         |_| async {},
         emit,
@@ -577,11 +621,13 @@ enum OwnedStreamEvent {
 /// responsibility (it has the AppState + JobworkerpHandle handy);
 /// dropping here just unblocks the local task immediately so the
 /// caller's downstream emits can run.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cancellable_named_stream<F, J, Fut>(
     handle: &JobworkerpHandle,
     worker_name: &str,
     input: serde_json::Value,
     using: Option<&str>,
+    timeout_sec: Option<u64>,
     cancel: tokio_util::sync::CancellationToken,
     on_job_id: J,
     mut emit: F,
@@ -605,7 +651,15 @@ pub async fn run_cancellable_named_stream<F, J, Fut>(
         emit(StreamEvent::Failed("cancelled"));
         return;
     }
-    let stream = match handle.dispatch_stream(worker_name, input, using).await {
+    let dispatched = match timeout_sec {
+        Some(timeout_sec) => {
+            handle
+                .dispatch_stream_with_timeout(worker_name, input, timeout_sec, using)
+                .await
+        }
+        None => handle.dispatch_stream(worker_name, input, using).await,
+    };
+    let stream = match dispatched {
         Ok(s) => s,
         Err(e) => {
             let msg = e.to_string();
@@ -680,9 +734,11 @@ pub async fn run_cancellable_named_stream<F, J, Fut>(
                 }
                 None => {
                     // Channel closed without an explicit terminal event —
-                    // synthesise Done so the caller doesn't sit at Active
-                    // forever.
-                    emit(StreamEvent::Done(None));
+                    // report the broken protocol as a failure. Treating it
+                    // as Done can falsely claim that a timed-out workflow
+                    // produced summaries.
+                    let message = unexpected_dispatch_stream_close().to_string();
+                    emit(StreamEvent::Failed(&message));
                     return;
                 }
             },
@@ -730,10 +786,7 @@ impl DispatchStream {
                 }
             }
         }
-        // Stream closed without an explicit terminator — synthesize End so
-        // the UI doesn't sit at Active forever.
-        on_event(ProgressEvent::End { final_text: None });
-        Ok(())
+        Err(unexpected_dispatch_stream_close())
     }
 
     /// Variant of [`drain`] that hands the caller raw bytes instead of
@@ -904,6 +957,19 @@ mod tests {
             metadata.insert((*k).to_string(), (*v).to_string());
         }
         Trailer { metadata }
+    }
+
+    #[test]
+    fn long_server_job_deadline_keeps_safe_client_request_deadline() {
+        assert_eq!(
+            grpc_request_timeout_sec(72 * 24 * 60 * 60).unwrap(),
+            72 * 24 * 60 * 60
+        );
+    }
+
+    #[test]
+    fn grpc_request_timeout_rejects_values_outside_the_client_api_range() {
+        assert!(grpc_request_timeout_sec(u64::from(u32::MAX) + 1).is_err());
     }
 
     #[test]
@@ -1182,6 +1248,14 @@ mod tests {
     #[test]
     fn default_job_timeout_allows_three_hour_generation() {
         assert_eq!(JobworkerpHandle::DEFAULT_JOB_TIMEOUT_SEC, 3 * 60 * 60);
+    }
+
+    #[test]
+    fn unexpected_dispatch_stream_close_is_an_error() {
+        assert_eq!(
+            unexpected_dispatch_stream_close().to_string(),
+            "jobworkerp: dispatch stream closed without a terminal result"
+        );
     }
 
     /// Regression for the "Cannot block the current thread from within a

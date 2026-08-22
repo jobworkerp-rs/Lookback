@@ -95,8 +95,8 @@ export function localTodayMinusDays(days: number, timeZone?: string): string {
 
 /** Per-thread epoch-ms window for a `[from, to]` calendar-date range.
  *
- *  The memories thread filter uses strict `>` for `updated_after` and
- *  inclusive `<=` for `updated_before`, so both ends are nudged by 1ms to
+ *  The memories thread filter uses strict `>` for `last_message_after` and
+ *  inclusive `<=` for `last_message_before`, so both ends are nudged by 1ms to
  *  make the range "inclusive of both calendar days":
  *    - after  = from's local 00:00 − 1   (keeps the `from` day's 00:00:00.000)
  *    - before = (to + 1 day)'s local 00:00 − 1 (keeps the `to` day's last ms)
@@ -105,8 +105,9 @@ export function localTodayMinusDays(days: number, timeZone?: string): string {
  *  +24h): on a DST transition the next midnight is 23h/25h away, so adding a
  *  constant day would over- or under-shoot the boundary. Stepping the date
  *  string and re-resolving its midnight in `timeZone` keeps the boundary exact
- *  across DST. Both ends are optional and independent; an absent end yields
- *  `undefined` (unbounded). */
+ *  across DST. This shared helper deliberately accepts either end on its own
+ *  and returns `undefined` for an absent/unbounded end. The summary generation
+ *  UI separately requires both ends before it dispatches a range request. */
 export function dayRangeToEpochMs(
   from?: string,
   to?: string,

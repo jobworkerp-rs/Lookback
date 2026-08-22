@@ -89,9 +89,20 @@ pub async fn redispatch_memory_embeddings(
     state: State<'_, AppState>,
     req: RedispatchMemoryEmbeddingsRequest,
 ) -> AppResult<RedispatchEmbeddingsResult> {
+    let registered = super::begin_search_index_write(
+        &state,
+        &[crate::search_index_maintenance::MaintenanceTable::Memory],
+    )
+    .await?;
     let request = build_redispatch_request(&req);
     let mut client = MemoryVectorServiceClient::new(state.memories_channel().await?);
-    let resp = client.redispatch_embeddings(request).await?.into_inner();
+    let result = client
+        .redispatch_embeddings(request)
+        .await
+        .map(|response| response.into_inner());
+    let finish = super::finish_search_index_write(&state, registered).await;
+    let resp = result?;
+    finish?;
     Ok(RedispatchEmbeddingsResult {
         dispatched_count: resp.dispatched_count,
         skipped_count: resp.skipped_count,

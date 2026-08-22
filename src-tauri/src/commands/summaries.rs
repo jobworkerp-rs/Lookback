@@ -47,8 +47,10 @@ pub enum SummaryKind {
 }
 
 impl SummaryKind {
-    /// Stable namespace used only when parsing a summary external ID. Queries
-    /// must use `user_id` plus `memory_kind`, not this textual convention.
+    /// Stable namespace used when parsing and server-side filtering. Queries
+    /// combine this prefix with `user_id` and `memory_kind`: the kind guards
+    /// the typed row while the prefix prevents stale namespaces from crossing
+    /// tabs before pagination is applied.
     fn external_id_namespace(self) -> &'static str {
         match self {
             SummaryKind::PerThread => "summary:",
@@ -156,37 +158,72 @@ pub struct ListSummariesRequest {
     pub labels_any: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ListSummariesForSelectionRequest {
+    #[serde(default)]
+    pub kind: SummaryKind,
+    pub limit: Option<i32>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummarySelectionPage {
+    pub entries: Vec<SummaryEntry>,
+    pub next_offset: Option<i64>,
+}
+
 /// Build the `FindListByCondition` request for a summaries list query. Pure
 /// so the wire-shape (prefix selection, date windows) is unit-tested.
 fn build_find_request(req: &ListSummariesRequest) -> mem_svc::FindMemoryListRequest {
+    let mut request = build_summary_memory_request_for(req.kind);
+    request.limit = req.limit;
+    request.offset = req.offset;
+    request.updated_after = req.updated_after_ms;
+    request.updated_before = req.updated_before_ms;
+    request.thread_filter = (!req.labels_any.is_empty()).then(|| mem_data::ThreadSearchFilter {
+        user_id: Some(LOOKBACK_USER_ID),
+        labels: req.labels_any.clone(),
+        label_match_mode: Some(LabelMatch::All.to_proto()),
+        channel: None,
+        thread_created_after: None,
+        thread_created_before: None,
+        thread_updated_after: None,
+        thread_updated_before: None,
+        first_message_after: None,
+        first_message_before: None,
+        last_message_after: None,
+        last_message_before: None,
+        memory_kinds: vec![summary_memory_kind(req.kind)],
+    });
+    request.created_after = req.created_after_ms;
+    request.created_before = req.created_before_ms;
+    request
+}
+
+/// Build the common owner and summary-kind scope. Callers overlay only the
+/// filters that are meaningful for their query shape.
+fn build_summary_memory_request_for(kind: SummaryKind) -> mem_svc::FindMemoryListRequest {
     mem_svc::FindMemoryListRequest {
-        limit: req.limit,
-        offset: req.offset,
+        limit: None,
+        offset: None,
         roles: vec![],
         user_id: Some(mem_data::UserId {
             value: LOOKBACK_USER_ID,
         }),
         thread_id: None,
-        updated_after: req.updated_after_ms,
-        updated_before: req.updated_before_ms,
+        updated_after: None,
+        updated_before: None,
         external_id: None,
         content_types: vec![],
-        thread_filter: (!req.labels_any.is_empty()).then(|| mem_data::ThreadSearchFilter {
-            user_id: Some(LOOKBACK_USER_ID),
-            labels: req.labels_any.clone(),
-            label_match_mode: Some(LabelMatch::All.to_proto()),
-            channel: None,
-            created_after: None,
-            created_before: None,
-            updated_after: None,
-            updated_before: None,
-            memory_kinds: vec![summary_memory_kind(req.kind)],
-        }),
-        created_after: req.created_after_ms,
-        created_before: req.created_before_ms,
+        thread_filter: None,
+        created_after: None,
+        created_before: None,
         sort: None,
-        external_id_prefix: None,
-        memory_kinds: vec![summary_memory_kind(req.kind)],
+        // Filter by namespace before applying pagination.  The memory kind
+        // alone is not sufficient on older memories databases where rows
+        // with a stale external_id can otherwise share the same kind.
+        external_id_prefix: Some(kind.external_id_namespace().to_string()),
+        memory_kinds: vec![summary_memory_kind(kind)],
     }
 }
 
@@ -252,10 +289,14 @@ async fn summary_threads(
         limit: None,
         offset: None,
         user_id: Some(LOOKBACK_USER_ID),
-        created_after: None,
-        created_before: None,
-        updated_after: None,
-        updated_before: None,
+        thread_created_after: None,
+        thread_created_before: None,
+        thread_updated_after: None,
+        thread_updated_before: None,
+        first_message_after: None,
+        first_message_before: None,
+        last_message_after: None,
+        last_message_before: None,
         sort: None,
         memory_kinds: vec![summary_memory_kind(SummaryKind::PerThread)],
     };
@@ -298,25 +339,7 @@ async fn summary_memory_thread_ids(state: &State<'_, AppState>) -> AppResult<Has
 /// occurs in `summary_threads`; keeping this query free of a thread filter
 /// prevents the server from expanding every summary thread ID in one request.
 fn build_summary_memory_request() -> mem_svc::FindMemoryListRequest {
-    mem_svc::FindMemoryListRequest {
-        limit: None,
-        offset: None,
-        roles: vec![],
-        user_id: Some(mem_data::UserId {
-            value: LOOKBACK_USER_ID,
-        }),
-        thread_id: None,
-        updated_after: None,
-        updated_before: None,
-        external_id: None,
-        content_types: vec![],
-        thread_filter: None,
-        created_after: None,
-        created_before: None,
-        sort: None,
-        external_id_prefix: None,
-        memory_kinds: vec![summary_memory_kind(SummaryKind::PerThread)],
-    }
+    build_summary_memory_request_for(SummaryKind::PerThread)
 }
 
 fn summary_filter_labels(selected: &[String]) -> Vec<String> {
@@ -403,6 +426,11 @@ pub async fn list_summaries(
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         let entry = item?;
+        // The memories server applies both `memory_kinds` and
+        // `external_id_prefix` before limit/offset. Remote targets missing
+        // either field are rejected by the reflection compatibility gate, so
+        // a current server cannot consume a page with an invalid-kind row.
+        // Keep this post-filter as a defense for malformed/legacy rows.
         if let Some(s) = entry_to_summary(entry, req.kind)
             && req
                 .period_key
@@ -413,6 +441,88 @@ pub async fn list_summaries(
         }
     }
     Ok(out)
+}
+
+/// Selection-modal pagination keeps the server-side raw offset independent
+/// from the number of rows that survive defensive kind/namespace validation.
+/// The public summaries page continues to use `list_summaries` unchanged.
+#[tauri::command]
+pub async fn list_summaries_for_selection(
+    state: State<'_, AppState>,
+    req: ListSummariesForSelectionRequest,
+) -> AppResult<SummarySelectionPage> {
+    let mut client = MemoryServiceClient::new(state.memories_channel().await?);
+    let page_limit = req.limit.unwrap_or(50).max(1);
+    let list_request = build_find_request(&ListSummariesRequest {
+        kind: req.kind,
+        limit: Some(page_limit.saturating_add(1)),
+        offset: req.offset,
+        ..Default::default()
+    });
+    // Fetch one extra raw row so malformed rows do not hide a later valid
+    // row behind the modal's "load more" boundary.
+    let mut stream = client
+        .find_list_by_condition(list_request)
+        .await?
+        .into_inner();
+    let mut raw_rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        raw_rows.push(item?);
+    }
+    Ok(summary_selection_page_from_raw(
+        raw_rows,
+        req.kind,
+        page_limit,
+        req.offset.unwrap_or(0),
+    ))
+}
+
+fn summary_selection_page_from_raw(
+    raw_rows: Vec<mem_svc::MemoryListEntry>,
+    expected_kind: SummaryKind,
+    page_limit: i32,
+    offset: i64,
+) -> SummarySelectionPage {
+    let limit = page_limit.max(1) as usize;
+    let has_more = raw_rows.len() > limit;
+    let entries = raw_rows
+        .into_iter()
+        .take(limit)
+        .filter_map(|row| entry_to_summary(row, expected_kind))
+        .collect();
+    SummarySelectionPage {
+        entries,
+        next_offset: has_more.then(|| offset.saturating_add(limit as i64)),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetSummaryContentRequest {
+    #[serde(with = "crate::serde_id")]
+    pub memory_id: i64,
+}
+
+/// Fetch the authoritative content for one summary selected from a list row.
+/// List responses may be compacted for browsing, so selection must not create
+/// a chat snapshot from their `content_json` excerpt.
+#[tauri::command]
+pub async fn get_summary_content(
+    state: State<'_, AppState>,
+    req: GetSummaryContentRequest,
+) -> AppResult<Option<String>> {
+    let mut client = MemoryServiceClient::new(state.memories_channel().await?);
+    let response = client
+        .find(mem_data::MemoryId {
+            value: req.memory_id,
+        })
+        .await?
+        .into_inner();
+    // `Find` is an ID lookup and therefore does not inherit the owner filter
+    // used by the list endpoint. Never expose a summary just because its ID
+    // was guessed or supplied by another user.
+    Ok(response
+        .data
+        .and_then(|memory| summary_content_for_owner(memory, LOOKBACK_USER_ID)))
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -428,7 +538,14 @@ pub async fn count_summaries(
 ) -> AppResult<i64> {
     let mut client = MemoryServiceClient::new(state.memories_channel().await?);
 
-    let request = mem_svc::MemoryCountCondition {
+    let request = build_count_request(&req);
+
+    let resp = client.count_by_condition(request).await?;
+    Ok(resp.into_inner().total)
+}
+
+fn build_count_request(req: &CountSummariesRequest) -> mem_svc::MemoryCountCondition {
+    mem_svc::MemoryCountCondition {
         roles: vec![],
         user_id: Some(mem_data::UserId {
             value: LOOKBACK_USER_ID,
@@ -441,12 +558,9 @@ pub async fn count_summaries(
         thread_filter: None,
         created_after: None,
         created_before: None,
-        external_id_prefix: None,
+        external_id_prefix: Some(req.kind.external_id_namespace().to_string()),
         memory_kinds: vec![summary_memory_kind(req.kind)],
-    };
-
-    let resp = client.count_by_condition(request).await?;
-    Ok(resp.into_inner().total)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,25 +607,7 @@ pub async fn list_summary_period_keys(
 }
 
 fn summary_period_keys_request(kind: SummaryKind) -> mem_svc::FindMemoryListRequest {
-    mem_svc::FindMemoryListRequest {
-        limit: None,
-        offset: None,
-        roles: vec![],
-        user_id: Some(mem_data::UserId {
-            value: LOOKBACK_USER_ID,
-        }),
-        thread_id: None,
-        updated_after: None,
-        updated_before: None,
-        external_id: None,
-        content_types: vec![],
-        thread_filter: None,
-        created_after: None,
-        created_before: None,
-        sort: None,
-        external_id_prefix: None,
-        memory_kinds: vec![summary_memory_kind(kind)],
-    }
+    build_summary_memory_request_for(kind)
 }
 
 fn summary_memory_kind(kind: SummaryKind) -> i32 {
@@ -621,13 +717,21 @@ pub async fn delete_summary(
     state: State<'_, AppState>,
     req: DeleteSummaryRequest,
 ) -> AppResult<()> {
+    let registered = super::begin_search_index_write(
+        &state,
+        &[crate::search_index_maintenance::MaintenanceTable::Memory],
+    )
+    .await?;
     let mut client = MemoryServiceClient::new(state.memories_channel().await?);
-    client
+    let result = client
         .delete(mem_data::MemoryId {
             value: req.memory_id,
         })
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ());
+    let finish = super::finish_search_index_write(&state, registered).await;
+    result?;
+    finish
 }
 
 fn entry_to_summary(
@@ -636,7 +740,20 @@ fn entry_to_summary(
 ) -> Option<SummaryEntry> {
     let memory = e.memory?;
     let data = memory.data?;
+    // Reflection records have a dedicated selection tab.  Reject malformed
+    // legacy rows even if their memory kind or external-id was accidentally
+    // rewritten to look like a summary.
+    if data.role == mem_data::MessageRole::RoleReflection as i32 {
+        return None;
+    }
+    let memory_kind = mem_data::MemoryKind::try_from(data.memory_kind).ok()?;
+    if memory_kind as i32 != summary_memory_kind(expected_kind) {
+        return None;
+    }
     let coords = summary_coords_from_external_id(data.external_id.as_deref());
+    if coords.kind != Some(expected_kind) {
+        return None;
+    }
     Some(SummaryEntry {
         memory_id: memory.id?.value,
         thread_id: coords.thread_id,
@@ -649,6 +766,24 @@ fn entry_to_summary(
     })
 }
 
+fn summary_content(memory: mem_data::Memory) -> Option<String> {
+    let data = memory.data?;
+    let kind = mem_data::MemoryKind::try_from(data.memory_kind).ok()?;
+    matches!(
+        kind,
+        mem_data::MemoryKind::ThreadSummary
+            | mem_data::MemoryKind::DailySummary
+            | mem_data::MemoryKind::WeeklySummary
+            | mem_data::MemoryKind::MonthlySummary
+    )
+    .then_some(data.content)
+}
+
+fn summary_content_for_owner(memory: mem_data::Memory, owner_id: i64) -> Option<String> {
+    let data = memory.data.as_ref()?;
+    (data.user_id.as_ref()?.value == owner_id).then(|| summary_content(memory))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +793,61 @@ mod tests {
         let req: DeleteSummaryRequest =
             serde_json::from_str(r#"{"memory_id":"9007199254740993"}"#).unwrap();
         assert_eq!(req.memory_id, 9_007_199_254_740_993);
+    }
+
+    #[test]
+    fn get_summary_content_request_deserializes_memory_id_from_json_string() {
+        let req: GetSummaryContentRequest =
+            serde_json::from_str(r#"{"memory_id":"9007199254740993"}"#).unwrap();
+        assert_eq!(req.memory_id, 9_007_199_254_740_993);
+    }
+
+    #[test]
+    fn summary_content_accepts_only_summary_memory_kinds() {
+        let summary = mem_data::Memory {
+            id: None,
+            data: Some(mem_data::MemoryData {
+                content: "full content".into(),
+                memory_kind: mem_data::MemoryKind::DailySummary as i32,
+                ..Default::default()
+            }),
+            media: None,
+        };
+        assert_eq!(summary_content(summary), Some("full content".into()));
+
+        let raw = mem_data::Memory {
+            id: None,
+            data: Some(mem_data::MemoryData {
+                content: "not a summary".into(),
+                memory_kind: mem_data::MemoryKind::Raw as i32,
+                ..Default::default()
+            }),
+            media: None,
+        };
+        assert_eq!(summary_content(raw), None);
+    }
+
+    #[test]
+    fn summary_content_for_owner_rejects_other_or_missing_owners() {
+        let owned = memory_with_external_id(1, Some("summary:1"));
+        assert_eq!(
+            summary_content_for_owner(owned, LOOKBACK_USER_ID),
+            Some(String::new())
+        );
+
+        let mut other_owner = memory_with_external_id(2, Some("summary:2"));
+        other_owner.data.as_mut().unwrap().user_id = Some(mem_data::UserId { value: 2 });
+        assert_eq!(
+            summary_content_for_owner(other_owner, LOOKBACK_USER_ID),
+            None
+        );
+
+        let mut missing_owner = memory_with_external_id(3, Some("summary:3"));
+        missing_owner.data.as_mut().unwrap().user_id = None;
+        assert_eq!(
+            summary_content_for_owner(missing_owner, LOOKBACK_USER_ID),
+            None
+        );
     }
 
     #[test]
@@ -724,13 +914,13 @@ mod tests {
     }
 
     #[test]
-    fn build_find_request_scopes_by_owner_and_kind_without_external_id() {
+    fn build_find_request_scopes_by_owner_kind_and_namespace_before_paging() {
         let req = ListSummariesRequest {
             kind: SummaryKind::Weekly,
             ..Default::default()
         };
         let r = build_find_request(&req);
-        assert!(r.external_id_prefix.is_none());
+        assert_eq!(r.external_id_prefix.as_deref(), Some("weekly:"));
         assert_eq!(r.user_id.unwrap().value, LOOKBACK_USER_ID);
         assert_eq!(
             r.memory_kinds,
@@ -739,9 +929,42 @@ mod tests {
     }
 
     #[test]
-    fn build_find_request_default_kind_has_no_external_id_condition() {
+    fn build_find_request_default_kind_uses_summary_namespace() {
         let r = build_find_request(&ListSummariesRequest::default());
-        assert!(r.external_id_prefix.is_none());
+        assert_eq!(r.external_id_prefix.as_deref(), Some("summary:"));
+    }
+
+    #[test]
+    fn summary_memory_base_request_is_reused_without_list_only_filters() {
+        let base = build_summary_memory_request_for(SummaryKind::Weekly);
+        let list = build_find_request(&ListSummariesRequest {
+            kind: SummaryKind::Weekly,
+            limit: Some(10),
+            offset: Some(20),
+            labels_any: vec!["agent:codex".into()],
+            ..Default::default()
+        });
+
+        assert_eq!(base.user_id, list.user_id);
+        assert_eq!(base.external_id_prefix, list.external_id_prefix);
+        assert_eq!(base.memory_kinds, list.memory_kinds);
+        assert!(base.thread_filter.is_none());
+        assert_eq!(list.limit, Some(10));
+        assert_eq!(list.offset, Some(20));
+        assert!(list.thread_filter.is_some());
+    }
+
+    #[test]
+    fn build_count_request_scopes_by_kind_and_namespace() {
+        let request = build_count_request(&CountSummariesRequest {
+            kind: SummaryKind::Monthly,
+        });
+        assert_eq!(request.external_id_prefix.as_deref(), Some("monthly:"));
+        assert_eq!(
+            request.memory_kinds,
+            vec![mem_data::MemoryKind::MonthlySummary as i32]
+        );
+        assert_eq!(request.user_id.map(|id| id.value), Some(LOOKBACK_USER_ID));
     }
 
     #[test]
@@ -752,6 +975,14 @@ mod tests {
     }
 
     fn memory_with_external_id(memory_id: i64, external_id: Option<&str>) -> mem_data::Memory {
+        memory_with_kind(memory_id, external_id, mem_data::MemoryKind::ThreadSummary)
+    }
+
+    fn memory_with_kind(
+        memory_id: i64,
+        external_id: Option<&str>,
+        kind: mem_data::MemoryKind,
+    ) -> mem_data::Memory {
         mem_data::Memory {
             id: Some(mem_data::MemoryId { value: memory_id }),
             data: Some(mem_data::MemoryData {
@@ -769,10 +1000,162 @@ mod tests {
                 external_id: external_id.map(str::to_string),
                 media_object_id: None,
                 thread_ids: vec![],
-                memory_kind: mem_data::MemoryKind::ThreadSummary as i32,
+                memory_kind: kind as i32,
             }),
             media: None,
         }
+    }
+
+    fn memory_list_entry(memory: mem_data::Memory) -> mem_svc::MemoryListEntry {
+        mem_svc::MemoryListEntry {
+            memory: Some(memory),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn entry_to_summary_rejects_kind_or_namespace_mismatch() {
+        let daily = memory_with_kind(
+            1,
+            Some("daily:1:2026-07-01:_all"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        assert!(entry_to_summary(memory_list_entry(daily), SummaryKind::Daily).is_some());
+
+        let wrong_kind = memory_with_kind(
+            2,
+            Some("daily:1:2026-07-01:_all"),
+            mem_data::MemoryKind::WeeklySummary,
+        );
+        assert!(entry_to_summary(memory_list_entry(wrong_kind), SummaryKind::Daily).is_none());
+
+        let wrong_namespace = memory_with_kind(
+            3,
+            Some("weekly:1:2026-W27:_all"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        assert!(entry_to_summary(memory_list_entry(wrong_namespace), SummaryKind::Daily).is_none());
+
+        let malformed = memory_with_kind(
+            4,
+            Some("daily:not-a-period"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        assert!(entry_to_summary(memory_list_entry(malformed), SummaryKind::Daily).is_none());
+    }
+
+    #[test]
+    fn entry_to_summary_rejects_reflection_role_and_namespace() {
+        let mut reflection_role =
+            memory_with_kind(5, Some("summary:42"), mem_data::MemoryKind::ThreadSummary);
+        reflection_role.data.as_mut().unwrap().role = mem_data::MessageRole::RoleReflection as i32;
+        assert!(
+            entry_to_summary(memory_list_entry(reflection_role), SummaryKind::PerThread).is_none()
+        );
+
+        let reflection_namespace = memory_with_kind(
+            6,
+            Some("reflection:42"),
+            mem_data::MemoryKind::ThreadSummary,
+        );
+        assert!(
+            entry_to_summary(
+                memory_list_entry(reflection_namespace),
+                SummaryKind::PerThread
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn entry_to_summary_accepts_assistant_thread_summary() {
+        let mut summary =
+            memory_with_kind(7, Some("summary:42"), mem_data::MemoryKind::ThreadSummary);
+        summary.data.as_mut().unwrap().role = mem_data::MessageRole::RoleAssistant as i32;
+
+        let entry = entry_to_summary(memory_list_entry(summary), SummaryKind::PerThread)
+            .expect("normal assistant summaries must remain selectable");
+        assert_eq!(entry.thread_id, Some(42));
+        assert_eq!(entry.kind, SummaryKind::PerThread);
+    }
+
+    #[test]
+    fn summary_selection_page_keeps_next_offset_when_raw_rows_are_filtered() {
+        let wrong_namespace = memory_with_kind(
+            1,
+            Some("weekly:1:2026-W27:_all"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        let wrong_kind = memory_with_kind(
+            2,
+            Some("daily:1:2026-07-01:_all"),
+            mem_data::MemoryKind::WeeklySummary,
+        );
+        let valid = memory_with_kind(
+            3,
+            Some("daily:1:2026-07-02:_all"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        let page = summary_selection_page_from_raw(
+            vec![
+                memory_list_entry(wrong_namespace),
+                memory_list_entry(wrong_kind),
+                memory_list_entry(valid),
+            ],
+            SummaryKind::Daily,
+            2,
+            10,
+        );
+        assert!(page.entries.is_empty());
+        assert_eq!(page.next_offset, Some(12));
+    }
+
+    #[test]
+    fn summary_selection_page_returns_tail_without_next_offset() {
+        let valid = memory_with_kind(
+            3,
+            Some("daily:1:2026-07-02:_all"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        let page = summary_selection_page_from_raw(
+            vec![memory_list_entry(valid)],
+            SummaryKind::Daily,
+            2,
+            10,
+        );
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn summary_selection_page_uses_processed_raw_count_for_normal_offset() {
+        let first = memory_with_kind(
+            1,
+            Some("daily:1:2026-07-01:_all"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        let second = memory_with_kind(
+            2,
+            Some("daily:1:2026-07-02:_all"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        let extra = memory_with_kind(
+            3,
+            Some("daily:1:2026-07-03:_all"),
+            mem_data::MemoryKind::DailySummary,
+        );
+        let page = summary_selection_page_from_raw(
+            vec![
+                memory_list_entry(first),
+                memory_list_entry(second),
+                memory_list_entry(extra),
+            ],
+            SummaryKind::Daily,
+            2,
+            10,
+        );
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.next_offset, Some(12));
     }
 
     #[test]
@@ -862,7 +1245,7 @@ mod tests {
             ..Default::default()
         };
         let r = build_find_request(&req);
-        assert!(r.external_id_prefix.is_none());
+        assert_eq!(r.external_id_prefix.as_deref(), Some("summary:"));
         let filter = r.thread_filter.expect("thread label filter");
         assert_eq!(filter.user_id, Some(LOOKBACK_USER_ID));
         assert_eq!(filter.labels, vec!["summary", "agent:codex"]);
@@ -880,7 +1263,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(request.external_id_prefix.is_none());
+        assert_eq!(request.external_id_prefix.as_deref(), Some("daily:"));
         assert!(request.updated_after.is_none());
         assert!(request.updated_before.is_none());
     }
@@ -889,7 +1272,7 @@ mod tests {
     fn summary_period_keys_request_scopes_calendar_by_owner_and_kind() {
         let request = summary_period_keys_request(SummaryKind::Daily);
 
-        assert!(request.external_id_prefix.is_none());
+        assert_eq!(request.external_id_prefix.as_deref(), Some("daily:"));
         assert_eq!(
             request.memory_kinds,
             vec![mem_data::MemoryKind::DailySummary as i32]
@@ -974,7 +1357,7 @@ mod tests {
         let request = build_summary_memory_request();
 
         assert_eq!(request.user_id.map(|id| id.value), Some(LOOKBACK_USER_ID));
-        assert!(request.external_id_prefix.is_none());
+        assert_eq!(request.external_id_prefix.as_deref(), Some("summary:"));
         assert!(request.thread_filter.is_none());
     }
 }

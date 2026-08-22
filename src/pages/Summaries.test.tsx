@@ -1,4 +1,5 @@
 import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SidecarStatus } from "@/hooks/useSidecarStatus";
 import type { StepStreamProgressHandle } from "@/hooks/useStepStreamProgress";
@@ -154,6 +155,115 @@ async function openSummaryLabelBar() {
 }
 
 describe("Summaries calendar", () => {
+  it("opens a newly supplied focus in its selected calendar period", async () => {
+    function FocusHarness({ onFocusConsumed }: { onFocusConsumed: () => void }) {
+      const [focus, setFocus] = useState<{
+        kind: "daily";
+        month: string;
+        periodKey: string;
+      } | null>(null);
+      return (
+        <>
+          <button
+            type="button"
+            onClick={() => setFocus({ kind: "daily", month: "2026-07", periodKey: "2026-07-10" })}
+          >
+            フォーカスを設定
+          </button>
+          <Summaries
+            summaryProgress={noopProgress()}
+            sidecar={readySidecar}
+            focus={focus}
+            onFocusConsumed={onFocusConsumed}
+          />
+        </>
+      );
+    }
+
+    mockListSummaries.mockResolvedValue([]);
+    mockListSummaryPeriodKeys.mockResolvedValue(["2026-07-10"]);
+    const onFocusConsumed = vi.fn();
+    renderWithProviders(<FocusHarness onFocusConsumed={onFocusConsumed} />);
+    fireEvent.click(screen.getByRole("button", { name: "フォーカスを設定" }));
+
+    await waitFor(() => {
+      expect(mockListSummaryPeriodKeys).toHaveBeenCalledWith({
+        kind: "daily",
+        period_key_prefixes: ["2026-07-"],
+      });
+    });
+    expect(screen.getByRole("button", { name: "10" })).toHaveClass("selected");
+    expect(onFocusConsumed).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the daily calendar when selected from per-thread summaries", async () => {
+    mockListSummaries.mockResolvedValue([]);
+    renderSummaries();
+
+    const calendarButton = screen.getByRole("button", { name: "カレンダー" });
+    expect(calendarButton).toBeEnabled();
+    fireEvent.click(calendarButton);
+
+    await waitFor(() => {
+      expect(mockListSummaryPeriodKeys).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "daily" }),
+      );
+    });
+  });
+
+  it("restores the last period calendar month and selected key after visiting per-thread", async () => {
+    mockListSummaryPeriodKeys.mockResolvedValue(["2026-W27"]);
+    mockListSummaries.mockResolvedValue([
+      perThreadEntry({ kind: "weekly", period_key: "2026-W27" }),
+    ]);
+    renderCalendar("weekly", "2026-07");
+
+    const selectedWeek = (await screen.findAllByTitle("2026-W27"))[0];
+    fireEvent.click(selectedWeek as HTMLElement);
+    await waitFor(() => {
+      expect(mockListSummaries).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "weekly", period_key: "2026-W27" }),
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "スレッド" }));
+    fireEvent.click(screen.getByRole("button", { name: "カレンダー" }));
+
+    await waitFor(() => {
+      expect(mockListSummaryPeriodKeys).toHaveBeenLastCalledWith({
+        kind: "weekly",
+        period_key_prefixes: ["2026-W27", "2026-W28", "2026-W29", "2026-W30", "2026-W31"],
+      });
+    });
+    expect(screen.getAllByTitle("2026-W27")[0]).toHaveClass("selected");
+  });
+
+  it("clears the selected key when switching directly between period kinds", async () => {
+    mockListSummaryPeriodKeys.mockResolvedValue(["2026-W27"]);
+    mockListSummaries.mockResolvedValue([
+      perThreadEntry({ kind: "weekly", period_key: "2026-W27" }),
+    ]);
+    renderCalendar("weekly", "2026-07");
+
+    fireEvent.click((await screen.findAllByTitle("2026-W27"))[0] as HTMLElement);
+    await waitFor(() => {
+      expect(mockListSummaries).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "weekly", period_key: "2026-W27" }),
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "日次" }));
+    fireEvent.click(screen.getByRole("button", { name: "週次" }));
+
+    await waitFor(() => {
+      expect(mockListSummaryPeriodKeys).toHaveBeenLastCalledWith({
+        kind: "weekly",
+        period_key_prefixes: ["2026-W27", "2026-W28", "2026-W29", "2026-W30", "2026-W31"],
+      });
+    });
+    expect(screen.getAllByTitle("2026-W27")[0]).not.toHaveClass("selected");
+  });
+
   it("uses period-key prefixes for daily, weekly, and monthly calendar windows", () => {
     expect(periodKeyPrefixesForMonth("daily", "2026-07")).toEqual(["2026-07-"]);
     expect(periodKeyPrefixesForMonth("monthly", "2026-07")).toEqual(["2026-07"]);
@@ -269,6 +379,30 @@ describe("Summaries per-thread Thread link", () => {
 });
 
 describe("Summaries source_memory_ids chip", () => {
+  it("opens the cited period summary in its calendar slot", async () => {
+    mockListSummaries.mockResolvedValue([perThreadEntry()]);
+    mockListSummaryPeriodKeys.mockResolvedValue(["2026-07-10"]);
+    mockResolveSummaryMemoryRef.mockResolvedValue({
+      memory_id: "111",
+      thread_id: null,
+      external_id: "daily_summary:2026-07-10",
+      kind: "daily",
+      period_key: "2026-07-10",
+      scope_key: "_all",
+    });
+    renderSummaries();
+
+    fireEvent.click((await screen.findAllByTitle(/^memory /))[0] as HTMLElement);
+
+    await waitFor(() => {
+      expect(mockListSummaryPeriodKeys).toHaveBeenCalledWith({
+        kind: "daily",
+        period_key_prefixes: ["2026-07-"],
+      });
+    });
+    expect(screen.getByRole("button", { name: "10" })).toHaveClass("selected");
+  });
+
   it("opens ThreadDetail when the resolved memory is a per-thread summary", async () => {
     mockListSummaries.mockResolvedValue([perThreadEntry()]);
     const resolved: ResolvedSummaryMemoryRef = {

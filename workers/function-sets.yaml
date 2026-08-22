@@ -33,14 +33,20 @@ function_sets:
         # belt-and-suspenders; explicit is cheaper to read than relying
         # on that default for code we don't own.
         using: run
+      - type: WORKER
+        name: lookback_get_context
+        using: run
+      - type: WORKER
+        name: lookback_get_reflections
+        using: run
 
   # MCP-exposed retrieval tools. Surfaced to EXTERNAL MCP clients
   # (e.g. Claude Desktop) when the user enables the MCP server in Settings —
   # the sidecar is then spawned with `MCP_SET_NAME=lookback-mcp-rag`, which
   # narrows jobworkerp's MCP tool surface to exactly this set. Kept SEPARATE
   # from `lookback-rag` (the in-app chat tool set) so the MCP-visible surface
-  # can grow independently of what the chat LLM may call. Today both sets
-  # expose the same single tool; the split is the extension point.
+  # can grow independently of what the chat LLM may call. The split is the
+  # extension point.
   - name: lookback-mcp-rag
     description: >-
       Tools for searching the user's saved memories of their past work and
@@ -51,4 +57,10 @@ function_sets:
     targets:
       - type: WORKER
         name: lookback_recall
+        using: run
+      - type: WORKER
+        name: lookback_get_context
+        using: run
+      - type: WORKER
+        name: lookback_get_reflections
         using: run

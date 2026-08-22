@@ -46,8 +46,8 @@ describe("buildGenerateRequest", () => {
     const { request, error } = buildGenerateRequest(sel({ "per-thread": true }), "", "", 9);
     expect(error).toBeNull();
     expect(request?.run_per_thread).toBe(true);
-    expect(request?.updated_after_ms).toBeUndefined();
-    expect(request?.updated_before_ms).toBeUndefined();
+    expect(request?.last_message_after_ms).toBeUndefined();
+    expect(request?.last_message_before_ms).toBeUndefined();
     expect(request?.daily_start).toBe("");
   });
 
@@ -74,8 +74,28 @@ describe("buildGenerateRequest", () => {
     );
     expect(request?.daily_start).toBe("2026-05-01");
     expect(request?.daily_end).toBe("2026-05-31");
-    expect(request?.updated_after_ms).toBeDefined();
-    expect(request?.updated_before_ms).toBeDefined();
+    expect(request?.last_message_after_ms).toBeDefined();
+    expect(request?.last_message_before_ms).toBeDefined();
+  });
+
+  it("weekly range keeps weekly enabled while expanding W30 into its daily dependency", () => {
+    const { request, error } = buildGenerateRequest(
+      sel({ "per-thread": true, daily: true, weekly: true }),
+      "2026-W30",
+      "2026-W30",
+      9,
+    );
+    expect(error).toBeNull();
+    expect(request).toMatchObject({
+      run_per_thread: true,
+      run_daily: true,
+      run_weekly: true,
+      run_monthly: false,
+      weekly_start: "2026-W30",
+      weekly_end: "2026-W30",
+      daily_start: "2026-07-20",
+      daily_end: "2026-07-26",
+    });
   });
 
   it("monthly range extends daily START to the leading week's Monday", () => {
@@ -94,7 +114,7 @@ describe("buildGenerateRequest", () => {
     expect(request?.daily_start).toBe("2026-02-23");
     expect(request?.daily_end).toBe("2026-05-31");
     // per-thread epoch bounds follow the extended daily span.
-    expect(request?.updated_after_ms).toBe((localDateToEpochMs("2026-02-23") as number) - 1);
+    expect(request?.last_message_after_ms).toBe((localDateToEpochMs("2026-02-23") as number) - 1);
   });
 
   it("monthly range keeps the daily END inside the month (boundary-week attribution)", () => {
@@ -157,11 +177,14 @@ describe("SummaryGenerateDialog", () => {
 
   it("dispatches generate_summaries with the staged request", async () => {
     const { onStarted } = setup("daily");
+    expect((screen.getByLabelText("エラー時に中断する") as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(screen.getByLabelText("エラー時に中断する"));
     fireEvent.click(screen.getByText("生成を開始"));
     await vi.waitFor(() => expect(generateSummaries).toHaveBeenCalledTimes(1));
     const req = generateSummaries.mock.calls[0]?.[0];
     expect(req.run_daily).toBe(true);
     expect(req.run_per_thread).toBe(true); // daily depends on per-thread
+    expect(req.stop_on_error).toBe(true);
     await vi.waitFor(() => expect(onStarted).toHaveBeenCalledWith("summaries-1"));
   });
 

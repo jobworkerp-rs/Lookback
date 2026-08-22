@@ -79,6 +79,26 @@ binaries at the target-triple paths Tauri validates, such as
 resolution mirrors app runtime resolution: environment override, `PATH`, then
 workspace-relative fallback.
 
+This step also stages the official Memories SQLite migration bundle at
+`src-tauri/migration-bundle/`. When `LOOKBACK_MEMORIES_DB_MIGRATE_BUNDLE` is
+set, the script validates that bundle strictly and stops without falling back
+to generation if it is invalid. Without the override, it validates
+`../memories/target/memories-db-migrate-sqlite/`. If that output is missing or
+invalid, an already-staged bundle is reused when it satisfies the current
+release contract. Otherwise, the script runs the same checkout's official
+`scripts/build-memories-db-migrate-sqlite.sh` into a temporary directory and
+activates it only after successful verification. The first run can take longer
+while compiling the coordinator or obtaining Atlas. Concurrent dev launches
+are serialized, and generation or verification failures preserve the existing
+staged bundle.
+
+To inspect the resolution and build plan without building or writing files,
+run:
+
+```bash
+scripts/stage-dev-external-bins.sh --dry-run
+```
+
 The same staging step also satisfies Tauri's `plugins/*.so*` and `*.dylib`
 resource globs. Those globs are resolved from `src-tauri`, so the bundle staging
 destination is `agent-app/src-tauri/plugins/`. Linux uses `plugins/*.so*` to
@@ -284,6 +304,62 @@ If remote memories pages or searches look empty:
    remote memories instance has data for the `user_id` Lookback is querying.
 
 ## Environment Variables
+
+### Sidecar log defaults
+
+The resident `jobworkerp`, `memories`, and `conductor` sidecars select their
+default `RUST_LOG` filter from the build profile:
+
+- `pnpm tauri dev` (a debug build) uses an `info` baseline.
+- Release bundles such as the macOS DMG use a `warn` baseline to keep routine
+  progress out of the packaged application's log files.
+
+Both profiles keep the `app=warn`, `worker_app=warn`, and `lance=warn` target
+filters because those targets can emit very large request or storage traces.
+Set `LOOKBACK_RUST_LOG` to replace the complete filter in either profile, for
+example `LOOKBACK_RUST_LOG=debug pnpm tauri dev`. This setting applies to the
+three resident sidecars; the short-lived `memories-import` process is not
+controlled by this policy.
+
+### Log rotation and retention
+
+Lookback keeps the active application and sidecar output files under
+`<data-root>/log/`. The active names (`lookback.log` and
+`<sidecar>.<stdout|stderr>.log`) are stable, so the in-app log viewer continues
+to show the current file after a rotation. A writer rotates an active file on
+the UTC date boundary or before a write that would exceed 10 MiB. The previous
+file receives a UTC timestamp suffix and is never edited after it is closed.
+
+The retention policy differs only for the capacity limit:
+
+- Both debug (`pnpm tauri dev`) and release builds remove closed, managed log
+  archives older than 14 days.
+- Release builds additionally remove the oldest closed archives when managed
+  logs exceed 256 MiB in total. Active files are not deleted by this sweep.
+- Debug builds do not delete logs because of total size; use the normal
+  rotation to retain the history while investigating development issues.
+
+Short-lived native tracing files produced by sidecars or `memories-import` are
+written below `log/native/<launch-id>/`. The parent-captured stdout/stderr files
+are the canonical logs. Native files are considered for the same 14-day sweep
+only after their process has exited; they are not renamed or deleted while a
+child is running.
+
+Migration attempt logs (`database-migration-*.log`) are closed audit files and
+follow the 14-day age policy. Release builds also include them in the 256 MiB
+capacity sweep. Unknown files, directories, symlinks, and active files are not
+deleted by log maintenance.
+
+To inspect rotated logs:
+
+1. Resolve the data root from the Settings page or the `LOOKBACK_*` launch
+   configuration, then list `<data-root>/log/` and its `native/` subdirectory.
+2. Read the stable active file first. If the relevant event predates the last
+   rotation, select the timestamped archive for that stream; archives are
+   ordinary text/JSONL files and can be copied while the app is running.
+3. For release cleanup diagnostics, check `lookback.log` for the best-effort
+   retention result. A cleanup failure does not stop sidecar startup or normal
+   application work; retrying at the next maintenance interval is expected.
 
 Common development overrides:
 

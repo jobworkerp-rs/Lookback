@@ -6,17 +6,29 @@ import type { StartupFailureCode } from "@/types/api";
 import { BootError, RECOVERY_TABLE } from "./BootError";
 
 const invokeMock = vi.fn();
+const openExternalMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
+}));
+vi.mock("@tauri-apps/plugin-shell", () => ({
+  open: (...args: unknown[]) => openExternalMock(...args),
 }));
 
 beforeEach(() => {
   i18n.changeLanguage("ja");
   invokeMock.mockReset();
+  openExternalMock.mockReset();
+  openExternalMock.mockResolvedValue(undefined);
   // The lancedb / settings rewrite commands always return a
   // `RecoveryResult`; the open-log / quit ones return undefined. A
   // default-success makes the happy-path test concise.
-  invokeMock.mockResolvedValue({ restarted: true, backupPath: null, restartError: null });
+  invokeMock.mockImplementation((command: string) =>
+    Promise.resolve(
+      command === "restore_database_migration_backup"
+        ? { state: "safeStopped", backupPath: "/data/database-migration-backups/a" }
+        : { restarted: true, backupPath: null, restartError: null },
+    ),
+  );
 });
 
 describe("BootError", () => {
@@ -51,69 +63,134 @@ describe("BootError", () => {
     expect(screen.queryByText(/ベクトル DB をバックアップ/)).not.toBeInTheDocument();
   });
 
-  it("previews an unmigrated database before the destructive migration is approved", async () => {
-    invokeMock.mockResolvedValueOnce({
-      warningCount: 2,
-      totalRecordCount: 5,
-      unresolvedMemoryCount: 1,
-      unresolvedThreadCount: 1,
-      plannedMemoryDeleteCount: 1,
-      plannedThreadDeleteCount: 1,
-      plannedMemoryIds: [10],
-      plannedThreadIds: [7],
-      relatedDeletionCounts: { thread_memory: 2 },
-      requiresConfirmation: true,
-    });
+  it("offers retry, explicit restore, logs, and quit for migration failure", async () => {
     renderWithProviders(
       <BootError
         failure={{
-          kind: "memory_kind_migration_required",
-          db_path: "/data/memories/default.sqlite3",
+          kind: "database_migration_failed",
+          phase: "schema apply",
+          reason: "checksum mismatch",
+          backup_path: "/data/database-migration-backups/a",
         }}
       />,
     );
-    expect(screen.getByText("メモリデータの移行が必要です")).toBeInTheDocument();
-    expect(screen.getByText(/SQLite のバックアップ/)).toBeInTheDocument();
-    fireEvent.click(screen.getByText("移行を実行"));
-    await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("preview_memory_kind_migration");
-    });
-    expect(screen.getByText("移行内容を確認")).toBeInTheDocument();
-    expect(screen.getByText(/未解決 warning: 2 件/)).toBeInTheDocument();
-    expect(screen.getByText("関連行: thread_memory — 2 件")).toBeInTheDocument();
-    fireEvent.click(screen.getByText("ダンプして削除・移行を実行"));
+    expect(screen.getByText("データベースの移行に失敗しました")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "データベース移行を再試行" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("retry_database_migration"));
+    fireEvent.click(screen.getByRole("button", { name: "移行前のデータを復元" }));
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("migrate_memory_kind", {
-        approval: expect.objectContaining({ plannedMemoryIds: [10], plannedThreadIds: [7] }),
+      expect(invokeMock).toHaveBeenCalledWith("restore_database_migration_backup", {
+        backupPath: "/data/database-migration-backups/a",
       }),
     );
-    expect(screen.queryByText("手動移行手順を開く")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "ログを開く" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "アプリを終了" })).toBeInTheDocument();
   });
 
-  it("cancels the destructive confirmation without calling the migration command", async () => {
-    invokeMock.mockResolvedValueOnce({
-      warningCount: 1,
-      totalRecordCount: 1,
-      unresolvedMemoryCount: 1,
-      unresolvedThreadCount: 0,
-      plannedMemoryDeleteCount: 1,
-      plannedThreadDeleteCount: 0,
-      plannedMemoryIds: [1],
-      plannedThreadIds: [],
-      relatedDeletionCounts: {},
-      requiresConfirmation: true,
+  it("offers restore instead of retry while a restore is incomplete", () => {
+    renderWithProviders(
+      <BootError
+        failure={{
+          kind: "database_migration_failed",
+          phase: "restore pending recovery",
+          reason: "restore interrupted",
+          backup_path: "/data/database-migration-backups/a",
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "移行前のデータを復元" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "データベース移行を再試行" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps migration recovery safe-stopped after restore until retry is explicitly selected", async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "restore_database_migration_backup") {
+        return Promise.resolve({
+          backupPath: "/data/database-migration-backups/a",
+          state: "safeStopped",
+        });
+      }
+      return Promise.resolve({ restarted: true, backupPath: null, restartError: null });
     });
     renderWithProviders(
-      <BootError failure={{ kind: "memory_kind_migration_required", db_path: "/db" }} />,
+      <BootError
+        failure={{
+          kind: "database_migration_failed",
+          phase: "schema apply",
+          reason: "checksum mismatch",
+          backup_path: "/data/database-migration-backups/a",
+        }}
+      />,
     );
-    fireEvent.click(screen.getByText("移行を実行"));
-    await screen.findByText("移行内容を確認");
-    fireEvent.click(screen.getByText("キャンセル"));
-    expect(invokeMock).not.toHaveBeenCalledWith("migrate_memory_kind");
+
+    const restore = screen.getByRole("button", { name: "移行前のデータを復元" });
+    fireEvent.click(restore);
+
+    expect(
+      await screen.findByText(
+        "移行前のデータを復元しました。サイドカーは停止中です。移行を再試行するか、アプリを終了してください。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/サイドカーが再起動できませんでした/)).not.toBeInTheDocument();
+    expect(restore).toBeDisabled();
+
+    const retry = screen.getByRole("button", { name: "データベース移行を再試行" });
+    expect(retry).toBeEnabled();
+    expect(screen.getByRole("button", { name: "ログを開く" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "アプリを終了" })).toBeEnabled();
+
+    fireEvent.click(retry);
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenLastCalledWith("retry_database_migration");
+    });
   });
 
-  it("offers the manual migration guide when preview fails", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("bundled migration failed"));
+  it("clears safe-stopped status when retry starts and allows restore after retry fails", async () => {
+    let resolveRetry: ((value: unknown) => void) | undefined;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "restore_database_migration_backup") {
+        return Promise.resolve({
+          backupPath: "/data/database-migration-backups/a",
+          state: "safeStopped",
+        });
+      }
+      if (command === "retry_database_migration") {
+        return new Promise((resolve) => {
+          resolveRetry = resolve;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+    renderWithProviders(
+      <BootError
+        failure={{
+          kind: "database_migration_failed",
+          phase: "schema apply",
+          reason: "checksum mismatch",
+          backup_path: "/data/database-migration-backups/a",
+        }}
+      />,
+    );
+
+    const restore = screen.getByRole("button", { name: "移行前のデータを復元" });
+    fireEvent.click(restore);
+    await screen.findByText(/移行前のデータを復元しました/);
+
+    fireEvent.click(screen.getByRole("button", { name: "データベース移行を再試行" }));
+    await waitFor(() => {
+      expect(screen.queryByText(/移行前のデータを復元しました/)).not.toBeInTheDocument();
+    });
+    expect(restore).toBeDisabled();
+
+    resolveRetry?.({ restarted: false, backupPath: null, restartError: "retry failed" });
+    await screen.findByText(/復旧処理に失敗しました: retry failed/);
+    expect(restore).toBeEnabled();
+  });
+
+  it("shows the v0.0.7 migration release action only for a migration-required database", async () => {
     renderWithProviders(
       <BootError
         failure={{
@@ -122,31 +199,32 @@ describe("BootError", () => {
         }}
       />,
     );
-
-    expect(screen.queryByText("手動移行手順を開く")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByText("移行を実行"));
+    expect(
+      screen.getByText(
+        /Lookback v0\.0\.7 の移行ツールで移行してから、アプリを再起動してください。/,
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "v0.0.7 の移行ツールを開く" }));
     await waitFor(() => {
-      expect(screen.getByText(/bundled migration failed/)).toBeInTheDocument();
+      expect(openExternalMock).toHaveBeenCalledWith(
+        "https://github.com/jobworkerp-rs/Lookback/releases/tag/v0.0.7",
+      );
     });
-    fireEvent.click(screen.getByText("手動移行手順を開く"));
-    expect(invokeMock).toHaveBeenCalledWith("open_memory_kind_migration_guide");
-    expect(invokeMock).not.toHaveBeenCalledWith("migrate_memory_kind");
   });
 
-  it("refuses automatic migration for unexpected owner evidence", () => {
+  it("renders a database check failure with the path and original reason", () => {
     renderWithProviders(
       <BootError
         failure={{
-          kind: "unexpected_memory_data",
+          kind: "memory_kind_database_check_failed",
           db_path: "/data/memories/default.sqlite3",
-          reason: "memory.user_id is not a Lookback owner",
+          reason: "unable to open database file",
         }}
       />,
     );
-    expect(screen.getByText("想定外のメモリデータが見つかりました")).toBeInTheDocument();
-    expect(screen.queryByText("移行を実行")).not.toBeInTheDocument();
-    expect(screen.getByText("新しい空の保存先で開始")).toBeInTheDocument();
-    expect(screen.queryByText("手動移行手順を開く")).not.toBeInTheDocument();
+    expect(screen.getByText("データベースを確認できません")).toBeInTheDocument();
+    expect(screen.getByText(/\/data\/memories\/default\.sqlite3/)).toBeInTheDocument();
+    expect(screen.getByText(/unable to open database file/)).toBeInTheDocument();
   });
 
   it("invokes recover_evacuate_lancedb when the primary action is clicked", async () => {

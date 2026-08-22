@@ -22,11 +22,15 @@ import {
   getMcpSettings,
   getModelStatus,
   getReflectionIntentIndexStats,
+  getReflectionSelectionContent,
   getSetupStatus,
+  getSummaryContent,
   listPeriodicExecutionHistory,
   listPeriodicTaskStatuses,
   listPeriodicTasks,
   listPersonalitySignals,
+  listReflectionSelection,
+  listSummariesForSelection,
   parsePersonalitySignalContent,
   parseSummaryContent,
   readSidecarLog,
@@ -122,6 +126,35 @@ describe("command wrappers", () => {
     expect(invokeMock).toHaveBeenCalledWith("search_memories_hybrid", { req });
   });
 
+  it("getSummaryContent invokes get_summary_content with the memory id", async () => {
+    await getSummaryContent("99");
+    expect(invokeMock).toHaveBeenCalledWith("get_summary_content", { req: { memory_id: "99" } });
+  });
+
+  it("listSummariesForSelection preserves the continuation offset", async () => {
+    const req = { kind: "daily" as const, limit: 50, offset: 50 };
+    invokeMock.mockResolvedValue({ entries: [], next_offset: 100 });
+    const page = await listSummariesForSelection(req);
+    expect(invokeMock).toHaveBeenCalledWith("list_summaries_for_selection", { req });
+    expect(page.next_offset).toBe(100);
+  });
+
+  it("listReflectionSelection invokes the dedicated selection list command", async () => {
+    invokeMock.mockResolvedValue({ entries: [], next_cursor_after_memory_id: "100" });
+    const page = await listReflectionSelection({ limit: 50, cursor_after_memory_id: "50" });
+    expect(invokeMock).toHaveBeenCalledWith("list_reflections_for_selection", {
+      req: { limit: 50, cursor_after_memory_id: "50" },
+    });
+    expect(page.next_cursor_after_memory_id).toBe("100");
+  });
+
+  it("getReflectionContent invokes the canonical reflection content command", async () => {
+    await getReflectionSelectionContent("99");
+    expect(invokeMock).toHaveBeenCalledWith("get_reflection_selection_content", {
+      req: { memory_id: "99" },
+    });
+  });
+
   it("searchReflectionsByIntent invokes search_reflections_by_intent", async () => {
     const req = { intent_text: "fix flaky tests", top_k: 50 };
     await searchReflectionsByIntent(req);
@@ -203,6 +236,7 @@ describe("command wrappers", () => {
       run_daily: true,
       run_weekly: false,
       run_monthly: false,
+      stop_on_error: false,
       daily_start: "2026-05-01",
       daily_end: "2026-05-31",
       weekly_start: "",

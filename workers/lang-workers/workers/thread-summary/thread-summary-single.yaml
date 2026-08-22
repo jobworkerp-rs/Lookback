@@ -11,7 +11,7 @@ input:
       required: [user_id, thread_id, memories_grpc_host, memories_grpc_port]
       properties:
         user_id: { type: integer }
-        thread_id: { type: integer }
+        thread_id: { type: string }
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
@@ -208,7 +208,7 @@ do:
           ${ $workflow.input.force_resummarize
              or ($thread.data.description // "") == ""
              or ($existing_summary_memory == null)
-             or ($thread.data.updatedAt
+             or ($thread.data.lastMessageAt
                  > $existing_summary_memory.data.updatedAt) }
 
   # Same setTask shape as the other skip gates above.
@@ -352,8 +352,8 @@ do:
                 labels: ( ($thread.data.labels
                            // ["thread_" + ($workflow.input.thread_id | tostring)])
                           + [$workflow.input.memory_thread_label_prefix] ),
-                created_at: $thread.data.createdAt,
-                updated_at: $thread.data.updatedAt,
+                created_at: $thread.data.firstMessageAt,
+                updated_at: $thread.data.lastMessageAt,
                 memory_kind: "MEMORY_KIND_THREAD_SUMMARY"
               } | tojson }
             as_json: true
@@ -516,8 +516,8 @@ do:
                     summary_version: "1.0"
                   } | tojson),
                   external_id: ("summary:" + ($workflow.input.thread_id | tostring)),
-                  created_at: $thread.data.createdAt,
-                  updated_at: $thread.data.updatedAt,
+                  created_at: $thread.data.firstMessageAt,
+                  updated_at: $thread.data.lastMessageAt,
                   memory_kind: "MEMORY_KIND_THREAD_SUMMARY"
                 }
               } | tojson }

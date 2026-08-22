@@ -7,6 +7,7 @@
 //! with optional filters.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tauri::State;
 use tokio_stream::StreamExt;
 
@@ -55,6 +56,56 @@ pub struct ReflectionEntry {
     pub updated_at_ms: i64,
 }
 
+/// Stable, compact projection used by the chat "select material" modal.
+/// Reflection IDs are the backing memory IDs by contract, so the frontend
+/// can use the same selection snapshot shape as summary memories.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReflectionSelectionEntry {
+    #[serde(with = "crate::serde_id")]
+    pub memory_id: i64,
+    #[serde(with = "crate::serde_id::option")]
+    pub origin_thread_id: Option<i64>,
+    pub summary: String,
+    pub content_json: String,
+    pub source_thread_ids: Vec<String>,
+    pub source_memory_ids: Vec<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReflectionSelectionPage {
+    pub entries: Vec<ReflectionSelectionEntry>,
+    #[serde(with = "crate::serde_id::option")]
+    pub next_cursor_after_memory_id: Option<i64>,
+}
+
+/// Authoritative full content for one reflection selection. The ACL is
+/// applied by `get_reflection_selection_content` before this DTO is built.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReflectionSelectionContent {
+    #[serde(with = "crate::serde_id")]
+    pub memory_id: i64,
+    #[serde(with = "crate::serde_id::option")]
+    pub origin_thread_id: Option<i64>,
+    pub content_json: String,
+    pub source_thread_ids: Vec<String>,
+    pub source_memory_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ListReflectionsForSelectionRequest {
+    pub limit: Option<u32>,
+    #[serde(default, with = "crate::serde_id::option")]
+    pub cursor_after_memory_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetReflectionSelectionContentRequest {
+    #[serde(with = "crate::serde_id")]
+    pub memory_id: i64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListReflectionsByThreadRequest {
     #[serde(with = "crate::serde_id")]
@@ -87,6 +138,116 @@ pub async fn list_reflections_by_thread(
         }
     }
     Ok(out)
+}
+
+/// List reflections for the selection modal using the server's filter-only
+/// branch. The cursor is a memory-id keyset cursor, so rows added while the
+/// modal is open cannot shift an offset and cause duplicates.
+#[tauri::command]
+pub async fn list_reflections_for_selection(
+    state: State<'_, AppState>,
+    req: ListReflectionsForSelectionRequest,
+) -> AppResult<ReflectionSelectionPage> {
+    let mut client = ReflectionServiceClient::new(state.memories_channel().await?);
+    let page_limit = req.limit.unwrap_or(50).max(1);
+    let mut search_request = build_selection_list_request(&req);
+    // Fetch one extra raw row.  Filtering malformed/foreign rows locally
+    // must not make the frontend lose the cursor for valid rows that follow.
+    search_request.limit = Some(page_limit.saturating_add(1));
+    let response = client.search(search_request).await?.into_inner();
+    let mut raw_rows = Vec::new();
+    let mut stream = response;
+    while let Some(item) = stream.next().await {
+        let reflection = item?.reflection;
+        let memory_id = reflection
+            .as_ref()
+            .and_then(|reflection| reflection.id.as_ref())
+            .map(|id| id.value);
+        raw_rows.push(RawReflectionRow {
+            memory_id,
+            reflection,
+        });
+    }
+    selection_page_from_raw(raw_rows, page_limit)
+}
+
+/// Fetch complete reflection content and provenance for one selected row.
+/// `Find` is an ID lookup and does not inherit the list filter, so the
+/// origin-user check is mandatory before returning any content.
+#[tauri::command]
+pub async fn get_reflection_selection_content(
+    state: State<'_, AppState>,
+    req: GetReflectionSelectionContentRequest,
+) -> AppResult<Option<ReflectionSelectionContent>> {
+    let mut client = ReflectionServiceClient::new(state.memories_channel().await?);
+    let response = client
+        .find(mem_svc::FindReflectionRequest {
+            id: Some(mem_data::ReflectionId {
+                value: req.memory_id,
+            }),
+        })
+        .await?
+        .into_inner();
+    Ok(response.reflection.and_then(|reflection| {
+        reflection_selection_content_for_owner(reflection, REFLECTION_MEMORY_USER_ID)
+    }))
+}
+
+fn build_selection_list_request(
+    req: &ListReflectionsForSelectionRequest,
+) -> mem_svc::SearchReflectionsRequest {
+    mem_svc::SearchReflectionsRequest {
+        query_text: None,
+        query_vectors: vec![],
+        filter: Some(build_reflection_filter(
+            Some(REFLECTION_MEMORY_USER_ID),
+            &[],
+            None,
+            None,
+        )),
+        sort: None,
+        boost_pinned_high_score: None,
+        hybrid_options: None,
+        limit: req.limit,
+        cursor_after_memory_id: req.cursor_after_memory_id,
+    }
+}
+
+#[derive(Debug)]
+struct RawReflectionRow {
+    memory_id: Option<i64>,
+    reflection: Option<mem_data::Reflection>,
+}
+
+fn selection_page_from_raw(
+    rows: Vec<RawReflectionRow>,
+    page_limit: u32,
+) -> AppResult<ReflectionSelectionPage> {
+    let limit = page_limit.max(1) as usize;
+    let has_more = rows.len() > limit;
+    let next_cursor_after_memory_id = if has_more {
+        rows.iter()
+            .take(limit)
+            .rev()
+            .find_map(|row| row.memory_id)
+            .ok_or_else(|| {
+                AppError::Grpc(tonic::Status::data_loss(
+                    "reflection search page has no memory id before its boundary",
+                ))
+            })
+            .map(Some)?
+    } else {
+        None
+    };
+    let entries = rows
+        .into_iter()
+        .take(limit)
+        .filter_map(|row| row.reflection.and_then(selection_entry_from_proto))
+        .collect();
+    Ok(ReflectionSelectionPage {
+        entries,
+        next_cursor_after_memory_id,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -353,11 +514,19 @@ pub async fn redispatch_reflection_embeddings(
     req: RedispatchReflectionEmbeddingsRequest,
 ) -> AppResult<RedispatchEmbeddingsResult> {
     let request = build_redispatch_request(&req)?;
+    let registered = super::begin_search_index_write(
+        &state,
+        &[crate::search_index_maintenance::MaintenanceTable::Thread],
+    )
+    .await?;
     let mut client = ReflectionVectorServiceClient::new(state.memories_channel().await?);
-    let resp = client
+    let result = client
         .redispatch_reflection_embeddings(request)
-        .await?
-        .into_inner();
+        .await
+        .map(|response| response.into_inner());
+    let finish = super::finish_search_index_write(&state, registered).await;
+    let resp = result?;
+    finish?;
     Ok(RedispatchEmbeddingsResult {
         dispatched_count: resp.dispatched_count,
         skipped_count: resp.skipped_count,
@@ -380,13 +549,21 @@ pub async fn delete_reflection(
     state: State<'_, AppState>,
     req: DeleteReflectionRequest,
 ) -> AppResult<()> {
+    let registered = super::begin_search_index_write(
+        &state,
+        &[crate::search_index_maintenance::MaintenanceTable::Thread],
+    )
+    .await?;
     let mut client = ReflectionServiceClient::new(state.memories_channel().await?);
-    client
+    let result = client
         .delete(mem_svc::DeleteReflectionRequest {
             id: Some(mem_data::ReflectionId { value: req.id }),
         })
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ());
+    let finish = super::finish_search_index_write(&state, registered).await;
+    result?;
+    finish
 }
 
 fn build_search_request(req: &SearchReflectionsRequest) -> mem_svc::SearchReflectionsRequest {
@@ -493,6 +670,128 @@ fn entry_from_proto(refl: mem_data::Reflection) -> Option<ReflectionEntry> {
     })
 }
 
+fn selection_entry_from_proto(refl: mem_data::Reflection) -> Option<ReflectionSelectionEntry> {
+    let id = refl.id?.value;
+    let data = refl.data?;
+    if data.origin_user_id.as_ref().map(|id| id.value) != Some(REFLECTION_MEMORY_USER_ID) {
+        return None;
+    }
+    if data.summary.trim().is_empty() {
+        return None;
+    }
+    let content = selection_content_from_data(id, &data);
+    Some(ReflectionSelectionEntry {
+        memory_id: id,
+        origin_thread_id: data.origin_thread_id.as_ref().map(|id| id.value),
+        summary: data.summary,
+        content_json: content.content_json,
+        source_thread_ids: content.source_thread_ids,
+        source_memory_ids: content.source_memory_ids,
+        created_at_ms: data.created_at,
+        updated_at_ms: data.updated_at,
+    })
+}
+
+fn reflection_selection_content_for_owner(
+    reflection: mem_data::Reflection,
+    owner_id: i64,
+) -> Option<ReflectionSelectionContent> {
+    let id = reflection.id?.value;
+    let data = reflection.data?;
+    (data.origin_user_id?.value == owner_id).then(|| selection_content_from_data(id, &data))
+}
+
+fn selection_content_from_data(
+    memory_id: i64,
+    data: &mem_data::ReflectionData,
+) -> ReflectionSelectionContent {
+    let origin_thread_id = data.origin_thread_id.as_ref().map(|id| id.value);
+    let (source_thread_ids, source_memory_ids) = reflection_source_ids(data);
+    ReflectionSelectionContent {
+        memory_id,
+        origin_thread_id,
+        content_json: normalized_reflection_json(data),
+        source_thread_ids,
+        source_memory_ids,
+    }
+}
+
+fn reflection_source_ids(data: &mem_data::ReflectionData) -> (Vec<String>, Vec<String>) {
+    let source_thread_ids = data
+        .origin_thread_id
+        .as_ref()
+        .map(|id| id.value.to_string())
+        .into_iter()
+        .collect();
+    let mut source_memory_ids = Vec::new();
+    let mut seen_memory_ids = HashSet::new();
+    for fact in &data.facts {
+        if let Some(anchor) = fact.anchor_memory_id.as_ref().map(|id| id.value)
+            && seen_memory_ids.insert(anchor)
+        {
+            source_memory_ids.push(anchor.to_string());
+        }
+    }
+    (source_thread_ids, source_memory_ids)
+}
+
+/// Produce a JSON object rather than forwarding protobuf/JSON wire details.
+/// Int64 identifiers are strings so JavaScript cannot lose precision while
+/// parsing a selected reflection snapshot.
+fn normalized_reflection_json(data: &mem_data::ReflectionData) -> String {
+    let origin_thread_id = data
+        .origin_thread_id
+        .as_ref()
+        .map(|id| id.value.to_string());
+    let facts = data
+        .facts
+        .iter()
+        .map(|fact| {
+            serde_json::json!({
+                "turn_index": fact.turn_index,
+                "anchor_memory_id": fact.anchor_memory_id.as_ref().map(|id| id.value.to_string()),
+                "kind": fact.kind,
+                "weight": fact.weight,
+                "note": fact.note,
+                "links": fact.links.iter().map(|link| serde_json::json!({
+                    "field": link.field,
+                    "index": link.index,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let (source_thread_ids, source_memory_ids) = reflection_source_ids(data);
+    serde_json::json!({
+        "origin_thread_id": origin_thread_id,
+        "source_thread_ids": source_thread_ids,
+        "source_memory_ids": source_memory_ids,
+        "origin_channel": data.origin_channel,
+        "outcome": data.outcome,
+        "score": data.score,
+        "score_self": data.score_self,
+        "score_heuristic": data.score_heuristic,
+        "summary": data.summary,
+        "task_intent": data.task_intent,
+        "task_category": data.task_category,
+        "reflection_aspect": data.reflection_aspect,
+        "failure_modes": data.failure_modes,
+        "failure_modes_other": data.failure_modes_other,
+        "success_factors": data.success_factors,
+        "lessons": data.lessons,
+        "key_decisions": data.key_decisions,
+        "tools_used": data.tools_used,
+        "mitigation_hint": data.mitigation_hint,
+        "is_recurrence": data.is_recurrence,
+        "facts": facts,
+        "tool_outcomes": data.tool_outcomes.iter().map(|entry| serde_json::json!({
+            "tool": entry.tool,
+            "contribution": entry.contribution,
+            "error_kind": entry.error_kind,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +832,24 @@ mod tests {
         }
     }
 
+    fn proto_with_facts() -> mem_data::Reflection {
+        let mut reflection = proto_with_summary("selection summary");
+        let data = reflection.data.as_mut().unwrap();
+        data.facts = vec![
+            mem_data::ReflectionFact {
+                turn_index: 3,
+                anchor_memory_id: Some(mem_data::MemoryId { value: 9001 }),
+                ..Default::default()
+            },
+            mem_data::ReflectionFact {
+                turn_index: 4,
+                anchor_memory_id: Some(mem_data::MemoryId { value: 9001 }),
+                ..Default::default()
+            },
+        ];
+        reflection
+    }
+
     fn memory_hit(memory_id: i64) -> mem_svc::MemorySearchResult {
         mem_svc::MemorySearchResult {
             memory: Some(mem_data::Memory {
@@ -545,6 +862,209 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn selection_request_accepts_omitted_cursor() {
+        let request: ListReflectionsForSelectionRequest =
+            serde_json::from_str(r#"{"limit":50}"#).expect("optional cursor should default");
+        assert_eq!(request.limit, Some(50));
+        assert_eq!(request.cursor_after_memory_id, None);
+    }
+
+    #[test]
+    fn selection_list_request_is_filter_only_and_uses_memory_id_cursor() {
+        let request = build_selection_list_request(&ListReflectionsForSelectionRequest {
+            limit: Some(30),
+            cursor_after_memory_id: Some(1234),
+        });
+        assert!(request.query_text.is_none());
+        assert!(request.query_vectors.is_empty());
+        assert_eq!(request.limit, Some(30));
+        assert_eq!(request.cursor_after_memory_id, Some(1234));
+        assert_eq!(
+            request
+                .filter
+                .and_then(|filter| filter.origin_user_id)
+                .map(|id| id.value),
+            Some(REFLECTION_MEMORY_USER_ID)
+        );
+    }
+
+    #[test]
+    fn selection_page_filters_foreign_and_empty_rows_but_keeps_raw_cursor() {
+        let mut foreign = proto_with_summary("foreign");
+        foreign.id = Some(mem_data::ReflectionId { value: 20 });
+        foreign.data.as_mut().unwrap().origin_user_id = Some(mem_data::UserId { value: 2 });
+        let mut empty = proto_with_summary(" ");
+        empty.id = Some(mem_data::ReflectionId { value: 19 });
+        let mut own = proto_with_summary("own");
+        own.id = Some(mem_data::ReflectionId { value: 18 });
+        let page = selection_page_from_raw(
+            vec![
+                RawReflectionRow {
+                    memory_id: Some(20),
+                    reflection: Some(foreign),
+                },
+                RawReflectionRow {
+                    memory_id: Some(19),
+                    reflection: Some(empty),
+                },
+                RawReflectionRow {
+                    memory_id: Some(18),
+                    reflection: Some(own),
+                },
+            ],
+            2,
+        )
+        .expect("page should remain addressable");
+        assert_eq!(page.entries.len(), 0);
+        // The second raw row is the page boundary even though both rows were
+        // filtered, so the next request can reach the valid row.
+        assert_eq!(page.next_cursor_after_memory_id, Some(19));
+    }
+
+    #[test]
+    fn selection_page_uses_previous_id_when_boundary_row_has_no_id() {
+        let mut own = proto_with_summary("own");
+        own.id = Some(mem_data::ReflectionId { value: 20 });
+        let mut malformed = proto_with_summary("malformed");
+        malformed.id = None;
+        let page = selection_page_from_raw(
+            vec![
+                RawReflectionRow {
+                    memory_id: Some(20),
+                    reflection: Some(own),
+                },
+                RawReflectionRow {
+                    memory_id: None,
+                    reflection: Some(malformed),
+                },
+                RawReflectionRow {
+                    memory_id: Some(18),
+                    reflection: None,
+                },
+            ],
+            2,
+        )
+        .expect("the preceding row keeps the next page addressable");
+
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.next_cursor_after_memory_id, Some(20));
+    }
+
+    #[test]
+    fn selection_page_rejects_boundary_without_any_prior_id() {
+        let mut first_malformed = proto_with_summary("first malformed");
+        first_malformed.id = None;
+        let mut boundary_malformed = proto_with_summary("boundary malformed");
+        boundary_malformed.id = None;
+        let mut later = proto_with_summary("later");
+        later.id = Some(mem_data::ReflectionId { value: 18 });
+        let error = selection_page_from_raw(
+            vec![
+                RawReflectionRow {
+                    memory_id: None,
+                    reflection: Some(first_malformed),
+                },
+                RawReflectionRow {
+                    memory_id: None,
+                    reflection: Some(boundary_malformed),
+                },
+                RawReflectionRow {
+                    memory_id: Some(18),
+                    reflection: Some(later),
+                },
+            ],
+            2,
+        )
+        .expect_err("a page without a cursor cannot make progress");
+
+        match error {
+            AppError::Grpc(status) => {
+                assert_eq!(status.code(), tonic::Code::DataLoss);
+                assert!(status.message().contains("memory id"));
+            }
+            other => panic!("expected DataLoss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selection_page_returns_tail_without_cursor_when_raw_rows_fit() {
+        let mut own = proto_with_summary("own");
+        own.id = Some(mem_data::ReflectionId { value: 18 });
+        let page = selection_page_from_raw(
+            vec![RawReflectionRow {
+                memory_id: Some(18),
+                reflection: Some(own),
+            }],
+            2,
+        )
+        .expect("page should be returned");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.next_cursor_after_memory_id, None);
+    }
+
+    #[test]
+    fn selection_page_returns_last_raw_id_for_a_normal_full_page() {
+        let rows = [18_i64, 17, 16]
+            .into_iter()
+            .map(|id| {
+                let mut reflection = proto_with_summary("own");
+                reflection.id = Some(mem_data::ReflectionId { value: id });
+                RawReflectionRow {
+                    memory_id: Some(id),
+                    reflection: Some(reflection),
+                }
+            })
+            .collect();
+        let page = selection_page_from_raw(rows, 2).expect("page should be returned");
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.next_cursor_after_memory_id, Some(17));
+    }
+
+    #[test]
+    fn selection_content_normalizes_ids_and_deduplicates_fact_anchors() {
+        let reflection = proto_with_facts();
+        let entry = selection_entry_from_proto(reflection).expect("selection entry");
+        assert_eq!(entry.memory_id, 42);
+        assert_eq!(entry.origin_thread_id, Some(100));
+        assert_eq!(entry.source_thread_ids, vec!["100"]);
+        assert_eq!(entry.source_memory_ids, vec!["9001"]);
+        let json: serde_json::Value = serde_json::from_str(&entry.content_json).unwrap();
+        assert_eq!(json["origin_thread_id"], "100");
+        assert_eq!(json["facts"][0]["anchor_memory_id"], "9001");
+        assert_eq!(json["facts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn selection_entry_drops_empty_summary_but_keeps_missing_origin_defensively() {
+        let mut empty = proto_with_summary(" ");
+        assert!(selection_entry_from_proto(empty).is_none());
+        empty = proto_with_summary("usable");
+        empty.data.as_mut().unwrap().origin_thread_id = None;
+        let entry = selection_entry_from_proto(empty).expect("usable reflection");
+        assert_eq!(entry.origin_thread_id, None);
+        assert!(entry.source_thread_ids.is_empty());
+    }
+
+    #[test]
+    fn selection_entry_rejects_foreign_origin_user() {
+        let mut reflection = proto_with_summary("foreign");
+        reflection.data.as_mut().unwrap().origin_user_id = Some(mem_data::UserId { value: 2 });
+        assert!(selection_entry_from_proto(reflection).is_none());
+    }
+
+    #[test]
+    fn selection_content_acl_rejects_reflections_owned_by_another_user() {
+        let mut reflection = proto_with_facts();
+        reflection.data.as_mut().unwrap().origin_user_id = Some(mem_data::UserId { value: 2 });
+        assert!(
+            reflection_selection_content_for_owner(reflection, REFLECTION_MEMORY_USER_ID).is_none()
+        );
+
+        let own = proto_with_facts();
+        assert!(reflection_selection_content_for_owner(own, REFLECTION_MEMORY_USER_ID).is_some());
     }
 
     #[test]

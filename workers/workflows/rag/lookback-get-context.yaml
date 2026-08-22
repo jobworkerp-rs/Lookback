@@ -1,0 +1,189 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: lookback
+  name: lookback-get-context
+  version: "1.0.0"
+  summary: >-
+    Retrieve selected memories or messages from selected threads by exact id.
+    This worker does not perform vector search and is usable when embeddings
+    are unavailable.
+
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        memory_ids:
+          type: array
+          items: { type: string }
+          minItems: 1
+          maxItems: 10
+        thread_ids:
+          type: array
+          items: { type: string }
+          minItems: 1
+          maxItems: 10
+        query:
+          type: string
+          maxLength: 1000
+          default: ""
+        query_normalized:
+          type: string
+          maxLength: 1000
+          default: ""
+        max_items_per_thread:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+        memories_grpc_host:
+          { type: string, default: "%{LOOKBACK_RAG_MEMORIES_HOST:-127.0.0.1}", x-hidden: true }
+        memories_grpc_port: { type: integer, default: %{LOOKBACK_RAG_MEMORIES_PORT:-9010}, x-hidden: true }
+        memories_grpc_tls: { type: boolean, default: %{LOOKBACK_RAG_MEMORIES_TLS:-false}, x-hidden: true }
+        origin_user_id: { type: integer, default: 1, x-hidden: true }
+      required: []
+      anyOf:
+        - required: [memory_ids]
+        - required: [thread_ids]
+
+do:
+  - initialize:
+      set:
+        items: "${ [] }"
+        unresolved: "${ [] }"
+        memory_count: "${ $workflow.input.memory_ids // [] | length }"
+  - fetchMemories:
+      for:
+        each: requested_memory_id
+        in: "${ $workflow.input.memory_ids // [] }"
+      onError: continue
+      do:
+        - findAndRecordMemory:
+            try:
+              - findMemory:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: streaming
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.MemoryService/Find"
+                        json_body: >-
+                          ${ { value: $requested_memory_id } | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      memory_result: "${ .jsonBody | fromjson }"
+              - recordMemory:
+                  set:
+                    items: >-
+                      ${ $items + [
+                          {
+                            input_kind: "memory",
+                            input_id: $requested_memory_id,
+                            input_index: $index,
+                            memory: (if (($memory_result.data.data.userId.value // $memory_result.data.data.user_id.value // -1) == $workflow.input.origin_user_id) then ($memory_result.data // null) else null end),
+                            unresolved: (($memory_result.data.data.userId.value // $memory_result.data.data.user_id.value // -1) != $workflow.input.origin_user_id),
+                            reason: (if (($memory_result.data.data.userId.value // $memory_result.data.data.user_id.value // -1) == $workflow.input.origin_user_id) then null else "not_found_or_not_allowed" end)
+                          }
+                        ] }
+            catch:
+              as: error
+              do:
+                - recordMemoryFailure:
+                    set:
+                      items: >-
+                        ${ $items + [{ input_kind: "memory", input_id: $requested_memory_id, input_index: $index, memory: null, unresolved: true, reason: "not_found_or_not_allowed" }] }
+  - fetchThreads:
+      for:
+        each: requested_thread_id
+        in: "${ $workflow.input.thread_ids // [] }"
+      onError: continue
+      do:
+        - findAndRecordThread:
+            try:
+              - findThreadMemories:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: streaming
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+                        json_body: >-
+                          ${ {
+                            thread_id: { value: $requested_thread_id },
+                            roles: [],
+                            content_types: [],
+                            limit: ($workflow.input.max_items_per_thread // 20)
+                          } | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      thread_result: "${ .jsonBody | fromjson }"
+              - filterThreadMemories:
+                  set:
+                    matched_thread_memories: >-
+                      ${ (($thread_result // [])
+                        | map(select((.data.userId.value // .data.user_id.value // -1) == $workflow.input.origin_user_id))
+                        | if (($workflow.input.query // "") | length) == 0 then .
+                          else map(select(
+                            ((.data.content // "") | contains($workflow.input.query))
+                            or (
+                              (($workflow.input.query_normalized // "") | length) > 0
+                              and (((.data.content // "")
+                                | explode
+                                | map(
+                                    if . >= 65296 and . <= 65305 then . - 65248
+                                    elif . >= 65313 and . <= 65338 then . - 65248
+                                    elif . >= 65345 and . <= 65370 then . - 65248
+                                    elif . == 12288 then 32
+                                    else .
+                                    end
+                                  )
+                                | implode
+                                | ascii_downcase
+                                | gsub("[[:space:][:punct:]]"; ""))
+                                | contains($workflow.input.query_normalized))
+                            )
+                          ))
+                          end) }
+              - recordThread:
+                  set:
+                    items: >-
+                      ${ $items + [
+                          {
+                            input_kind: "thread",
+                            input_id: $requested_thread_id,
+                            input_index: ($memory_count + $index),
+                            owner_thread_id: $requested_thread_id,
+                            memories: ($matched_thread_memories[0:($workflow.input.max_items_per_thread // 20)]),
+                            truncated: (($matched_thread_memories | length) > ($workflow.input.max_items_per_thread // 20))
+                              or ((($workflow.input.query // "") | length) == 0
+                                and (($thread_result // []) | length) >= ($workflow.input.max_items_per_thread // 20)),
+                            query_applied: (($workflow.input.query // "") | length) > 0
+                          } | . + {
+                            unresolved: (.memories | length == 0),
+                            reason: (if (.memories | length) == 0 then "not_found_or_not_allowed" else null end)
+                          })
+                        ] }
+            catch:
+              as: error
+              do:
+                - recordThreadFailure:
+                    set:
+                      items: >-
+                        ${ $items + [{ input_kind: "thread", input_id: $requested_thread_id, input_index: ($memory_count + $index), owner_thread_id: $requested_thread_id, memories: [], truncated: false, query_applied: (($workflow.input.query // "") | length) > 0, unresolved: true, reason: "not_found_or_not_allowed" }] }
+
+output:
+  as:
+    items: ${ $items }
+    unresolved: ${ $items | map(select(.unresolved == true)) }

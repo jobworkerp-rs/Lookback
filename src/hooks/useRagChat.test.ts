@@ -41,6 +41,14 @@ describe("mergeChatEvent — TEST-CHAT-8", () => {
     expect(final[0]?.answer).toBe("Hello, world");
   });
 
+  it("marks a done event from cancellation so partial answers are not reusable", () => {
+    const next = mergeChatEvent(
+      [baseTurn({ answer: "partial", phase: "token" })],
+      ev({ phase: "done", message: "cancelled", cancelled: true }),
+    );
+    expect(next[0]).toMatchObject({ phase: "done", answer: "partial", cancelled: true });
+  });
+
   it("accumulates sources across multiple source events in order", () => {
     const turns = [baseTurn()];
     const a = mergeChatEvent(

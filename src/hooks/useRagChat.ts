@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { chatAsk, chatCancel } from "@/api";
-import type { ChatMessage, ChatPhase, ChatSource, ChatStepUpdate } from "@/types/api";
+import type {
+  ChatMessage,
+  ChatPhase,
+  ChatSource,
+  ChatStepUpdate,
+  RetrievalMode,
+  SelectedMemorySnapshot,
+} from "@/types/api";
 import { useTauriEvent } from "./useTauriEvent";
 
 /** One turn of the in-screen conversation. Lives in React state only —
@@ -21,6 +28,10 @@ export interface ChatTurn {
    *  events; `token`/`source` leave this null. */
   message: string | null;
   error: string | null;
+  cancelled?: boolean;
+  selectedMemories?: SelectedMemorySnapshot[];
+  selectedContentTruncated?: boolean;
+  retrievalMode?: RetrievalMode | null;
 }
 
 const MAX_TURNS = 5;
@@ -86,7 +97,7 @@ function applyEvent(turn: ChatTurn, ev: ChatStepUpdate): ChatTurn {
       // turn; bail out on the second one so React's setState same-ref
       // shortcut skips a useless re-render of every ChatTurnCard.
       if (turn.phase === "done" && turn.message === msg) return turn;
-      return { ...turn, phase: "done", message: msg };
+      return { ...turn, phase: "done", message: msg, cancelled: ev.cancelled === true };
     }
     case "error":
       return {
@@ -105,7 +116,7 @@ function applyEvent(turn: ChatTurn, ev: ChatStepUpdate): ChatTurn {
 export function buildHistoryMessages(turns: ChatTurn[]): ChatMessage[] {
   const out: ChatMessage[] = [];
   for (const t of turns) {
-    if (t.phase !== "done" || !t.answer) continue;
+    if (t.phase !== "done" || t.cancelled || !t.answer) continue;
     out.push({ role: "user", content: t.question });
     out.push({ role: "assistant", content: t.answer });
   }
@@ -116,7 +127,11 @@ export interface UseRagChat {
   turns: ChatTurn[];
   /** Submit a question. The history (last 5 turns) is prepended on the
    *  server-bound `messages` array automatically. */
-  ask: (question: string) => Promise<void>;
+  ask: (
+    question: string,
+    selectedMemories?: SelectedMemorySnapshot[],
+    retrievalMode?: RetrievalMode,
+  ) => Promise<void>;
   /** Wipe the screen-only history. */
   reset: () => void;
   /** Cancel the in-flight turn (OPEN-CHAT-2). Resolves immediately; the
@@ -147,51 +162,69 @@ export function useRagChat(): UseRagChat {
     setTurns((prev) => mergeChatEvent(prev, ev));
   });
 
-  const ask = useCallback(async (question: string) => {
-    const trimmed = question.trim();
-    if (!trimmed) return;
-    const history = buildHistoryMessages(turnsRef.current);
+  const ask = useCallback(
+    async (
+      question: string,
+      selectedMemories: SelectedMemorySnapshot[] = [],
+      retrievalMode?: RetrievalMode,
+    ) => {
+      const trimmed = question.trim();
+      if (!trimmed) return;
+      const history = buildHistoryMessages(turnsRef.current);
 
-    // Register the turn BEFORE invoking `chat_ask`. The Rust side
-    // emits `Start` synchronously during the command body, and the
-    // detached stream task can land `Token`/`Error` before the
-    // command's response has even reached us. Pre-registering with a
-    // client-chosen `jobId` means those events never hit an unknown
-    // turn (mergeChatEvent would otherwise drop them).
-    const jobId = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    setTurns((prev) => [
-      ...prev,
-      {
-        jobId,
-        question: trimmed,
-        answer: "",
-        sources: [],
-        phase: "start",
-        message: null,
-        error: null,
-      },
-    ]);
+      // Register the turn BEFORE invoking `chat_ask`. The Rust side
+      // emits `Start` synchronously during the command body, and the
+      // detached stream task can land `Token`/`Error` before the
+      // command's response has even reached us. Pre-registering with a
+      // client-chosen `jobId` means those events never hit an unknown
+      // turn (mergeChatEvent would otherwise drop them).
+      const jobId = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      setTurns((prev) => [
+        ...prev,
+        {
+          jobId,
+          question: trimmed,
+          answer: "",
+          sources: [],
+          phase: "start",
+          message: null,
+          error: null,
+          selectedMemories: structuredClone(selectedMemories),
+          retrievalMode: retrievalMode ?? (selectedMemories.length > 0 ? "source_details" : null),
+        },
+      ]);
 
-    try {
-      await chatAsk({
-        messages: [...history, { role: "user", content: trimmed }],
-        job_id: jobId,
-      });
-    } catch (e) {
-      // `chat_ask` rejected before the stream could start (sidecar
-      // down, validation error, etc.). Surface it on the turn we
-      // already registered so the user sees what went wrong.
-      const msg = e instanceof Error ? e.message : String(e);
-      setTurns((prev) =>
-        mergeChatEvent(prev, {
+      try {
+        const response = await chatAsk({
+          messages: [...history, { role: "user", content: trimmed }],
           job_id: jobId,
-          phase: "error",
-          message: msg,
-        }),
-      );
-      throw e;
-    }
-  }, []);
+          selected_memories: selectedMemories,
+          retrieval_mode: retrievalMode,
+        });
+        if (response.selected_content_truncated) {
+          setTurns((prev) =>
+            prev.map((turn) =>
+              turn.jobId === jobId ? { ...turn, selectedContentTruncated: true } : turn,
+            ),
+          );
+        }
+      } catch (e) {
+        // `chat_ask` rejected before the stream could start (sidecar
+        // down, validation error, etc.). Surface it on the turn we
+        // already registered so the user sees what went wrong.
+        const msg = e instanceof Error ? e.message : String(e);
+        setTurns((prev) =>
+          mergeChatEvent(prev, {
+            job_id: jobId,
+            phase: "error",
+            message: msg,
+          }),
+        );
+        throw e;
+      }
+    },
+    [],
+  );
 
   const reset = useCallback(() => setTurns([]), []);
 

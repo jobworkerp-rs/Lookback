@@ -59,6 +59,53 @@ describe("interpolation placeholder parity", () => {
   });
 });
 
+describe("summary selection labels", () => {
+  it("provides labels for the structured summary renderer in both locales", () => {
+    const keys = [
+      "chat.selectSummary.summaryFields.title",
+      "chat.selectSummary.summaryFields.summary",
+      "chat.selectSummary.summaryFields.overallPurpose",
+      "chat.selectSummary.summaryFields.category",
+      "chat.selectSummary.summaryFields.status",
+      "chat.selectSummary.summaryFields.keyDecisions",
+      "chat.selectSummary.summaryFields.purposeGroups",
+      "chat.selectSummary.summaryFields.byTopic",
+      "chat.selectSummary.summaryFields.carryover",
+      "chat.selectSummary.summaryFields.trends",
+      "chat.selectSummary.summaryFields.highlights",
+      "chat.selectSummary.summaryFields.milestones",
+      "chat.selectSummary.summaryFields.sourceMemoryIds",
+      "chat.selectSummary.summaryFields.sourceThreadIds",
+      "chat.selectSummary.summaryFields.details",
+      "chat.selectSummary.summaryFields.purpose",
+      "chat.selectSummary.summaryFields.bullets",
+      "chat.selectSummary.summaryFields.topic",
+      "chat.selectSummary.summaryFields.kind",
+      "chat.selectSummary.summaryFields.outcome",
+      "chat.selectSummary.summaryFields.completedInWeek",
+      "chat.selectSummary.category.coding",
+      "chat.selectSummary.category.consultation",
+      "chat.selectSummary.category.research",
+      "chat.selectSummary.category.creative",
+      "chat.selectSummary.category.general",
+      "chat.selectSummary.status.resolved",
+      "chat.selectSummary.status.ongoing",
+      "chat.selectSummary.status.in_review",
+      "chat.selectSummary.status.blocked",
+      "chat.selectSummary.status.deferred",
+      "chat.selectSummary.status.abandoned",
+      "chat.selectSummary.trendKind.continued",
+      "chat.selectSummary.trendKind.new",
+      "chat.selectSummary.trendKind.completed",
+    ];
+
+    for (const key of keys) {
+      expect(flatJa.get(key), `ja is missing ${key}`).toBeTruthy();
+      expect(flatEn.get(key), `en is missing ${key}`).toBeTruthy();
+    }
+  });
+});
+
 describe("search copy", () => {
   it("does not describe embedding search as server-side or GPU-only", () => {
     const forbidden = /サーバ側|server-side|GPU|MultimodalEmbeddingRunner|未配備/i;
@@ -67,17 +114,5 @@ describe("search copy", () => {
       .map(([, value]) => value);
 
     expect(searchCopy.filter((value) => forbidden.test(value))).toEqual([]);
-  });
-});
-
-describe("boot error copy", () => {
-  it("renders the unexpected-memory detail on a new line in both locales", () => {
-    for (const body of [
-      ja.bootError.unexpectedMemoryData.body,
-      en.bootError.unexpectedMemoryData.body,
-    ]) {
-      expect(body).toContain("\n");
-      expect(body).not.toContain("\\n");
-    }
   });
 });

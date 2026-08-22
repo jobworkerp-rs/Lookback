@@ -174,7 +174,9 @@ export function PeriodicTasks() {
                       <>
                         <span className="periodic-meta-separator">·</span>
                         <span>
-                          {t("periodic.card.lookback", { count: task.task.lookback_days })}
+                          {task.task.lookback_days === 0
+                            ? t("periodic.card.lookbackToday")
+                            : t("periodic.card.lookback", { count: task.task.lookback_days })}
                         </span>
                       </>
                     )}
@@ -711,7 +713,7 @@ function PeriodicTaskDialog({
             <span className="field-label">{t("periodic.dialog.lookbackDays")}</span>
             <input
               type="number"
-              min={1}
+              min={0}
               value={draft.lookback_days}
               onChange={(e) => set("lookback_days", Number(e.currentTarget.value))}
             />

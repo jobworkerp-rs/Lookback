@@ -31,6 +31,8 @@ pub struct ThreadSummary {
     pub labels: Vec<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub first_message_at_ms: Option<i64>,
+    pub last_message_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -54,8 +56,14 @@ pub struct ListThreadsRequest {
     pub user_id: Option<i64>,
     pub limit: Option<i32>,
     pub offset: Option<i64>,
-    pub created_after_ms: Option<i64>,
-    pub created_before_ms: Option<i64>,
+    pub thread_created_after_ms: Option<i64>,
+    pub thread_created_before_ms: Option<i64>,
+    pub thread_updated_after_ms: Option<i64>,
+    pub thread_updated_before_ms: Option<i64>,
+    pub first_message_after_ms: Option<i64>,
+    pub first_message_before_ms: Option<i64>,
+    pub last_message_after_ms: Option<i64>,
+    pub last_message_before_ms: Option<i64>,
     // serde rejects missing `Vec` fields by default; the frontend omits
     // this when no labels are picked, so accept absent as "no filter".
     #[serde(default)]
@@ -78,35 +86,13 @@ pub async fn list_threads(
 
     // The label filter RPC is separate so an over-limit selection isn't truncated.
     let mut stream = if req.labels_any.is_empty() {
-        let request = mem_svc::FindThreadListByUserIdRequest {
-            user_id: Some(mem_data::UserId { value: user_id }),
-            limit: req.limit,
-            offset: req.offset,
-            created_after: req.created_after_ms,
-            created_before: req.created_before_ms,
-            updated_after: None,
-            updated_before: None,
-            sort: None,
-            memory_kinds: vec![RAW_MEMORY_KIND],
-        };
+        let request = build_list_by_user_request(&req, user_id);
         client
             .find_thread_list_by_user_id(request)
             .await?
             .into_inner()
     } else {
-        let request = mem_svc::FindThreadListByLabelsRequest {
-            labels: req.labels_any.clone(),
-            match_mode: Some(match_mode.to_proto()),
-            limit: req.limit,
-            offset: req.offset,
-            user_id: Some(user_id),
-            created_after: req.created_after_ms,
-            created_before: req.created_before_ms,
-            updated_after: None,
-            updated_before: None,
-            sort: None,
-            memory_kinds: vec![RAW_MEMORY_KIND],
-        };
+        let request = build_list_by_labels_request(&req, user_id, match_mode);
         client
             .find_thread_list_by_labels(request)
             .await?
@@ -127,13 +113,64 @@ pub async fn list_threads(
     Ok(out)
 }
 
+fn build_list_by_user_request(
+    req: &ListThreadsRequest,
+    user_id: i64,
+) -> mem_svc::FindThreadListByUserIdRequest {
+    mem_svc::FindThreadListByUserIdRequest {
+        user_id: Some(mem_data::UserId { value: user_id }),
+        limit: req.limit,
+        offset: req.offset,
+        thread_created_after: req.thread_created_after_ms,
+        thread_created_before: req.thread_created_before_ms,
+        thread_updated_after: req.thread_updated_after_ms,
+        thread_updated_before: req.thread_updated_before_ms,
+        first_message_after: req.first_message_after_ms,
+        first_message_before: req.first_message_before_ms,
+        last_message_after: req.last_message_after_ms,
+        last_message_before: req.last_message_before_ms,
+        sort: None,
+        memory_kinds: vec![RAW_MEMORY_KIND],
+    }
+}
+
+fn build_list_by_labels_request(
+    req: &ListThreadsRequest,
+    user_id: i64,
+    match_mode: LabelMatch,
+) -> mem_svc::FindThreadListByLabelsRequest {
+    mem_svc::FindThreadListByLabelsRequest {
+        labels: req.labels_any.clone(),
+        match_mode: Some(match_mode.to_proto()),
+        limit: req.limit,
+        offset: req.offset,
+        user_id: Some(user_id),
+        thread_created_after: req.thread_created_after_ms,
+        thread_created_before: req.thread_created_before_ms,
+        thread_updated_after: req.thread_updated_after_ms,
+        thread_updated_before: req.thread_updated_before_ms,
+        first_message_after: req.first_message_after_ms,
+        first_message_before: req.first_message_before_ms,
+        last_message_after: req.last_message_after_ms,
+        last_message_before: req.last_message_before_ms,
+        sort: None,
+        memory_kinds: vec![RAW_MEMORY_KIND],
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FindDistinctLabelsRequest {
     pub user_id: Option<i64>,
     pub limit: Option<i32>,
     pub offset: Option<i64>,
-    pub created_after_ms: Option<i64>,
-    pub created_before_ms: Option<i64>,
+    pub thread_created_after_ms: Option<i64>,
+    pub thread_created_before_ms: Option<i64>,
+    pub thread_updated_after_ms: Option<i64>,
+    pub thread_updated_before_ms: Option<i64>,
+    pub first_message_after_ms: Option<i64>,
+    pub first_message_before_ms: Option<i64>,
+    pub last_message_after_ms: Option<i64>,
+    pub last_message_before_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -170,10 +207,14 @@ fn build_distinct_labels_request(
         user_id: Some(req.user_id.unwrap_or(1)),
         limit: req.limit,
         offset: req.offset,
-        created_after: req.created_after_ms,
-        created_before: req.created_before_ms,
-        updated_after: None,
-        updated_before: None,
+        thread_created_after: req.thread_created_after_ms,
+        thread_created_before: req.thread_created_before_ms,
+        thread_updated_after: req.thread_updated_after_ms,
+        thread_updated_before: req.thread_updated_before_ms,
+        first_message_after: req.first_message_after_ms,
+        first_message_before: req.first_message_before_ms,
+        last_message_after: req.last_message_after_ms,
+        last_message_before: req.last_message_before_ms,
         memory_kinds: vec![RAW_MEMORY_KIND],
     }
 }
@@ -184,8 +225,14 @@ pub struct FindCoOccurringLabelsRequest {
     pub labels: Vec<String>,
     pub limit: Option<i32>,
     pub offset: Option<i64>,
-    pub created_after_ms: Option<i64>,
-    pub created_before_ms: Option<i64>,
+    pub thread_created_after_ms: Option<i64>,
+    pub thread_created_before_ms: Option<i64>,
+    pub thread_updated_after_ms: Option<i64>,
+    pub thread_updated_before_ms: Option<i64>,
+    pub first_message_after_ms: Option<i64>,
+    pub first_message_before_ms: Option<i64>,
+    pub last_message_after_ms: Option<i64>,
+    pub last_message_before_ms: Option<i64>,
 }
 
 #[tauri::command]
@@ -208,10 +255,14 @@ fn build_co_occurring_labels_request(
         user_id: Some(req.user_id.unwrap_or(1)),
         limit: req.limit,
         offset: req.offset,
-        created_after: req.created_after_ms,
-        created_before: req.created_before_ms,
-        updated_after: None,
-        updated_before: None,
+        thread_created_after: req.thread_created_after_ms,
+        thread_created_before: req.thread_created_before_ms,
+        thread_updated_after: req.thread_updated_after_ms,
+        thread_updated_before: req.thread_updated_before_ms,
+        first_message_after: req.first_message_after_ms,
+        first_message_before: req.first_message_before_ms,
+        last_message_after: req.last_message_after_ms,
+        last_message_before: req.last_message_before_ms,
         memory_kinds: vec![RAW_MEMORY_KIND],
     }
 }
@@ -415,13 +466,24 @@ pub struct DeleteThreadRequest {
 /// this behind a confirm dialog inside the thread-detail modal.
 #[tauri::command]
 pub async fn delete_thread(state: State<'_, AppState>, req: DeleteThreadRequest) -> AppResult<()> {
+    let registered = super::begin_search_index_write(
+        &state,
+        &[
+            crate::search_index_maintenance::MaintenanceTable::Memory,
+            crate::search_index_maintenance::MaintenanceTable::Thread,
+        ],
+    )
+    .await?;
     let mut client = ThreadServiceClient::new(state.memories_channel().await?);
-    client
+    let result = client
         .delete(mem_data::ThreadId {
             value: req.thread_id,
         })
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ());
+    let finish = super::finish_search_index_write(&state, registered).await;
+    result?;
+    finish
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -460,6 +522,8 @@ fn thread_to_summary(t: mem_data::Thread) -> Option<ThreadSummary> {
         labels: data.labels,
         created_at_ms: data.created_at,
         updated_at_ms: data.updated_at,
+        first_message_at_ms: data.first_message_at,
+        last_message_at_ms: data.last_message_at,
     })
 }
 
@@ -507,6 +571,8 @@ mod tests {
                 labels: vec!["dir:/a".to_string(), "agent:codex".to_string()],
                 created_at: 100,
                 updated_at: 200,
+                first_message_at: Some(110),
+                last_message_at: Some(190),
                 ..Default::default()
             }),
         };
@@ -514,6 +580,8 @@ mod tests {
         assert_eq!(summary.id, 42);
         assert_eq!(summary.channel.as_deref(), Some("codex"));
         assert_eq!(summary.labels, vec!["dir:/a", "agent:codex"]);
+        assert_eq!(summary.first_message_at_ms, Some(110));
+        assert_eq!(summary.last_message_at_ms, Some(190));
     }
 
     #[test]
@@ -617,6 +685,96 @@ mod tests {
         );
     }
 
+    fn every_time_filter() -> ListThreadsRequest {
+        ListThreadsRequest {
+            user_id: Some(7),
+            limit: Some(25),
+            offset: Some(50),
+            thread_created_after_ms: Some(101),
+            thread_created_before_ms: Some(102),
+            thread_updated_after_ms: Some(103),
+            thread_updated_before_ms: Some(104),
+            first_message_after_ms: Some(105),
+            first_message_before_ms: Some(106),
+            last_message_after_ms: Some(107),
+            last_message_before_ms: Some(108),
+            labels_any: Vec::new(),
+            label_match: None,
+        }
+    }
+
+    #[test]
+    fn list_request_builders_preserve_all_eight_time_filters_together() {
+        let by_user = build_list_by_user_request(&every_time_filter(), 7);
+        let by_labels = build_list_by_labels_request(&every_time_filter(), 7, LabelMatch::All);
+        for fields in [
+            (
+                by_user.thread_created_after,
+                by_user.thread_created_before,
+                by_user.thread_updated_after,
+                by_user.thread_updated_before,
+                by_user.first_message_after,
+                by_user.first_message_before,
+                by_user.last_message_after,
+                by_user.last_message_before,
+            ),
+            (
+                by_labels.thread_created_after,
+                by_labels.thread_created_before,
+                by_labels.thread_updated_after,
+                by_labels.thread_updated_before,
+                by_labels.first_message_after,
+                by_labels.first_message_before,
+                by_labels.last_message_after,
+                by_labels.last_message_before,
+            ),
+        ] {
+            assert_eq!(
+                fields,
+                (
+                    Some(101),
+                    Some(102),
+                    Some(103),
+                    Some(104),
+                    Some(105),
+                    Some(106),
+                    Some(107),
+                    Some(108)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_thread_updated_filter_names_are_reserved_and_absent_from_workflows() {
+        let proto = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../proto/llm_memory/service/thread.proto"
+        ));
+        assert!(proto.contains(
+            "reserved \"created_after\", \"created_before\", \"updated_after\", \"updated_before\""
+        ));
+        assert!(!proto.contains("optional int64 updated_after"));
+        assert!(!proto.contains("optional int64 updated_before"));
+        for workflow in [
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../workers/workflows/thread-summary/thread-summary-batch.yaml"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../workers/workflows/personality/thread-personality-batch.yaml"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../workers/workflows/thread-reflection/thread-reflection-batch.yaml"
+            )),
+        ] {
+            assert!(!workflow.contains("updated_after:"));
+            assert!(!workflow.contains("updated_before:"));
+        }
+    }
+
     #[test]
     fn find_co_occurring_labels_request_deserializes_labels_array() {
         let req: FindCoOccurringLabelsRequest =
@@ -631,17 +789,18 @@ mod tests {
             user_id: Some(7),
             limit: Some(25),
             offset: Some(50),
-            created_after_ms: Some(100),
-            created_before_ms: Some(200),
+            thread_created_after_ms: Some(100),
+            thread_created_before_ms: Some(200),
+            ..Default::default()
         });
 
         assert_eq!(request.user_id, Some(7));
         assert_eq!(request.limit, Some(25));
         assert_eq!(request.offset, Some(50));
-        assert_eq!(request.created_after, Some(100));
-        assert_eq!(request.created_before, Some(200));
-        assert_eq!(request.updated_after, None);
-        assert_eq!(request.updated_before, None);
+        assert_eq!(request.thread_created_after, Some(100));
+        assert_eq!(request.thread_created_before, Some(200));
+        assert_eq!(request.thread_updated_after, None);
+        assert_eq!(request.thread_updated_before, None);
         assert_eq!(request.memory_kinds, vec![RAW_MEMORY_KIND]);
     }
 
@@ -652,18 +811,19 @@ mod tests {
             labels: vec!["alpha".to_string(), "beta".to_string()],
             limit: Some(25),
             offset: Some(50),
-            created_after_ms: Some(100),
-            created_before_ms: Some(200),
+            thread_created_after_ms: Some(100),
+            thread_created_before_ms: Some(200),
+            ..Default::default()
         });
 
         assert_eq!(request.labels, vec!["alpha", "beta"]);
         assert_eq!(request.user_id, Some(7));
         assert_eq!(request.limit, Some(25));
         assert_eq!(request.offset, Some(50));
-        assert_eq!(request.created_after, Some(100));
-        assert_eq!(request.created_before, Some(200));
-        assert_eq!(request.updated_after, None);
-        assert_eq!(request.updated_before, None);
+        assert_eq!(request.thread_created_after, Some(100));
+        assert_eq!(request.thread_created_before, Some(200));
+        assert_eq!(request.thread_updated_after, None);
+        assert_eq!(request.thread_updated_before, None);
         assert_eq!(request.memory_kinds, vec![RAW_MEMORY_KIND]);
     }
 

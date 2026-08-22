@@ -53,29 +53,38 @@ once_cell = { workspace = true }
 parking_lot = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = "0.10"
 url = { workspace = true }
 which = { workspace = true }
 dotenvy = { workspace = true }
 rusqlite = { workspace = true }
+fs2 = { workspace = true }
+open = { workspace = true }
 sha2 = "0.10"
+unicode-normalization = "0.1"
+# Use the tokenizer shipped beside the selected GGUF in the Hugging Face
+# cache when sizing chat requests.  The worker itself uses that tokenizer.
+# `default-features = false` omits tokenizers' default `onig` regex backend.
+# Keep the dependency free of a native Oniguruma build while enabling the
+# required pure-Rust backend used when loading tokenizer JSON files.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 # keyring backend is platform-specific (see [target.*] sections below): macOS
 # uses the native Keychain; Linux uses the Secret Service over D-Bus. The
 # `keyring::Entry` API is identical across backends so no code path branches.
 
 # Phase C-2.6: direct jobworkerp client instead of subprocess CLI calls.
-# Pinned to a git `rev` (NOT a `path` into the sibling memories checkout — that
-# repo isn't guaranteed to exist next to this one on every clone). The rev is
-# the same commit the local submodule tracked; it carries the `Load` RPC and
-# `register_workers_from_yaml_str` the hot-reload path needs. Cargo fetches the
-# crate's nested `protobuf` submodule automatically. `opentelemetry` satisfies
-# method signatures (Option<&opentelemetry::Context>); we only ever pass None.
-# `prost-reflect` decodes streamed proto bytes for human-readable progress.
+# The client carries the `u64` job-timeout conversion required by long-running
+# summary workflows. Cargo fetches the crate's nested `protobuf` submodule
+# automatically. `opentelemetry` satisfies method signatures
+# (Option<&opentelemetry::Context>); we only ever pass None. `prost-reflect`
+# decodes streamed proto bytes for human-readable progress.
 jobworkerp-client = { git = "https://github.com/jobworkerp-rs/jobworkerp-client-rs", branch = "main" }
 opentelemetry = "0.32"
 prost-reflect = { version = "0.16", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+command-utils = { git = "https://github.com/sutr-app/command-utils.git", branch = "main" }
 
 # Default to "custom-protocol" feature for production
 [features]

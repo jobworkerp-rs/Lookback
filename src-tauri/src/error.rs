@@ -27,16 +27,23 @@ pub enum AppError {
     )]
     AnotherInstanceRunning,
 
+    #[error("database migration failed during {phase}: {reason} (backup: {backup_path})")]
+    DatabaseMigrationFailed {
+        phase: String,
+        reason: String,
+        backup_path: String,
+    },
+
     #[error(
-        "memory_kind migration is required for {db_path}; run the bundled migrate-memory-kind client-apply procedure before starting Lookback"
+        "memory_kind migration is required for {db_path}; migrate with Lookback v0.0.7 before restarting"
     )]
     MemoryKindMigrationRequired { db_path: String },
 
-    #[error("memory_kind migration refused unexpected data at {db_path}: {reason}")]
-    UnexpectedMemoryData { db_path: String, reason: String },
-
     #[error("memory_kind database schema is invalid at {db_path}: {reason}")]
     MemoryKindDatabaseSchemaInvalid { db_path: String, reason: String },
+
+    #[error("memory_kind database check failed at {db_path}: {reason}")]
+    MemoryKindDatabaseCheckFailed { db_path: String, reason: String },
 
     #[error("gRPC error: {0}")]
     Grpc(#[from] tonic::Status),

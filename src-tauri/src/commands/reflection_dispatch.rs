@@ -24,7 +24,7 @@ use super::import::{
 };
 use super::{
     AppState, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner, emit_event,
-    emit_generated_refresh, thread_reflection_single_completed,
+    emit_generated_refresh, generated_refresh_scopes_from_position,
 };
 
 // `pub(crate)` so the Settings queue card (`background_jobs.rs`) can
@@ -37,7 +37,7 @@ pub struct EnqueueReflectionJobRequest {
     pub user_id: Option<i64>,
     /// Optional epoch-ms lower bound. Unset = all threads for the user
     /// (subject to single-workflow eligibility checks).
-    pub updated_after_ms: Option<i64>,
+    pub last_message_after_ms: Option<i64>,
     pub prompt_version: Option<String>,
     /// Cancel-key. The frontend generates a UUID and the Stop button
     /// forwards it to `reflection_cancel`.
@@ -88,7 +88,7 @@ pub async fn enqueue_reflection_job(
         req.prompt_version
             .as_deref()
             .unwrap_or(REFLECTION_PROMPT_VERSION),
-        req.updated_after_ms,
+        req.last_message_after_ms,
         llm_worker_name,
     );
 
@@ -101,6 +101,11 @@ pub async fn enqueue_reflection_job(
         .unwrap_or_else(|| format!("reflection-{}", chrono::Utc::now().timestamp_millis()));
     let job_id_ret = job_id.clone();
 
+    let maintenance_registered = super::begin_search_index_write(
+        &state,
+        &[crate::search_index_maintenance::MaintenanceTable::Thread],
+    )
+    .await?;
     let entry = state.dispatch_register(&job_id).await;
     let cancel = entry.token.clone();
     let current_job_id = entry.current_job_id.clone();
@@ -116,6 +121,7 @@ pub async fn enqueue_reflection_job(
             REFLECTION_WORKER_NAME,
             args,
             Some("run"),
+            None,
             cancel.clone(),
             move |jid| async move {
                 *park_job_id.lock().await = Some(jid);
@@ -124,13 +130,11 @@ pub async fn enqueue_reflection_job(
                 let (status, message) = match ev {
                     StreamEvent::Active(msg) => {
                         let digest = msg.map(|raw| {
-                            if thread_reflection_single_completed(raw) {
-                                emit_generated_refresh(
-                                    &app_for_emit,
-                                    &job_id_for_emit,
-                                    vec![GeneratedRefreshScope::Reflection],
-                                );
-                            }
+                            emit_generated_refresh(
+                                &app_for_emit,
+                                &job_id_for_emit,
+                                generated_refresh_scopes_from_position(raw),
+                            );
                             let (d, p) = summarize_workflow_chunk(raw, last_progress);
                             last_progress = p;
                             d
@@ -147,6 +151,11 @@ pub async fn enqueue_reflection_job(
                         (StepStatus::Done, digest)
                     }
                     StreamEvent::Failed(msg) => {
+                        emit_generated_refresh(
+                            &app_for_emit,
+                            &job_id_for_emit,
+                            vec![GeneratedRefreshScope::Reflection],
+                        );
                         let text = if cancel_for_emit.is_cancelled() {
                             "中断".to_string()
                         } else {
@@ -170,6 +179,11 @@ pub async fn enqueue_reflection_job(
         *current_job_id.lock().await = None;
         if let Some(state) = app.try_state::<AppState>() {
             state.dispatch_take(&job_id).await;
+            if let Err(error) =
+                super::finish_search_index_write(&state, maintenance_registered).await
+            {
+                tracing::warn!(%error, "reflection terminal maintenance reconcile failed");
+            }
         }
     });
 
@@ -202,7 +216,7 @@ fn build_workflow_input(
     callback: &MemoriesCallback,
     output_language: &str,
     prompt_version: &str,
-    updated_after_ms: Option<i64>,
+    last_message_after_ms: Option<i64>,
     llm_worker_name: &str,
 ) -> serde_json::Value {
     let mut value = serde_json::json!({
@@ -214,8 +228,8 @@ fn build_workflow_input(
         "prompt_version": prompt_version,
         "llm_worker_name": llm_worker_name,
     });
-    if let Some(ts) = updated_after_ms {
-        value["updated_after_ms"] = serde_json::Value::from(ts);
+    if let Some(ts) = last_message_after_ms {
+        value["last_message_after_ms"] = serde_json::Value::from(ts);
     }
     value
 }
@@ -271,11 +285,11 @@ mod tests {
         assert_eq!(v["output_language"], "ja");
         assert_eq!(v["prompt_version"], "v1");
         assert_eq!(v["llm_worker_name"], "memories-llm");
-        assert!(v.get("updated_after_ms").is_none());
+        assert!(v.get("last_message_after_ms").is_none());
     }
 
     #[test]
-    fn workflow_input_carries_updated_after_when_set() {
+    fn workflow_input_carries_last_message_after_when_set() {
         let v = build_workflow_input(
             42,
             &dummy_callback(),
@@ -286,7 +300,7 @@ mod tests {
         );
         assert_eq!(v["user_id"], 42);
         assert_eq!(v["prompt_version"], "v2");
-        assert_eq!(v["updated_after_ms"], 1_700_000_000_000_i64);
+        assert_eq!(v["last_message_after_ms"], 1_700_000_000_000_i64);
     }
 
     #[test]
@@ -311,7 +325,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(input_str).unwrap();
         assert_eq!(parsed, input);
         assert_eq!(parsed["user_id"], 7);
-        assert_eq!(parsed["updated_after_ms"], 1_700_000_000_000_i64);
+        assert_eq!(parsed["last_message_after_ms"], 1_700_000_000_000_i64);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 # Node
 node_modules/
+.pnpm-store/
 dist/
 .vite/
 
@@ -17,6 +18,8 @@ src-tauri/sidecar-bin/
 # See README for the build/copy procedure. Not committed.
 src-tauri/bin/
 src-tauri/plugins/
+src-tauri/migration-bundle/*
+!src-tauri/migration-bundle/.gitkeep
 
 # Local data / logs
 log/
@@ -49,7 +52,7 @@ log/
 /dict/lindera/
 /dict
 /ops/*
-
+/.serena/
 
 /specs
 

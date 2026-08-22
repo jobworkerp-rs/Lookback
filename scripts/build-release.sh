@@ -349,7 +349,6 @@ main() {
   run mkdir -p "${WORKDIR}"
   build_all
   stage_binaries
-  stage_memory_kind_toolkit
   stage_plugins
   sign_macos_plugins
   stage_lindera "${LINDERA}"

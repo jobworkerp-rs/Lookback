@@ -1,19 +1,17 @@
-import { open } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-shell";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  migrateMemoryKind,
   openLogDir,
-  openMemoryKindMigrationGuide,
-  previewMemoryKindMigration,
   quitApp,
   recoverEvacuateLancedb,
   recoverPurgeLancedb,
   recoverResetEmbeddingSettings,
-  startFreshSetup,
+  restoreDatabaseMigrationBackup,
+  retryDatabaseMigration,
 } from "@/api";
 import type {
-  MemoryKindMigrationPreview,
+  DatabaseRestoreResult,
   RecoveryResult,
   SidecarErrorPayload,
   StartupFailure,
@@ -28,11 +26,14 @@ type ActionId =
   | "evacuate"
   | "purge"
   | "reset_embedding"
-  | "migrate_memory_kind"
+  | "retry_migration"
+  | "restore_migration"
+  | "open_migration_release"
   | "open_log"
-  | "open_migration_guide"
-  | "start_fresh_setup"
   | "quit";
+
+export const MEMORY_KIND_MIGRATION_RELEASE_URL =
+  "https://github.com/jobworkerp-rs/Lookback/releases/tag/v0.0.7";
 
 /** Long-running recovery: invokes a Rust command that stops + restarts
  * the sidecar. `pendingLabelKey` is mandatory because the restart can take
@@ -50,7 +51,15 @@ interface RecoveryRestartAction {
   intent?: "primary" | "danger";
   pendingLabelKey: string;
   run: () => Promise<RecoveryResult>;
-  manualFallbackAction?: RecoveryEscapeAction;
+}
+
+interface DatabaseRestoreAction {
+  kind: "restore";
+  id: "restore_migration";
+  labelKey: string;
+  intent: "danger";
+  pendingLabelKey: string;
+  run: () => Promise<DatabaseRestoreResult>;
 }
 
 /** Escape-hatch action that returns near-instantly (open Finder, exit
@@ -63,7 +72,7 @@ interface RecoveryEscapeAction {
   run: () => Promise<void>;
 }
 
-type RecoveryAction = RecoveryRestartAction | RecoveryEscapeAction;
+type RecoveryAction = RecoveryRestartAction | DatabaseRestoreAction | RecoveryEscapeAction;
 
 const evacuateAction: RecoveryRestartAction = {
   kind: "restart",
@@ -88,39 +97,26 @@ const resetEmbeddingAction: RecoveryRestartAction = {
   pendingLabelKey: "bootError.action.resetEmbedding.pending",
   run: recoverResetEmbeddingSettings,
 };
+const retryMigrationAction: RecoveryRestartAction = {
+  kind: "restart",
+  id: "retry_migration",
+  labelKey: "bootError.action.retryMigration.label",
+  intent: "primary",
+  pendingLabelKey: "bootError.action.retryMigration.pending",
+  run: retryDatabaseMigration,
+};
 const openLogAction: RecoveryEscapeAction = {
   kind: "escape",
   id: "open_log",
   labelKey: "bootError.action.openLog.label",
   run: openLogDir,
 };
-const openMemoryKindMigrationGuideAction: RecoveryEscapeAction = {
+const openMemoryKindMigrationReleaseAction: RecoveryEscapeAction = {
   kind: "escape",
-  id: "open_migration_guide",
-  labelKey: "bootError.action.openMemoryKindMigrationGuide.label",
+  id: "open_migration_release",
+  labelKey: "bootError.action.openMemoryKindMigrationRelease.label",
   intent: "primary",
-  run: openMemoryKindMigrationGuide,
-};
-const migrateMemoryKindAction: RecoveryRestartAction = {
-  kind: "restart",
-  id: "migrate_memory_kind",
-  labelKey: "bootError.action.migrateMemoryKind.label",
-  intent: "primary",
-  pendingLabelKey: "bootError.action.migrateMemoryKind.pending",
-  run: async () => {
-    throw new Error("memory-kind migration requires a preview approval");
-  },
-  manualFallbackAction: openMemoryKindMigrationGuideAction,
-};
-const startFreshSetupAction: RecoveryEscapeAction = {
-  kind: "escape",
-  id: "start_fresh_setup",
-  labelKey: "bootError.action.startFreshSetup.label",
-  intent: "primary",
-  run: async () => {
-    const selected = await open({ directory: true, multiple: false });
-    if (typeof selected === "string") await startFreshSetup(selected);
-  },
+  run: () => open(MEMORY_KIND_MIGRATION_RELEASE_URL),
 };
 const quitAction: RecoveryEscapeAction = {
   kind: "escape",
@@ -217,8 +213,58 @@ export const RECOVERY_TABLE: RecoveryTable = {
  */
 export function BootError({ failure }: { failure: SidecarErrorPayload }) {
   const { t } = useTranslation();
+  if (failure.kind === "database_migration_failed") {
+    const restoreInProgress = failure.phase === "restore pending recovery";
+    const restoreMigrationAction: DatabaseRestoreAction = {
+      kind: "restore",
+      id: "restore_migration",
+      labelKey: "bootError.action.restoreMigration.label",
+      intent: "danger",
+      pendingLabelKey: "bootError.action.restoreMigration.pending",
+      run: () => restoreDatabaseMigrationBackup(failure.backup_path),
+    };
+    return (
+      <BootErrorShell
+        title={t("bootError.databaseMigrationFailed.title")}
+        body={
+          <pre className="boot-error-message">
+            {t("bootError.databaseMigrationFailed.body", failure)}
+          </pre>
+        }
+        actions={[
+          ...(!restoreInProgress ? [retryMigrationAction] : []),
+          ...(failure.backup_path ? [restoreMigrationAction] : []),
+          openLogAction,
+          quitAction,
+        ]}
+      />
+    );
+  }
   if (failure.kind === "memory_kind_migration_required") {
-    return <MemoryKindMigrationBootError failure={failure} />;
+    return (
+      <BootErrorShell
+        title={t("bootError.memoryKindMigrationRequired.title")}
+        body={
+          <pre className="boot-error-message">
+            {t("bootError.memoryKindMigrationRequired.body", failure)}
+          </pre>
+        }
+        actions={[openMemoryKindMigrationReleaseAction, openLogAction, quitAction]}
+      />
+    );
+  }
+  if (failure.kind === "memory_kind_database_check_failed") {
+    return (
+      <BootErrorShell
+        title={t("bootError.memoryKindDatabaseCheckFailed.title")}
+        body={
+          <pre className="boot-error-message">
+            {t("bootError.memoryKindDatabaseCheckFailed.body", failure)}
+          </pre>
+        }
+        actions={[openLogAction, quitAction]}
+      />
+    );
   }
   if (failure.kind === "memory_kind_database_schema_invalid") {
     return (
@@ -230,19 +276,6 @@ export function BootError({ failure }: { failure: SidecarErrorPayload }) {
           </pre>
         }
         actions={[openLogAction, quitAction]}
-      />
-    );
-  }
-  if (failure.kind === "unexpected_memory_data") {
-    return (
-      <BootErrorShell
-        title={t("bootError.unexpectedMemoryData.title")}
-        body={
-          <pre className="boot-error-message">
-            {t("bootError.unexpectedMemoryData.body", failure)}
-          </pre>
-        }
-        actions={[startFreshSetupAction, openLogAction, quitAction]}
       />
     );
   }
@@ -258,82 +291,6 @@ export function BootError({ failure }: { failure: SidecarErrorPayload }) {
     );
   }
   return <StructuredBootError failure={failure.failure} />;
-}
-
-function MemoryKindMigrationBootError({
-  failure,
-}: {
-  failure: Extract<SidecarErrorPayload, { kind: "memory_kind_migration_required" }>;
-}) {
-  const { t } = useTranslation();
-  const [preview, setPreview] = useState<MemoryKindMigrationPreview | null>(null);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const previewAction: RecoveryEscapeAction = {
-    kind: "escape",
-    id: "migrate_memory_kind",
-    labelKey: "bootError.action.migrateMemoryKind.label",
-    intent: "primary",
-    run: async () => {
-      setPreviewError(null);
-      try {
-        setPreview(await previewMemoryKindMigration());
-      } catch (error) {
-        setPreviewError(error instanceof Error ? error.message : String(error));
-      }
-    },
-  };
-  const runApprovedMigration = () => {
-    if (!preview) {
-      return Promise.reject(new Error("memory-kind migration requires a preview approval"));
-    }
-    return migrateMemoryKind(preview);
-  };
-  const approvedMigrationAction: RecoveryRestartAction = {
-    ...migrateMemoryKindAction,
-    labelKey: preview?.requiresConfirmation
-      ? "bootError.preview.confirm"
-      : migrateMemoryKindAction.labelKey,
-    run: runApprovedMigration,
-  };
-  return (
-    <BootErrorShell
-      title={t(preview ? "bootError.preview.title" : "bootError.memoryKindMigrationRequired.title")}
-      body={
-        preview ? (
-          <>
-            <p>{t("bootError.preview.body", { ...preview })}</p>
-            {Object.keys(preview.relatedDeletionCounts).length > 0 && (
-              <ul>
-                {Object.entries(preview.relatedDeletionCounts).map(([table, count]) => (
-                  <li key={table}>{t("bootError.preview.related", { table, count })}</li>
-                ))}
-              </ul>
-            )}
-            <button className="btn" type="button" onClick={() => setPreview(null)}>
-              {t("bootError.preview.cancel")}
-            </button>
-          </>
-        ) : (
-          <>
-            <pre className="boot-error-message">
-              {t("bootError.memoryKindMigrationRequired.body", failure)}
-            </pre>
-            {previewError && <div className="boot-error-restart">{previewError}</div>}
-          </>
-        )
-      }
-      actions={
-        preview
-          ? [approvedMigrationAction, openLogAction, quitAction]
-          : [
-              previewAction,
-              ...(previewError ? [openMemoryKindMigrationGuideAction] : []),
-              openLogAction,
-              quitAction,
-            ]
-      }
-    />
-  );
 }
 
 /** Per-variant lookup helper. Extracted so we can name the generic
@@ -377,12 +334,14 @@ function BootErrorShell({
   // silently become the same action.
   const [pendingId, setPendingId] = useState<ActionId | null>(null);
   const [restartError, setRestartError] = useState<string | null>(null);
-  const [manualFallbackFor, setManualFallbackFor] = useState<ActionId | null>(null);
+  const [restoreSucceeded, setRestoreSucceeded] = useState(false);
 
   const onClick = async (action: RecoveryAction) => {
     setPendingId(action.id);
     setRestartError(null);
-    setManualFallbackFor(null);
+    if (action.id === "retry_migration") {
+      setRestoreSucceeded(false);
+    }
     try {
       if (action.kind === "restart") {
         // The restart commands return a structured `RecoveryResult`; if
@@ -392,25 +351,23 @@ function BootErrorShell({
         if (!result.restarted) {
           setRestartError(result.restartError ?? t("bootError.restartFailedFallback"));
         }
+      } else if (action.kind === "restore") {
+        const result = await action.run();
+        if (result.state !== "safeStopped") {
+          throw new Error(`unexpected database restore state: ${String(result.state)}`);
+        }
+        setRestoreSucceeded(true);
       } else {
         await action.run();
       }
     } catch (e) {
       setRestartError(e instanceof Error ? e.message : String(e));
-      if (action.kind === "restart" && action.manualFallbackAction) {
-        setManualFallbackFor(action.id);
-      }
     } finally {
       setPendingId(null);
     }
   };
 
   const pendingAction = pendingId ? (actions.find((a) => a.id === pendingId) ?? null) : null;
-  const visibleActions = actions.flatMap((action) =>
-    action.kind === "restart" && manualFallbackFor === action.id && action.manualFallbackAction
-      ? [action, action.manualFallbackAction]
-      : [action],
-  );
 
   return (
     <div className="boot-error">
@@ -421,14 +378,19 @@ function BootErrorShell({
           {t("bootError.restartFailed", { message: restartError })}
         </div>
       )}
-      {pendingAction?.kind === "restart" && (
+      {restoreSucceeded && (
+        <div className="boot-error-restore-success" role="status">
+          {t("bootError.databaseRestoreSucceeded")}
+        </div>
+      )}
+      {pendingAction && pendingAction.kind !== "escape" && (
         <div className="boot-error-progress" role="status" aria-live="polite">
           <span className="saving-spinner" aria-hidden="true" />
           <span>{t(pendingAction.pendingLabelKey)}</span>
         </div>
       )}
       <div className="boot-error-actions">
-        {visibleActions.map((action) => {
+        {actions.map((action) => {
           const isPending = pendingId === action.id;
           return (
             <button
@@ -438,7 +400,7 @@ function BootErrorShell({
               // Disable every button while one is in flight to prevent
               // a second click (e.g. evacuate + purge) from racing the
               // first command's restart.
-              disabled={pendingId !== null}
+              disabled={pendingId !== null || (restoreSucceeded && action.kind === "restore")}
               onClick={() => {
                 void onClick(action);
               }}

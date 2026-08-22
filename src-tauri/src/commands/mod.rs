@@ -21,6 +21,7 @@ pub mod recovery;
 pub mod reflection_dispatch;
 pub mod reflections;
 pub mod search;
+pub mod search_index_maintenance;
 pub mod settings;
 pub mod setup;
 pub mod summaries;
@@ -179,20 +180,30 @@ pub(super) fn emit_generated_refresh(
     );
 }
 
-pub(super) fn thread_summary_single_completed(raw: &str) -> bool {
+/// Return the generated data scopes persisted by a workflow progress chunk.
+///
+/// A `position` is the stable workflow-engine breadcrumb emitted after each
+/// YAML step. Keeping the mapping here gives every streaming dispatch the
+/// same immediate-refresh behavior while terminal refreshes remain a safety
+/// net for chunks that are not observed by the client.
+pub(super) fn generated_refresh_scopes_from_position(raw: &str) -> Vec<GeneratedRefreshScope> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return false;
+        return Vec::new();
     };
     let position = v.get("position").and_then(|p| p.as_str()).unwrap_or("");
-    position.contains("summarizeEach") && position.contains("recordSuccess")
-}
-
-pub(super) fn thread_reflection_single_completed(raw: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return false;
-    };
-    let position = v.get("position").and_then(|p| p.as_str()).unwrap_or("");
-    position.contains("reflectEach") && position.contains("recordSuccess")
+    let has_step = |step| position.split('/').any(|segment| segment == step);
+    if has_step("summarizeEach") && (has_step("recordGenerated") || has_step("recordSuccess")) {
+        vec![GeneratedRefreshScope::ThreadSummary]
+    } else if has_step("reflectEach") && has_step("recordSuccess") {
+        vec![GeneratedRefreshScope::Reflection]
+    } else if (has_step("personalityEach") && has_step("recordSignalOutcome"))
+        || has_step("updateProfile")
+        || has_step("addProfileMemory")
+    {
+        vec![GeneratedRefreshScope::Personality]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Status of a single step in a streaming dispatch (import pipeline,
@@ -213,6 +224,25 @@ pub enum StepStatus {
     Failed,
 }
 
+/// The terminal state and optional detail for a dispatch step.
+///
+/// Classifiers remain with their respective workflows because their terminal
+/// contracts differ, while event consumers share this stable payload shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StepOutcome {
+    pub status: StepStatus,
+    pub message: Option<String>,
+}
+
+/// Coerce a JSON integer or a trimmed integer string to `i64`.
+///
+/// Workflow engines can serialize jq-produced counters in either form.
+pub(super) fn json_as_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+}
+
 /// Tauri-managed state container. Held inside `AppHandle::state()`.
 ///
 /// The gRPC clients are cached behind `Mutex<Option<..>>` (not `OnceCell`)
@@ -225,6 +255,13 @@ pub struct AppState {
     pub data: DataPaths,
     memories_channel: Mutex<Option<Channel>>,
     jobworkerp: Mutex<Option<crate::jobworkerp::JobworkerpHandle>>,
+    /// Local-only LanceDB maintenance admission and persistent state.
+    pub search_index_maintenance:
+        crate::search_index_maintenance::SharedSearchIndexMaintenanceCoordinator,
+    /// Serializes restore and retry commands within this process. The
+    /// instance lock only excludes other processes and cannot protect the
+    /// shared migration staging path from concurrent Tauri invocations.
+    pub database_migration_recovery: Mutex<()>,
     /// In-flight long-running dispatches keyed by the UI-side dispatch id.
     /// Shared by the RAG chat agent loop (`chat://step`), the import
     /// pipeline (`import://step`), and the analysis-tab dispatches
@@ -278,9 +315,15 @@ impl AppState {
     pub fn new(sidecars: Arc<Sidecars>, data: DataPaths) -> Self {
         Self {
             sidecars,
-            data,
+            data: data.clone(),
             memories_channel: Mutex::new(None),
             jobworkerp: Mutex::new(None),
+            search_index_maintenance: Arc::new(
+                crate::search_index_maintenance::SearchIndexMaintenanceCoordinator::new(
+                    data.clone(),
+                ),
+            ),
+            database_migration_recovery: Mutex::new(()),
             dispatch_in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -298,16 +341,21 @@ impl AppState {
     /// import / reflection-dispatch commands so they target the same endpoints
     /// (incl. the workflow callback host/port/tls) as the browse-only clients.
     pub(super) fn resolve_targets(&self) -> AppResult<connection::ResolvedTargets> {
+        Ok(self.resolve_connection()?.targets)
+    }
+
+    /// Resolve mode and URLs from the same persisted configuration snapshot.
+    pub(super) fn resolve_connection(&self) -> AppResult<connection::ResolvedConnection> {
         let cfg = connection::load_connection_config(&self.data.connection_config_path());
         let local = self.sidecars.current_endpoints();
-        connection::resolve_targets(&cfg, local.as_ref())
+        connection::resolve_connection(&cfg, local.as_ref())
     }
 
     /// The active connection mode (local live sidecars / remote configured
     /// URLs). Read on every call, same read-on-dispatch pattern as
     /// `resolve_targets()`, so a `set_connection_config` takes effect on the
     /// next command without a restart.
-    pub(super) fn connection_mode(&self) -> connection::ConnectionMode {
+    pub(crate) fn connection_mode(&self) -> connection::ConnectionMode {
         connection::load_connection_config(&self.data.connection_config_path()).mode
     }
 
@@ -378,7 +426,7 @@ impl AppState {
     /// memories sidecar. Tonic channels multiplex via HTTP/2 so all command
     /// handlers can share one. The `Mutex` serializes the connect so a burst
     /// of commands on startup opens exactly one channel.
-    pub async fn memories_channel(&self) -> AppResult<Channel> {
+    pub(crate) async fn memories_channel(&self) -> AppResult<Channel> {
         let target = self.resolve_targets()?;
         let mut guard = self.memories_channel.lock().await;
         if let Some(ch) = guard.as_ref() {
@@ -472,6 +520,30 @@ impl AppState {
     }
 }
 
+/// Register a direct memories mutation before it is sent.  Workflow dispatches
+/// use the same pair around their complete logical group.
+pub(super) async fn begin_search_index_write(
+    state: &AppState,
+    tables: &[crate::search_index_maintenance::MaintenanceTable],
+) -> AppResult<bool> {
+    if state.connection_mode() != connection::ConnectionMode::Local {
+        return Ok(false);
+    }
+    state.search_index_maintenance.begin_write(tables).await?;
+    Ok(true)
+}
+
+pub(super) async fn finish_search_index_write(state: &AppState, registered: bool) -> AppResult<()> {
+    if registered {
+        state.search_index_maintenance.finish_write().await?;
+        // The terminal edge does not wait for the hourly recovery cadence.
+        // A failed RPC intentionally leaves `reconcile_pending` durable.
+        let channel = state.memories_channel().await?;
+        state.search_index_maintenance.reconcile(channel).await?;
+    }
+    Ok(())
+}
+
 /// Cancel an in-flight dispatch keyed by `dispatch_id`. Shared by
 /// `chat_cancel`, `import_cancel`, and `analysis_cancel` — the only
 /// per-domain differences (UI event names, terminal messages) live in
@@ -534,12 +606,114 @@ mod tests {
         assert_eq!(resolve_output_language(Some(" en "), None), "en");
     }
 
+    #[test]
+    fn generated_refresh_scopes_detect_all_persisted_output_steps() {
+        let cases = [
+            (
+                "/ROOT/do/4/summarizeEach/for/do/1/recordGenerated",
+                GeneratedRefreshScope::ThreadSummary,
+            ),
+            (
+                "/ROOT/do/4/summarizeEach/for/do/1/recordSuccess",
+                GeneratedRefreshScope::ThreadSummary,
+            ),
+            (
+                "/ROOT/do/3/reflectEach/for/do/1/recordSuccess",
+                GeneratedRefreshScope::Reflection,
+            ),
+            (
+                "/ROOT/do/7/personalityEach/for/do/1/recordSignalOutcome",
+                GeneratedRefreshScope::Personality,
+            ),
+            (
+                "/ROOT/do/8/updateProfile",
+                GeneratedRefreshScope::Personality,
+            ),
+            (
+                "/ROOT/do/8/addProfileMemory",
+                GeneratedRefreshScope::Personality,
+            ),
+        ];
+
+        for (position, expected) in cases {
+            let chunk = serde_json::json!({ "position": position }).to_string();
+            assert_eq!(
+                generated_refresh_scopes_from_position(&chunk),
+                vec![expected]
+            );
+        }
+    }
+
+    #[test]
+    fn generated_refresh_scopes_ignore_non_persisted_or_invalid_chunks() {
+        let chunk = serde_json::json!({
+            "status": "Running",
+            "position": "/ROOT/do/4/summarizeEach/for/do/0/reportProgress",
+            "output": "{}"
+        })
+        .to_string();
+
+        assert!(generated_refresh_scopes_from_position(&chunk).is_empty());
+        assert!(generated_refresh_scopes_from_position("not json").is_empty());
+        assert!(
+            generated_refresh_scopes_from_position(r#"{"position":"/ROOT/do/1/unrelated"}"#)
+                .is_empty()
+        );
+        assert!(
+            generated_refresh_scopes_from_position(
+                r#"{"position":"/ROOT/do/1/not-recordSuccess/summarizeEachElse"}"#
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn generation_workflows_keep_the_refresh_completion_steps() {
+        for (workflow, completion_step) in [
+            (
+                include_str!("../../../workers/workflows/thread-summary/thread-summary-batch.yaml"),
+                "- recordGenerated:",
+            ),
+            (
+                include_str!(
+                    "../../../workers/workflows/thread-reflection/thread-reflection-batch.yaml"
+                ),
+                "- recordSuccess:",
+            ),
+            (
+                include_str!(
+                    "../../../workers/workflows/personality/thread-personality-batch.yaml"
+                ),
+                "- recordSignalOutcome:",
+            ),
+            (
+                include_str!(
+                    "../../../workers/lang-workers/workers/personality/user-personality-merge.yaml"
+                ),
+                "- updateProfile:",
+            ),
+            (
+                include_str!(
+                    "../../../workers/lang-workers/workers/personality/user-personality-merge.yaml"
+                ),
+                "- addProfileMemory:",
+            ),
+        ] {
+            assert!(
+                workflow.contains(completion_step),
+                "missing {completion_step}"
+            );
+        }
+    }
+
     fn dummy_state() -> AppState {
         let data = DataPaths::with_root("/tmp/lookback-appstate-test");
         let lance_home = data.lance_language_model_home();
         let sidecars = Arc::new(Sidecars::new(SidecarConfig {
             jobworkerp_bin: std::path::PathBuf::from("/bin/true"),
             memories_bin: std::path::PathBuf::from("/bin/true"),
+            memories_db_migrate_bin: std::path::PathBuf::from("/bin/true"),
+            startup_database_migration_enabled: false,
             conductor_bin: std::path::PathBuf::from("/bin/true"),
             data: data.clone(),
             worker_yaml_paths: Vec::new(),
@@ -567,6 +741,8 @@ mod tests {
         let sidecars = Arc::new(Sidecars::new(SidecarConfig {
             jobworkerp_bin: std::path::PathBuf::from("/bin/true"),
             memories_bin: std::path::PathBuf::from("/bin/true"),
+            memories_db_migrate_bin: std::path::PathBuf::from("/bin/true"),
+            startup_database_migration_enabled: false,
             conductor_bin: std::path::PathBuf::from("/bin/true"),
             data: data.clone(),
             worker_yaml_paths: Vec::new(),

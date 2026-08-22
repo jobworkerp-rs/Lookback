@@ -354,8 +354,8 @@ do:
   #
   # Split into three steps because jaq evaluates keys in a single
   # `set` block in parallel — sibling keys cannot reference one
-  # another. Same constraint as `resolvePersonalityWiring` in
-  # agent-chat-pipeline.yaml.
+  # another. The other multi-step workflows in this bundle have the same
+  # constraint.
   - capSignals:
       set:
         capped_signals: >-

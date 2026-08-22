@@ -47,12 +47,14 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsSnapshot> {
 /// Lets the frontend fetch status on mount instead of racing the
 /// one-shot `sidecar://ready` / `sidecar://error` events — a listener
 /// that mounted *after* either event already fired would otherwise stay
-/// stuck on the boot spinner forever. Both fields are `None` while a
-/// fresh start is still in flight.
+/// stuck on the boot spinner forever. Both lifecycle fields are `None` while
+/// a fresh start is still in flight; `database_migration_in_progress` then
+/// identifies the local migration-gate portion of that start.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SidecarStatusSnapshot {
     pub ready: Option<SidecarStartReport>,
     pub failure: Option<SidecarErrorPayload>,
+    pub database_migration_in_progress: bool,
 }
 
 #[tauri::command]
@@ -60,6 +62,7 @@ pub fn get_sidecar_status(state: State<'_, AppState>) -> AppResult<SidecarStatus
     Ok(SidecarStatusSnapshot {
         ready: state.sidecars.last_report(),
         failure: state.sidecars.last_start_failure(),
+        database_migration_in_progress: state.sidecars.database_migration_in_progress(),
     })
 }
 

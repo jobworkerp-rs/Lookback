@@ -1,6 +1,7 @@
 pub mod generation_workers;
 pub mod lifecycle;
 pub mod memory_kind_gate;
+pub mod migration_gate;
 pub mod ports;
 pub mod reaper;
 pub mod startup_error;

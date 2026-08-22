@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn function_sets_yaml_defines_the_mcp_set_targeting_lookback_recall() {
+    fn function_sets_yaml_defines_the_mcp_set_with_all_read_tools() {
         // Contract guard: `MCP_FUNCTION_SET_NAME` is the function-set VALUE we
         // pass to jobworkerp via the `MCP_SET_NAME` env var. If the committed
         // function-sets.yaml ever renames or drops that set, the MCP server
@@ -545,12 +545,16 @@ mod tests {
             raw.contains(&format!("name: {MCP_FUNCTION_SET_NAME}")),
             "function-sets.yaml must define a set named {MCP_FUNCTION_SET_NAME}"
         );
-        // The lookback_recall worker must be a target somewhere in the file
-        // (both lookback-rag and lookback-mcp-rag reference it).
-        assert!(
-            raw.contains("name: lookback_recall"),
-            "function-sets.yaml must target the lookback_recall worker"
-        );
+        for worker in [
+            "lookback_recall",
+            "lookback_get_context",
+            "lookback_get_reflections",
+        ] {
+            assert!(
+                raw.contains(&format!("name: {worker}")),
+                "function-sets.yaml must target the {worker} worker"
+            );
+        }
     }
 
     #[test]

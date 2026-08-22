@@ -130,6 +130,21 @@ describe("useStepStreamProgress", () => {
     expect(result.current.busy).toBe(false);
   });
 
+  it.each(["done", "warning", "failed"] as const)(
+    "treats a %s event as terminal",
+    async (status) => {
+      const { result } = renderHook(() => useStepStreamProgress("summary://step"));
+      await act(async () => {});
+      act(() => result.current.start("summary-1"));
+      emit({ job_id: "summary-1", status, message: "settled" });
+      expect(result.current.progress?.status).toBe(status);
+      expect(result.current.busy).toBe(false);
+
+      emit({ job_id: "summary-2", status: "done", message: "next run" });
+      expect(result.current.progress?.job_id).toBe("summary-2");
+    },
+  );
+
   it("cancel forwards the active job id to analysisCancel", async () => {
     analysisCancelMock.mockClear();
     const { result } = renderHook(() => useStepStreamProgress("summary://step"));

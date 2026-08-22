@@ -1,8 +1,11 @@
+import { save } from "@tauri-apps/plugin-dialog";
 import type { TFunction } from "i18next";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { saveChatMarkdown } from "@/api";
 import { MarkdownBody } from "@/components/MarkdownMessage";
 import type { Route } from "@/components/Sidebar";
+import { SummarySelectionModal } from "@/components/SummarySelectionModal";
 import { type OpenThreadState, ThreadDetail } from "@/components/ThreadDetail";
 import { Toolbar } from "@/components/Toolbar";
 import type { ChatTurn, UseRagChat } from "@/hooks/useRagChat";
@@ -11,7 +14,7 @@ import { resolveThreadHighlight } from "@/lib/chatSourceNav";
 import { classifyPeriodKey } from "@/lib/summaryPeriod";
 import { synthesizeThreadSummary } from "@/lib/threadSummary";
 import type { SummariesFocus } from "@/pages/Summaries";
-import type { ChatSource } from "@/types/api";
+import type { ChatSource, RetrievalMode, SelectedMemorySnapshot } from "@/types/api";
 
 export interface ChatPageProps {
   /** Plain tab switch — used as a fallback when a period-summary pill's
@@ -31,6 +34,13 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
   const { t } = useTranslation();
   const { turns, ask, reset, cancel, busy } = rag;
   const [draft, setDraft] = useState("");
+  const [selectedMemories, setSelectedMemories] = useState<SelectedMemorySnapshot[]>([]);
+  const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>("source_details");
+  const [selectionOpen, setSelectionOpen] = useState(false);
+  const clearChat = useCallback(() => {
+    reset();
+    setSelectedMemories([]);
+  }, [reset]);
   const [openThread, setOpenThread] = useState<OpenThreadState | null>(null);
   // Bumped on every source-pill click so stale `resolveThreadHighlight`
   // resolutions can detect they're no longer the active request and
@@ -54,7 +64,7 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
     // regardless of where they'd scrolled to read prior turns.
     scrollToBottom();
     try {
-      await ask(text);
+      await ask(text, selectedMemories, selectedMemories.length > 0 ? retrievalMode : undefined);
     } catch (e) {
       // `chat_ask` rejected before the stream could start (sidecar
       // down, validation error, etc.). `useRagChat.ask` has already
@@ -65,7 +75,7 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
       setDraft(text);
       console.error("chat_ask failed", e);
     }
-  }, [draft, busy, ask, scrollToBottom]);
+  }, [draft, busy, ask, retrievalMode, scrollToBottom, selectedMemories]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -79,6 +89,20 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
     },
     [submit],
   );
+
+  const copyAnswer = useCallback(async (answer: string) => {
+    await navigator.clipboard.writeText(answer);
+  }, []);
+
+  const saveAnswer = useCallback(async (answer: string) => {
+    const path = await save({
+      defaultPath: "lookback-draft.md",
+      filters: [{ name: "Markdown", extensions: ["md"] }],
+    });
+    if (!path) return false;
+    await saveChatMarkdown(path, answer);
+    return true;
+  }, []);
 
   const onSourceClick = useCallback(
     async (source: ChatSource) => {
@@ -103,10 +127,10 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
         return;
       }
       const threadId = source.source_thread_id;
-      const memoryId = source.memory_id;
+      const memoryId = source.source_kind === "reflection" ? null : source.memory_id;
       const thread = synthesizeThreadSummary({ id: threadId });
       const myToken = ++sourceClickToken.current;
-      const highlight = await resolveThreadHighlight(threadId, memoryId);
+      const highlight = memoryId ? await resolveThreadHighlight(threadId, memoryId) : undefined;
       if (myToken !== sourceClickToken.current) {
         // A later click superseded ours while we awaited the highlight.
         return;
@@ -125,7 +149,7 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
           <button
             type="button"
             className="btn"
-            onClick={reset}
+            onClick={clearChat}
             disabled={turns.length === 0 || busy}
             title={t("chat.clearTitle")}
           >
@@ -137,7 +161,13 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
       <div className="chat-scroll" ref={containerRef}>
         {turns.length === 0 && <ChatEmptyState />}
         {turns.map((turn) => (
-          <ChatTurnCard key={turn.jobId} turn={turn} onSourceClick={onSourceClick} />
+          <ChatTurnCard
+            key={turn.jobId}
+            turn={turn}
+            onSourceClick={onSourceClick}
+            onCopy={copyAnswer}
+            onSave={saveAnswer}
+          />
         ))}
         {isPinnedAway && (
           // Inside .chat-scroll so `position: sticky` pins it to the
@@ -160,6 +190,13 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
         onCancel={cancel}
         onKeyDown={onKeyDown}
         busy={busy}
+        selectedMemories={selectedMemories}
+        retrievalMode={retrievalMode}
+        onOpenSelection={() => setSelectionOpen(true)}
+        onRetrievalModeChange={setRetrievalMode}
+        onRemoveSelected={(memoryId) =>
+          setSelectedMemories((current) => current.filter((item) => item.memory_id !== memoryId))
+        }
       />
 
       {openThread && (
@@ -169,8 +206,57 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
           onClose={() => setOpenThread(null)}
         />
       )}
+      {selectionOpen && (
+        <SummarySelectionModal
+          selected={selectedMemories}
+          onClose={() => setSelectionOpen(false)}
+          onConfirm={(next) => {
+            setSelectedMemories(next);
+            setSelectionOpen(false);
+          }}
+        />
+      )}
     </div>
   );
+}
+
+/** Build an export that keeps selected summaries distinct from retrieved sources. */
+export interface ChatMarkdownLabels {
+  selectedSummaries: string;
+  sources: string;
+  kind: string;
+  memoryId: string;
+  memory: (id: string) => string;
+  selectedKind: (kind: SelectedMemorySnapshot["kind"]) => string;
+  sourceKind: (kind: ChatSource["source_kind"]) => string;
+}
+
+/** Build an export with caller-provided, localized labels. */
+export function buildChatMarkdown(
+  turn: ChatTurn,
+  includeSources: boolean,
+  labels: ChatMarkdownLabels,
+): string {
+  if (!includeSources) return turn.answer;
+  const sections = [turn.answer];
+  if (turn.selectedMemories && turn.selectedMemories.length > 0) {
+    sections.push(
+      `## ${labels.selectedSummaries}\n\n${turn.selectedMemories
+        .map((item) => {
+          const label = item.title ?? item.period_key ?? labels.memory(item.memory_id);
+          return `### ${label}\n\n- ${labels.kind}: ${labels.selectedKind(item.kind)}\n- ${labels.memoryId}: ${item.memory_id}`;
+        })
+        .join("\n\n")}`,
+    );
+  }
+  if (turn.sources.length > 0) {
+    sections.push(
+      `## ${labels.sources}\n\n${turn.sources
+        .map((source) => `- ${labels.sourceKind(source.source_kind)}: ${source.snippet}`)
+        .join("\n")}`,
+    );
+  }
+  return sections.join("\n\n");
 }
 
 function ChatEmptyState() {
@@ -186,10 +272,47 @@ function ChatEmptyState() {
 interface ChatTurnCardProps {
   turn: ChatTurn;
   onSourceClick: (source: ChatSource) => void;
+  onCopy: (answer: string) => Promise<void>;
+  onSave: (answer: string) => Promise<boolean>;
 }
 
-const ChatTurnCard = memo(function ChatTurnCard({ turn, onSourceClick }: ChatTurnCardProps) {
+const ChatTurnCard = memo(function ChatTurnCard({
+  turn,
+  onSourceClick,
+  onCopy,
+  onSave,
+}: ChatTurnCardProps) {
   const { t } = useTranslation();
+  const markdownLabels = useMemo<ChatMarkdownLabels>(
+    () => ({
+      selectedSummaries: t("chat.export.selectedSummaries"),
+      sources: t("chat.export.sources"),
+      kind: t("chat.export.kind"),
+      memoryId: t("chat.export.memoryId"),
+      memory: (id) => t("chat.export.memory", { id }),
+      selectedKind: (kind) => t(`chat.selectSummary.kind.${kind}`),
+      sourceKind: (kind) => t(`chat.sourceKind.${kind}`),
+    }),
+    [t],
+  );
+  const [actionStatus, setActionStatus] = useState<"copy" | "save" | "error" | null>(null);
+  const [includeSources, setIncludeSources] = useState(false);
+  const runAction = useCallback(
+    async (action: "copy" | "save") => {
+      try {
+        const markdown = buildChatMarkdown(turn, includeSources, markdownLabels);
+        if (action === "copy") {
+          await onCopy(markdown);
+          setActionStatus(action);
+          return;
+        }
+        if (await onSave(markdown)) setActionStatus(action);
+      } catch {
+        setActionStatus("error");
+      }
+    },
+    [includeSources, markdownLabels, onCopy, onSave, turn],
+  );
   // Auto-scroll is owned by the parent's `useStickToBottom` so the
   // viewport tracks the token stream only while the user is still at
   // the bottom — scrolling up to read earlier output no longer gets
@@ -199,10 +322,58 @@ const ChatTurnCard = memo(function ChatTurnCard({ turn, onSourceClick }: ChatTur
       <div className="chat-question">
         <strong>{t("chat.you")}</strong>
         <p>{turn.question}</p>
+        {turn.selectedMemories && turn.selectedMemories.length > 0 && (
+          <details className="chat-selected-used">
+            <summary className="chat-selected-summary">
+              {t("chat.selected", { count: turn.selectedMemories.length })}
+            </summary>
+            {turn.selectedContentTruncated && <p>{t("chat.selectedContentTruncated")}</p>}
+            <ul>
+              {turn.selectedMemories.map((item) => (
+                <li key={item.memory_id}>
+                  <strong>{item.title ?? item.period_key ?? item.memory_id}</strong>
+                  <span className="chat-selected-kind">
+                    {t(`chat.selectSummary.kind.${item.kind}`)}
+                  </span>
+                  <p>{item.content}</p>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
       </div>
       <div className="chat-answer">
         <strong>Lookback</strong>
         <ChatAnswerBody turn={turn} />
+        {turn.phase === "done" && !turn.cancelled && turn.answer && (
+          <div className="chat-answer-actions">
+            {(turn.sources.length > 0 || (turn.selectedMemories?.length ?? 0) > 0) && (
+              <label className="chat-answer-source-option">
+                <input
+                  type="checkbox"
+                  checked={includeSources}
+                  onChange={(event) => setIncludeSources(event.target.checked)}
+                />
+                {t("chat.answer.includeSources")}
+              </label>
+            )}
+            <button type="button" className="btn" onClick={() => void runAction("copy")}>
+              {t("chat.answer.copy")}
+            </button>
+            <button type="button" className="btn" onClick={() => void runAction("save")}>
+              {t("chat.answer.save")}
+            </button>
+            {actionStatus && (
+              <span className="chat-answer-action-status" role="status">
+                {actionStatus === "copy"
+                  ? t("chat.answer.copySuccess")
+                  : actionStatus === "save"
+                    ? t("chat.answer.saveSuccess")
+                    : t("chat.answer.actionFailed")}
+              </span>
+            )}
+          </div>
+        )}
         {turn.sources.length > 0 && (
           <ChatSourceList sources={turn.sources} onSourceClick={onSourceClick} />
         )}
@@ -274,11 +445,17 @@ function ChatSourceList({ sources, onSourceClick }: ChatSourceListProps) {
       </summary>
       <ul>
         {sources.map((src) => (
-          <ChatSourceItem key={src.memory_id} source={src} onSourceClick={onSourceClick} />
+          <ChatSourceItem key={sourceKey(src)} source={src} onSourceClick={onSourceClick} />
         ))}
       </ul>
     </details>
   );
+}
+
+function sourceKey(source: ChatSource): string {
+  return source.source_kind === "reflection"
+    ? `reflection-${source.reflection_id}`
+    : `memory-${source.memory_id}`;
 }
 
 /** Render the kind-count breakdown (e.g. "Raw 7 / Thread summary 2 / Period summary 1")
@@ -336,6 +513,7 @@ const SOURCE_KIND_ORDER: ChatSource["source_kind"][] = [
   "raw_memory",
   "thread_summary",
   "period_summary",
+  "reflection",
 ];
 
 interface ChatComposerProps {
@@ -345,6 +523,11 @@ interface ChatComposerProps {
   onCancel: () => void | Promise<void>;
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   busy: boolean;
+  selectedMemories: SelectedMemorySnapshot[];
+  retrievalMode: RetrievalMode;
+  onOpenSelection: () => void;
+  onRetrievalModeChange: (mode: RetrievalMode) => void;
+  onRemoveSelected: (memoryId: string) => void;
 }
 
 function ChatComposer({
@@ -354,10 +537,51 @@ function ChatComposer({
   onCancel,
   onKeyDown,
   busy,
+  selectedMemories,
+  retrievalMode,
+  onOpenSelection,
+  onRetrievalModeChange,
+  onRemoveSelected,
 }: ChatComposerProps) {
   const { t } = useTranslation();
   return (
     <div className="chat-composer">
+      <div className="chat-composer-tools">
+        <button type="button" className="btn" onClick={onOpenSelection} disabled={busy}>
+          {t("chat.composer.selectSummary")} ({selectedMemories.length})
+        </button>
+        {selectedMemories.length > 0 && (
+          <label className="chat-mode-select">
+            <span>{t("chat.composer.mode")}</span>
+            <select
+              value={retrievalMode}
+              onChange={(event) => onRetrievalModeChange(event.target.value as RetrievalMode)}
+              disabled={busy}
+            >
+              <option value="selected_only">{t("chat.composer.modeSelectedOnly")}</option>
+              <option value="source_details">{t("chat.composer.modeSourceDetails")}</option>
+              <option value="related_memories">{t("chat.composer.modeRelated")}</option>
+            </select>
+          </label>
+        )}
+      </div>
+      {selectedMemories.length > 0 && (
+        <fieldset className="chat-selected-chips">
+          <legend>{t("chat.selected", { count: selectedMemories.length })}</legend>
+          {selectedMemories.map((item) => (
+            <button
+              key={item.memory_id}
+              type="button"
+              className="chat-selected-chip"
+              onClick={() => onRemoveSelected(item.memory_id)}
+              disabled={busy}
+              title={t("chat.composer.removeSummary")}
+            >
+              {item.period_key ?? item.memory_id} ×
+            </button>
+          ))}
+        </fieldset>
+      )}
       <textarea
         className="chat-input"
         placeholder={t("chat.composer.placeholder")}

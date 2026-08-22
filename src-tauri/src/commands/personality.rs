@@ -236,10 +236,14 @@ async fn fetch_thread_count(
         user_id: Some(mem_data::UserId { value: user_id }),
         limit: Some(THREAD_COUNT_LIMIT + 1),
         offset: None,
-        created_after: None,
-        created_before: None,
-        updated_after: None,
-        updated_before: None,
+        thread_created_after: None,
+        thread_created_before: None,
+        thread_updated_after: None,
+        thread_updated_before: None,
+        first_message_after: None,
+        first_message_before: None,
+        last_message_after: None,
+        last_message_before: None,
         sort: None,
         memory_kinds: vec![mem_data::MemoryKind::Raw as i32],
     };
@@ -291,13 +295,21 @@ pub async fn delete_personality_signal(
     state: State<'_, AppState>,
     req: DeletePersonalityMemoryRequest,
 ) -> AppResult<()> {
+    let registered = super::begin_search_index_write(
+        &state,
+        &[crate::search_index_maintenance::MaintenanceTable::Memory],
+    )
+    .await?;
     let mut client = MemoryServiceClient::new(state.memories_channel().await?);
-    client
+    let result = client
         .delete(mem_data::MemoryId {
             value: req.memory_id,
         })
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ());
+    let finish = super::finish_search_index_write(&state, registered).await;
+    result?;
+    finish
 }
 
 /// Temporary investigation report for the "Signals count never grows" symptom.
@@ -364,10 +376,14 @@ pub async fn debug_personality_inventory(
                 }),
                 limit: Some(50_000),
                 offset: None,
-                created_after: None,
-                created_before: None,
-                updated_after: None,
-                updated_before: None,
+                thread_created_after: None,
+                thread_created_before: None,
+                thread_updated_after: None,
+                thread_updated_before: None,
+                first_message_after: None,
+                first_message_before: None,
+                last_message_after: None,
+                last_message_before: None,
                 sort: None,
                 memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
             })
@@ -528,10 +544,14 @@ async fn count_threads_by_labels(
             limit: Some(50_000),
             offset: None,
             user_id: Some(PERSONALITY_USER_ID),
-            created_after: None,
-            created_before: None,
-            updated_after: None,
-            updated_before: None,
+            thread_created_after: None,
+            thread_created_before: None,
+            thread_updated_after: None,
+            thread_updated_before: None,
+            first_message_after: None,
+            first_message_before: None,
+            last_message_after: None,
+            last_message_before: None,
             sort: None,
             memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
         })
@@ -563,13 +583,21 @@ pub async fn delete_personality_profile(
     state: State<'_, AppState>,
     req: DeletePersonalityMemoryRequest,
 ) -> AppResult<()> {
+    let registered = super::begin_search_index_write(
+        &state,
+        &[crate::search_index_maintenance::MaintenanceTable::Memory],
+    )
+    .await?;
     let mut client = MemoryServiceClient::new(state.memories_channel().await?);
-    client
+    let result = client
         .delete(mem_data::MemoryId {
             value: req.memory_id,
         })
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ());
+    let finish = super::finish_search_index_write(&state, registered).await;
+    result?;
+    finish
 }
 
 /// Thread-side filter narrowing to this user's `personality_signal`-tagged
@@ -587,10 +615,14 @@ fn signal_thread_filter(user_id: i64) -> mem_data::ThreadSearchFilter {
         ],
         label_match_mode: Some(mem_data::LabelMatchMode::LabelAll as i32),
         channel: None,
-        created_after: None,
-        created_before: None,
-        updated_after: None,
-        updated_before: None,
+        thread_created_after: None,
+        thread_created_before: None,
+        thread_updated_after: None,
+        thread_updated_before: None,
+        first_message_after: None,
+        first_message_before: None,
+        last_message_after: None,
+        last_message_before: None,
         memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
     }
 }

@@ -98,6 +98,7 @@ export function buildGenerateRequest(
     run_daily: selection.daily,
     run_weekly: selection.weekly,
     run_monthly: selection.monthly,
+    stop_on_error: false,
     ...EMPTY_TOKENS,
     timezone_offset_hours: tzOffsetHours,
   };
@@ -145,8 +146,8 @@ function applyDayRange(
   };
   if (selection["per-thread"]) {
     const { after, before } = dayRangeToEpochMs(dailySpan.fromDate, dailySpan.toDate, timeZone);
-    if (after !== undefined) req.updated_after_ms = after;
-    if (before !== undefined) req.updated_before_ms = before;
+    if (after !== undefined) req.last_message_after_ms = after;
+    if (before !== undefined) req.last_message_before_ms = before;
   }
   return req;
 }
@@ -171,6 +172,7 @@ export function SummaryGenerateDialog({
   const [selection, setSelection] = useState<KindSelection>(() => initialSelection(initialKind));
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+  const [stopOnError, setStopOnError] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const llmDown = hasLlmInitFailure(sidecar);
@@ -204,7 +206,11 @@ export function SummaryGenerateDialog({
       // entry the backend registers from this request, so the Stop
       // button in the toolbar (Summaries.tsx) hits the right job.
       const dispatch_id = crypto.randomUUID();
-      const res = await generateSummaries({ ...build.request, dispatch_id });
+      const res = await generateSummaries({
+        ...build.request,
+        stop_on_error: stopOnError,
+        dispatch_id,
+      });
       onStarted(res.job_id_hint);
       onClose();
     } catch (e) {
@@ -240,6 +246,17 @@ export function SummaryGenerateDialog({
             </label>
           ))}
           <div className="field-hint">{t("summaryGen.dependencyHint")}</div>
+        </div>
+
+        <div className="field">
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={stopOnError}
+              onChange={(e) => setStopOnError(e.target.checked)}
+            />
+            {t("summaryGen.stopOnError")}
+          </label>
         </div>
 
         {top != null && (

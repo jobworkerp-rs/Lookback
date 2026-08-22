@@ -28,6 +28,26 @@ use super::lifecycle::{SidecarWarning, SidecarWarningKind};
 /// `workflow_lang`, which is not part of agent-app's `WORKER_CHANNELS`.
 pub(crate) const LANG_WORKER_CHANNEL: &str = "llm_workflow";
 
+fn generation_workers_native_log_dir(log_dir: &Path) -> std::io::Result<std::path::PathBuf> {
+    crate::log_rotation::native_log_dir(log_dir, "generation-workers")
+}
+
+/// Marks the short-lived generation-worker scope closed on every exit path,
+/// including cancellation while the child process is being awaited.
+struct NativeGenerationLogGuard(std::path::PathBuf);
+
+impl Drop for NativeGenerationLogGuard {
+    fn drop(&mut self) {
+        if let Err(error) = crate::log_rotation::mark_native_log_dir_closed(&self.0) {
+            tracing::debug!(
+                path = %self.0.display(),
+                %error,
+                "could not mark native generation log closed",
+            );
+        }
+    }
+}
+
 /// Build the `memories-import upsert-generation-workers` command. Pure (no I/O)
 /// so the argv/env contract can be unit-tested. The caller spawns it.
 pub(crate) fn build_upsert_command(
@@ -79,6 +99,18 @@ fn warn_not_registered(warnings: &mut Vec<SidecarWarning>, message: String) {
     });
 }
 
+/// Preserve the helper process output in the parent-owned canonical log. The
+/// child also writes a native tracing file, but that file is only a diagnostic
+/// duplicate and is isolated under `log/native/<launch-id>/`.
+fn forward_generation_worker_output(stdout: &[u8], stderr: &[u8]) {
+    for line in String::from_utf8_lossy(stdout).lines() {
+        tracing::info!(target: "generation-workers", "{line}");
+    }
+    for line in String::from_utf8_lossy(stderr).lines() {
+        tracing::warn!(target: "generation-workers", "{line}");
+    }
+}
+
 /// Resolve the binary + repo root and run the upsert, converting any failure
 /// into a `WorkerApplyFailed` warning instead of propagating it (fail-soft).
 pub(crate) async fn register_generation_workers(
@@ -115,19 +147,60 @@ pub(crate) async fn register_generation_workers(
         }
     };
 
-    let std_cmd = build_upsert_command(&bin, &repo_root, LANG_WORKER_CHANNEL, jw_port, log_dir);
+    let native_log_dir = match generation_workers_native_log_dir(log_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            warn_not_registered(
+                warnings,
+                format!("could not create native generation log directory: {error}"),
+            );
+            return;
+        }
+    };
+    let _native_log_guard = NativeGenerationLogGuard(native_log_dir.clone());
+    let std_cmd = build_upsert_command(
+        &bin,
+        &repo_root,
+        LANG_WORKER_CHANNEL,
+        jw_port,
+        &native_log_dir,
+    );
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // Cancellation must terminate the short-lived child before the guard
+        // closes its native scope; otherwise a detached process could still
+        // append after the `.closed` marker is written.
+        .kill_on_drop(true);
 
-    match cmd.output().await {
-        Ok(out) if out.status.success() => {
-            tracing::info!(
-                repo_root = %repo_root.display(),
-                "language generation workers registered",
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // The guard closes the unowned scope when spawn fails; no child
+            // PID must be recorded for a process that never started.
+            warn_not_registered(
+                warnings,
+                format!("could not spawn memories-import: {error}"),
             );
+            return;
         }
+    };
+    if let Some(pid) = child.id()
+        && let Err(error) = crate::log_rotation::mark_native_log_dir_pid(&native_log_dir, pid)
+    {
+        tracing::debug!(%error, pid, "could not record native generation child PID");
+    }
+    let output = child.wait_with_output().await;
+    match output {
         Ok(out) => {
+            forward_generation_worker_output(&out.stdout, &out.stderr);
+            if out.status.success() {
+                tracing::info!(
+                    repo_root = %repo_root.display(),
+                    "language generation workers registered",
+                );
+                return;
+            }
             let stderr = String::from_utf8_lossy(&out.stderr);
             // Keep the tail — the actionable cause (e.g. an empty prompt file
             // failing `read_non_empty`) is usually the last line.
@@ -243,5 +316,27 @@ mod tests {
         assert_eq!(env_of(&cmd, "LOG_USE_JSON").as_deref(), Some("true"));
         assert_eq!(env_of(&cmd, "LOG_USE_STDOUT").as_deref(), Some("true"));
         assert_eq!(env_of(&cmd, "LOG_APP_NAME").as_deref(), Some("Lookback"));
+    }
+
+    #[test]
+    fn generation_worker_native_logs_are_isolated_under_native_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let path = generation_workers_native_log_dir(root.path()).unwrap();
+        assert_eq!(path.parent().unwrap(), root.path().join("native"));
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("generation-workers-"));
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn generation_worker_native_log_guard_marks_scope_closed_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let path = generation_workers_native_log_dir(root.path()).unwrap();
+        {
+            let _guard = NativeGenerationLogGuard(path.clone());
+            assert!(path.join(".active").is_file());
+        }
+        assert!(!path.join(".active").exists());
+        assert!(path.join(".closed").is_file());
     }
 }

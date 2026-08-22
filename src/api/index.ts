@@ -11,6 +11,7 @@ import type {
   ConnectionConfig,
   ConnectionTestReport,
   CountSummariesRequest,
+  DatabaseRestoreResult,
   DataRootValidation,
   DebugPersonalityInventoryRequest,
   EmbeddingPreset,
@@ -32,7 +33,11 @@ import type {
   LabelWithCount,
   ListPeriodicTasksRequest,
   ListPersonalitySignalsRequest,
+  ListReflectionSelectionRequest,
+  ListReflectionSelectionResponse,
   ListReflectionsByThreadRequest,
+  ListSummariesForSelectionRequest,
+  ListSummariesForSelectionResponse,
   ListSummariesRequest,
   ListSummaryPeriodKeysRequest,
   ListThreadsRequest,
@@ -43,8 +48,6 @@ import type {
   LogTail,
   McpSettingsResponse,
   MemoryEmbeddingStats,
-  MemoryKindMigrationPreview,
-  MemoryKindRedispatchStatus,
   MemoryPosition,
   MemoryRow,
   MemoryThreadPosition,
@@ -64,12 +67,15 @@ import type {
   RedispatchReflectionEmbeddingsRequest,
   ReflectionEntry,
   ReflectionIntentIndexStats,
+  ReflectionSelectionContent,
   ResolvedSummaryMemoryRef,
   SavePeriodicTaskRequest,
+  SearchIndexMaintenanceStatus,
   SearchReflectionsByIntentRequest,
   SearchReflectionsHybridRequest,
   SearchReflectionsRequest,
   SearchThreadsRequest,
+  SelectedMemoryLimits,
   SetEmbeddingSettingsRequest,
   SetEmbeddingSettingsResponse,
   SetHfHomeRequest,
@@ -138,6 +144,20 @@ export async function listSummaries(req: ListSummariesRequest): Promise<SummaryE
   return invoke<SummaryEntry[]>("list_summaries", { req });
 }
 
+/** Offset page for the selection modal; continuation is based on raw rows
+ * rather than the number of valid rows returned after namespace checks. */
+export async function listSummariesForSelection(
+  req: ListSummariesForSelectionRequest,
+): Promise<ListSummariesForSelectionResponse> {
+  return invoke<ListSummariesForSelectionResponse>("list_summaries_for_selection", { req });
+}
+
+/** Fetch complete summary content for selection and preview. `null` means the
+ * listed memory no longer exists or is no longer a summary. */
+export async function getSummaryContent(memory_id: string): Promise<string | null> {
+  return invoke<string | null>("get_summary_content", { req: { memory_id } });
+}
+
 /** Labels attached to per-thread summary threads, excluding internal period axes. */
 export async function findSummaryDistinctLabels(): Promise<LabelWithCount[]> {
   return invoke<LabelWithCount[]>("find_summary_distinct_labels");
@@ -196,6 +216,22 @@ export async function getSettings(): Promise<SettingsSnapshot> {
   return invoke<SettingsSnapshot>("get_settings");
 }
 
+export async function getSearchIndexMaintenanceStatus(): Promise<SearchIndexMaintenanceStatus> {
+  return invoke<SearchIndexMaintenanceStatus>("get_search_index_maintenance_status");
+}
+
+export async function startSearchIndexMaintenance(): Promise<void> {
+  return invoke<void>("start_search_index_maintenance");
+}
+
+export async function setSearchIndexMaintenanceSchedule(req: {
+  enabled: boolean;
+  start: string | null;
+  end: string | null;
+}): Promise<void> {
+  return invoke<void>("set_search_index_maintenance_schedule", { req });
+}
+
 /** Persist the generation output language ("ja" | "en") so headless paths
  *  (conductor periodic runs) generate in the UI's current language. The UI
  *  locale itself stays in localStorage; this mirror is read by the backend. */
@@ -219,6 +255,22 @@ export async function listReflectionsByThread(
 
 export async function searchReflections(req: SearchReflectionsRequest): Promise<ReflectionEntry[]> {
   return invoke<ReflectionEntry[]>("search_reflections", { req });
+}
+
+/** Chronological, filter-only reflection listing for the selection modal. */
+export async function listReflectionSelection(
+  req: ListReflectionSelectionRequest,
+): Promise<ListReflectionSelectionResponse> {
+  return invoke<ListReflectionSelectionResponse>("list_reflections_for_selection", { req });
+}
+
+/** Fetch the canonical structured reflection body for selection/preview. */
+export async function getReflectionSelectionContent(
+  memory_id: string,
+): Promise<ReflectionSelectionContent | null> {
+  return invoke<ReflectionSelectionContent | null>("get_reflection_selection_content", {
+    req: { memory_id },
+  });
 }
 
 export async function searchReflectionsHybrid(
@@ -440,6 +492,14 @@ export async function chatCancel(jobId: string): Promise<void> {
   return invoke<void>("chat_cancel", { jobId });
 }
 
+export async function getSelectedMemoryLimits(): Promise<SelectedMemoryLimits> {
+  return invoke<SelectedMemoryLimits>("get_selected_memory_limits");
+}
+
+export async function saveChatMarkdown(path: string, content: string): Promise<void> {
+  return invoke<void>("save_chat_markdown", { req: { path, content } });
+}
+
 /** Read the persisted connection-target override. */
 export async function getConnectionConfig(): Promise<ConnectionConfig> {
   return invoke<ConnectionConfig>("get_connection_config");
@@ -632,9 +692,9 @@ export function parsePersonalitySignalContent(signal: {
 // ---- Sidecar recovery commands -----------------------------------------
 // Invoked from the BootError screen when a structured `sidecar://error`
 // arrives. Each command rewrites local state (or only opens / quits)
-// then re-runs the standard startup pipeline; the returned
-// `RecoveryResult` tells the UI whether to keep showing BootError
-// (restart still failed) or wait for the upcoming `sidecar://ready`.
+// Recovery commands that restart return `RecoveryResult`. Database restore is
+// deliberately separate: it leaves sidecars stopped until the user selects
+// migration retry.
 
 /** Rename the existing lancedb tree to a timestamped backup directory
  * and restart the sidecars. Use when the user wants the dimension
@@ -656,34 +716,18 @@ export function recoverResetEmbeddingSettings(): Promise<RecoveryResult> {
   return invoke<RecoveryResult>("recover_reset_embedding_settings");
 }
 
+export function retryDatabaseMigration(): Promise<RecoveryResult> {
+  return invoke<RecoveryResult>("retry_database_migration");
+}
+
+export function restoreDatabaseMigrationBackup(backupPath: string): Promise<DatabaseRestoreResult> {
+  return invoke<DatabaseRestoreResult>("restore_database_migration_backup", { backupPath });
+}
+
 /** Open the log directory in the OS file browser. Escape hatch on
  * BootError for failures that need manual investigation. */
 export function openLogDir(): Promise<void> {
   return invoke<void>("open_log_dir");
-}
-
-/** Open the client-apply runbook bundled with the current release. */
-export function openMemoryKindMigrationGuide(): Promise<void> {
-  return invoke<void>("open_memory_kind_migration_guide");
-}
-
-/** Run the bundled client migration after the startup gate blocks a legacy DB. */
-export function migrateMemoryKind(approval: MemoryKindMigrationPreview): Promise<RecoveryResult> {
-  return invoke<RecoveryResult>("migrate_memory_kind", { approval });
-}
-
-export function previewMemoryKindMigration(): Promise<MemoryKindMigrationPreview> {
-  return invoke<MemoryKindMigrationPreview>("preview_memory_kind_migration");
-}
-
-/** Read the durable post-migration vector redispatch notice. */
-export function getMemoryKindRedispatchStatus(): Promise<MemoryKindRedispatchStatus> {
-  return invoke<MemoryKindRedispatchStatus>("get_memory_kind_redispatch_status");
-}
-
-/** Retry all migration vector enqueue RPCs and clear the notice on success. */
-export function retryMemoryKindRedispatch(): Promise<void> {
-  return invoke<void>("retry_memory_kind_redispatch");
 }
 
 /** Cleanly stop the sidecars and quit the app. */

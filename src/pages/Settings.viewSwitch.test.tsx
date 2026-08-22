@@ -17,12 +17,13 @@ const listEmbeddingPresets = vi.fn();
 const getAppSettings = vi.fn();
 const getConnectionConfig = vi.fn();
 const getMemoryEmbeddingStats = vi.fn();
-const getMemoryKindRedispatchStatus = vi.fn();
-const retryMemoryKindRedispatch = vi.fn();
 const getBackgroundJobQueueStatus = vi.fn();
 const getModelStatus = vi.fn();
 const getSettings = vi.fn();
 const getMcpSettings = vi.fn();
+const getSearchIndexMaintenanceStatus = vi.fn();
+const startSearchIndexMaintenance = vi.fn();
+const setSearchIndexMaintenanceSchedule = vi.fn();
 
 vi.mock("@/api", () => ({
   applySettings: (req: unknown) => applySettings(req),
@@ -34,16 +35,17 @@ vi.mock("@/api", () => ({
   getAppSettings: () => getAppSettings(),
   getConnectionConfig: () => getConnectionConfig(),
   getMemoryEmbeddingStats: () => getMemoryEmbeddingStats(),
-  getMemoryKindRedispatchStatus: () => getMemoryKindRedispatchStatus(),
   getBackgroundJobQueueStatus: () => getBackgroundJobQueueStatus(),
   getModelStatus: () => getModelStatus(),
   getSettings: () => getSettings(),
+  getSearchIndexMaintenanceStatus: () => getSearchIndexMaintenanceStatus(),
+  startSearchIndexMaintenance: () => startSearchIndexMaintenance(),
+  setSearchIndexMaintenanceSchedule: (req: unknown) => setSearchIndexMaintenanceSchedule(req),
   setConnectionConfig: () => Promise.resolve(),
   setDataRoot: () => Promise.resolve(),
   createDataRoot: () => Promise.resolve(),
   validateDataRoot: () => Promise.resolve(null),
   redispatchMemoryEmbeddings: () => Promise.resolve(null),
-  retryMemoryKindRedispatch: () => retryMemoryKindRedispatch(),
   retryModelSetup: () => Promise.resolve(),
   listTimezones: () => Promise.resolve(["Asia/Tokyo", "America/New_York", "UTC"]),
   purgeAllData: () => Promise.resolve({ warnings: [] }),
@@ -204,10 +206,6 @@ describe("Settings view switching", () => {
       records_without_embedding: 0,
       vector_dimension: 1024,
     });
-    getMemoryKindRedispatchStatus.mockReset();
-    getMemoryKindRedispatchStatus.mockResolvedValue({ pending: false, error: null });
-    retryMemoryKindRedispatch.mockReset();
-    retryMemoryKindRedispatch.mockResolvedValue(undefined);
     getBackgroundJobQueueStatus.mockResolvedValue({ active: false, rows: [] });
     // Both models report a concrete state; the production refetchInterval
     // reads `d.llm.state` / `d.embedding.state` and would NPE on null sides.
@@ -216,6 +214,22 @@ describe("Settings view switching", () => {
       embedding: { name: "emb", repo: "org/emb", state: "ready", error: null },
     });
     getSettings.mockResolvedValue(SETTINGS_SNAPSHOT);
+    startSearchIndexMaintenance.mockReset();
+    startSearchIndexMaintenance.mockResolvedValue(undefined);
+    setSearchIndexMaintenanceSchedule.mockReset();
+    setSearchIndexMaintenanceSchedule.mockResolvedValue(undefined);
+    getSearchIndexMaintenanceStatus.mockResolvedValue({
+      memory: { write_generation: 0, dirty: false, ready_runtime_secs: 0, last_result: null },
+      thread: { write_generation: 0, dirty: false, ready_runtime_secs: 0, last_result: null },
+      reconcile_pending: false,
+      writing: false,
+      optimizing: false,
+      active_optimizations: [],
+      memory_eligible: false,
+      thread_eligible: false,
+      recovery_required: null,
+      schedule: { enabled: false, start: null, end: null },
+    });
   });
 
   it("shows only the basic cards by default", async () => {
@@ -232,6 +246,58 @@ describe("Settings view switching", () => {
     expect(screen.queryByText("Destructive")).toBeNull();
     // Entry button present.
     expect(screen.getByText("高度な設定を開く…")).toBeInTheDocument();
+  });
+
+  it("shows active index optimization and prevents another manual start", async () => {
+    getSearchIndexMaintenanceStatus.mockResolvedValue({
+      memory: {
+        write_generation: 3,
+        dirty: true,
+        ready_runtime_secs: 3600,
+        last_result: "accepted",
+      },
+      thread: { write_generation: 2, dirty: true, ready_runtime_secs: 1800, last_result: null },
+      reconcile_pending: false,
+      writing: false,
+      optimizing: true,
+      active_optimizations: [{ table: "memory", task_id: "maintenance-1", state: "accepted" }],
+      memory_eligible: false,
+      thread_eligible: false,
+      recovery_required: null,
+      schedule: { enabled: false, start: null, end: null },
+    });
+
+    renderSettings();
+
+    const button = await screen.findByRole("button", { name: "最適化中…" });
+    expect(button).toBeDisabled();
+    expect(screen.getByText("最適化中です。完了までお待ちください。")).toBeInTheDocument();
+    expect(screen.getByText("memory: 最適化中 / 未反映 / 稼働 1h")).toBeInTheDocument();
+    expect(screen.getByText("thread: 待機中 / 未反映 / 稼働 0h")).toBeInTheDocument();
+    fireEvent.click(button);
+    expect(startSearchIndexMaintenance).not.toHaveBeenCalled();
+  });
+
+  it("enables maintenance-window saving only after scheduled optimization is enabled", async () => {
+    renderSettings();
+
+    await screen.findByText("memory: 待機中 / 最適化済み / 稼働 0h");
+    const save = await screen.findByRole("button", { name: "保守時間帯を保存" });
+    expect(save).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "未使用時間帯に定期最適化" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "保守時間帯を保存" })).toBeEnabled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "保守時間帯を保存" }));
+    await waitFor(() =>
+      expect(setSearchIndexMaintenanceSchedule).toHaveBeenCalledWith({
+        enabled: true,
+        start: "23:00",
+        end: "02:00",
+      }),
+    );
   });
 
   it("disables timezone edits when the saved connection mode is remote", async () => {

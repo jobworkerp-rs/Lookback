@@ -26,7 +26,7 @@ describe("useGeneratedRefresh", () => {
     captured = null;
   });
 
-  it("invalidates caches from generated refresh events", async () => {
+  it("invalidates the matching caches from generated refresh events", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const invalidate = vi.spyOn(client, "invalidateQueries");
 
@@ -37,5 +37,10 @@ describe("useGeneratedRefresh", () => {
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["summaries"] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["threads"] });
+
+    emit({ job_id: "reflection-1", scopes: ["reflection"] });
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["reflections"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["reflection-hybrid-search"] });
   });
 });

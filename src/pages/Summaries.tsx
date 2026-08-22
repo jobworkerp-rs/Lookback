@@ -58,6 +58,8 @@ const LOOKBACK_USER_ID = 1;
 
 type View = "list" | "search" | "calendar";
 type CalendarKind = Exclude<SummaryKind, "per-thread">;
+type CalendarState = { month: string; selectedKey: string | null };
+type CalendarStateByKind = Record<CalendarKind, CalendarState>;
 
 /** Summary-thread label that scopes full-text search to a single kind.
  *  All four kinds share the Lookback user, so without a label filter a search
@@ -126,12 +128,24 @@ export function Summaries({
   useEffect(() => {
     if (vectorDisabled && isEmbeddingSearchMode(mode)) setMode("keyword");
   }, [vectorDisabled]);
-  const [month, setMonth] = useState(() => {
-    if (focus) return focus.month;
+  const [calendarStateByKind, setCalendarStateByKind] = useState<CalendarStateByKind>(() => {
     const d = new Date();
-    return yearMonthToKey(d.getFullYear(), d.getMonth() + 1);
+    const currentMonth = yearMonthToKey(d.getFullYear(), d.getMonth() + 1);
+    const emptyState = { month: currentMonth, selectedKey: null };
+    return {
+      daily:
+        focus?.kind === "daily" ? { month: focus.month, selectedKey: focus.periodKey } : emptyState,
+      weekly:
+        focus?.kind === "weekly"
+          ? { month: focus.month, selectedKey: focus.periodKey }
+          : emptyState,
+      monthly:
+        focus?.kind === "monthly"
+          ? { month: focus.month, selectedKey: focus.periodKey }
+          : emptyState,
+    };
   });
-  const [selectedKey, setSelectedKey] = useState<string | null>(focus?.periodKey ?? null);
+  const [lastCalendarKind, setLastCalendarKind] = useState<CalendarKind>(focus?.kind ?? "daily");
   const [generateOpen, setGenerateOpen] = useState(false);
   // Source-ID chips and the per-thread `Thread #{id}` link both pop the
   // ThreadDetail modal — reuses the same `OpenThreadState` shape that the
@@ -142,17 +156,6 @@ export function Summaries({
   // matching the Chat tab's source-pill click guard.
   const refClickToken = useRef(0);
 
-  // When a fresh `focus` arrives after mount (e.g. a second chat source
-  // pill clicked while the tab is already open), reapply it and signal
-  // back so the parent can drop the seed.
-  useEffect(() => {
-    if (!focus) return;
-    setKind(focus.kind);
-    setView("calendar");
-    setMonth(focus.month);
-    setSelectedKey(focus.periodKey);
-    onFocusConsumed?.();
-  }, [focus, onFocusConsumed]);
   // A summary appears in the list, calendar-detail, and search caches, and the
   // sidebar count badge; invalidate every family so all views drop the row.
   // Mirrors the App-level "summary generation done" invalidation set.
@@ -169,10 +172,40 @@ export function Summaries({
   const calendarKind: CalendarKind | null = kind === "per-thread" ? null : kind;
   const isPerThread = kind === "per-thread";
   const effectiveView: View = view === "calendar" && calendarKind == null ? "list" : view;
+  const calendarState = calendarKind == null ? null : calendarStateByKind[calendarKind];
+  const month = calendarState?.month ?? "";
+  const selectedKey = calendarState?.selectedKey ?? null;
   const calendarPeriodKeyPrefixes = useMemo(
     () => (calendarKind == null ? [] : periodKeyPrefixesForMonth(calendarKind, month)),
     [calendarKind, month],
   );
+
+  const updateCalendarState = useCallback(
+    (targetKind: CalendarKind, next: Partial<CalendarState>) => {
+      setCalendarStateByKind((current) => ({
+        ...current,
+        [targetKind]: { ...current[targetKind], ...next },
+      }));
+    },
+    [],
+  );
+  const openCalendar = useCallback(
+    (targetKind: CalendarKind, state?: Partial<CalendarState>) => {
+      setKind(targetKind);
+      setView("calendar");
+      setLastCalendarKind(targetKind);
+      if (state) updateCalendarState(targetKind, state);
+    },
+    [updateCalendarState],
+  );
+  // When a fresh `focus` arrives after mount (e.g. a second chat source
+  // pill clicked while the tab is already open), reapply it and signal
+  // back so the parent can drop the seed.
+  useEffect(() => {
+    if (!focus) return;
+    openCalendar(focus.kind, { month: focus.month, selectedKey: focus.periodKey });
+    onFocusConsumed?.();
+  }, [focus, onFocusConsumed, openCalendar]);
   const summaryLabelArgs = useMemo(
     () =>
       isPerThread && sortedLabels.length > 0 ? { labels_any: ["summary", ...sortedLabels] } : {},
@@ -278,20 +311,23 @@ export function Summaries({
   // (jump within Summaries to the cited calendar card). The async resolve
   // is guarded by a click token so a later click supersedes ours; a null
   // target (deleted memory, unknown external_id) leaves the UI untouched.
-  const handleOpenMemoryRef = useCallback(async (memoryId: string) => {
-    const myToken = ++refClickToken.current;
-    const target = await resolveSummaryRefNavigation(memoryId);
-    if (myToken !== refClickToken.current) return;
-    if (!target) return;
-    if (target.kind === "open-thread") {
-      setOpenThread(target.open);
-    } else {
-      setKind(target.focus.kind);
-      setView("calendar");
-      setMonth(target.focus.month);
-      setSelectedKey(target.focus.periodKey);
-    }
-  }, []);
+  const handleOpenMemoryRef = useCallback(
+    async (memoryId: string) => {
+      const myToken = ++refClickToken.current;
+      const target = await resolveSummaryRefNavigation(memoryId);
+      if (myToken !== refClickToken.current) return;
+      if (!target) return;
+      if (target.kind === "open-thread") {
+        setOpenThread(target.open);
+      } else {
+        openCalendar(target.focus.kind, {
+          month: target.focus.month,
+          selectedKey: target.focus.periodKey,
+        });
+      }
+    },
+    [openCalendar],
+  );
 
   const refHandlers = useMemo(
     () => ({ onOpenThread: handleOpenThread, onOpenMemoryRef: handleOpenMemoryRef }),
@@ -375,7 +411,12 @@ export function Summaries({
                 className={`segment-btn ${kind === k ? "active" : ""}`}
                 onClick={() => {
                   setKind(k);
-                  setSelectedKey(null);
+                  if (k !== "per-thread") {
+                    setLastCalendarKind(k);
+                    if (kind !== "per-thread" && kind !== k) {
+                      updateCalendarState(k, { selectedKey: null });
+                    }
+                  }
                   setSelectedLabels([]);
                 }}
               >
@@ -402,9 +443,10 @@ export function Summaries({
             <button
               type="button"
               className={`segment-btn ${effectiveView === "calendar" ? "active" : ""}`}
-              onClick={() => setView("calendar")}
-              disabled={calendarKind == null}
-              title={calendarKind == null ? t("summaries.calendarDisabledTitle") : undefined}
+              onClick={() => {
+                if (calendarKind == null) setKind(lastCalendarKind);
+                setView("calendar");
+              }}
             >
               {t("summaries.view.calendar")}
             </button>
@@ -497,10 +539,9 @@ export function Summaries({
               month={month}
               periodKeys={periodKeysQuery.data ?? []}
               selectedKey={selectedKey}
-              onSelectKey={setSelectedKey}
+              onSelectKey={(key) => updateCalendarState(calendarKind, { selectedKey: key })}
               onMonthChange={(m) => {
-                setMonth(m);
-                setSelectedKey(null);
+                updateCalendarState(calendarKind, { month: m, selectedKey: null });
               }}
             />
             <div className="sum-cal-detail">

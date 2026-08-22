@@ -1,0 +1,91 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: lookback
+  name: lookback-get-reflections
+  version: "1.0.0"
+  summary: Retrieve the latest non-empty reflections for selected thread ids.
+
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        thread_ids:
+          type: array
+          items: { type: string }
+          maxItems: 10
+          default: []
+        include_history:
+          type: boolean
+          default: false
+        memories_grpc_host:
+          { type: string, default: "%{LOOKBACK_RAG_MEMORIES_HOST:-127.0.0.1}", x-hidden: true }
+        memories_grpc_port: { type: integer, default: %{LOOKBACK_RAG_MEMORIES_PORT:-9010}, x-hidden: true }
+        memories_grpc_tls: { type: boolean, default: %{LOOKBACK_RAG_MEMORIES_TLS:-false}, x-hidden: true }
+        origin_user_id: { type: integer, default: 1, x-hidden: true }
+      required: [thread_ids]
+
+do:
+  - initialize:
+      set:
+        items: "${ [] }"
+  - fetchEachThread:
+      for:
+        each: requested_thread_id
+        in: "${ $workflow.input.thread_ids // [] }"
+      onError: continue
+      do:
+        - findAndRecordReflections:
+            try:
+              - findReflections:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: streaming
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.ReflectionService/FindByThread"
+                        json_body: >-
+                          ${ {
+                            thread_id: { value: $requested_thread_id },
+                            include_history: ($workflow.input.include_history // false)
+                          } | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      reflection_result: "${ .jsonBody | fromjson }"
+              - recordReflections:
+                  set:
+                    items: >-
+                      ${ $items + [
+                        {
+                          input_kind: "thread",
+                          input_id: $requested_thread_id,
+                          input_index: $index,
+                          origin_thread_id: $requested_thread_id,
+                          reflections: (($reflection_result // [])
+                            | map(select(
+                              (.data.originUserId.value // .data.origin_user_id.value // -1) == $workflow.input.origin_user_id
+                              and (.data.summary // "") != ""
+                            ))
+                            | sort_by((.data.createdAt // .data.created_at // .createdAt // .created_at // 0) | tonumber)
+                            | reverse
+                            | if ($workflow.input.include_history // false) then .[0:3] else .[0:1] end)
+                        }
+                        | . + { unresolved: (.reflections | length == 0) }
+                      ] }
+            catch:
+              as: error
+              do:
+                - recordReflectionFailure:
+                    set:
+                      items: >-
+                        ${ $items + [{ input_kind: "thread", input_id: $requested_thread_id, input_index: $index, origin_thread_id: $requested_thread_id, reflections: [], unresolved: true, reason: "not_found_or_not_allowed" }] }
+output:
+  as:
+    items: ${ $items }
+    unresolved: ${ $items | map(select(.unresolved == true)) }

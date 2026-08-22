@@ -192,10 +192,14 @@ fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
             labels: req.labels_any.clone(),
             label_match_mode: Some(req.label_match.unwrap_or(LabelMatch::Any).to_proto()),
             channel: None,
-            created_after: None,
-            created_before: None,
-            updated_after: None,
-            updated_before: None,
+            thread_created_after: None,
+            thread_created_before: None,
+            thread_updated_after: None,
+            thread_updated_before: None,
+            first_message_after: None,
+            first_message_before: None,
+            last_message_after: None,
+            last_message_before: None,
             memory_kinds: memory_kinds.clone(),
         })
     };

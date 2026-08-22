@@ -12,18 +12,19 @@ import {
   getLlmSettings,
   getMcpSettings,
   getMemoryEmbeddingStats,
-  getMemoryKindRedispatchStatus,
   getModelStatus,
+  getSearchIndexMaintenanceStatus,
   getSettings,
   listEmbeddingPresets,
   listLlmPresets,
   purgeAllData,
   readSidecarLog,
   redispatchMemoryEmbeddings,
-  retryMemoryKindRedispatch,
   retryModelSetup,
   setConnectionConfig,
   setDataRoot,
+  setSearchIndexMaintenanceSchedule,
+  startSearchIndexMaintenance,
   testConnectionConfig,
   validateDataRoot,
 } from "@/api";
@@ -45,6 +46,7 @@ import type {
   ModelState,
   ModelStatus,
   RedispatchEmbeddingsResult,
+  SearchIndexMaintenanceStatus,
   SetEmbeddingSettingsRequest,
   SetHfHomeRequest,
   SetLlmSettingsRequest,
@@ -405,6 +407,8 @@ export function Settings({
 
             <LogsCard />
 
+            <SearchIndexMaintenanceCard />
+
             {applyError && (
               <div className="settings-card" style={{ borderColor: "var(--danger)" }}>
                 <div style={{ color: "var(--danger)", fontSize: 12 }}>{applyError}</div>
@@ -593,6 +597,165 @@ export function Settings({
         </Modal>
       )}
     </>
+  );
+}
+
+function SearchIndexMaintenanceCard() {
+  const status = useQuery({
+    queryKey: ["search-index-maintenance"],
+    queryFn: getSearchIndexMaintenanceStatus,
+    refetchInterval: 5000,
+  });
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [scheduleEnabled, setScheduleEnabled] = useState(false);
+  const [scheduleStart, setScheduleStart] = useState("23:00");
+  const [scheduleEnd, setScheduleEnd] = useState("02:00");
+  const [savingSchedule, setSavingSchedule] = useState(false);
+  const data: SearchIndexMaintenanceStatus | undefined = status.data;
+  const savedScheduleEnabled = data?.schedule.enabled;
+  const savedScheduleStart = data?.schedule.start;
+  const savedScheduleEnd = data?.schedule.end;
+  const isTableOptimizing = (table: "memory" | "thread") =>
+    data?.active_optimizations.some((attempt) => attempt.table === table) ?? false;
+  const tableStatus = (table: "memory" | "thread") => {
+    const entry = data?.[table];
+    const activity = isTableOptimizing(table) ? "最適化中" : "待機中";
+    const freshness = entry?.dirty ? "未反映" : "最適化済み";
+    const runtimeHours = Math.floor((entry?.ready_runtime_secs ?? 0) / 3600);
+    const result = entry?.last_result;
+    const resultLabel =
+      result && !isTableOptimizing(table)
+        ? ` / 最終結果: ${
+            {
+              succeeded: "成功",
+              failed: "失敗",
+              generation_changed: "更新あり",
+              unknown: "要確認",
+            }[result] ?? result
+          }`
+        : "";
+    return `${table}: ${activity} / ${freshness} / 稼働 ${runtimeHours}h${resultLabel}`;
+  };
+
+  useEffect(() => {
+    if (savedScheduleEnabled === undefined) return;
+    setScheduleEnabled(savedScheduleEnabled);
+    setScheduleStart(savedScheduleStart ?? "23:00");
+    setScheduleEnd(savedScheduleEnd ?? "02:00");
+  }, [savedScheduleEnabled, savedScheduleStart, savedScheduleEnd]);
+
+  const start = async () => {
+    setRunning(true);
+    setError(null);
+    try {
+      await startSearchIndexMaintenance();
+      await status.refetch();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRunning(false);
+      setConfirming(false);
+    }
+  };
+
+  const saveSchedule = async () => {
+    setSavingSchedule(true);
+    setError(null);
+    try {
+      await setSearchIndexMaintenanceSchedule({
+        enabled: scheduleEnabled,
+        start: scheduleEnabled ? scheduleStart : null,
+        end: scheduleEnabled ? scheduleEnd : null,
+      });
+      await status.refetch();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSavingSchedule(false);
+    }
+  };
+
+  return (
+    <div className="settings-card">
+      <div className="settings-card-title">検索 index の最適化</div>
+      <div className="settings-card-desc">
+        新規レコードは最適化前も検索できます。最適化は compaction と index 更新を順に実行します。
+      </div>
+      <div className="settings-row">
+        <div className="settings-row-label">
+          {data?.writing ? "書込み処理の完了後に開始できます" : "必要に応じて手動で開始できます"}
+        </div>
+        <button
+          type="button"
+          className="btn"
+          disabled={running || data?.optimizing || data?.writing}
+          onClick={() => setConfirming(true)}
+        >
+          {running ? "開始中…" : data?.optimizing ? "最適化中…" : "最適化"}
+        </button>
+      </div>
+      {data && (
+        <div className="settings-card-desc">
+          {data.optimizing && <div role="status">最適化中です。完了までお待ちください。</div>}
+          <div>{tableStatus("memory")}</div>
+          <div>{tableStatus("thread")}</div>
+        </div>
+      )}
+      <div className="settings-row" style={{ marginTop: 10 }}>
+        <label className="settings-row-label" htmlFor="maintenance-schedule-enabled">
+          未使用時間帯に定期最適化
+        </label>
+        <input
+          id="maintenance-schedule-enabled"
+          type="checkbox"
+          checked={scheduleEnabled}
+          onChange={(event) => setScheduleEnabled(event.target.checked)}
+        />
+      </div>
+      {scheduleEnabled && (
+        <div className="settings-row">
+          <div className="settings-row-label">保守時間帯</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input
+              type="time"
+              value={scheduleStart}
+              onChange={(event) => setScheduleStart(event.target.value)}
+            />
+            <span>–</span>
+            <input
+              type="time"
+              value={scheduleEnd}
+              onChange={(event) => setScheduleEnd(event.target.value)}
+            />
+          </div>
+        </div>
+      )}
+      <div className="settings-row">
+        <div className="settings-row-label" />
+        <button
+          type="button"
+          className="btn"
+          disabled={!scheduleEnabled || savingSchedule}
+          onClick={() => void saveSchedule()}
+        >
+          {savingSchedule ? "保存中…" : "保守時間帯を保存"}
+        </button>
+      </div>
+      {error && <div style={{ color: "var(--danger)", fontSize: 12 }}>{error}</div>}
+      {confirming && (
+        <ConfirmDialog
+          title="検索 index を最適化しますか？"
+          message="実行中の書込み処理がある場合は開始できません。"
+          confirmLabel="最適化"
+          onConfirm={() => {
+            void start();
+          }}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+    </div>
   );
 }
 
@@ -970,9 +1133,7 @@ export function LlmProviderCard({
           ? localHfRepo.trim()
           : null
         : (data.local_hf_repo ?? null),
-      local_ctx_size: isLocal
-        ? parseOptionalNonNegativeNumber(localCtxSize)
-        : (data.local_ctx_size ?? null),
+      local_ctx_size: parseOptionalNonNegativeNumber(localCtxSize),
       local_kv_cache_type: isLocal ? localKvCacheType : (data.local_kv_cache_type ?? null),
     };
     // Dirty check: compare each field against the persisted snapshot. The
@@ -1189,6 +1350,23 @@ export function LlmProviderCard({
         {t("settings.llm.genParamsHintPre")} <strong>{t("settings.llm.genParamsHintChat")}</strong>{" "}
         {t("settings.llm.genParamsHintPost")}
       </div>
+
+      {mode === "external" && (
+        <div className="settings-row">
+          <div className="settings-row-label">ctx_size</div>
+          <input
+            type="number"
+            value={localCtxSize}
+            placeholder="8192"
+            min={512}
+            onChange={(e) => setLocalCtxSize(e.target.value)}
+            style={{ width: 140 }}
+          />
+          <span style={{ marginLeft: 8, color: "var(--label-tertiary)", fontSize: 11 }}>
+            {t("settings.llm.ctxSizeExternalHint", { value: 8192 })}
+          </span>
+        </div>
+      )}
 
       {mode === "local" && (
         <>
@@ -2417,15 +2595,9 @@ export function MemoryEmbeddingCard() {
     queryKey: ["memory-embedding-stats"],
     queryFn: getMemoryEmbeddingStats,
   });
-  const migrationRedispatch = useQuery({
-    queryKey: ["memory-kind-redispatch-status"],
-    queryFn: getMemoryKindRedispatchStatus,
-  });
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<RedispatchEmbeddingsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [retryingMigration, setRetryingMigration] = useState(false);
-  const [migrationRetryError, setMigrationRetryError] = useState<string | null>(null);
 
   const {
     total_records: total = 0,
@@ -2466,46 +2638,10 @@ export function MemoryEmbeddingCard() {
     }
   };
 
-  const retryMigrationRedispatch = async () => {
-    setRetryingMigration(true);
-    setMigrationRetryError(null);
-    try {
-      await retryMemoryKindRedispatch();
-      await queryClient.invalidateQueries({ queryKey: ["memory-kind-redispatch-status"] });
-      await invalidateEmbeddingStats();
-    } catch (e) {
-      setMigrationRetryError((e as Error).message);
-    } finally {
-      setRetryingMigration(false);
-    }
-  };
-
   return (
     <div className="settings-card">
       <div className="settings-card-title">{t("settings.embeddingIndex.title")}</div>
       <div className="settings-card-desc">{t("settings.embeddingIndex.desc")}</div>
-      {migrationRedispatch.data?.pending && (
-        <div className="warning-banner" role="alert">
-          <div className="warning-banner-title">
-            {t("settings.embeddingIndex.migrationPendingTitle")}
-          </div>
-          <div className="warning-banner-body">
-            {t("settings.embeddingIndex.migrationPendingBody")}
-            {migrationRedispatch.data.error && ` ${migrationRedispatch.data.error}`}
-          </div>
-          <button
-            type="button"
-            className="warning-banner-cta"
-            onClick={() => void retryMigrationRedispatch()}
-            disabled={retryingMigration}
-          >
-            {retryingMigration
-              ? t("settings.embeddingIndex.migrationRetrying")
-              : t("settings.embeddingIndex.migrationRetry")}
-          </button>
-          {migrationRetryError && <div className="warning-banner-body">{migrationRetryError}</div>}
-        </div>
-      )}
       {stats.error && (
         <div style={{ color: "var(--danger)", fontSize: 11 }}>{(stats.error as Error).message}</div>
       )}

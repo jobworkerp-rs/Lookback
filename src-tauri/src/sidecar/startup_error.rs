@@ -173,18 +173,35 @@ pub type StartupFailureSlot = Arc<Mutex<Option<StartupFailure>>>;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SidecarErrorPayload {
-    Structured { failure: StartupFailure },
-    MemoryKindMigrationRequired { db_path: String },
-    UnexpectedMemoryData { db_path: String, reason: String },
-    MemoryKindDatabaseSchemaInvalid { db_path: String, reason: String },
-    Raw { message: String },
+    Structured {
+        failure: StartupFailure,
+    },
+    MemoryKindMigrationRequired {
+        db_path: String,
+    },
+    MemoryKindDatabaseSchemaInvalid {
+        db_path: String,
+        reason: String,
+    },
+    MemoryKindDatabaseCheckFailed {
+        db_path: String,
+        reason: String,
+    },
+    DatabaseMigrationFailed {
+        phase: String,
+        reason: String,
+        backup_path: String,
+    },
+    Raw {
+        message: String,
+    },
 }
 
 impl SidecarErrorPayload {
-    /// Lift an `AppError` into a frontend-shaped payload. Only the
-    /// `SidecarStartupFailed` variant carries a structured failure —
-    /// everything else collapses into a raw message so the BootError UI
-    /// can still render a meaningful fallback.
+    /// Lift an `AppError` into a frontend-shaped payload. Known startup and
+    /// database-gate failures keep their structured recovery fields;
+    /// everything else collapses into a raw message so the BootError UI can
+    /// still render a meaningful fallback.
     pub fn from_app_error(err: &crate::error::AppError) -> Self {
         if let crate::error::AppError::SidecarStartupFailed(failure) = err {
             return Self::Structured {
@@ -196,16 +213,28 @@ impl SidecarErrorPayload {
                 db_path: db_path.clone(),
             };
         }
-        if let crate::error::AppError::UnexpectedMemoryData { db_path, reason } = err {
-            return Self::UnexpectedMemoryData {
-                db_path: db_path.clone(),
-                reason: reason.clone(),
-            };
-        }
         if let crate::error::AppError::MemoryKindDatabaseSchemaInvalid { db_path, reason } = err {
             return Self::MemoryKindDatabaseSchemaInvalid {
                 db_path: db_path.clone(),
                 reason: reason.clone(),
+            };
+        }
+        if let crate::error::AppError::MemoryKindDatabaseCheckFailed { db_path, reason } = err {
+            return Self::MemoryKindDatabaseCheckFailed {
+                db_path: db_path.clone(),
+                reason: reason.clone(),
+            };
+        }
+        if let crate::error::AppError::DatabaseMigrationFailed {
+            phase,
+            reason,
+            backup_path,
+        } = err
+        {
+            return Self::DatabaseMigrationFailed {
+                phase: phase.clone(),
+                reason: reason.clone(),
+                backup_path: backup_path.clone(),
             };
         }
         Self::Raw {
@@ -257,6 +286,39 @@ mod tests {
         // Pinned: the memories side declares the same literal. Renaming
         // requires a coordinated change in both crates.
         assert_eq!(STARTUP_ERROR_TARGET, "app::startup_error");
+    }
+
+    #[test]
+    fn sidecar_error_payload_preserves_memory_kind_gate_failures() {
+        let migration = crate::error::AppError::MemoryKindMigrationRequired {
+            db_path: "/data/memories/default.sqlite3".into(),
+        };
+        assert!(matches!(
+            SidecarErrorPayload::from_app_error(&migration),
+            SidecarErrorPayload::MemoryKindMigrationRequired { db_path }
+                if db_path == "/data/memories/default.sqlite3"
+        ));
+
+        let invalid = crate::error::AppError::MemoryKindDatabaseSchemaInvalid {
+            db_path: "/data/memories/default.sqlite3".into(),
+            reason: "only memory has memory_kind".into(),
+        };
+        assert!(matches!(
+            SidecarErrorPayload::from_app_error(&invalid),
+            SidecarErrorPayload::MemoryKindDatabaseSchemaInvalid { reason, .. }
+                if reason == "only memory has memory_kind"
+        ));
+
+        let check_failed = crate::error::AppError::MemoryKindDatabaseCheckFailed {
+            db_path: "/data/memories/default.sqlite3".into(),
+            reason: "unable to open database file".into(),
+        };
+        assert!(matches!(
+            SidecarErrorPayload::from_app_error(&check_failed),
+            SidecarErrorPayload::MemoryKindDatabaseCheckFailed { db_path, reason }
+                if db_path == "/data/memories/default.sqlite3"
+                    && reason == "unable to open database file"
+        ));
     }
 
     #[test]
@@ -502,31 +564,6 @@ mod tests {
             SidecarErrorPayload::Structured { failure: inner } => assert_eq!(inner, failure),
             other => panic!("expected Structured, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn sidecar_error_payload_preserves_memory_kind_migration_details() {
-        let err = crate::error::AppError::MemoryKindMigrationRequired {
-            db_path: "/data/memories/default.sqlite3".into(),
-        };
-        assert!(matches!(
-            SidecarErrorPayload::from_app_error(&err),
-            SidecarErrorPayload::MemoryKindMigrationRequired { db_path }
-                if db_path == "/data/memories/default.sqlite3"
-        ));
-    }
-
-    #[test]
-    fn sidecar_error_payload_preserves_unexpected_memory_data_details() {
-        let err = crate::error::AppError::UnexpectedMemoryData {
-            db_path: "/data/memories/default.sqlite3".into(),
-            reason: "owner evidence is inconsistent".into(),
-        };
-        assert!(matches!(
-            SidecarErrorPayload::from_app_error(&err),
-            SidecarErrorPayload::UnexpectedMemoryData { db_path, reason }
-                if db_path == "/data/memories/default.sqlite3" && reason == "owner evidence is inconsistent"
-        ));
     }
 
     #[test]

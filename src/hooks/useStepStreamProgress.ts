@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { analysisCancel } from "@/api";
+import { isTerminalStepStatus } from "@/lib/stepStatus";
 import type { AnalysisStepUpdate } from "@/types/api";
 import { useTauriEvent } from "./useTauriEvent";
 
@@ -24,10 +25,6 @@ export interface StepStreamProgressHandle {
   cancel(): Promise<void>;
 }
 
-function isTerminal(status: StepStreamProgress["status"]): boolean {
-  return status === "done" || status === "failed";
-}
-
 /**
  * Generic single-job progress tracker for the standalone analysis
  * dispatches (`summary://step` / `personality://step`). Parametrized by
@@ -50,7 +47,7 @@ export function useStepStreamProgress(eventName: string): StepStreamProgressHand
       //     user re-ran without dismissing the prior done/failed result).
       // A different job_id while the prior slot is still active is ignored to
       // avoid interleaving two concurrent dispatches into one slot.
-      if (prev == null || (prev.job_id !== p.job_id && isTerminal(prev.status))) {
+      if (prev == null || (prev.job_id !== p.job_id && isTerminalStepStatus(prev.status))) {
         return { job_id: p.job_id, status: p.status, message: p.message };
       }
       if (prev.job_id !== p.job_id) return prev;

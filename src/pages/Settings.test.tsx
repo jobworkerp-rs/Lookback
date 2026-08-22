@@ -32,8 +32,6 @@ const getEmbeddingSettings = vi.fn();
 const getMemoryEmbeddingStats = vi.fn();
 const getBackgroundJobQueueStatus = vi.fn();
 const redispatchMemoryEmbeddings = vi.fn();
-const getMemoryKindRedispatchStatus = vi.fn();
-const retryMemoryKindRedispatch = vi.fn();
 const listLlmPresets = vi.fn();
 const listEmbeddingPresets = vi.fn();
 vi.mock("@/api", () => ({
@@ -45,8 +43,6 @@ vi.mock("@/api", () => ({
   getMemoryEmbeddingStats: () => getMemoryEmbeddingStats(),
   getBackgroundJobQueueStatus: () => getBackgroundJobQueueStatus(),
   redispatchMemoryEmbeddings: (req: unknown) => redispatchMemoryEmbeddings(req),
-  getMemoryKindRedispatchStatus: () => getMemoryKindRedispatchStatus(),
-  retryMemoryKindRedispatch: () => retryMemoryKindRedispatch(),
   listLlmPresets: () => listLlmPresets(),
   listEmbeddingPresets: () => listEmbeddingPresets(),
   // LlmProviderCard reads model status via these as part of its render but
@@ -687,6 +683,16 @@ describe("LlmProviderCard local LLM presets", () => {
       }),
     );
   });
+
+  it("allows an external model context size override", async () => {
+    getLlmSettings.mockResolvedValue(EXTERNAL_NO_KEY);
+    const onDirty = renderLlmCard();
+    await screen.findByPlaceholderText("8192");
+    fireEvent.change(screen.getByPlaceholderText("8192"), { target: { value: "16384" } });
+    await waitFor(() =>
+      expect(llmPayload(onDirty)).toMatchObject({ mode: "external", local_ctx_size: 16384 }),
+    );
+  });
 });
 
 // MemoryEmbeddingCard: the regression that pulled the old "自省インデックス"
@@ -773,9 +779,6 @@ describe("MemoryEmbeddingCard", () => {
     i18n.changeLanguage("ja");
     getMemoryEmbeddingStats.mockReset();
     redispatchMemoryEmbeddings.mockReset();
-    getMemoryKindRedispatchStatus.mockReset();
-    retryMemoryKindRedispatch.mockReset();
-    getMemoryKindRedispatchStatus.mockResolvedValue({ pending: false, error: null });
   });
 
   it("disables 再生成 when the memory_vector table is missing", async () => {
@@ -819,22 +822,6 @@ describe("MemoryEmbeddingCard", () => {
     } finally {
       confirmSpy.mockRestore();
     }
-  });
-
-  it("retries the complete migration redispatch when its durable notice is pending", async () => {
-    getMemoryEmbeddingStats.mockResolvedValue(STATS_HEALTHY);
-    getMemoryKindRedispatchStatus.mockResolvedValue({
-      pending: true,
-      error: "memory RPC unavailable",
-    });
-    retryMemoryKindRedispatch.mockResolvedValue(undefined);
-    renderEmbeddingCard();
-
-    await screen.findByText("移行後のベクトル再生成が完了していません。");
-    expect(screen.getByText(/memory RPC unavailable/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "移行後の再生成を再試行" }));
-    await waitFor(() => expect(retryMemoryKindRedispatch).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(getMemoryKindRedispatchStatus).toHaveBeenCalledTimes(2));
   });
 
   it("does not dispatch when the user cancels the confirm dialog", async () => {

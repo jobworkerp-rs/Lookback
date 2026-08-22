@@ -13,8 +13,10 @@ pub mod error;
 pub mod grpc;
 pub mod jobworkerp;
 pub mod lindera;
+pub mod log_rotation;
 pub mod maintenance;
 pub mod plugins;
+pub mod search_index_maintenance;
 pub mod serde_id;
 pub mod sidecar;
 
@@ -48,6 +50,8 @@ pub fn run() {
             commands::threads::count_threads,
             commands::threads::delete_thread,
             commands::summaries::list_summaries,
+            commands::summaries::list_summaries_for_selection,
+            commands::summaries::get_summary_content,
             commands::summaries::find_summary_distinct_labels,
             commands::summaries::find_summary_co_occurring_labels,
             commands::summaries::count_summaries,
@@ -58,12 +62,17 @@ pub fn run() {
             commands::import::start_import_cancel,
             commands::settings::get_settings,
             commands::settings::get_sidecar_status,
+            commands::search_index_maintenance::get_search_index_maintenance_status,
+            commands::search_index_maintenance::start_search_index_maintenance,
+            commands::search_index_maintenance::set_search_index_maintenance_schedule,
             commands::settings::purge_all_data,
             commands::connection::get_connection_config,
             commands::connection::set_connection_config,
             commands::connection::test_connection_config,
             commands::logs::read_sidecar_log,
             commands::reflections::list_reflections_by_thread,
+            commands::reflections::list_reflections_for_selection,
+            commands::reflections::get_reflection_selection_content,
             commands::reflections::search_reflections,
             commands::reflections::search_reflections_hybrid,
             commands::reflections::search_reflections_by_intent,
@@ -98,6 +107,8 @@ pub fn run() {
             commands::analysis_dispatch::analysis_cancel,
             commands::chat::chat_ask,
             commands::chat::chat_cancel,
+            commands::chat::get_selected_memory_limits,
+            commands::chat::save_chat_markdown,
             commands::llm_settings::get_llm_settings,
             commands::llm_settings::set_llm_settings,
             commands::app_settings::get_app_settings,
@@ -126,12 +137,9 @@ pub fn run() {
             commands::recovery::recover_evacuate_lancedb,
             commands::recovery::recover_purge_lancedb,
             commands::recovery::recover_reset_embedding_settings,
-            commands::recovery::migrate_memory_kind,
-            commands::recovery::preview_memory_kind_migration,
-            commands::recovery::get_memory_kind_redispatch_status,
-            commands::recovery::retry_memory_kind_redispatch,
+            commands::recovery::retry_database_migration,
+            commands::recovery::restore_database_migration_backup,
             commands::recovery::open_log_dir,
-            commands::recovery::open_memory_kind_migration_guide,
             commands::recovery::quit_app,
             resolve_memories_import_bin,
         ])
@@ -146,6 +154,9 @@ pub fn run() {
             let sidecars = Arc::new(Sidecars::new(config));
 
             app.manage(AppState::new(sidecars.clone(), data.clone()));
+
+            spawn_log_maintenance(data.clone());
+            spawn_search_index_maintenance_scheduler(handle.clone());
 
             // Spawn sidecars on a tokio task — keep the Tauri setup path
             // non-blocking so the UI shell renders immediately.
@@ -173,6 +184,172 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// Run best-effort log retention at startup and every six hours. The cleanup
+/// never blocks sidecar startup and failures are diagnostic only: losing a
+/// maintenance pass must not make the application unavailable.
+fn spawn_log_maintenance(data: DataPaths) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+        loop {
+            tick.tick().await;
+            let log_dir = data.log_dir();
+            match tokio::task::spawn_blocking(move || {
+                crate::log_rotation::cleanup_log_dir(&log_dir)
+            })
+            .await
+            {
+                Ok(Ok(report)) if report.expired > 0 || report.capacity > 0 => {
+                    tracing::debug!(
+                        expired = report.expired,
+                        capacity = report.capacity,
+                        "log retention maintenance removed archived logs"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::debug!(%error, "log retention maintenance failed"),
+                Err(error) => tracing::debug!(%error, "log retention task failed"),
+            }
+        }
+    });
+}
+
+/// Local, sidecar-ready time is checkpointed once a minute.  The scheduler is
+/// deliberately owned by the app, not by `front`, so desktop downtime never
+/// counts towards the 24-hour compaction qualification.
+fn spawn_search_index_maintenance_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut ready_minutes: u64 = 0;
+        loop {
+            tick.tick().await;
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            if state.connection_mode() != commands::connection::ConnectionMode::Local
+                || state.sidecars.current_endpoints().is_none()
+            {
+                continue;
+            }
+            if let Err(error) = state.search_index_maintenance.add_ready_runtime(60).await {
+                tracing::warn!(%error, "search-index maintenance runtime checkpoint failed");
+                continue;
+            }
+            let app_settings =
+                crate::data::paths::load_app_settings(&state.data.app_settings_path());
+            let timezone = crate::sidecar::lifecycle::resolve_timezone(Some(&app_settings));
+            if let Ok(channel) = state.memories_channel().await {
+                let coordinator = state.search_index_maintenance.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = coordinator
+                        .start_scheduled_optimize(channel, chrono::Utc::now(), &timezone)
+                        .await
+                    {
+                        tracing::warn!(%error, "scheduled search-index optimization failed");
+                    }
+                });
+            }
+            monitor_periodic_maintenance(&app).await;
+            ready_minutes = ready_minutes.saturating_add(1);
+            if ready_minutes.is_multiple_of(60) {
+                match state.memories_channel().await {
+                    Ok(channel) => {
+                        if let Err(error) = state.search_index_maintenance.reconcile(channel).await
+                        {
+                            tracing::warn!(%error, "hourly search-index reconcile failed");
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "hourly maintenance channel unavailable"),
+                }
+            }
+        }
+    });
+}
+
+/// Conductor owns periodic workflow dispatch, so terminal execution records
+/// are observed in the backend rather than relying on a mounted UI view.
+async fn monitor_periodic_maintenance(app: &AppHandle) {
+    let tasks = match commands::periodic_tasks::list_periodic_tasks(
+        app.state::<AppState>(),
+        commands::periodic_tasks::ListPeriodicTasksRequest {
+            limit: Some(100),
+            offset: Some(0),
+        },
+    )
+    .await
+    {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            tracing::debug!(%error, "periodic maintenance monitor could not list tasks");
+            return;
+        }
+    };
+    let ids = tasks
+        .into_iter()
+        .filter(|task| task.enabled)
+        .map(|task| task.id)
+        .collect();
+    let statuses = match commands::periodic_execution::list_periodic_task_statuses(
+        app.state::<AppState>(),
+        commands::periodic_execution::ListPeriodicTaskStatusesRequest { scheduler_ids: ids },
+    )
+    .await
+    {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            tracing::debug!(%error, "periodic maintenance monitor could not resolve status");
+            return;
+        }
+    };
+    for summary in statuses {
+        let terminal = matches!(
+            summary.status,
+            commands::periodic_execution::PeriodicExecutionStatus::Succeeded
+                | commands::periodic_execution::PeriodicExecutionStatus::Failed
+                | commands::periodic_execution::PeriodicExecutionStatus::Cancelled
+                | commands::periodic_execution::PeriodicExecutionStatus::EnqueueFailed
+        );
+        let Some(execution_id) = summary
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.execution_ref_id.as_str())
+        else {
+            continue;
+        };
+        if !terminal {
+            if summary.active {
+                let state = app.state::<AppState>();
+                if let Err(error) = state
+                    .search_index_maintenance
+                    .begin_periodic_execution(execution_id)
+                    .await
+                {
+                    tracing::warn!(%error, "periodic execution maintenance admission failed");
+                }
+            }
+            continue;
+        }
+        let state = app.state::<AppState>();
+        match state
+            .search_index_maintenance
+            .finish_periodic_execution(execution_id)
+            .await
+        {
+            Ok(true) => match state.memories_channel().await {
+                Ok(channel) => {
+                    if let Err(error) = state.search_index_maintenance.reconcile(channel).await {
+                        tracing::warn!(%error, "periodic terminal maintenance reconcile failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "periodic terminal maintenance channel unavailable")
+                }
+            },
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "periodic terminal maintenance state failed"),
+        }
+    }
 }
 
 /// Initialise tracing to stderr AND, when the data root is reachable, to
@@ -212,9 +389,8 @@ fn init_tracing() {
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let stderr_layer = tracing_subscriber::fmt::layer().with_target(true);
 
-    // Append (not truncate) so a crash-and-relaunch keeps prior context; the
-    // file is line-based plain text like the sidecar logs (no rotation in the
-    // MVP — same deferred item noted in commands/logs.rs).
+    // Append (not truncate) so a crash-and-relaunch keeps prior context. The
+    // shared writer rotates the active file on the common size/day boundary.
     let file = DataPaths::resolve().ok().and_then(|data| {
         let dir = data.log_dir();
         std::fs::create_dir_all(&dir).ok()?;
@@ -222,11 +398,10 @@ fn init_tracing() {
         // External→Local hard-crash position survives the OS panic that the
         // buffered tracing appender below loses (see `crashtrace`).
         crate::crashtrace::init(dir.clone());
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(crate::commands::logs::APP_LOG_FILE))
-            .ok()
+        crate::log_rotation::SharedRotatingWriter::new(
+            dir.join(crate::commands::logs::APP_LOG_FILE),
+        )
+        .ok()
     });
 
     let registry = tracing_subscriber::registry().with(stderr_layer.with_filter(filter()));
@@ -236,7 +411,7 @@ fn init_tracing() {
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false) // a file is not a TTY; colour codes are noise
                     .with_target(true)
-                    .with_writer(std::sync::Arc::new(file))
+                    .with_writer(file)
                     .with_filter(filter()),
             )
             .try_init(),
@@ -283,6 +458,46 @@ pub(crate) async fn stage_and_start_sidecars(
 
     match sidecars.start_with_warnings(plugin_warnings).await {
         Ok(report) => {
+            // A listening TCP port alone does not prove that the new explicit
+            // maintenance service is compatible.  Verify its read-only RPC
+            // before advertising this Local sidecar as ready, then request a
+            // single reconcile for work left by a previous app session.
+            if let Some(state) = app.try_state::<crate::commands::AppState>()
+                && state.connection_mode() == crate::commands::connection::ConnectionMode::Local
+            {
+                let maintenance = state.search_index_maintenance.clone();
+                match state.memories_channel().await {
+                    Ok(channel) => {
+                        if let Err(error) = maintenance.verify_service(channel.clone()).await {
+                            tracing::error!(%error, "maintenance service compatibility check failed");
+                            let _ = sidecars.stop().await;
+                            crate::commands::emit_event(
+                                app,
+                                "sidecar://error",
+                                crate::sidecar::startup_error::SidecarErrorPayload::from_app_error(
+                                    &error,
+                                ),
+                            );
+                            return;
+                        }
+                        if let Err(error) = maintenance.reconcile(channel).await {
+                            tracing::warn!(%error, "initial search-index reconcile is pending retry");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "maintenance service connection failed");
+                        let _ = sidecars.stop().await;
+                        crate::commands::emit_event(
+                            app,
+                            "sidecar://error",
+                            crate::sidecar::startup_error::SidecarErrorPayload::from_app_error(
+                                &error,
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
             crate::commands::emit_event(app, "sidecar://ready", report);
         }
         Err(e) => {
@@ -302,16 +517,10 @@ pub(crate) async fn stage_and_start_sidecars(
 
 fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std::error::Error>> {
     let data = DataPaths::resolve()?;
-    // Ensure the data dirs exist before staging the Lindera dictionary into
-    // them (sidecars also call ensure(), but staging runs first here).
-    if matches!(
-        commands::connection::load_connection_config(&data.connection_config_path()).mode,
-        commands::connection::ConnectionMode::Remote
-    ) {
-        data.ensure_runtime()?;
-    } else {
-        data.ensure()?;
-    }
+    // The local sidecar performs its read-only memory_kind compatibility gate
+    // immediately before `ensure()`. Only create runtime prerequisites here so
+    // config construction never changes a legacy memories database first.
+    data.ensure_runtime()?;
 
     // Resolve sidecar binary paths. Priority:
     //   1. LOOKBACK_JOBWORKERP_BIN / LOOKBACK_MEMORIES_BIN env (dev override).
@@ -337,6 +546,7 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
         "memories-front",
         "../../memories/target/release/front",
     )?;
+    let memories_db_migrate_bin = resolve_memories_db_migrate_bin(handle);
     let conductor_bin = resolve_bin_for_app(
         handle,
         "LOOKBACK_CONDUCTOR_BIN",
@@ -427,6 +637,8 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
     Ok(SidecarConfig {
         jobworkerp_bin,
         memories_bin,
+        memories_db_migrate_bin,
+        startup_database_migration_enabled: true,
         conductor_bin,
         data,
         worker_yaml_paths,
@@ -442,6 +654,27 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
         llm_kv_cache_type: Some(llm_kv_cache_type),
         env_file: resolve_env_file(),
     })
+}
+
+fn resolve_memories_db_migrate_bin(app: &AppHandle) -> PathBuf {
+    if let Ok(path) = std::env::var("LOOKBACK_MEMORIES_DB_MIGRATE_BIN") {
+        return PathBuf::from(path);
+    }
+    if let Ok(resources) = app.path().resource_dir() {
+        let candidate = resources
+            .join("memories-db-migrate")
+            .join("memories-db-migrate");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("migration-bundle")
+        .join("memories-db-migrate");
+    if candidate.is_file() {
+        return candidate;
+    }
+    candidate
 }
 
 /// Locate a `.env` template to forward to the sidecars. Resolution:
@@ -698,12 +931,12 @@ mod tests {
         let macos = dir.path().join("Contents/MacOS");
         std::fs::create_dir_all(&resources).unwrap();
         std::fs::create_dir_all(&macos).unwrap();
-        let bundled = macos.join("migrate-memory-kind");
+        let bundled = macos.join("front");
         std::fs::write(&bundled, b"bundled sidecar").unwrap();
 
         let p = resolve_bin_from_dir(
             "LOOKBACK_TEST_BIN_RESOURCE",
-            "migrate-memory-kind",
+            "front",
             "lookback-nonexistent-resource-bin-zzz",
             "fallback",
             BinResolutionPaths {
@@ -760,9 +993,9 @@ mod tests {
 
         let error = resolve_bin_from_dir(
             "LOOKBACK_TEST_BIN_PACKAGED",
-            "migrate-memory-kind",
+            "front",
             "lookback-nonexistent-packaged-bin-zzz",
-            "/Users/example/workspace/migrate-memory-kind",
+            "/Users/example/workspace/front",
             BinResolutionPaths {
                 exe_dir: None,
                 resource_dir: Some(&resources),
@@ -775,7 +1008,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("bundled sidecar migrate-memory-kind is missing")
+                .contains("bundled sidecar front is missing")
         );
         assert!(!error.to_string().contains("/Users/example"));
     }
@@ -786,12 +1019,12 @@ mod tests {
         let resources = dir.path().join("usr/lib/lookback/resources");
         let package_dir = resources.parent().unwrap();
         std::fs::create_dir_all(&resources).unwrap();
-        let bundled = package_dir.join("migrate-memory-kind");
+        let bundled = package_dir.join("front");
         std::fs::write(&bundled, b"bundled sidecar").unwrap();
 
         let p = resolve_bin_from_dir(
             "LOOKBACK_TEST_BIN_LINUX_RESOURCE",
-            "migrate-memory-kind",
+            "front",
             "lookback-nonexistent-linux-resource-bin-zzz",
             "fallback",
             BinResolutionPaths {
@@ -847,9 +1080,10 @@ mod tests {
         assert_eq!(resources.get("../workers/"), Some(&"workers/".into()));
         assert_eq!(resources.get("../dict/"), Some(&"dict/".into()));
         assert_eq!(
-            resources.get("migration-toolkit/"),
-            Some(&"migration-toolkit/".into())
+            resources.get("migration-bundle/"),
+            Some(&"memories-db-migrate/".into())
         );
+        assert_eq!(resources.len(), 3);
         // The plugin glob must NOT be in the shared config (would break the
         // other platform's build).
         assert!(resources.get("plugins/*.dylib").is_none());
@@ -870,6 +1104,35 @@ mod tests {
         assert_eq!(
             linux["bundle"]["resources"].get("plugins/*.so*"),
             Some(&"plugins/".into())
+        );
+    }
+
+    #[test]
+    fn shell_open_is_limited_to_the_memory_kind_migration_release() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let permissions = capability["permissions"]
+            .as_array()
+            .expect("default capability has permissions");
+        assert!(
+            permissions
+                .iter()
+                .any(|permission| permission == "shell:allow-open"),
+            "the migration-release button needs the shell open command"
+        );
+        assert!(
+            !permissions
+                .iter()
+                .any(|permission| permission == "shell:default"),
+            "shell:default would grant the plugin's broad http(s), tel and mailto scope"
+        );
+
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            config["plugins"]["shell"]["open"],
+            "https://github\\.com/jobworkerp-rs/Lookback/releases/tag/v0\\.0\\.7",
+            "the shell plugin anchors this validation regex, so only the exact release URL is openable"
         );
     }
 }

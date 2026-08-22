@@ -26,12 +26,24 @@ make_bin() {
   chmod +x "${path}"
 }
 
+make_migration_bundle() {
+  local root=$1
+  make_bin "${root}/memories-db-migrate"
+  make_bin "${root}/atlas/bin/atlas"
+  mkdir -p "${root}/atlas/sqlite/migrations"
+  printf "INSERT INTO memories_schema_contract (contract_key, version) VALUES ('rdb_schema', '20260803000003');\n" >"${root}/atlas/sqlite/migrations/20260803000003_schema_contract.sql"
+  printf 'catalog\n' >"${root}/atlas/sqlite/migrations/atlas.sum"
+  cat >"${root}/atlas/post-migration-tasks.json" <<'EOF'
+{"tasks":[{"id":"thread-message-times-v1","generation":1,"lifecycle":"active","completion_required_by_schema_version":"20260803000003"}]}
+EOF
+}
+
 make_bin "${TMP_ROOT}/src/all-in-one"
 make_bin "${TMP_ROOT}/src/front"
 make_bin "${TMP_ROOT}/src/conductor-main"
 make_bin "${TMP_ROOT}/src/memories-import"
-make_bin "${TMP_ROOT}/src/migrate-memory-kind"
 make_bin "${TMP_ROOT}/src/protoc"
+make_migration_bundle "${TMP_ROOT}/migration-bundle"
 mkdir -p "${TMP_ROOT}/plugins/cuda_runner" "${TMP_ROOT}/github"
 printf 'plugin\n' >"${TMP_ROOT}/plugins/cuda_runner/libcuda_runner.${PLUGIN_EXT}"
 
@@ -49,7 +61,7 @@ LOOKBACK_AGENT_APP="${TMP_ROOT}/github/agent-app" \
   LOOKBACK_MEMORIES_BIN="${TMP_ROOT}/src/front" \
   LOOKBACK_CONDUCTOR_BIN="${TMP_ROOT}/src/conductor-main" \
   LOOKBACK_MEMORIES_IMPORT_BIN="${TMP_ROOT}/src/memories-import" \
-  LOOKBACK_MIGRATE_MEMORY_KIND_BIN="${TMP_ROOT}/src/migrate-memory-kind" \
+  LOOKBACK_MEMORIES_DB_MIGRATE_BUNDLE="${TMP_ROOT}/migration-bundle" \
   LOOKBACK_PLUGINS_SRC="${TMP_ROOT}/plugins" \
   PROTOC="${TMP_ROOT}/src/protoc" \
   TAURI_ARG_LOG="${TMP_ROOT}/args.log" \
@@ -84,7 +96,7 @@ LOOKBACK_AGENT_APP="${TMP_ROOT}/github/agent-app-explicit" \
   LOOKBACK_MEMORIES_BIN="${TMP_ROOT}/src/front" \
   LOOKBACK_CONDUCTOR_BIN="${TMP_ROOT}/src/conductor-main" \
   LOOKBACK_MEMORIES_IMPORT_BIN="${TMP_ROOT}/src/memories-import" \
-  LOOKBACK_MIGRATE_MEMORY_KIND_BIN="${TMP_ROOT}/src/migrate-memory-kind" \
+  LOOKBACK_MEMORIES_DB_MIGRATE_BUNDLE="${TMP_ROOT}/migration-bundle" \
   LOOKBACK_PLUGINS_SRC="${TMP_ROOT}/plugins" \
   PROTOC="${TMP_ROOT}/src/protoc" \
   GDK_BACKEND=wayland \
@@ -97,5 +109,18 @@ LOOKBACK_AGENT_APP="${TMP_ROOT}/github/agent-app-explicit" \
 
 grep -q '^wayland$' "${TMP_ROOT}/gdk-explicit.log"
 grep -q '^0$' "${TMP_ROOT}/webkit-explicit.log"
+
+LOOKBACK_AGENT_APP="${TMP_ROOT}/github/agent-app-build" \
+  TAURI_ARG_LOG="${TMP_ROOT}/args-build.log" \
+  TAURI_GDK_LOG="${TMP_ROOT}/gdk-build.log" \
+  TAURI_WEBKIT_LOG="${TMP_ROOT}/webkit-build.log" \
+  PATH="${TMP_ROOT}/toolbin:${PATH}" \
+  bash "${WRAPPER}" build
+
+grep -q '^build$' "${TMP_ROOT}/args-build.log"
+[[ ! -e "${TMP_ROOT}/github/agent-app-build/src-tauri" ]] || {
+  echo "build wrapper unexpectedly ran dev external binary staging" >&2
+  exit 1
+}
 
 echo "run-tauri tests passed"

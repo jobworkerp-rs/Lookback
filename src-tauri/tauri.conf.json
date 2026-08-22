@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5180",
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "pnpm build && pnpm verify:migration-bundle"
   },
   "app": {
     "windows": [
@@ -24,6 +24,11 @@
     ],
     "security": {
       "csp": null
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": "https://github\\.com/jobworkerp-rs/Lookback/releases/tag/v0\\.0\\.7"
     }
   },
   "bundle": {
@@ -45,13 +50,12 @@
       "bin/front",
       "bin/conductor-main",
       "bin/memories-import",
-      "bin/migrate-memory-kind",
       "bin/protoc"
     ],
     "resources": {
       "../workers/": "workers/",
       "../dict/": "dict/",
-      "migration-toolkit/": "migration-toolkit/"
+      "migration-bundle/": "memories-db-migrate/"
     }
   }
 }

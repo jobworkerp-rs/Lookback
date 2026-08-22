@@ -29,6 +29,8 @@ fn make_sidecars(tmp: PathBuf) -> Sidecars {
     let config = SidecarConfig {
         jobworkerp_bin: sleep.clone(),
         memories_bin: sleep.clone(),
+        memories_db_migrate_bin: PathBuf::from("/bin/true"),
+        startup_database_migration_enabled: false,
         conductor_bin: sleep,
         data,
         worker_yaml_paths: Vec::new(),

@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "llm_memory/service/memory_vector.proto",
         "llm_memory/service/reflection.proto",
         "llm_memory/service/reflection_vector.proto",
+        "llm_memory/service/search_index_maintenance.proto",
         "llm_memory/service/thread.proto",
         "llm_memory/service/thread_vector.proto",
         "jobworkerp/runner/llm/chat_args.proto",

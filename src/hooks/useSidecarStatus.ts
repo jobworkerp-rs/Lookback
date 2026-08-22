@@ -17,6 +17,8 @@ export interface SidecarStatus {
   phase: SidecarPhase;
   endpoints?: SidecarEndpoints;
   warnings: SidecarWarning[];
+  /** True only while a local memories database migration gate is running. */
+  databaseMigrationInProgress?: boolean;
   /**
    * Failure payload from the most recent `sidecar://error` event.
    * Present iff `phase === "error"`. The BootError component branches
@@ -29,7 +31,12 @@ export interface SidecarStatus {
 /** Map a `SidecarStartReport` to the ready status (splits the flattened endpoints). */
 export function readyStatusFrom(report: SidecarStartReport): SidecarStatus {
   const { warnings = [], ...endpoints } = report;
-  return { phase: "ready", endpoints: endpoints as SidecarEndpoints, warnings };
+  return {
+    phase: "ready",
+    endpoints: endpoints as SidecarEndpoints,
+    warnings,
+    databaseMigrationInProgress: false,
+  };
 }
 
 /** Normalise a `sidecar://error` payload into the SidecarStatus error
@@ -38,7 +45,7 @@ export function readyStatusFrom(report: SidecarStartReport): SidecarStatus {
  * is a 1:1 wrap — kept as a function only so the event handler reads
  * symmetrically with `readyStatusFrom`. */
 export function errorStatusFrom(payload: SidecarErrorPayload): SidecarStatus {
-  return { phase: "error", warnings: [], failure: payload };
+  return { phase: "error", warnings: [], failure: payload, databaseMigrationInProgress: false };
 }
 
 /**
@@ -62,7 +69,10 @@ export function applySnapshot(
   if (prev.phase !== "starting" || snapshot == null) return prev;
   if (snapshot.failure) return errorStatusFrom(snapshot.failure);
   if (snapshot.ready) return readyStatusFrom(snapshot.ready);
-  return prev;
+  if (Boolean(prev.databaseMigrationInProgress) === snapshot.database_migration_in_progress) {
+    return prev;
+  }
+  return { ...prev, databaseMigrationInProgress: snapshot.database_migration_in_progress };
 }
 
 /**
@@ -85,18 +95,31 @@ export function useSidecarStatus(): SidecarStatus {
   });
 
   useEffect(() => {
+    if (status.phase !== "starting") return;
+
     let cancelled = false;
-    getSidecarStatus()
-      .then((snapshot) => {
-        if (!cancelled) setStatus((prev) => applySnapshot(prev, snapshot));
-      })
-      .catch((err) => {
-        console.error("get_sidecar_status failed", err);
-      });
+    let poll: number | undefined;
+    const scheduleNext = () => {
+      if (!cancelled) poll = window.setTimeout(refresh, 500);
+    };
+    const refresh = () => {
+      getSidecarStatus()
+        .then((snapshot) => {
+          if (!cancelled) setStatus((prev) => applySnapshot(prev, snapshot));
+        })
+        .catch((err) => {
+          console.error("get_sidecar_status failed", err);
+        })
+        .finally(() => {
+          scheduleNext();
+        });
+    };
+    refresh();
     return () => {
       cancelled = true;
+      if (poll !== undefined) window.clearTimeout(poll);
     };
-  }, []);
+  }, [status.phase]);
 
   return status;
 }

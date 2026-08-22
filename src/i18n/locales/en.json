@@ -88,6 +88,26 @@
       "1": "Task outcome",
       "2": "Interaction style",
       "3": "Both"
+    },
+    "failureMode": {
+      "unspecified": "Unspecified",
+      "toolMisuse": "Tool misuse",
+      "loop": "Loop",
+      "scopeDrift": "Scope drift",
+      "hallucination": "Hallucination",
+      "contextOverflow": "Context overflow",
+      "dataLoss": "Data loss",
+      "permissionIssue": "Permission issue",
+      "ambiguousInstruction": "Ambiguous instruction",
+      "conflictingRequirements": "Conflicting requirements",
+      "missingContext": "Missing context",
+      "misleadingPremise": "Misleading premise",
+      "goalDriftByUser": "Goal drift by user",
+      "toolUnavailable": "Tool unavailable",
+      "externalServiceFailure": "External service failure",
+      "rateLimit": "Rate limit",
+      "other": "Other",
+      "unknown": "Unclassified"
     }
   },
   "search": {
@@ -160,6 +180,7 @@
       "unknownSource": "unknown",
       "unsupportedFormat": "Unsupported format",
       "unnamed": "(Unnamed)",
+      "lookbackToday": "today",
       "lookback_one": "last {{count}} day",
       "lookback_other": "last {{count}} days"
     },
@@ -217,7 +238,7 @@
       "reflection": "Reflection",
       "weekday": "Day of week",
       "monthlyDay": "Day of month",
-      "lookbackDays": "Lookback days",
+      "lookbackDays": "Lookback days (0 for today)",
       "save": "Save"
     },
     "weekday": {
@@ -253,7 +274,7 @@
       "sourceInvalid": "Choose source from codex / claude-code / codex + claude-code",
       "hourRange": "Enter the hour as 0-23",
       "minuteRange": "Enter the minute as 0-59",
-      "lookbackRange": "Enter lookback days as 1 or more",
+      "lookbackRange": "Enter lookback days as 0 or more",
       "intervalRange": "Enter the interval as 1 or more",
       "intervalHourChoice": "Choose the hour interval from 1/2/3/4/6/8/12/24",
       "weekdayInvalid": "Invalid day of week",
@@ -322,6 +343,14 @@
       "noAnswer": "No answer was generated."
     },
     "errorPrefix": "Error:",
+    "answer": {
+      "copy": "Copy Markdown",
+      "save": "Save as Markdown",
+      "includeSources": "Include sources",
+      "copySuccess": "Copied",
+      "saveSuccess": "Saved",
+      "actionFailed": "The operation failed"
+    },
     "sources": {
       "label": "Sources ({{count}})",
       "threadDetail": "thread #{{id}}"
@@ -329,9 +358,91 @@
     "sourceKind": {
       "raw_memory": "Raw",
       "thread_summary": "Thread summary",
-      "period_summary": "Period summary"
+      "period_summary": "Period summary",
+      "reflection": "Reflection"
+    },
+    "selected": "Selected summaries ({{count}})",
+    "selectedContentTruncated": "Some selected materials were omitted to fit the context capacity.",
+    "export": {
+      "selectedSummaries": "Selected summaries",
+      "sources": "Sources",
+      "kind": "Kind",
+      "memoryId": "Memory ID",
+      "memory": "Memory {{id}}"
+    },
+    "selectSummary": {
+      "title": "Select summaries",
+      "tabs": "Summary kind",
+      "kind": {
+        "per-thread": "Thread summary",
+        "daily": "Daily",
+        "weekly": "Weekly",
+        "monthly": "Monthly",
+        "reflection": "Reflection"
+      },
+      "count": "Selected: {{count}} / 10",
+      "limitReached": "You can select up to 10 summaries.",
+      "preview": "View full summary",
+      "closePreview": "Close preview",
+      "loading": "Loading summaries…",
+      "retry": "Retry",
+      "loadMore": "Load more",
+      "error": "Could not load summaries: {{error}}",
+      "empty": "No summaries",
+      "summaryFields": {
+        "title": "Title",
+        "summary": "Summary",
+        "overallPurpose": "Overall purpose",
+        "category": "Category",
+        "status": "Status",
+        "keyDecisions": "Key decisions",
+        "purposeGroups": "Purpose groups",
+        "byTopic": "By topic",
+        "carryover": "Carryover",
+        "trends": "Trends",
+        "highlights": "Highlights",
+        "milestones": "Milestones",
+        "sourceMemoryIds": "Source memories",
+        "sourceThreadIds": "Source threads",
+        "details": "Details",
+        "purpose": "Purpose",
+        "bullets": "Items",
+        "topic": "Topic",
+        "kind": "Kind",
+        "outcome": "Outcome",
+        "completedInWeek": "Completed in week"
+      },
+      "category": {
+        "coding": "Coding",
+        "consultation": "Consultation",
+        "research": "Research",
+        "creative": "Creative",
+        "general": "General"
+      },
+      "status": {
+        "resolved": "Resolved",
+        "ongoing": "Ongoing",
+        "in_review": "In review",
+        "blocked": "Blocked",
+        "deferred": "Deferred",
+        "abandoned": "Abandoned"
+      },
+      "trendKind": {
+        "continued": "Continued",
+        "new": "New",
+        "completed": "Completed"
+      },
+      "clear": "Clear selection",
+      "cancel": "Cancel",
+      "confirm": "Use selected summaries"
     },
     "composer": {
+      "selectSummary": "Select summaries",
+      "mode": "Additional retrieval",
+      "modeSelectedOnly": "Selected summaries only",
+      "modeSourceDetails": "Check source threads if needed",
+      "modeRelated": "Search all related memories",
+      "removeSummary": "Remove from selection",
       "placeholder": "Type a question (⌘Enter to send)",
       "stop": "Stop",
       "send": "Send"
@@ -369,8 +480,15 @@
     },
     "card": {
       "openThread": "Open source thread →",
+      "taskIntent": "Intent",
+      "summary": "Summary",
       "lessons": "Lessons",
       "keyDecisions": "Key decisions",
+      "successFactors": "Success factors",
+      "tools": "Tools used",
+      "failureModes": "Failure modes",
+      "facts": "Facts",
+      "factWithoutNote": "Related fact",
       "mitigationHint": "Mitigation hint"
     }
   },
@@ -388,7 +506,6 @@
       "search": "Search",
       "calendar": "Calendar"
     },
-    "calendarDisabledTitle": "Thread summaries have no period",
     "searchPlaceholder": "Search query",
     "date": {
       "createdAfter": "Created after (strict >)",
@@ -507,6 +624,7 @@
       "advancedToggleOpen": "▼ Advanced",
       "advancedToggleClosed": "▶ Advanced",
       "ctxSizeHint": "Leave blank to use the preset's recommended value ({{value}})",
+      "ctxSizeExternalHint": "Leave blank to use the conservative default ({{value}})",
       "ctxSizeNote": "You can reduce it for memory constraints. The reflection workflow needs roughly 222k of context; smaller values split long summaries.",
       "kvCacheType": "KV cache type",
       "kvCacheTypeHint": "Smaller values reduce RAM use but can affect model quality.",
@@ -568,10 +686,6 @@
       "embedded": "Embedded",
       "pending": "Not generated",
       "allDone": "All generated (auto-generation is working).",
-      "migrationPendingTitle": "Post-migration vector regeneration is incomplete.",
-      "migrationPendingBody": "The SQLite migration is complete. Retry vector regeneration for memory, thread, and reflection to restore the search index. Details:",
-      "migrationRetry": "Retry post-migration regeneration",
-      "migrationRetrying": "Retrying post-migration regeneration…",
       "redispatch": "Re-generate",
       "redispatchTitle": "Use this to fill gaps or rebuild after changing the embedding model (this takes a while)",
       "redispatching": "Re-generating…",
@@ -760,7 +874,8 @@
     "statusActive": "Running…",
     "statusDone": "Done",
     "statusWarning": "Partially failed",
-    "statusFailed": "Failed"
+    "statusFailed": "Failed",
+    "noticeNoImportableLogSources": "No importable session logs were found."
   },
   "summaryGen": {
     "title": "Generate summaries",
@@ -768,6 +883,7 @@
     "llmDownBody": "Summary generation requires the LLM. Check the Sidecar status in the sidebar.",
     "stages": "Stages to generate",
     "dependencyHint": "Selecting a higher level auto-selects its dependencies (weekly → daily → thread).",
+    "stopOnError": "Stop on error",
     "targetPeriod": "Target period",
     "rangeStart": "Start",
     "rangeEnd": "End",
@@ -783,6 +899,7 @@
   },
   "analysis": {
     "done": "Generation complete",
+    "warning": "Partially failed",
     "failed": "Generation failed",
     "running": "Generating",
     "close": "Close"
@@ -836,6 +953,7 @@
   },
   "boot": {
     "startingSidecar": "Starting sidecar…",
+    "databaseMigrationInProgress": "Checking or migrating the database. Do not quit or restart Lookback until it finishes.",
     "checkingSetup": "Checking setup status…",
     "setupCheckFailed": "Could not check setup status.",
     "retry": "Retry"
@@ -879,31 +997,28 @@
     }
   },
   "bootError": {
-    "memoryKindMigrationRequired": {
-      "title": "Memory data migration is required",
-      "body": "This Lookback data has not been migrated to memory_kind. Migration creates a SQLite backup, runs the bundled conversion, and redispatches vectors. Database: {{db_path}}"
-    },
-    "preview": {
-      "title": "Review migration",
-      "body": "The SQLite copy was checked. Unresolved warnings: {{warningCount}} (memory: {{unresolvedMemoryCount}}, thread: {{unresolvedThreadCount}}). Total memory/thread records: {{totalRecordCount}}. Planned deletion: {{plannedMemoryDeleteCount}} memories and {{plannedThreadDeleteCount}} threads. Approval dumps and removes any unresolved client records found at execution, then continues the migration.",
-      "related": "Related rows: {{table}} — {{count}}",
-      "confirm": "Dump, remove, and migrate",
-      "cancel": "Cancel"
-    },
-    "memoryKindDatabaseSchemaInvalid": {
-      "title": "Check the memory database state",
-      "body": "The memory database cannot be migrated from its current state. Verify the backup, then follow the migration procedure. Database: {{db_path}}\nDetails: {{reason}}"
-    },
-    "unexpectedMemoryData": {
-      "title": "Unexpected memory data was found",
-      "body": "This data cannot be migrated automatically. Review the audit, then start first-time setup in a new empty data location. Database: {{db_path}}\nDetails: {{reason}}"
-    },
     "raw": {
       "title": "Sidecar failed to start"
+    },
+    "databaseMigrationFailed": {
+      "title": "Database migration failed",
+      "body": "Phase: {{phase}}\nCause: {{reason}}\nRestore point: {{backup_path}}"
     },
     "other": {
       "title": "Sidecar failed to start",
       "body": "[{{component}}] {{message}}"
+    },
+    "memoryKindMigrationRequired": {
+      "title": "Database migration required",
+      "body": "Migrate with the Lookback v0.0.7 migration tool, then restart the app.\nDatabase: {{db_path}}"
+    },
+    "memoryKindDatabaseCheckFailed": {
+      "title": "Could not check the database",
+      "body": "Lookback could not open the memories database safely, so the sidecar was not started.\nDatabase: {{db_path}}\nDetail: {{reason}}"
+    },
+    "memoryKindDatabaseSchemaInvalid": {
+      "title": "Database schema is invalid",
+      "body": "The memories database could not be safely inspected. Check the logs.\nDatabase: {{db_path}}\nDetail: {{reason}}"
     },
     "lancedbSchemaMismatch": {
       "title": "The embedding vector dimension has changed",
@@ -946,15 +1061,19 @@
         "label": "Reset embedding settings and restart",
         "pending": "Resetting embedding settings and restarting the sidecar…"
       },
-      "migrateMemoryKind": {
-        "label": "Run migration",
-        "pending": "Backing up data and migrating…"
+      "retryMigration": {
+        "label": "Retry database migration",
+        "pending": "Retrying database migration…"
+      },
+      "restoreMigration": {
+        "label": "Restore pre-migration data",
+        "pending": "Restoring SQLite and LanceDB from the same restore point…"
       },
       "openLog": {
         "label": "Open logs"
       },
-      "openMemoryKindMigrationGuide": {
-        "label": "Open manual migration guide"
+      "openMemoryKindMigrationRelease": {
+        "label": "Open the v0.0.7 migration tool"
       },
       "startFreshSetup": {
         "label": "Start with a new empty data location"
@@ -964,6 +1083,7 @@
       }
     },
     "actionRunning": "Running…",
+    "databaseRestoreSucceeded": "Pre-migration data was restored. Sidecars remain stopped. Retry the migration or quit the app.",
     "restartFailed": "Recovery action failed: {{message}}",
     "restartFailedFallback": "The sidecar could not be restarted."
   }

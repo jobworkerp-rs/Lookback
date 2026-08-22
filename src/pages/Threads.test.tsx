@@ -102,7 +102,11 @@ describe("Threads page label filter", () => {
     expect(findDistinctLabels).toHaveBeenCalledWith({ user_id: 1, limit: 10_000 });
     // First load: no label filter.
     await waitFor(() => expect(listThreads).toHaveBeenCalled());
-    expect((listThreads.mock.calls[0]?.[0] as ListThreadsRequest).labels_any).toBeUndefined();
+    const firstCall = listThreads.mock.calls[0];
+    if (!firstCall) {
+      throw new Error("Expected the initial listThreads call");
+    }
+    expect((firstCall[0] as ListThreadsRequest).labels_any).toBeUndefined();
 
     fireEvent.click(barChip("lookback", 5));
     await waitFor(() => {
@@ -110,7 +114,11 @@ describe("Threads page label filter", () => {
       expect(lastReq?.labels_any).toEqual(["lookback"]);
     });
     // Single label → label_match is intentionally omitted (server defaults to ANY).
-    expect((listThreads.mock.calls.at(-1)?.[0] as ListThreadsRequest).label_match).toBeUndefined();
+    const latestCall = listThreads.mock.calls.at(-1);
+    if (!latestCall) {
+      throw new Error("Expected a listThreads call after selecting a label");
+    }
+    expect((latestCall[0] as ListThreadsRequest).label_match).toBeUndefined();
 
     // Default mode is AND, so a 2nd selection lands with label_match="all".
     fireEvent.click(barChip("review", 3));

@@ -88,6 +88,26 @@
       "1": "タスク結果",
       "2": "対話スタイル",
       "3": "両方"
+    },
+    "failureMode": {
+      "unspecified": "未指定",
+      "toolMisuse": "ツールの誤用",
+      "loop": "ループ",
+      "scopeDrift": "スコープ逸脱",
+      "hallucination": "ハルシネーション",
+      "contextOverflow": "コンテキスト超過",
+      "dataLoss": "データ損失",
+      "permissionIssue": "権限エラー",
+      "ambiguousInstruction": "曖昧な指示",
+      "conflictingRequirements": "要件の競合",
+      "missingContext": "コンテキスト不足",
+      "misleadingPremise": "誤った前提",
+      "goalDriftByUser": "ユーザーによる目標変更",
+      "toolUnavailable": "ツール利用不可",
+      "externalServiceFailure": "外部サービス障害",
+      "rateLimit": "レート制限",
+      "other": "その他",
+      "unknown": "分類不能"
     }
   },
   "search": {
@@ -159,6 +179,7 @@
       "unknownSource": "unknown",
       "unsupportedFormat": "未対応形式",
       "unnamed": "(名称なし)",
+      "lookbackToday": "当日",
       "lookback_other": "過去{{count}}日分"
     },
     "enabled": "有効",
@@ -214,7 +235,7 @@
       "reflection": "自省",
       "weekday": "曜日",
       "monthlyDay": "日付",
-      "lookbackDays": "処理対象期間（過去日数）",
+      "lookbackDays": "処理対象期間（過去日数、0で当日）",
       "save": "保存"
     },
     "weekday": {
@@ -250,7 +271,7 @@
       "sourceInvalid": "source は codex / claude-code / codex + claude-code から選択してください",
       "hourRange": "時刻の時は 0-23 で入力してください",
       "minuteRange": "時刻の分は 0-59 で入力してください",
-      "lookbackRange": "Lookback 日数は 1 以上で入力してください",
+      "lookbackRange": "Lookback 日数は 0 以上で入力してください",
       "intervalRange": "実行間隔は 1 以上で入力してください",
       "intervalHourChoice": "時間間隔は 1/2/3/4/6/8/12/24 から選択してください",
       "weekdayInvalid": "曜日が不正です",
@@ -318,6 +339,14 @@
       "noAnswer": "回答を生成できませんでした"
     },
     "errorPrefix": "エラー:",
+    "answer": {
+      "copy": "Markdownをコピー",
+      "save": "Markdownとして保存",
+      "includeSources": "出典を含める",
+      "copySuccess": "コピーしました",
+      "saveSuccess": "保存しました",
+      "actionFailed": "操作に失敗しました"
+    },
     "sources": {
       "label": "出典 ({{count}})",
       "threadDetail": "thread #{{id}}"
@@ -325,9 +354,91 @@
     "sourceKind": {
       "raw_memory": "原文",
       "thread_summary": "スレッド要約",
-      "period_summary": "期間要約"
+      "period_summary": "期間要約",
+      "reflection": "自省"
+    },
+    "selected": "使用した要約 ({{count}})",
+    "selectedContentTruncated": "一部の選択資料はコンテキスト容量のため省略されました。",
+    "export": {
+      "selectedSummaries": "選択した要約",
+      "sources": "出典",
+      "kind": "種別",
+      "memoryId": "メモリ ID",
+      "memory": "メモリ {{id}}"
+    },
+    "selectSummary": {
+      "title": "要約を選択",
+      "tabs": "要約種別",
+      "kind": {
+        "per-thread": "スレッド要約",
+        "daily": "日次",
+        "weekly": "週次",
+        "monthly": "月次",
+        "reflection": "自省"
+      },
+      "count": "選択中: {{count}} / 10",
+      "limitReached": "一度に選択できる要約は10件までです。",
+      "preview": "全文を確認",
+      "closePreview": "プレビューを閉じる",
+      "loading": "要約を読み込み中…",
+      "retry": "再試行",
+      "loadMore": "さらに読み込む",
+      "error": "要約の取得に失敗しました: {{error}}",
+      "empty": "要約がありません",
+      "summaryFields": {
+        "title": "タイトル",
+        "summary": "要約",
+        "overallPurpose": "全体の目的",
+        "category": "カテゴリ",
+        "status": "状態",
+        "keyDecisions": "主な決定事項",
+        "purposeGroups": "目的別グループ",
+        "byTopic": "トピック別",
+        "carryover": "引き継ぎ",
+        "trends": "傾向",
+        "highlights": "ハイライト",
+        "milestones": "マイルストーン",
+        "sourceMemoryIds": "参照メモリ",
+        "sourceThreadIds": "参照スレッド",
+        "details": "詳細",
+        "purpose": "目的",
+        "bullets": "項目",
+        "topic": "トピック",
+        "kind": "種別",
+        "outcome": "結果",
+        "completedInWeek": "完了週"
+      },
+      "category": {
+        "coding": "コーディング",
+        "consultation": "相談",
+        "research": "調査",
+        "creative": "創作",
+        "general": "一般"
+      },
+      "status": {
+        "resolved": "解決済み",
+        "ongoing": "進行中",
+        "in_review": "レビュー中",
+        "blocked": "ブロック中",
+        "deferred": "保留",
+        "abandoned": "中止"
+      },
+      "trendKind": {
+        "continued": "継続",
+        "new": "新規",
+        "completed": "完了"
+      },
+      "clear": "選択を解除",
+      "cancel": "キャンセル",
+      "confirm": "選択を確定"
     },
     "composer": {
+      "selectSummary": "要約を選択",
+      "mode": "追加取得モード",
+      "modeSelectedOnly": "選択した要約のみ",
+      "modeSourceDetails": "必要なら元スレッドの詳細を確認",
+      "modeRelated": "関連メモリ全体も検索",
+      "removeSummary": "選択から外す",
       "placeholder": "質問を入力 (⌘Enter で送信)",
       "stop": "停止",
       "send": "送信"
@@ -364,8 +475,15 @@
     },
     "card": {
       "openThread": "元スレッドを開く →",
+      "taskIntent": "意図",
+      "summary": "要約",
       "lessons": "Lessons",
       "keyDecisions": "Key decisions",
+      "successFactors": "成功要因",
+      "tools": "使用ツール",
+      "failureModes": "失敗要因",
+      "facts": "事実",
+      "factWithoutNote": "関連する事実",
       "mitigationHint": "Mitigation hint"
     }
   },
@@ -382,7 +500,6 @@
       "search": "検索",
       "calendar": "カレンダー"
     },
-    "calendarDisabledTitle": "スレッド要約には期間がありません",
     "searchPlaceholder": "検索クエリ",
     "date": {
       "createdAfter": "作成日 下限 (strict >)",
@@ -501,6 +618,7 @@
       "advancedToggleOpen": "▼ 上級設定",
       "advancedToggleClosed": "▶ 上級設定",
       "ctxSizeHint": "空欄でプリセット推奨値 ({{value}}) を使用",
+      "ctxSizeExternalHint": "空欄では保守的な既定値 ({{value}}) を使用",
       "ctxSizeNote": "メモリ制約に応じて縮小できます。reflection workflow は 222k 程度の context を要求しますが、小さくすると長文要約が分割されます。",
       "kvCacheType": "KV cache type",
       "kvCacheTypeHint": "小さいほどRAM消費は減りますが、モデル品質への影響が出る場合があります。",
@@ -562,10 +680,6 @@
       "embedded": "埋め込み済み",
       "pending": "未生成",
       "allDone": "全件生成済みです (自動生成が機能しています)。",
-      "migrationPendingTitle": "移行後のベクトル再生成が完了していません。",
-      "migrationPendingBody": "SQLite の移行は完了しています。検索インデックスを復元するため、memory・thread・reflection のベクトル再生成を再試行してください。詳細:",
-      "migrationRetry": "移行後の再生成を再試行",
-      "migrationRetrying": "移行後の再生成を再試行中…",
       "redispatch": "再生成",
       "redispatchTitle": "未生成分の補填、または embedding モデル変更後の張り直しに使います (時間がかかります)",
       "redispatching": "再生成中…",
@@ -754,7 +868,8 @@
     "statusActive": "実行中…",
     "statusDone": "完了",
     "statusWarning": "一部失敗",
-    "statusFailed": "失敗"
+    "statusFailed": "失敗",
+    "noticeNoImportableLogSources": "読み込めるセッションログが見つかりませんでした"
   },
   "summaryGen": {
     "title": "要約を生成",
@@ -762,6 +877,7 @@
     "llmDownBody": "要約の生成には LLM が必要です。サイドバーの Sidecar 状態を確認してください。",
     "stages": "生成する段階",
     "dependencyHint": "上位を選ぶと依存する下位も自動で選択されます (週次→日次→スレッド)。",
+    "stopOnError": "エラー時に中断する",
     "targetPeriod": "対象期間",
     "rangeStart": "開始",
     "rangeEnd": "終了",
@@ -777,6 +893,7 @@
   },
   "analysis": {
     "done": "生成完了",
+    "warning": "一部失敗",
     "failed": "生成失敗",
     "running": "生成中",
     "close": "閉じる"
@@ -830,6 +947,7 @@
   },
   "boot": {
     "startingSidecar": "sidecar を起動中…",
+    "databaseMigrationInProgress": "データベースの移行を確認・実行中です。完了するまで Lookback を終了または再起動しないでください。",
     "checkingSetup": "セットアップ状態を確認中…",
     "setupCheckFailed": "セットアップ状態を確認できませんでした。",
     "retry": "再試行"
@@ -873,31 +991,28 @@
     }
   },
   "bootError": {
-    "memoryKindMigrationRequired": {
-      "title": "メモリデータの移行が必要です",
-      "body": "この Lookback データは memory_kind 形式へ未移行です。移行を実行すると、SQLite のバックアップを作成してから同梱ツールで変換し、ベクトルを再生成します。対象 DB: {{db_path}}"
-    },
-    "preview": {
-      "title": "移行内容を確認",
-      "body": "SQLite の複製で確認しました。未解決 warning: {{warningCount}} 件（memory: {{unresolvedMemoryCount}}、thread: {{unresolvedThreadCount}}）。全 memory/thread: {{totalRecordCount}} 件。削除予定: memory {{plannedMemoryDeleteCount}} 件、thread {{plannedThreadDeleteCount}} 件。承認すると、実行時に検出される未解決 client レコードを JSON にダンプして削除し、移行を続行します。",
-      "related": "関連行: {{table}} — {{count}} 件",
-      "confirm": "ダンプして削除・移行を実行",
-      "cancel": "キャンセル"
-    },
-    "memoryKindDatabaseSchemaInvalid": {
-      "title": "メモリデータベースの状態を確認してください",
-      "body": "memory_kind 移行を開始できないデータベース状態です。バックアップを確認してから移行手順に従ってください。対象 DB: {{db_path}}\n詳細: {{reason}}"
-    },
-    "unexpectedMemoryData": {
-      "title": "想定外のメモリデータが見つかりました",
-      "body": "このデータは安全に自動移行できません。監査内容を確認し、新しい空の保存先で初回セットアップを開始してください。対象 DB: {{db_path}}\n詳細: {{reason}}"
-    },
     "raw": {
       "title": "サイドカーの起動に失敗しました"
+    },
+    "databaseMigrationFailed": {
+      "title": "データベースの移行に失敗しました",
+      "body": "処理: {{phase}}\n原因: {{reason}}\n復元点: {{backup_path}}"
     },
     "other": {
       "title": "サイドカーの起動に失敗しました",
       "body": "[{{component}}] {{message}}"
+    },
+    "memoryKindMigrationRequired": {
+      "title": "データベースの移行が必要です",
+      "body": "Lookback v0.0.7 の移行ツールで移行してから、アプリを再起動してください。\n対象: {{db_path}}"
+    },
+    "memoryKindDatabaseCheckFailed": {
+      "title": "データベースを確認できません",
+      "body": "memories データベースを安全に開けないため、サイドカーを起動できませんでした。\n対象: {{db_path}}\n詳細: {{reason}}"
+    },
+    "memoryKindDatabaseSchemaInvalid": {
+      "title": "データベースのスキーマが不正です",
+      "body": "memories データベースを安全に確認できませんでした。ログを確認してください。\n対象: {{db_path}}\n詳細: {{reason}}"
     },
     "lancedbSchemaMismatch": {
       "title": "Embedding ベクトルの次元が変わりました",
@@ -940,15 +1055,19 @@
         "label": "Embedding 設定をリセットして再起動",
         "pending": "Embedding 設定をリセットしてサイドカーを再起動中…"
       },
-      "migrateMemoryKind": {
-        "label": "移行を実行",
-        "pending": "データをバックアップして移行中…"
+      "retryMigration": {
+        "label": "データベース移行を再試行",
+        "pending": "データベース移行を再試行中…"
+      },
+      "restoreMigration": {
+        "label": "移行前のデータを復元",
+        "pending": "SQLite と LanceDB を同じ復元点から復元中…"
       },
       "openLog": {
         "label": "ログを開く"
       },
-      "openMemoryKindMigrationGuide": {
-        "label": "手動移行手順を開く"
+      "openMemoryKindMigrationRelease": {
+        "label": "v0.0.7 の移行ツールを開く"
       },
       "startFreshSetup": {
         "label": "新しい空の保存先で開始"
@@ -958,6 +1077,7 @@
       }
     },
     "actionRunning": "実行中…",
+    "databaseRestoreSucceeded": "移行前のデータを復元しました。サイドカーは停止中です。移行を再試行するか、アプリを終了してください。",
     "restartFailed": "復旧処理に失敗しました: {{message}}",
     "restartFailedFallback": "サイドカーが再起動できませんでした。"
   }

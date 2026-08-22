@@ -278,6 +278,26 @@ workers:
       workflow_data:
         $file: workflows/rag/lookback-recall.yaml
 
+  - name: lookback_get_context
+    description: "Retrieve selected memories or messages from exact memory/thread ids without embedding search."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: false
+    channel: rag
+    settings:
+      workflow_data:
+        $file: workflows/rag/lookback-get-context.yaml
+
+  - name: lookback_get_reflections
+    description: "Retrieve the latest non-empty reflections for exact thread ids."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: false
+    channel: rag
+    settings:
+      workflow_data:
+        $file: workflows/rag/lookback-get-reflections.yaml
+
 # The RAG chat does NOT register a parent workflow worker. The
 # `dispatch_stream` over a WORKFLOW worker aggregates the inner LLM's
 # per-token chunks (only `execute_workflow_with_events` emits raw

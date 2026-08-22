@@ -1,5 +1,5 @@
 import { fireEvent, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultSnapshot, IMPORT_STEPS, type ImportSnapshot } from "@/hooks/useImportProgress";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
@@ -22,6 +22,10 @@ function terminalSnapshot(): ImportSnapshot {
 }
 
 beforeEach(() => {
+  i18n.changeLanguage("ja");
+});
+
+afterEach(() => {
   i18n.changeLanguage("ja");
 });
 
@@ -81,5 +85,32 @@ describe("ImportToast warning status", () => {
     // 詳細 button must be present (warning is multi-line) so the user can
     // open the full error context — same affordance as a hard failure.
     expect(screen.getByRole("button", { name: "詳細" })).toBeTruthy();
+  });
+});
+
+describe("ImportToast notices", () => {
+  it("localizes the no-importable-log-sources notice", () => {
+    const snap = terminalSnapshot();
+    snap.steps["thread-import"] = {
+      status: "done",
+      message: null,
+      notice_code: "no-importable-log-sources",
+    };
+    renderWithProviders(<ImportToast snapshot={snap} onClose={vi.fn()} onCancel={vi.fn()} />);
+
+    expect(screen.getByText("読み込めるセッションログが見つかりませんでした")).toBeTruthy();
+  });
+
+  it("localizes the no-importable-log-sources notice in English", () => {
+    i18n.changeLanguage("en");
+    const snap = terminalSnapshot();
+    snap.steps["thread-import"] = {
+      status: "done",
+      message: null,
+      notice_code: "no-importable-log-sources",
+    };
+    renderWithProviders(<ImportToast snapshot={snap} onClose={vi.fn()} onCancel={vi.fn()} />);
+
+    expect(screen.getByText("No importable session logs were found.")).toBeTruthy();
   });
 });

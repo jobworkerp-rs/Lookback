@@ -46,6 +46,7 @@ export function refreshGeneratedCaches(
 
   if (unique.has("reflection")) {
     invalidate(queryClient, ["reflections"]);
+    invalidate(queryClient, ["reflection-hybrid-search"]);
     invalidate(queryClient, ["memories"]);
   }
 }

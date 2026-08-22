@@ -211,11 +211,6 @@ pub fn validate_task(task: &PeriodicTaskArgs) -> AppResult<()> {
     if task.minute > 59 {
         return Err(AppError::Config("minute must be 0..59".into()));
     }
-    if task.lookback_days == 0 {
-        return Err(AppError::Config(
-            "lookback_days must be greater than 0".into(),
-        ));
-    }
     match task.task_kind {
         PeriodicTaskKind::Regular => {
             let has_hours = task.interval_hours.is_some();
@@ -892,6 +887,11 @@ pub async fn set_enabled_periodic_task(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use command_utils::util::jq::execute_jq;
+    use serde_json::json;
+
     use super::*;
 
     fn task(kind: PeriodicTaskKind) -> PeriodicTaskArgs {
@@ -1172,6 +1172,9 @@ mod tests {
         assert!(yaml.contains("treat_nonzero_as_error: true"));
         assert!(yaml.contains("interval_hours: { type: [integer, \"null\"], minimum: 1 }"));
         assert!(yaml.contains("interval_days: { type: [integer, \"null\"], minimum: 1 }"));
+        assert!(yaml.contains("lookback_days: { type: integer, minimum: 0 }"));
+        assert!(yaml.contains("start_date: (if $workflow.input.task.lookback_days == 0"));
+        assert!(yaml.contains("end_date: (if $workflow.input.task.lookback_days == 0"));
         assert!(yaml.contains("elif $workflow.input.task.source == \"codex+claude-code\""));
         assert!(yaml.contains("then [\"codex\", \"claude-code\"]"));
         assert!(yaml.contains("- resolveSourceFilterLabels:"));
@@ -1185,6 +1188,62 @@ mod tests {
         assert!(yaml.contains("($workflow.input.task.run_reflection // false)"));
         assert!(yaml.contains("workerName: memories-personality-batch"));
         assert!(yaml.contains("workerName: memories-reflection-batch"));
+        for stage in ["dailyForRegular", "weeklyStage", "monthlyStage"] {
+            let start = yaml
+                .find(&format!("  - {stage}:"))
+                .unwrap_or_else(|| panic!("missing {stage}"));
+            let end = yaml[start + 1..]
+                .find("\n  - ")
+                .map(|offset| start + 1 + offset)
+                .unwrap_or(yaml.len());
+            assert!(
+                yaml[start..end].contains("user_id: 1"),
+                "{stage} must pass the required owner to its summary batch"
+            );
+        }
+        let weekly_stage = yaml.find("  - weeklyStage:").unwrap();
+        let monthly_stage = yaml.find("  - monthlyStage:").unwrap();
+        let weekly_body = &yaml[weekly_stage..monthly_stage];
+        assert!(
+            weekly_body.find("workerName: memories-daily-summary-batch")
+                < weekly_body.find("workerName: memories-weekly-summary-batch"),
+            "periodic weekly must generate its daily prerequisites first"
+        );
+        assert!(
+            weekly_body.contains("start_date: $periodic_week_start_date")
+                && weekly_body.contains("end_date: $periodic_week_end_date")
+                && weekly_body.contains("start_week: $periodic_week_target")
+                && weekly_body.contains("end_week: $periodic_week_target")
+                && !weekly_body.contains("last_n_days: 7")
+                && !weekly_body.contains("last_n_weeks: 1"),
+            "periodic weekly must rebuild the exact completed ISO week, not a run-relative window"
+        );
+        let monthly_body = &yaml[monthly_stage..];
+        assert!(
+            monthly_body.find("workerName: memories-daily-summary-batch")
+                < monthly_body.find("workerName: memories-weekly-summary-batch")
+                && monthly_body.find("workerName: memories-weekly-summary-batch")
+                    < monthly_body.find("workerName: memories-monthly-summary-batch"),
+            "periodic monthly must generate daily and weekly prerequisites first"
+        );
+        assert!(
+            monthly_body.contains("start_date: $periodic_month_start_date")
+                && monthly_body.contains("end_date: $periodic_month_end_date")
+                && monthly_body.contains("start_week: $periodic_month_start_week")
+                && monthly_body.contains("end_week: $periodic_month_end_week")
+                && monthly_body.contains("start_month: $periodic_month_target")
+                && monthly_body.contains("end_month: $periodic_month_target")
+                && !monthly_body.contains("last_n_days: 31")
+                && !monthly_body.contains("last_n_weeks: 5")
+                && !monthly_body.contains("last_n_months: 1"),
+            "periodic monthly must rebuild the exact prior month and its covering ISO weeks"
+        );
+        assert!(
+            yaml.contains("- resolvePeriodicMonthDependencyDateRange:")
+                && yaml.contains("periodic_month_start_date: >-")
+                && yaml.contains("$periodic_month_start_week + \"-1\""),
+            "periodic monthly daily dependencies must start on the leading ISO week's Monday"
+        );
         assert!(
             !yaml.contains("then []"),
             "combined source must not become an empty all-sources label filter"
@@ -1196,6 +1255,330 @@ mod tests {
             source_index < labels_step_index && labels_step_index < labels_index,
             "workflow set keys are evaluated in parallel; source_filter_sources must be resolved in an earlier step"
         );
+    }
+
+    #[test]
+    fn periodic_wrapper_root_probe_contract_is_structured() {
+        let workflow = periodic_workflow_fixture();
+        let codex_probe = workflow_step(&workflow, "probeCodexImportRoot");
+        let claude_probe = workflow_step(&workflow, "probeClaudeCodeImportRoot");
+
+        let codex_probe_if = yaml_field(codex_probe, "if").as_str().unwrap();
+        assert!(codex_probe_if.contains(r#"index("codex")"#));
+        assert!(codex_probe_if.contains("!= null"));
+        let claude_probe_if = yaml_field(claude_probe, "if").as_str().unwrap();
+        assert!(claude_probe_if.contains(r#"index("claude-code")"#));
+        assert!(claude_probe_if.contains("!= null"));
+        for (probe, root, export_key) in [
+            (
+                codex_probe,
+                "$HOME/.codex/sessions",
+                "codex_import_root_status",
+            ),
+            (
+                claude_probe,
+                "$HOME/.claude/projects",
+                "claude_code_import_root_status",
+            ),
+        ] {
+            let arguments = yaml_field(
+                yaml_field(
+                    yaml_field(yaml_field(probe, "run"), "function"),
+                    "arguments",
+                ),
+                "args",
+            )
+            .as_sequence()
+            .unwrap();
+            assert_eq!(
+                yaml_field(yaml_field(probe, "run"), "function")["arguments"]["command"],
+                "/bin/sh"
+            );
+            assert!(arguments[1].as_str().unwrap().contains(root));
+            assert!(arguments[1].as_str().unwrap().contains("printf present"));
+            assert_eq!(
+                yaml_field(yaml_field(probe, "export"), "as")[export_key],
+                "${ .stdout }"
+            );
+        }
+
+        let skipped = workflow_step(&workflow, "collectSkippedImportSources");
+        assert!(
+            yaml_field(skipped, "if")
+                .as_str()
+                .unwrap()
+                .contains("regular")
+        );
+        assert!(
+            yaml_field(yaml_field(skipped, "set"), "skipped_import_sources")
+                .as_str()
+                .unwrap()
+                .contains("codex_import_root_status")
+        );
+        assert!(
+            yaml_field(yaml_field(skipped, "set"), "skipped_import_sources")
+                .as_str()
+                .unwrap()
+                .contains("claude_code_import_root_status")
+        );
+
+        let codex_import = workflow_step(&workflow, "runImportCodex");
+        let claude_import = workflow_step(&workflow, "runImportClaudeCode");
+        assert!(
+            yaml_field(codex_import, "if")
+                .as_str()
+                .unwrap()
+                .contains(r#"index("codex")"#)
+        );
+        assert!(
+            yaml_field(codex_import, "if")
+                .as_str()
+                .unwrap()
+                .contains(r#"(($codex_import_root_status // "") == "present")"#)
+        );
+        assert!(
+            yaml_field(claude_import, "if")
+                .as_str()
+                .unwrap()
+                .contains(r#"index("claude-code")"#)
+        );
+        assert!(
+            yaml_field(claude_import, "if")
+                .as_str()
+                .unwrap()
+                .contains(r#"(($claude_code_import_root_status // "") == "present")"#)
+        );
+        let skipped_expression = yaml_field(yaml_field(skipped, "set"), "skipped_import_sources")
+            .as_str()
+            .unwrap();
+        assert!(skipped_expression.matches(r#"== "missing""#).count() >= 2);
+        assert!(skipped_expression.contains(r#"then ["codex"] else [] end"#));
+        assert!(skipped_expression.contains(r#"then ["claude-code"] else [] end"#));
+
+        assert!(
+            workflow_step_index(&workflow, "probeCodexImportRoot")
+                < workflow_step_index(&workflow, "collectSkippedImportSources")
+        );
+        assert!(
+            workflow_step_index(&workflow, "probeClaudeCodeImportRoot")
+                < workflow_step_index(&workflow, "collectSkippedImportSources")
+        );
+        assert!(
+            workflow_step_index(&workflow, "collectSkippedImportSources")
+                < workflow_step_index(&workflow, "runImportCodex")
+        );
+        assert!(
+            workflow_step_index(&workflow, "probeClaudeCodeImportRoot")
+                < workflow_step_index(&workflow, "runImportClaudeCode")
+        );
+
+        let output = yaml_field(yaml_field(&workflow, "output"), "as");
+        assert_eq!(
+            yaml_field(output, "skipped_import_sources").as_str(),
+            Some("${ $skipped_import_sources }")
+        );
+    }
+
+    #[test]
+    fn collect_skipped_import_sources_jq_evaluates_import_root_states() {
+        assert_eq!(
+            evaluate_skipped_import_sources(
+                &["codex", "claude-code"],
+                json!("present"),
+                json!("present")
+            ),
+            json!([])
+        );
+        assert_eq!(
+            evaluate_skipped_import_sources(
+                &["codex", "claude-code"],
+                json!("missing"),
+                json!("present")
+            ),
+            json!(["codex"])
+        );
+        assert_eq!(
+            evaluate_skipped_import_sources(
+                &["codex", "claude-code"],
+                json!("present"),
+                json!("missing")
+            ),
+            json!(["claude-code"])
+        );
+        assert_eq!(
+            evaluate_skipped_import_sources(
+                &["codex", "claude-code"],
+                json!("missing"),
+                json!("missing")
+            ),
+            json!(["codex", "claude-code"])
+        );
+        assert_eq!(
+            evaluate_skipped_import_sources(&["codex"], json!("present"), json!("missing")),
+            json!([])
+        );
+        assert_eq!(
+            evaluate_skipped_import_sources(&["claude-code"], json!("missing"), json!("missing")),
+            json!(["claude-code"])
+        );
+        assert_eq!(
+            evaluate_skipped_import_sources(
+                &["codex", "claude-code"],
+                serde_json::Value::Null,
+                json!("present")
+            ),
+            json!([])
+        );
+        assert_eq!(
+            evaluate_skipped_import_sources(&["codex", "claude-code"], json!(""), json!("present")),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn regular_daily_input_uses_current_day_range_for_zero_lookback_only() {
+        let current_day = evaluate_regular_daily_input(0, "2026-08-11");
+        assert_eq!(current_day["start_date"], "2026-08-11");
+        assert_eq!(current_day["end_date"], "2026-08-11");
+        assert_eq!(current_day["last_n_days"], 0);
+
+        let previous_days = evaluate_regular_daily_input(1, "2026-08-10");
+        assert_eq!(previous_days["start_date"], "");
+        assert_eq!(previous_days["end_date"], "");
+        assert_eq!(previous_days["last_n_days"], 1);
+    }
+
+    fn evaluate_skipped_import_sources(
+        source_filter_sources: &[&str],
+        codex_import_root_status: serde_json::Value,
+        claude_code_import_root_status: serde_json::Value,
+    ) -> serde_json::Value {
+        let workflow = periodic_workflow_fixture();
+        let skipped = workflow_step(&workflow, "collectSkippedImportSources");
+        let expression = yaml_field(yaml_field(skipped, "set"), "skipped_import_sources")
+            .as_str()
+            .expect("skipped import expression must be a string")
+            .trim()
+            .strip_prefix("${")
+            .and_then(|expression| expression.strip_suffix('}'))
+            .expect("skipped import expression must be wrapped in ${ ... }")
+            .trim();
+        let values = BTreeMap::from([
+            (
+                "source_filter_sources".to_owned(),
+                Arc::new(json!(source_filter_sources)),
+            ),
+            (
+                "codex_import_root_status".to_owned(),
+                Arc::new(codex_import_root_status),
+            ),
+            (
+                "claude_code_import_root_status".to_owned(),
+                Arc::new(claude_code_import_root_status),
+            ),
+        ]);
+        execute_jq(serde_json::Value::Null, expression, &values)
+            .expect("collectSkippedImportSources jq expression must parse and evaluate")
+    }
+
+    fn evaluate_regular_daily_input(
+        lookback_days: u16,
+        regular_import_start_date: &str,
+    ) -> serde_json::Value {
+        let workflow = periodic_workflow_fixture();
+        let daily = workflow_step(&workflow, "dailyForRegular");
+        let run_daily = yaml_field(
+            yaml_field(daily, "do")
+                .as_sequence()
+                .and_then(|steps| steps.first())
+                .expect("daily stage must contain a batch step"),
+            "runDailyBatch",
+        );
+        let input = yaml_field(
+            yaml_field(yaml_field(run_daily, "run"), "function"),
+            "arguments",
+        )["input"]
+            .as_str()
+            .expect("daily batch input must be a jq expression")
+            .trim();
+        let expression = input
+            .strip_prefix("${")
+            .and_then(|value| value.strip_suffix('}'))
+            .map(str::trim)
+            .expect("daily batch input must use expression interpolation");
+        let values = BTreeMap::from([
+            (
+                "workflow".to_owned(),
+                Arc::new(json!({
+                    "input": {
+                        "task": { "lookback_days": lookback_days },
+                        "runtime": {
+                            "memories_grpc_host": "memories.example.test",
+                            "memories_grpc_port": 9000,
+                            "memories_grpc_tls": true,
+                            "llm_worker_name": "memories-llm",
+                            "output_language": "ja"
+                        }
+                    }
+                })),
+            ),
+            (
+                "regular_import_start_date".to_owned(),
+                Arc::new(json!(regular_import_start_date)),
+            ),
+            ("source_filter_labels".to_owned(), Arc::new(json!([]))),
+            (
+                "source_filter_match_mode".to_owned(),
+                Arc::new(json!("LABEL_ALL")),
+            ),
+        ]);
+        let encoded = execute_jq(serde_json::Value::Null, expression, &values)
+            .expect("daily batch input expression must parse and evaluate");
+        serde_json::from_str(
+            encoded
+                .as_str()
+                .expect("daily batch input expression must encode JSON"),
+        )
+        .expect("daily batch input must be valid JSON")
+    }
+
+    fn periodic_workflow_fixture() -> serde_yaml::Value {
+        serde_yaml::from_str(include_str!(
+            "../../../workers/workflows/lookback-periodic-run.yaml"
+        ))
+        .expect("periodic workflow must remain valid YAML")
+    }
+
+    fn yaml_field<'a>(value: &'a serde_yaml::Value, key: &str) -> &'a serde_yaml::Value {
+        value
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String(key.to_owned())))
+            .unwrap_or_else(|| panic!("missing YAML field {key}"))
+    }
+
+    fn workflow_step<'a>(workflow: &'a serde_yaml::Value, name: &str) -> &'a serde_yaml::Value {
+        workflow["do"]
+            .as_sequence()
+            .and_then(|steps| {
+                steps.iter().find_map(|step| {
+                    step.as_mapping()
+                        .and_then(|mapping| mapping.get(serde_yaml::Value::String(name.to_owned())))
+                })
+            })
+            .unwrap_or_else(|| panic!("missing workflow step {name}"))
+    }
+
+    fn workflow_step_index(workflow: &serde_yaml::Value, name: &str) -> usize {
+        workflow["do"]
+            .as_sequence()
+            .and_then(|steps| {
+                steps.iter().position(|step| {
+                    step.as_mapping().is_some_and(|mapping| {
+                        mapping.contains_key(serde_yaml::Value::String(name.to_owned()))
+                    })
+                })
+            })
+            .unwrap_or_else(|| panic!("missing workflow step {name}"))
     }
 
     #[test]
@@ -1431,15 +1814,19 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_missing_source_and_zero_lookback() {
+    fn validation_accepts_zero_lookback_for_current_day() {
+        let mut t = task(PeriodicTaskKind::Regular);
+        t.interval_hours = Some(24);
+        t.lookback_days = 0;
+        assert!(validate_task(&t).is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_missing_source() {
         let mut t = task(PeriodicTaskKind::Regular);
         t.interval_hours = Some(24);
         t.source.clear();
         t.sources.clear();
-        assert!(validate_task(&t).is_err());
-
-        t.source = "codex".into();
-        t.lookback_days = 0;
         assert!(validate_task(&t).is_err());
     }
 

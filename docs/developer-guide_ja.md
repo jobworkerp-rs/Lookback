@@ -78,6 +78,14 @@ pnpm tauri:dev
 
 `pnpm tauri:dev` と `pnpm tauri dev` は、起動前に `scripts/stage-dev-external-bins.sh` を実行し、Tauri が検証する `src-tauri/bin/<name>-<target-triple>` を実バイナリで配置します。配置元の解決順序はアプリ実行時と同じく、環境変数、`PATH`、workspace 相対の予備パスです。たとえば Linux x86_64 では `src-tauri/bin/all-in-one-x86_64-unknown-linux-gnu` が必要です。
 
+この処理は Memories の公式 SQLite migration bundle も `src-tauri/migration-bundle/` へ配置します。`LOOKBACK_MEMORIES_DB_MIGRATE_BUNDLE` を指定した場合はその bundle を厳密に検証し、不正なら自動生成へフォールバックせず起動を中止します。未指定の場合は、隣接する `../memories` checkout の `target/memories-db-migrate-sqlite/` を検証して使用します。成果物がない、または不正な場合は、すでに配置された bundle が現行 release 契約を満たせば再利用します。それも利用できなければ、同じ checkout の `scripts/build-memories-db-migrate-sqlite.sh` を一時ディレクトリ向けに実行し、検証成功後にのみ配置します。初回は coordinator のコンパイルや Atlas の取得に時間がかかることがあります。並行する dev 起動は直列化され、生成・検証に失敗しても既存の配置済み bundle は保持されます。
+
+書き込みやビルドをせず解決・生成予定だけを確認するには、次を実行します。
+
+```bash
+scripts/stage-dev-external-bins.sh --dry-run
+```
+
 同じ staging で、Tauri が検証する `plugins/*.so*` / `*.dylib` も満たします。この glob は `src-tauri` 基準なので、bundle 用の staging 先は `agent-app/src-tauri/plugins/` です。Linux は `plugins/*.so*` で通常の plugin `.so` と、CUDA runtime の `libcudart.so.12` や SONAME symlink のような versioned 共有ライブラリをまとめて含めます。`LOOKBACK_PLUGINS_SRC` が指定されていればその配下を再帰的に探し、未指定の場合は従来の workspace 配置である `agent-app/../../plugins/cuda_runner/` と `agent-app/../../plugins/` から共有ライブラリを探して、`agent-app/src-tauri/plugins/` へコピーします。dev/release staging は `agent-app/../plugins/` には書き込みません。
 
 macOS で動いて Linux で `resource path bin/all-in-one-x86_64-unknown-linux-gnu doesn't exist` になる場合、macOS 側には `src-tauri/bin/*-aarch64-apple-darwin` または `*-x86_64-apple-darwin` が既に残っていて、Linux 用の `*-x86_64-unknown-linux-gnu` が未配置であることが原因です。`scripts/build-release.sh` は release build の中でこの配置を行いますが、通常の dev 起動では release script を通らないため、dev 用 staging が必要です。
@@ -277,6 +285,56 @@ conductor scheduler や jobworkerp periodic worker は使わず、Tauri 側か�
 4. 再実行したい場合はアプリを終了し、`jobworkerp-maintenance.json` を削除してから起動します。
 
 ## 環境変数
+
+### サイドカーのログ既定値
+
+常駐する `jobworkerp`、`memories`、`conductor` サイドカーの `RUST_LOG` は
+ビルドプロファイルで決まります。
+
+- `pnpm tauri dev`（debug ビルド）では、`info` 基準です。
+- macOS の DMG などの release バンドルでは、通常の進捗ログをパッケージ済みアプリの
+  ログへ出しすぎないよう `warn` 基準です。
+
+どちらのプロファイルでも、ログ量の多い対象を抑制する
+`app=warn`、`worker_app=warn`、`lance=warn` は維持します。
+`LOOKBACK_RUST_LOG` を設定すると、プロファイルにかかわらずフィルター全体を上書きできます。
+たとえば `LOOKBACK_RUST_LOG=debug pnpm tauri dev` のように起動します。この設定の対象は
+3 つの常駐サイドカーで、短命な `memories-import` プロセスは対象外です。
+
+### ログのローテーションと保持
+
+Lookback はアプリ本体とサイドカーの標準出力・標準エラーを
+`<data-root>/log/` に保存します。アクティブログの名前
+（`lookback.log` と `<sidecar>.<stdout|stderr>.log`）は固定のままなので、ローテーション後も
+アプリ内のログビューアは現在のファイルを表示できます。UTC の日付が変わったとき、または
+次の書込みで 10 MiB を超えるときに writer がローテーションします。閉じた旧ファイルには
+UTC のタイムスタンプ付きサフィックスが付き、閉じた後は内容を変更しません。
+
+容量上限に関する動作だけが debug/release で異なります。
+
+- debug（`pnpm tauri dev`）と release のどちらも、閉じた管理対象アーカイブを 14 日後に削除します。
+- release では、管理対象ログの合計が 256 MiB を超えた場合にも、古い閉じたアーカイブから削除します。
+  アクティブログはこの掃除では削除しません。
+- debug では合計容量を理由に削除しません。開発時の調査記録は通常のローテーションで保持されます。
+
+サイドカーや `memories-import` が生成する短命プロセスの native tracing ファイルは
+`log/native/<起動識別子>/` に隔離されます。親が捕捉する stdout/stderr ファイルを正本とし、
+native ファイルは子プロセス終了後だけ同じ 14 日保持の対象にします。実行中のファイルを
+rename/delete することはありません。
+
+マイグレーション試行ログ（`database-migration-*.log`）は閉じた監査ログとして 14 日保持します。
+release では 256 MiB の容量掃除にも含めます。未知のファイル、ディレクトリ、シンボリックリンク、
+アクティブログはログ保守で削除しません。
+
+ローテーション済みログの確認手順:
+
+1. Settings または `LOOKBACK_*` の起動設定から data root を確認し、`<data-root>/log/` と
+   `native/` 配下を一覧します。
+2. まず固定名のアクティブログを確認します。ローテーション前のイベントを探す場合は、対象 stream の
+   UTC タイムスタンプ付きアーカイブを開きます。アーカイブは通常の text/JSONL なので、アプリ実行中でも
+   コピーできます。
+3. release の掃除結果を調べる場合は `lookback.log` の retention 実行結果を確認します。掃除に失敗しても
+   sidecar の起動や通常処理は停止せず、次の保守間隔で再試行されます。
 
 開発時によく使う上書き設定は次のとおりです。
 

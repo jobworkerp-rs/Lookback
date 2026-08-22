@@ -1,8 +1,8 @@
 # Lookback Worker / Workflow YAML バンドル
 
 `agent-app` がローカル起動する jobworkerp sidecar に対して、起動時に
-`jobworkerp-client` 経由で適用するワーカー定義群と、`memories-import`
-や `agent-chat-pipeline` から参照するワークフロー定義群を集約する。
+`jobworkerp-client` 経由で適用するワーカー定義群と、Lookback の import 処理や
+定期実行から参照するワークフロー定義群を集約する。
 
 memories リポジトリのオリジナル YAML は変更せず、ここに **編集済みの
 コピー** を置く運用とする（Phase B 時点で確認済みの方針。memories
@@ -26,8 +26,6 @@ workers/
     │   └── auto-reflection-*-embedding*.yaml # embedding (据え置き)
     ├── personality/
     │   └── thread-personality-batch.yaml    # merge_enabled で lang-workers の 2層 merge を起動
-    ├── agent-chat-pipeline/
-    │   └── agent-chat-pipeline.yaml         # reflection branch
     ├── summaries-pipeline/summaries-pipeline.yaml
     ├── {daily,weekly,monthly}-work-summary/<feature>-batch.yaml
     ├── lookback-periodic-run.yaml           # conductor CronScheduler entry
@@ -65,6 +63,22 @@ batch は `output_language` を受け取り `workerName: "memories-<feature>-sin
 memories 側の更新を取り込むときは `sync-memories-prompts.sh` で prompts を同期し、
 `diff-memories-singles.sh` で single/batch の差分を確認して、LLM 呼び出し方式と progress を壊さない
 範囲で手マージする。
+
+## 要約バッチの結果契約
+
+thread / daily / weekly / monthly の各要約 batch は、子 single workflow の結果を
+`generated`、`skipped`、`failed` に分類して返す。`skipped` は既存かつ最新の要約、または
+入力不足による正常な非生成結果であり、`succeeded_count` に含まれる。したがって
+`summaries-pipeline` は依存順を `thread → daily → weekly → monthly` に保ったまま、全件が
+スキップされた stage の後続も実行する。既定の `stop_on_error: false` では、batch が返した
+失敗を終端出力の各 stage 結果と `per_day_failed_dates` に残して後続も続行する。子 workflow 自体の
+実行失敗は `execution_failures` に stage 名と簡潔なエラー詳細を記録する。手動復旧などで
+最初の失敗時に停止したい場合だけ `stop_on_error: true` を渡す。この場合は失敗を検出した stage
+または日単位の依存処理で raise し、後続 stage は実行しない。
+
+`thread-summary-batch` は既存の thread summary memory と専用 summary thread を一括取得して、
+最新でラベルも一致する thread を子 workflow 起動前に除外する。長い期間を指定したときに、既存
+要約ごとの逐次スキップ確認で後続の日次要約へ到達するまで長時間かかることを防ぐためである。
 
 ## function-set (`function-sets.yaml`)
 
@@ -124,7 +138,7 @@ LLM 系は strict parent → child の階層構造、`llm_pipeline` はそれと
 | 0 | `llm` | 1 | `memories-llm` (LLMPromptRunner) の LLM job 本体。GPU/モデルメモリ競合を回避するため逐次化 |
 | 0 | `llm_external` | 2 | External API LLM (`memories-llm-external`)。API-bound なので local GPU 用の `llm` とは分離 |
 | 1 | `llm_workflow` | 1 | LLM step を **直接** 含む single workflow (thread-summary-single / thread-personality-single / thread-reflection-single / user-personality-merge) |
-| 2 | `llm_batch` | 2 | LLM workflow を **fan-out** する batch workflow (thread-summary-batch / thread-personality-batch / thread-reflection-batch、および agent-chat-pipeline / summaries-pipeline から呼ぶ daily/weekly/monthly-work-summary-batch) |
+| 2 | `llm_batch` | 2 | LLM workflow を **fan-out** する batch workflow (thread-summary-batch / thread-personality-batch / thread-reflection-batch、および summaries-pipeline / periodic-run から呼ぶ daily/weekly/monthly-work-summary-batch) |
 | ─ | `llm_pipeline` | 1 | `memories-summaries-pipeline` (生成ダイアログの段階生成親)。`llm_batch` の子を順次呼ぶため **別 channel** に分離。concurrency 1 で同時 1 pipeline に制限 |
 | ─ | `llm_periodic` | 1 | conductor の `CronSchedulerService` から実行される `memories-lookback-periodic-run`。手動生成と競合しすぎないよう定期実行 parent を逐次化 |
 | 0 | `embedding` | 1 | `memories-mm-embedding`。Metal/GPU bound の embedding job 本体 |
@@ -151,7 +165,7 @@ invocation も `options.channel: llm_batch` を指定する。
 `llm_workflow` 側に残す。
 大量の layer-1 signal を統合する merge はローカル LLM で長時間化しやすい。
 `user-personality-merge` 単体 workflow は 6 時間まで許容し、ユーザー操作から
-到達する `thread-personality-batch` / `agent-chat-pipeline` 内の merge 呼び出しと
+到達する `thread-personality-batch` 内の merge 呼び出しと
 Tauri の jobworkerp dispatch timeout は 3 時間に揃える。`マージのみ` は
 `user-personality-merge` 内の `mergeProfile` から `memories-llm` を直接呼ぶため、
 この inner LLM step にも 3 時間 timeout を明示する。
@@ -228,7 +242,12 @@ runtime refresh で現在のパスに再保存される。
 `codex+claude-code` は `codex` と `claude-code` の両方に展開され、wrapper 内の
 `runImportCodex` / `runImportClaudeCode` が必要な方だけ実行される。その後、同じ
 source filter を使って thread summary / daily summary / personality / reflection を
-実行する。`agent-chat-pipeline.yaml` はこの conductor 定期実行経路では使わない。
+実行する。ユーザー操作による import は Tauri の `start_import` が同じ batch 群を直接
+dispatch し、定期実行は `lookback-periodic-run.yaml` が担当する。
+
+`regular` タスクの `lookback_days` は `0` 以上を指定できる。`0` は import の開始日と
+日次要約の対象日を実行時点の当日にする。`1` 以上では import を指定日数前の0時から
+開始し、日次要約は従来どおり前日を終点とする直近日数を対象にする。
 
 初回起動時、Lookback は無効状態の既定 scheduler を 3 件だけ投入する
 (`Daily import and summaries`, `Weekly summary`, `Monthly summary`)。投入済み marker は
@@ -244,8 +263,10 @@ data root の `periodic-defaults-seeded.json` に保存されるため、ユー�
 3. `conductor-main` 起動後、Lookback が既存 scheduler の runtime endpoint
    (gRPC port + `output_language`) を現在の値へ再保存する。
 4. conductor の cron 発火時、wrapper workflow が `task.task_kind` に応じて処理する。
-   `regular` は source import の後に thread summary と optional な daily /
-   personality / reflection を呼ぶ。`weekly` / `monthly` は既存の daily / weekly
+   `regular` は選択済みの Codex / Claude Code ログルートを source ごとに確認してから、
+   存在する source だけを import し、thread summary と optional な daily /
+   personality / reflection を呼ぶ。欠損したログルートは workflow 出力の
+   `skipped_import_sources` に記録し、後続ステージは継続する。`weekly` / `monthly` は既存の daily / weekly
    summary を集約する。各 batch は言語別 single worker を worker 名で解決する。
 
 ## LLM モデルの集中管理
@@ -302,11 +323,8 @@ KV cache typeから算出したKV cache目安」を表示する。
 
 ## reflection ステージ
 
-`agent-chat-pipeline.yaml` に reflection branch を追加している。
-有効化条件:
-
-1. pipeline 入力で `thread_reflection_batch_yaml` /
-   `thread_reflection_single_yaml` を指定 (空文字なら branch skip)
-2. memories sidecar 起動時に `MEMORY_REFLECTION_DISPATCH_ENABLED=true`
-   が注入されていること (Phase C で `lib.rs` から true を渡す)
-3. `reflection_prompt_version` (既定 `"v1"`) を pipeline 入力で供給
+ユーザー操作による import では Tauri の `start_import` が、importer の構造化 event から
+確定した対象 thread ID を `thread-reflection-batch` へ直接渡す。Reflection を選択した
+場合にだけ dispatch し、sidecar には `MEMORY_REFLECTION_DISPATCH_ENABLED=true` を渡す。
+prompt version はアプリ側の既定値 `v1` を batch 入力へ供給する。定期実行では
+`lookback-periodic-run.yaml` が同じ batch を呼び出す。

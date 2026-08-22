@@ -167,6 +167,24 @@ describe("PeriodicTasks", () => {
     expect(screen.getByText("0 30 9 * * 1")).toBeInTheDocument();
   });
 
+  it("labels a zero-day lookback as today", async () => {
+    const defaultTask = task().task;
+    if (!defaultTask) throw new Error("test fixture must include a periodic task");
+    mockListPeriodicTasks.mockResolvedValue([
+      task({
+        task: {
+          ...defaultTask,
+          lookback_days: 0,
+        },
+      }),
+    ]);
+
+    renderWithProviders(<PeriodicTasks />);
+
+    expect(await screen.findByText("当日")).toBeInTheDocument();
+    expect(screen.queryByText("過去0日分")).not.toBeInTheDocument();
+  });
+
   it("creates a local periodic task from the dialog", async () => {
     renderWithProviders(<PeriodicTasks />);
 

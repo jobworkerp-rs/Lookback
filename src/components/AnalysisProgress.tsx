@@ -1,5 +1,6 @@
 import { useTranslation } from "react-i18next";
 import type { StepStreamProgress } from "@/hooks/useStepStreamProgress";
+import { isTerminalStepStatus } from "@/lib/stepStatus";
 
 /**
  * Inline progress/error block for the standalone summary / personality
@@ -16,7 +17,7 @@ export function AnalysisProgress({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
-  const terminal = progress?.status === "done" || progress?.status === "failed";
+  const terminal = progress != null && isTerminalStepStatus(progress.status);
   return (
     <>
       {error && (
@@ -30,9 +31,11 @@ export function AnalysisProgress({
           <strong>
             {progress.status === "done"
               ? t("analysis.done")
-              : progress.status === "failed"
-                ? t("analysis.failed")
-                : t("analysis.running")}
+              : progress.status === "warning"
+                ? t("analysis.warning")
+                : progress.status === "failed"
+                  ? t("analysis.failed")
+                  : t("analysis.running")}
           </strong>
           {progress.message && (
             <pre
