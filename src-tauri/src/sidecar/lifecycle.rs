@@ -688,6 +688,20 @@ pub struct Sidecars {
     degraded: Arc<Mutex<Option<DegradedInfo>>>,
 }
 
+/// Return the signed resource plugin directory for a bundled macOS sidecar.
+/// Development executables do not have this layout and intentionally fall
+/// back to the writable data directory.
+#[cfg(any(target_os = "macos", test))]
+fn macos_bundle_plugins_dir(jobworkerp_bin: &Path) -> Option<PathBuf> {
+    let macos_dir = jobworkerp_bin.parent()?;
+    let contents_dir = macos_dir.parent()?;
+    if macos_dir.file_name()? != "MacOS" || contents_dir.file_name()? != "Contents" {
+        return None;
+    }
+    let plugins = contents_dir.join("Resources/plugins");
+    plugins.is_dir().then_some(plugins)
+}
+
 /// Clears the migration activity signal even if the startup future is dropped
 /// while the coordinator is still running.
 struct DatabaseMigrationActivity {
@@ -729,6 +743,18 @@ impl Sidecars {
             spawned_external_key_env: Arc::new(Mutex::new(None)),
             active_mcp_port: Arc::new(Mutex::new(None)),
             degraded: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn plugin_runner_dir(&self) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            return macos_bundle_plugins_dir(&self.config.jobworkerp_bin)
+                .unwrap_or_else(|| self.config.data.plugins_dir());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.config.data.plugins_dir()
         }
     }
 
@@ -1841,7 +1867,7 @@ impl Sidecars {
         cmd
     }
 
-    /// macOS-only: make the staged plugins dir a dynamic-library search path
+    /// macOS-only: make the signed bundled plugin dir a dynamic-library search path
     /// for the sidecar children.
     ///
     /// Plugins like `libmm_embedding_runner.dylib` may bundle sibling dylibs
@@ -1855,7 +1881,7 @@ impl Sidecars {
     /// resolution behaviour. No-op on Linux / Windows.
     #[cfg(target_os = "macos")]
     fn apply_macos_dyld_path(&self, cmd: &mut Command) {
-        let plugins_dir = self.config.data.plugins_dir();
+        let plugins_dir = self.plugin_runner_dir();
         let plugins_str = plugins_dir.to_string_lossy().into_owned();
         let value = match std::env::var_os("DYLD_LIBRARY_PATH") {
             Some(existing) if !existing.is_empty() => {
@@ -1905,10 +1931,7 @@ impl Sidecars {
             .env("STORAGE_RESTORE_AT_STARTUP", "false")
             .env("GRPC_ADDR", format!("127.0.0.1:{port}"))
             .env("SQLITE_URL", self.config.data.sqlite_url())
-            .env(
-                "PLUGINS_RUNNER_DIR",
-                self.config.data.plugins_dir().to_string_lossy().as_ref(),
-            );
+            .env("PLUGINS_RUNNER_DIR", self.plugin_runner_dir());
 
         // MCP server env. When disabled this is just
         // `MCP_ENABLED=false` (the long-standing default — jobworkerp boots
@@ -3312,6 +3335,26 @@ mod tests {
             serde_json::to_value(&on).unwrap().get("mcp_server_port"),
             Some(&serde_json::json!(39010))
         );
+    }
+
+    #[test]
+    fn macos_bundle_plugins_dir_uses_signed_resource_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("Lookback.app/Contents/MacOS/all-in-one");
+        let plugins = dir.path().join("Lookback.app/Contents/Resources/plugins");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&plugins).unwrap();
+
+        assert_eq!(macos_bundle_plugins_dir(&executable), Some(plugins));
+    }
+
+    #[test]
+    fn macos_bundle_plugins_dir_rejects_an_unbundled_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("target/release/all-in-one");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+
+        assert_eq!(macos_bundle_plugins_dir(&executable), None);
     }
 
     fn test_sidecars() -> Sidecars {

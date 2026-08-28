@@ -217,9 +217,10 @@ notarization で Apple ID / Team ID / app-specific password の誤りが判明�
 Tauri build 後は workflow 側で各 migration 実行ファイルの署名と、packaging 後 Atlas の SHA-256 を検証し、DMG に `notarytool submit --wait` と
 `stapler staple` を明示的に実行して、Release へ添付する前に `stapler validate` と Gatekeeper 判定を行います。
 
-macOS の起動時に Lookback は同梱 plugin ディレクトリをデータディレクトリへ同期し、もはや同梱されない
-`.dylib` を削除します。これにより別 Team ID で署名された旧 plugin や CI placeholder が、hardened
-macOS sidecar に走査されることを防ぎます。Linux のユーザー管理 `.so` plugin は保持します。
+macOS release build では、jobworkerp は plugin の検出と依存 dylib の解決の両方で、署名済みの
+`.app/Contents/Resources/plugins` を直接使います。data directory へコピーされた plugin は参照しないため、
+別 Team ID で署名された旧 plugin や CI placeholder が hardened macOS sidecar に走査されません。Linux の
+ユーザー管理 `.so` plugin は保持します。
 
 公開リポジトリで署名と notarization を行う手順:
 
