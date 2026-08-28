@@ -31,6 +31,18 @@ assert_order() {
   fi
 }
 
+assert_cpu_build_contains() {
+  local needle="$1"
+  if ! awk '
+    /^  build:/ { in_cpu_build = 1; next }
+    in_cpu_build && /^  [[:alnum:]_-]+:/ { exit }
+    in_cpu_build { print }
+  ' "${WORKFLOW}" | grep -Fq "${needle}"; then
+    echo "expected CPU build job to contain: ${needle}" >&2
+    exit 1
+  fi
+}
+
 [[ -f "${WORKFLOW}" ]] || { echo "release workflow not found: ${WORKFLOW}" >&2; exit 1; }
 
 assert_contains "build-macos:"
@@ -63,7 +75,8 @@ assert_contains "xcrun notarytool submit"
 assert_contains "xcrun stapler staple"
 assert_contains "codesign --verify --deep --strict --verbose=2"
 assert_contains 'Contents/Resources/memories-db-migrate/memories-db-migrate'
-assert_contains 'Contents/Resources/memories-db-migrate/atlas/bin/atlas'
+assert_contains 'node scripts/verify-atlas-lock.mjs'
+assert_contains 'Contents/Resources/memories-db-migrate/atlas" darwin-arm64'
 assert_contains "find \"\$app/Contents/Resources/plugins\" -name '*.dylib'"
 assert_contains "xcrun stapler validate"
 assert_contains "target/release/bundle/dmg/*.dmg"
@@ -80,7 +93,8 @@ assert_contains "desktop-file-utils file fuse libfuse2 patchelf jq xdg-utils"
 assert_contains "xdg-utils"
 assert_contains "command -v xdg-open"
 assert_contains "command -v jq"
-assert_contains "fuse libfuse2 file desktop-file-utils patchelf jq"
+assert_cpu_build_contains "fuse libfuse2 file desktop-file-utils patchelf jq xdg-utils"
+assert_cpu_build_contains "command -v xdg-open"
 assert_contains "needs: [test, build-cuda]"
 assert_order "Clean stale Apple signing keychains" "uses: apple-actions/import-codesign-certs@v3"
 assert_order "uses: apple-actions/import-codesign-certs@v3" "bash scripts/build-release.sh --profile mac"

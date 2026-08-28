@@ -203,15 +203,17 @@ toolcache など、このリリースビルドで使わない大きなプリイ�
 `build-cuda`、Linux CPU の `build` の順に実行します。`build-macos` は `self-hosted`、`macOS`、
 `lookback-macos` label の runner で `scripts/build-release.sh --profile mac` を実行し、生成された
 DMG を同じ GitHub Release に添付します。
-macOS profile では、Tauri packaging の前に `src-tauri/plugins/*.dylib` と migration bundle の実行ファイル
-（`memories-db-migrate`、`atlas/bin/atlas`）を `APPLE_SIGNING_IDENTITY` で明示的に署名します。この処理は
-macOS 限定で、Linux の `.so` plugin や CUDA runtime staging には影響しません。workflow は証明書 import の前に、self-hosted runner の前回
+macOS profile では、Tauri packaging の前に `src-tauri/plugins/*.dylib` と migration coordinator
+（`memories-db-migrate`）を `APPLE_SIGNING_IDENTITY` で明示的に署名します。固定バイナリの
+`atlas/bin/atlas` は `atlas-tool.lock.json` が完全な SHA-256 を固定するため、個別署名しません。build 時と
+packaging 後の `.app` の双方で lock との一致を検証します。この処理は macOS 限定で、Linux の `.so` plugin や
+CUDA runtime staging には影響しません。workflow は証明書 import の前に、self-hosted runner の前回
 試行で残った `signing_temp*.keychain-db` を削除し、その後 `apple-actions/import-codesign-certs` で
 `.p12` を run ごとの keychain に import します。さらに keychain 内の署名 identity と
 `notarytool history` による notarization 認証を検証します。これを省略すると、plugin `.dylib` の
 明示署名が `The specified item could not be found in the keychain` で失敗したり、長時間ビルド後の
 notarization で Apple ID / Team ID / app-specific password の誤りが判明したりします。
-Tauri build 後は workflow 側で各 migration 実行ファイルの署名を検証し、DMG に `notarytool submit --wait` と
+Tauri build 後は workflow 側で migration coordinator の署名と、packaging 後 Atlas の SHA-256 を検証し、DMG に `notarytool submit --wait` と
 `stapler staple` を明示的に実行して、Release へ添付する前に `stapler validate` と Gatekeeper 判定を行います。
 
 公開リポジトリで署名と notarization を行う手順:
@@ -242,8 +244,11 @@ Tauri build 後は workflow 側で各 migration 実行ファイルの署名を�
 公開リポジトリのワークフローを変更した場合は `bash scripts/test-release-workflow.sh` で、
 macOS job の存在、Linux CPU job との依存関係、署名用 Secrets、事前認証チェック、DMG の Release
 添付対象を検証してください。
-macOS plugin 署名ロジックを変更した場合は `bash scripts/test-build-release-macos-signing.sh` で、
-macOS の `.dylib` だけが署名対象になり、Linux では no-op になることを検証してください。
+macOS plugin / migration 署名ロジックを変更した場合は
+`bash scripts/test-build-release-macos-signing.sh` で、macOS の `.dylib` と
+`memories-db-migrate` だけが署名対象となり、Atlas は固定 SHA-256 を保つため未署名で、Linux では
+no-op になることを検証してください。`bash scripts/test-verify-atlas-lock.sh` は固定 Atlas の
+checksum guard を検証します。
 
 ### リモート memories 接続の診断
 

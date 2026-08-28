@@ -352,6 +352,7 @@ main() {
   stage_plugins
   sign_macos_plugins
   sign_macos_migration_binaries
+  verify_fixed_atlas_lock
   stage_lindera "${LINDERA}"
   build_frontend
   patch_linux_appimages

@@ -388,13 +388,26 @@ sign_macos_migration_binaries() {
   [[ "${PLATFORM}" == "mac" ]] || return 0
 
   local root="${AGENT_APP}/src-tauri/migration-bundle"
-  local binaries=(
+  local required_binaries=(
     "${root}/memories-db-migrate"
     "${root}/atlas/bin/atlas"
   )
   local binary
-  for binary in "${binaries[@]}"; do
+  for binary in "${required_binaries[@]}"; do
     [[ -f "${binary}" ]] || die "macOS migration bundle executable is missing: ${binary}"
   done
-  sign_macos_files "migration bundle executables" "${binaries[@]}"
+  sign_macos_files "migration bundle executables" "${root}/memories-db-migrate"
+}
+
+# verify_fixed_atlas_lock: Atlas' lock pins the exact upstream binary bytes.
+# A macOS code signature changes those bytes, so Atlas must never be signed.
+verify_fixed_atlas_lock() {
+  local platform
+  case "${PLATFORM}" in
+    mac) platform="darwin-arm64" ;;
+    linux) platform="linux-amd64" ;;
+    *) die "unsupported Atlas lock platform: ${PLATFORM}" ;;
+  esac
+  run node "${AGENT_APP}/scripts/verify-atlas-lock.mjs" \
+    "${AGENT_APP}/src-tauri/migration-bundle/atlas" "${platform}"
 }
