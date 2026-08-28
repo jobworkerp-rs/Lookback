@@ -235,8 +235,11 @@ jobs:
             codesign --verify --deep --strict --verbose=2 "$app"
             find "$app/Contents/Resources/plugins" -name '*.dylib' \
               -exec codesign --verify --verbose=2 {} \;
-            codesign --verify --strict --verbose=2 \
-              "$app/Contents/Resources/memories-db-migrate/memories-db-migrate"
+            for binary in \
+              "$app/Contents/Resources/memories-db-migrate/memories-db-migrate" \
+              "$app/Contents/Resources/memories-db-migrate/atlas/bin/atlas"; do
+              codesign --verify --strict --verbose=2 "$binary"
+            done
             node scripts/verify-atlas-lock.mjs \
               "$app/Contents/Resources/memories-db-migrate/atlas" darwin-arm64
           done
