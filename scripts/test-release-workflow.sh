@@ -75,6 +75,7 @@ assert_contains "xcrun notarytool submit"
 assert_contains "xcrun stapler staple"
 assert_contains "codesign --verify --deep --strict --verbose=2"
 assert_contains 'Contents/Resources/memories-db-migrate/memories-db-migrate'
+assert_contains 'Contents/Resources/memories-db-migrate/atlas/bin/atlas'
 assert_contains 'node scripts/verify-atlas-lock.mjs'
 assert_contains 'Contents/Resources/memories-db-migrate/atlas" darwin-arm64'
 assert_contains "find \"\$app/Contents/Resources/plugins\" -name '*.dylib'"

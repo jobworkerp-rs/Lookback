@@ -28,4 +28,15 @@ fi
 grep -Fq "Fixed Atlas binary SHA-256 does not match atlas-tool.lock.json" \
   "${TMP_DIR}/mismatch.err"
 
+node "${SCRIPT_DIR}/record-signed-atlas-lock.mjs" "${bundle}" darwin-arm64
+node "${SCRIPT_DIR}/verify-atlas-lock.mjs" "${bundle}" darwin-arm64
+grep -Fq "\"source_sha256\": \"${sha}\"" "${bundle}/atlas-tool.lock.json"
+
+if node "${SCRIPT_DIR}/record-signed-atlas-lock.mjs" "${bundle}" darwin-arm64 \
+  >"${TMP_DIR}/already-signed.out" 2>"${TMP_DIR}/already-signed.err"; then
+  echo "expected recording an already signed Atlas lock to fail" >&2
+  exit 1
+fi
+grep -Fq "already records a distinct source SHA-256" "${TMP_DIR}/already-signed.err"
+
 echo "Atlas lock verification tests passed"

@@ -243,11 +243,12 @@ The public repository's `.github/workflows/release.yml` runs on tag pushes in th
 `build-macos`, `build-cuda`, then the Linux CPU `build`. `build-macos` uses the `self-hosted`,
 `macOS`, `lookback-macos` runner labels to execute `scripts/build-release.sh --profile mac` and
 uploads the generated DMG to the same GitHub Release.
-For the macOS profile, the script explicitly signs `src-tauri/plugins/*.dylib` and the migration
-coordinator (`memories-db-migrate`) with `APPLE_SIGNING_IDENTITY` before Tauri packaging. The fixed
-`atlas/bin/atlas` binary is deliberately not individually signed: `atlas-tool.lock.json` pins its exact
-SHA-256. The build and the packaged `.app` are both checked against that lock before release. This path is
-macOS-only and does not affect Linux `.so` plugins or CUDA runtime staging. Before
+For the macOS profile, the script explicitly signs `src-tauri/plugins/*.dylib` and the migration bundle
+executables (`memories-db-migrate` and `atlas/bin/atlas`) with `APPLE_SIGNING_IDENTITY` before Tauri
+packaging. Atlas is verified against its upstream lock before signing. The signed binary's SHA-256 is then
+recorded in the bundled lock while retaining the upstream SHA-256 as `source_sha256`; this preserves source
+provenance while allowing runtime integrity verification and notarization. This path is macOS-only and does not affect Linux `.so`
+plugins or CUDA runtime staging. Before
 importing the certificate, the workflow deletes stale
 `signing_temp*.keychain-db` files left by earlier self-hosted runner attempts, then imports the
 `.p12` into a run-scoped keychain with `apple-actions/import-codesign-certs`. It verifies the signing
@@ -255,7 +256,7 @@ identity in the keychain and verifies notarization credentials with `notarytool 
 running `scripts/build-release.sh --profile mac`; without these checks, explicit plugin signing can
 fail with `The specified item could not be found in the keychain`, or invalid Apple ID / Team ID /
 app-specific password values can fail only after a long build.
-After Tauri build, the workflow verifies the migration coordinator signature and the packaged Atlas SHA-256,
+After Tauri build, the workflow verifies each migration executable signature and the packaged Atlas SHA-256,
 explicitly runs
 `notarytool submit --wait` and `stapler staple` on the DMG, then validates the stapled ticket and
 Gatekeeper assessment before uploading the release asset.
@@ -288,8 +289,8 @@ To sign and notarize from the public repository:
 After changing the public workflow, run `bash scripts/test-release-workflow.sh` to verify the macOS
 job, Linux dependency, signing secrets, preflight auth checks, and DMG upload target. After changing
 macOS plugin signing, run `bash scripts/test-build-release-macos-signing.sh` to verify that `.dylib`
-files plus the migration coordinator are signed, Atlas remains unsigned, and Linux remains a no-op. Run
-`bash scripts/test-verify-atlas-lock.sh` to verify the pinned Atlas checksum guard.
+files and both migration executables are signed, and Linux remains a no-op. Run
+`bash scripts/test-verify-atlas-lock.sh` to verify the upstream and signed Atlas checksum guard.
 
 ### Remote memories Diagnostics
 

@@ -350,9 +350,10 @@ main() {
   build_all
   stage_binaries
   stage_plugins
+  verify_fixed_atlas_lock
   sign_macos_plugins
   sign_macos_migration_binaries
-  verify_fixed_atlas_lock
+  record_signed_atlas_lock
   stage_lindera "${LINDERA}"
   build_frontend
   patch_linux_appimages

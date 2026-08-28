@@ -51,7 +51,7 @@ test_signs_macos_dylibs_with_runtime_options() {
   grep -Fq "${PLUGINS_DIR}/libb.dylib" "${log}"
 }
 
-test_signs_only_the_migration_coordinator_with_runtime_options() {
+test_signs_macos_migration_binaries_with_runtime_options() {
   local log="${TMP_DIR}/codesign-migration.log"
   : >"${log}"
   make_codesign_mock "${TMP_DIR}/mockbin-migration" "${log}"
@@ -64,13 +64,10 @@ test_signs_only_the_migration_coordinator_with_runtime_options() {
 
   sign_macos_migration_binaries
 
-  assert_count 1 "${log}"
+  assert_count 2 "${log}"
   grep -Fq -- '--force --options runtime --timestamp --sign Developer ID Application: Example (TEAMID)' "${log}"
   grep -Fq "${AGENT_APP}/src-tauri/migration-bundle/memories-db-migrate" "${log}"
-  if grep -Fq "${AGENT_APP}/src-tauri/migration-bundle/atlas/bin/atlas" "${log}"; then
-    echo "Atlas must remain unsigned because its lock records its exact SHA-256" >&2
-    exit 1
-  fi
+  grep -Fq "${AGENT_APP}/src-tauri/migration-bundle/atlas/bin/atlas" "${log}"
 }
 
 test_linux_does_not_codesign_migration_binaries() {
@@ -152,7 +149,7 @@ test_missing_identity_skips_for_local_unsigned_builds() {
 }
 
 test_signs_macos_dylibs_with_runtime_options
-test_signs_only_the_migration_coordinator_with_runtime_options
+test_signs_macos_migration_binaries_with_runtime_options
 test_linux_does_not_codesign_plugins
 test_linux_does_not_codesign_migration_binaries
 test_missing_identity_skips_for_local_unsigned_builds
