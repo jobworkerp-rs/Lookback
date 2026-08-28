@@ -235,11 +235,10 @@ jobs:
             codesign --verify --deep --strict --verbose=2 "$app"
             find "$app/Contents/Resources/plugins" -name '*.dylib' \
               -exec codesign --verify --verbose=2 {} \;
-            for binary in \
-              "$app/Contents/Resources/memories-db-migrate/memories-db-migrate" \
-              "$app/Contents/Resources/memories-db-migrate/atlas/bin/atlas"; do
-              codesign --verify --strict --verbose=2 "$binary"
-            done
+            codesign --verify --strict --verbose=2 \
+              "$app/Contents/Resources/memories-db-migrate/memories-db-migrate"
+            node scripts/verify-atlas-lock.mjs \
+              "$app/Contents/Resources/memories-db-migrate/atlas" darwin-arm64
           done
           for dmg in "${dmgs[@]}"; do
             codesign --verify --verbose=2 "$dmg"
