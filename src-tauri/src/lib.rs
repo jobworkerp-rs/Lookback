@@ -442,6 +442,7 @@ pub(crate) async fn stage_and_start_sidecars(
                 source = %report.source.display(),
                 copied = report.copied.len(),
                 skipped = report.skipped_same.len(),
+                removed = report.removed.len(),
                 "plugins staged"
             );
             Vec::new()

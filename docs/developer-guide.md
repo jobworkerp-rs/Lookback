@@ -261,6 +261,10 @@ explicitly runs
 `notarytool submit --wait` and `stapler staple` on the DMG, then validates the stapled ticket and
 Gatekeeper assessment before uploading the release asset.
 
+At startup on macOS, Lookback synchronizes the bundled plugin directory into its data directory and removes
+stale `.dylib` files that are no longer bundled. This prevents an older plugin signed by another team (or a
+CI placeholder) from being scanned by the hardened macOS sidecar. Linux keeps user-managed `.so` plugins.
+
 To sign and notarize from the public repository:
 
 1. Create a `Developer ID Application` certificate in Apple Developer.

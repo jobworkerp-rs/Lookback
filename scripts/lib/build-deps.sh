@@ -328,6 +328,10 @@ _stage_cuda_lib_with_soname() {
 stage_plugins() {
   log "stage plugins -> ${PLUGINS_DIR}"
   run mkdir -p "${PLUGINS_DIR}"
+  # The self-hosted macOS checkout persists between jobs. Do not let an old
+  # plugin (or CI placeholder) leak into a release bundle and later into the
+  # app's data directory, where hardened runtime rejects a mismatched signer.
+  run sh -c 'find "$1" -maxdepth 1 -type f -name "*.$2" -delete' _ "${PLUGINS_DIR}" "${LIBEXT}"
   local llama mm
   llama=$(repo_path llama); mm=$(repo_path mm)
   want_repo llama && install_file "${llama}/target/release/libjobworkerp_llama_cpp_plugin.${LIBEXT}" "${PLUGINS_DIR}/libjobworkerp_llama_cpp_plugin.${LIBEXT}"

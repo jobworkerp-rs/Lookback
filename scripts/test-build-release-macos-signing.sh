@@ -70,6 +70,24 @@ test_signs_macos_migration_binaries_with_runtime_options() {
   grep -Fq "${AGENT_APP}/src-tauri/migration-bundle/atlas/bin/atlas" "${log}"
 }
 
+test_release_staging_removes_stale_macos_plugins() {
+  WORKDIR="${TMP_DIR}/staging-deps"
+  PLUGINS_DIR="${TMP_DIR}/staging-plugins"
+  export PLATFORM=mac LIBEXT=dylib GPU=metal ONLY_REPOS="llama,mm"
+  mkdir -p "${WORKDIR}/llama-cpp-runner/target/release"
+  mkdir -p "${WORKDIR}/mm-embedding-runner/target/release"
+  mkdir -p "${PLUGINS_DIR}"
+  touch "${WORKDIR}/llama-cpp-runner/target/release/libjobworkerp_llama_cpp_plugin.dylib"
+  touch "${WORKDIR}/mm-embedding-runner/target/release/libmm_embedding_runner.dylib"
+  touch "${PLUGINS_DIR}/libplaceholder_ci.dylib"
+
+  stage_plugins
+
+  [[ -f "${PLUGINS_DIR}/libjobworkerp_llama_cpp_plugin.dylib" ]]
+  [[ -f "${PLUGINS_DIR}/libmm_embedding_runner.dylib" ]]
+  [[ ! -e "${PLUGINS_DIR}/libplaceholder_ci.dylib" ]]
+}
+
 test_linux_does_not_codesign_migration_binaries() {
   local log="${TMP_DIR}/codesign-migration-linux.log"
   : >"${log}"
@@ -150,6 +168,7 @@ test_missing_identity_skips_for_local_unsigned_builds() {
 
 test_signs_macos_dylibs_with_runtime_options
 test_signs_macos_migration_binaries_with_runtime_options
+test_release_staging_removes_stale_macos_plugins
 test_linux_does_not_codesign_plugins
 test_linux_does_not_codesign_migration_binaries
 test_missing_identity_skips_for_local_unsigned_builds

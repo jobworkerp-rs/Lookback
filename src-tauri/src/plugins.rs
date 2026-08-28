@@ -13,8 +13,11 @@
 //!
 //! Copy is incremental: we sha256 each source against the existing dest
 //! file and skip when they match, so the ~100 MB of dylibs only flush
-//! to disk on the first launch (or after a fresh plugin build).
+//! to disk on the first launch (or after a fresh plugin build). On macOS,
+//! stale libraries are removed to preserve hardened-runtime signer matching.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use tauri::AppHandle;
@@ -32,11 +35,12 @@ pub struct StageReport {
     pub source: PathBuf,
     pub copied: Vec<PathBuf>,
     pub skipped_same: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
 }
 
 impl StageReport {
     pub fn is_empty(&self) -> bool {
-        self.copied.is_empty() && self.skipped_same.is_empty()
+        self.copied.is_empty() && self.skipped_same.is_empty() && self.removed.is_empty()
     }
 }
 
@@ -54,6 +58,14 @@ pub fn stage_plugins(app: &AppHandle, dest: &Path) -> AppResult<StageReport> {
 /// Variant of [`stage_plugins`] that takes an explicit source — used
 /// internally and from unit tests.
 pub fn stage_plugins_from(source: &Path, dest: &Path) -> AppResult<StageReport> {
+    stage_plugins_from_with_prune(source, dest, cfg!(target_os = "macos"))
+}
+
+fn stage_plugins_from_with_prune(
+    source: &Path,
+    dest: &Path,
+    remove_stale: bool,
+) -> AppResult<StageReport> {
     if !source.exists() {
         return Err(AppError::Config(format!(
             "plugins source dir not found: {}",
@@ -64,7 +76,12 @@ pub fn stage_plugins_from(source: &Path, dest: &Path) -> AppResult<StageReport> 
 
     let mut copied = Vec::new();
     let mut skipped_same = Vec::new();
-    for src in plugin_library_files(source)? {
+    let source_plugins = plugin_library_files(source)?;
+    let source_names: HashSet<OsString> = source_plugins
+        .iter()
+        .filter_map(|path| path.file_name().map(OsString::from))
+        .collect();
+    for src in source_plugins {
         let Some(filename) = src.file_name() else {
             continue;
         };
@@ -88,10 +105,26 @@ pub fn stage_plugins_from(source: &Path, dest: &Path) -> AppResult<StageReport> 
             }
         }
     }
+    let mut removed = Vec::new();
+    if remove_stale {
+        for entry in std::fs::read_dir(dest)? {
+            let path = entry?.path();
+            if is_plugin_library(&path)
+                && path
+                    .file_name()
+                    .is_some_and(|filename| !source_names.contains(filename))
+            {
+                std::fs::remove_file(&path)?;
+                info!(file = %path.display(), "stale plugin dylib removed");
+                removed.push(path);
+            }
+        }
+    }
     Ok(StageReport {
         source: source.to_path_buf(),
         copied,
         skipped_same,
+        removed,
     })
 }
 
@@ -201,6 +234,22 @@ mod tests {
         assert!(report.skipped_same.is_empty());
         let staged = std::fs::read(dst.path().join("libfoo.dylib")).unwrap();
         assert_eq!(staged, b"NEW_CONTENT");
+    }
+
+    #[test]
+    fn stage_removes_stale_plugin_libraries() {
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        write_dylib(src.path(), "libcurrent.dylib", b"CURRENT");
+        let stale = write_dylib(dst.path(), "libstale.dylib", b"STALE");
+        write_dylib(dst.path(), "notes.txt", b"KEEP");
+
+        let report = stage_plugins_from_with_prune(src.path(), dst.path(), true).unwrap();
+
+        assert_eq!(report.removed, vec![stale.clone()]);
+        assert!(!stale.exists());
+        assert!(dst.path().join("libcurrent.dylib").exists());
+        assert!(dst.path().join("notes.txt").exists());
     }
 
     #[test]
