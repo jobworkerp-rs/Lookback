@@ -18,8 +18,8 @@ use jobworkerp_client::jobworkerp::data::{
 use jobworkerp_client::jobworkerp::function::data::FunctionSetId;
 use jobworkerp_client::jobworkerp::service::{
     CountJobProcessingStatusRequest, CountJobProcessingStatusResponse, ListenRequest,
-    LoadWorkerRequest, PurgeStaleJobsRequest, ReleaseStaticWorkerRequest, listen_request,
-    load_worker_request, release_static_worker_request,
+    LoadWorkerRequest, PurgeStaleJobsRequest, ReleaseStaticWorkerRequest, RunnerNameRequest,
+    listen_request, load_worker_request, release_static_worker_request,
 };
 use prost_reflect::{DynamicMessage, MessageDescriptor};
 use serde::Serialize as _;
@@ -97,6 +97,22 @@ impl JobworkerpHandle {
                 .await
                 .map_err(|e| AppError::Jobworkerp(format!("connect {jw_url}: {e}")))?;
         Ok(Self { inner })
+    }
+
+    /// Confirm that the Runner gRPC service can answer a real RPC.
+    ///
+    /// A listening TCP port is not enough at startup: the server may still be
+    /// completing its HTTP/2 setup. A missing runner is still a successful
+    /// probe because the caller only needs to know that the service replied.
+    pub async fn probe_runner_service(&self) -> AppResult<()> {
+        let mut client = self.inner.jobworkerp_client.runner_client().await;
+        client
+            .find_by_name(RunnerNameRequest {
+                name: "LLMPromptRunner".into(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| AppError::Jobworkerp(format!("probe RunnerService: {e}")))
     }
 
     /// Apply a function-set YAML. MUST be called AFTER

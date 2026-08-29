@@ -4,9 +4,9 @@
 //! processes when the Tauri app launches; stop them — via SIGTERM with a
 //! short grace window before SIGKILL — when the app exits or `Drop` runs.
 //!
-//! Health is determined by polling the gRPC port until a TCP connection
-//! succeeds (poor man's health check; gRPC `tonic_health` Check is the
-//! follow-up once we know what services are registered).
+//! TCP polling only establishes that a child has bound its listener. Every
+//! startup step that depends on gRPC follows it with a service-specific
+//! readiness probe before it performs work over that connection.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -26,6 +26,7 @@ use tracing::{Level, debug, info, warn};
 use crate::data::DataPaths;
 use crate::error::{AppError, AppResult};
 use crate::sidecar::ports;
+use crate::sidecar::readiness::{ReadinessRetryError, retry_until_ready};
 use crate::sidecar::reaper::{self, PidEntry};
 
 /// Default `RUST_LOG` filters for the resident sidecars.
@@ -40,6 +41,8 @@ use crate::sidecar::reaper::{self, PidEntry};
 const DEFAULT_SIDECAR_LOG_DEV: &str = "info,app=warn,worker_app=warn,lance=warn";
 const DEFAULT_SIDECAR_LOG_RELEASE: &str = "warn,app=warn,worker_app=warn,lance=warn";
 const MEMORIES_START_TIMEOUT: Duration = Duration::from_secs(60);
+const SIDECAR_GRPC_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const SIDECAR_GRPC_READY_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The document prefix is consumed while expanding Lookback's jobworkerp
 /// workflow YAMLs. The memories frontend rejects it because its internally
@@ -1300,88 +1303,88 @@ impl Sidecars {
             apply_embedding_env(&embedding_env_vars);
         }
 
-        // Apply named workers before memories spawns so its first
-        // workflow dispatch can resolve `workerName: memories-llm`.
-        // Non-fatal: memories can still boot; failures surface as
-        // `WorkerApplyFailed` warnings so the UI can disable LLM-tagged
-        // flows instead of letting the user wait for jobs that will
-        // forever return `WorkerNotFound`.
-        if !self.config.worker_yaml_paths.is_empty()
-            || !self.config.function_set_yaml_paths.is_empty()
-        {
-            let server_url = format!("http://127.0.0.1:{jw_port}");
-            match crate::jobworkerp::JobworkerpHandle::connect(&server_url).await {
-                Ok(handle) => {
-                    for yaml in &self.config.worker_yaml_paths {
-                        match handle.register_workers_from_yaml(yaml).await {
-                            Ok(map) => info!(
+        // A TCP listener can accept a connection before its HTTP/2 service is
+        // ready. Wait for a Runner RPC with a freshly-created channel before
+        // registering workers; otherwise a transient h2 error leaves every
+        // LLM worker absent until the user manually restarts the app.
+        let server_url = format!("http://127.0.0.1:{jw_port}");
+        let registration_handle = wait_for_jobworkerp_grpc_ready(&server_url).await;
+
+        // Apply named workers before memories spawns so its first workflow
+        // dispatch can resolve `workerName: memories-llm`. Non-fatal:
+        // memories can still boot; failures surface as `WorkerApplyFailed`
+        // warnings so the UI can disable LLM-tagged flows instead of letting
+        // the user wait for jobs that will forever return `WorkerNotFound`.
+        if let Ok(handle) = &registration_handle {
+            if !self.config.worker_yaml_paths.is_empty()
+                || !self.config.function_set_yaml_paths.is_empty()
+            {
+                for yaml in &self.config.worker_yaml_paths {
+                    match handle.register_workers_from_yaml(yaml).await {
+                        Ok(map) => info!(
+                            yaml = %yaml.display(),
+                            count = map.len(),
+                            "workers registered",
+                        ),
+                        Err(e) => {
+                            warn!(
                                 yaml = %yaml.display(),
-                                count = map.len(),
-                                "workers registered",
-                            ),
-                            Err(e) => {
-                                warn!(
-                                    yaml = %yaml.display(),
-                                    error = %e,
-                                    "worker registration failed (continuing)",
-                                );
-                                warnings.push(SidecarWarning {
-                                    kind: SidecarWarningKind::WorkerApplyFailed,
-                                    message: e.to_string(),
-                                    detail: Some(yaml.display().to_string()),
-                                });
-                            }
-                        }
-                    }
-                    // Function sets resolve target worker names against
-                    // the live registry, so they MUST apply after the
-                    // worker YAMLs in the same startup.
-                    for yaml in &self.config.function_set_yaml_paths {
-                        match handle.register_function_sets_from_yaml(yaml).await {
-                            Ok(map) => info!(
-                                yaml = %yaml.display(),
-                                count = map.len(),
-                                "function sets registered",
-                            ),
-                            Err(e) => {
-                                warn!(
-                                    yaml = %yaml.display(),
-                                    error = %e,
-                                    "function set registration failed (continuing)",
-                                );
-                                warnings.push(SidecarWarning {
-                                    kind: SidecarWarningKind::WorkerApplyFailed,
-                                    message: e.to_string(),
-                                    detail: Some(yaml.display().to_string()),
-                                });
-                            }
+                                error = %e,
+                                "worker registration failed (continuing)",
+                            );
+                            warnings.push(SidecarWarning {
+                                kind: SidecarWarningKind::WorkerApplyFailed,
+                                message: e.to_string(),
+                                detail: Some(yaml.display().to_string()),
+                            });
                         }
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "could not connect for worker registration");
-                    warnings.push(SidecarWarning {
-                        kind: SidecarWarningKind::WorkerApplyFailed,
-                        message: e.to_string(),
-                        detail: None,
-                    });
+                // Function sets resolve target worker names against
+                // the live registry, so they MUST apply after the
+                // worker YAMLs in the same startup.
+                for yaml in &self.config.function_set_yaml_paths {
+                    match handle.register_function_sets_from_yaml(yaml).await {
+                        Ok(map) => info!(
+                            yaml = %yaml.display(),
+                            count = map.len(),
+                            "function sets registered",
+                        ),
+                        Err(e) => {
+                            warn!(
+                                yaml = %yaml.display(),
+                                error = %e,
+                                "function set registration failed (continuing)",
+                            );
+                            warnings.push(SidecarWarning {
+                                kind: SidecarWarningKind::WorkerApplyFailed,
+                                message: e.to_string(),
+                                detail: Some(yaml.display().to_string()),
+                            });
+                        }
+                    }
                 }
             }
-        }
 
-        // Register the language-specific generation workers
-        // (`memories-<feature>-single-<lang>`) BEFORE memories spawns: the
-        // batches resolve them by name on their first dispatch. jobworkerp is
-        // already accepting connections (TCP wait above) and the named
-        // `memories-llm` worker is registered, so the upsert can connect and
-        // the single workflows can route their LLM step. Fail-soft: a failure
-        // is a `WorkerApplyFailed` warning, not a startup abort.
-        crate::sidecar::generation_workers::register_generation_workers(
-            jw_port,
-            &self.config.data.log_dir(),
-            &mut warnings,
-        )
-        .await;
+            // Register the language-specific generation workers
+            // (`memories-<feature>-single-<lang>`) BEFORE memories spawns:
+            // the batches resolve them by name on their first dispatch.
+            // Fail-soft: a failure is a `WorkerApplyFailed` warning, not a
+            // startup abort.
+            crate::sidecar::generation_workers::register_generation_workers(
+                jw_port,
+                &self.config.data.log_dir(),
+                &mut warnings,
+            )
+            .await;
+        } else if let Err(error) = registration_handle {
+            warn!(%error, "jobworkerp gRPC did not become ready for worker registration");
+            warnings.push(SidecarWarning {
+                kind: SidecarWarningKind::WorkerApplyFailed,
+                message: error.to_string(),
+                detail: Some(server_url),
+            });
+        }
 
         if let Some(mem_port) = mem_port {
             self.spawn_and_register_memories(
@@ -1450,10 +1453,8 @@ impl Sidecars {
                 warnings.push(info.into_warning());
             }
 
-            if let Err(error) = crate::commands::connection::validate_local_memories_services(
-                &format!("http://127.0.0.1:{mem_port}"),
-            )
-            .await
+            if let Err(error) =
+                wait_for_local_memories_grpc_ready(&format!("http://127.0.0.1:{mem_port}")).await
             {
                 self.stop_blocking();
                 return Err(error);
@@ -1490,16 +1491,26 @@ impl Sidecars {
         );
         let memories_import_bin = crate::resolve_memories_import_bin_path()
             .unwrap_or_else(|_| std::path::PathBuf::from("memories-import"));
-        let periodic_refresh = crate::commands::periodic_tasks::refresh_lookback_periodic_runtime(
-            &format!("http://127.0.0.1:{conductor_port}"),
-            jw_port,
-            &memories_callback,
-            llm_worker_name,
-            &periodic_output_language,
-            &memories_import_bin,
-            &self.config.data.periodic_defaults_seed_path(),
+        let conductor_url = format!("http://127.0.0.1:{conductor_port}");
+        let periodic_defaults_seed_path = self.config.data.periodic_defaults_seed_path();
+        let periodic_refresh = retry_until_ready(
+            SIDECAR_GRPC_READY_TIMEOUT,
+            SIDECAR_GRPC_READY_RETRY_INTERVAL,
+            || {
+                crate::commands::periodic_tasks::refresh_lookback_periodic_runtime(
+                    &conductor_url,
+                    jw_port,
+                    &memories_callback,
+                    llm_worker_name,
+                    &periodic_output_language,
+                    &memories_import_bin,
+                    &periodic_defaults_seed_path,
+                )
+            },
+            is_transient_startup_grpc_error,
         )
-        .await;
+        .await
+        .map_err(|error| startup_grpc_readiness_error("conductor", error));
         if let Err(e) = periodic_refresh {
             warn!(error = %e, "periodic scheduler runtime refresh failed (continuing)");
             warnings.push(SidecarWarning {
@@ -2628,9 +2639,9 @@ unsafe fn libc_kill(pid: i32, sig: i32) {
 }
 
 /// Block until a TCP connect succeeds against `addr`, polling once every
-/// 200 ms up to the deadline. Used as a lightweight "service is listening"
-/// check in lieu of the gRPC Health Check (which requires we have the
-/// generated client available at startup — circular dependency).
+/// 200 ms up to the deadline. This establishes only that the child bound its
+/// listener; callers that require gRPC must follow with their service-specific
+/// readiness probe rather than treating TCP success as protocol readiness.
 ///
 /// When `failure_slot` is `Some`, the loop additionally polls the shared
 /// slot each iteration: as soon as the per-stream scanner writes a
@@ -2662,6 +2673,69 @@ async fn wait_for_tcp_or_failure(
             }
         }
     }
+}
+
+/// Startup compatibility failures are actionable configuration problems, not
+/// transient readiness conditions. Transport failures and the generic gRPC
+/// statuses emitted while a freshly-bound HTTP/2 server is settling are safe
+/// to retry with a fresh connection.
+fn is_transient_startup_grpc_error(error: &AppError) -> bool {
+    match error {
+        AppError::Transport(_) | AppError::Jobworkerp(_) => true,
+        AppError::Grpc(status) => matches!(
+            status.code(),
+            tonic::Code::Unknown
+                | tonic::Code::Internal
+                | tonic::Code::Unavailable
+                | tonic::Code::DeadlineExceeded
+        ),
+        _ => false,
+    }
+}
+
+fn startup_grpc_readiness_error(service: &str, error: ReadinessRetryError<AppError>) -> AppError {
+    match error {
+        ReadinessRetryError::Probe(error) => AppError::SidecarNotReady(format!(
+            "{service} gRPC readiness probe failed within {:?}: {error}",
+            SIDECAR_GRPC_READY_TIMEOUT
+        )),
+        ReadinessRetryError::TimedOut => AppError::SidecarNotReady(format!(
+            "{service} gRPC readiness probe did not respond within {:?}",
+            SIDECAR_GRPC_READY_TIMEOUT
+        )),
+    }
+}
+
+/// Return a fresh jobworkerp handle only after a real RunnerService RPC
+/// succeeds. `Endpoint::connect` alone proves only that a TCP connection can
+/// be made; the first HTTP/2 request may still fail while a newly spawned
+/// server finishes accepting its transport.
+async fn wait_for_jobworkerp_grpc_ready(
+    server_url: &str,
+) -> AppResult<crate::jobworkerp::JobworkerpHandle> {
+    retry_until_ready(
+        SIDECAR_GRPC_READY_TIMEOUT,
+        SIDECAR_GRPC_READY_RETRY_INTERVAL,
+        || async {
+            let handle = crate::jobworkerp::JobworkerpHandle::connect(server_url).await?;
+            handle.probe_runner_service().await?;
+            Ok::<_, AppError>(handle)
+        },
+        |_| true,
+    )
+    .await
+    .map_err(|error| startup_grpc_readiness_error("jobworkerp", error))
+}
+
+async fn wait_for_local_memories_grpc_ready(url: &str) -> AppResult<()> {
+    retry_until_ready(
+        SIDECAR_GRPC_READY_TIMEOUT,
+        SIDECAR_GRPC_READY_RETRY_INTERVAL,
+        || crate::commands::connection::validate_local_memories_services(url),
+        is_transient_startup_grpc_error,
+    )
+    .await
+    .map_err(|error| startup_grpc_readiness_error("memories", error))
 }
 
 /// Signature of the per-line structured-failure parser. Passed in from
