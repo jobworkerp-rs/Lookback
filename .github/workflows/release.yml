@@ -42,11 +42,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config protobuf-compiler libprotobuf-dev \
+            build-essential cmake pkg-config protobuf-compiler libprotobuf-dev jq \
             libssl-dev libdbus-1-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev
+          command -v protoc >/dev/null || { echo "protoc missing" >&2; exit 1; }
+          command -v jq >/dev/null || { echo "jq missing" >&2; exit 1; }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -88,7 +90,11 @@ jobs:
       # (which never run the binaries). This job doesn't run build-release.sh,
       # so stage empty placeholders to satisfy the existence check.
       - name: Stage CI placeholders
-        run: bash scripts/ci-stage-placeholders.sh
+        run: |
+          bash scripts/ci-stage-placeholders.sh
+          # The tracked .gitkeep was removed; Tauri still requires the mapped
+          # resource directory to exist while build.rs runs in this lint job.
+          mkdir -p src-tauri/migration-bundle
 
       # build.rs runs tonic-prost-build, so protoc (installed above) is required
       # for clippy/test to compile the crate.
@@ -116,6 +122,7 @@ jobs:
       - name: Install system dependencies
         run: |
           brew install protobuf cmake pkgconf jq
+          command -v protoc >/dev/null || { echo "protoc missing" >&2; exit 1; }
           command -v jq >/dev/null || { echo "jq missing" >&2; exit 1; }
 
       - name: Install Rust toolchain
@@ -135,6 +142,7 @@ jobs:
             .build-deps/jobworkerp-conductor
             .build-deps/llama-cpp-runner
             .build-deps/mm-embedding-runner
+            .build-deps/issue-tracker-server
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -242,6 +250,13 @@ jobs:
             done
             node scripts/verify-atlas-lock.mjs \
               "$app/Contents/Resources/memories-db-migrate/atlas" darwin-arm64
+            node scripts/verify-migration-release.mjs \
+              "$app/Contents/Resources/memories-db-migrate" \
+              --require-provenance --atlas-platform darwin-arm64 \
+              --app-assets "$GITHUB_WORKSPACE" \
+              --distributed-assets "$app/Contents/Resources" \
+              --front "$app/Contents/MacOS/front" \
+              --import "$app/Contents/MacOS/memories-import"
           done
           for dmg in "${dmgs[@]}"; do
             codesign --verify --verbose=2 "$dmg"
@@ -304,6 +319,7 @@ jobs:
             .build-deps/jobworkerp-conductor
             .build-deps/llama-cpp-runner
             .build-deps/mm-embedding-runner
+            .build-deps/issue-tracker-server
 
       - name: Cache lindera artifacts
         uses: actions/cache@v4
@@ -347,7 +363,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            desktop-file-utils file fuse libfuse2 patchelf jq xdg-utils
+            protobuf-compiler desktop-file-utils file fuse libfuse2 patchelf jq xdg-utils
+          command -v protoc >/dev/null || { echo "protoc missing" >&2; exit 1; }
           command -v appimagetool >/dev/null || { echo "appimagetool missing" >&2; exit 1; }
           command -v patchelf >/dev/null || { echo "patchelf missing" >&2; exit 1; }
           command -v desktop-file-validate >/dev/null || { echo "desktop-file-utils missing" >&2; exit 1; }
@@ -418,6 +435,7 @@ jobs:
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           sudo chmod +x /usr/local/bin/appimagetool
           command -v appimagetool >/dev/null || { echo "appimagetool missing" >&2; exit 1; }
+          command -v protoc >/dev/null || { echo "protoc missing" >&2; exit 1; }
           command -v jq >/dev/null || { echo "jq missing" >&2; exit 1; }
           command -v xdg-open >/dev/null || { echo "xdg-utils missing xdg-open" >&2; exit 1; }
 
@@ -441,6 +459,7 @@ jobs:
             .build-deps/jobworkerp-conductor
             .build-deps/llama-cpp-runner
             .build-deps/mm-embedding-runner
+            .build-deps/issue-tracker-server
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
