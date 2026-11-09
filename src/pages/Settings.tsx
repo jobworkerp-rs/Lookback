@@ -5,55 +5,90 @@ import { useTranslation } from "react-i18next";
 import {
   applySettings,
   createDataRoot,
+  generateMcpAuthToken,
   getAppSettings,
   getBackgroundJobQueueStatus,
   getConnectionConfig,
   getEmbeddingSettings,
+  getEmbeddingSpace,
+  getIssueTrackerSettings,
   getLlmSettings,
   getMcpSettings,
   getMemoryEmbeddingStats,
   getModelStatus,
   getSearchIndexMaintenanceStatus,
   getSettings,
+  inspectEmbeddingMigration,
   listEmbeddingPresets,
   listLlmPresets,
+  planEmbeddingChange,
   purgeAllData,
   readSidecarLog,
   redispatchMemoryEmbeddings,
   retryModelSetup,
+  rotateMcpAuthToken,
+  setAutoIssuePolicy,
   setConnectionConfig,
   setDataRoot,
   setSearchIndexMaintenanceSchedule,
   startSearchIndexMaintenance,
-  testConnectionConfig,
+  switchEmbeddingSpace,
   validateDataRoot,
 } from "@/api";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { CodingAgentIssuePolicyCard } from "@/components/coding-agent/CodingAgentIssuePolicyCard";
+import { CodingAgentSettingsCard } from "@/components/coding-agent/CodingAgentSettingsCard";
+import {
+  type CodingAgentSettingsEditor,
+  CodingAgentSettingsEditorProvider,
+} from "@/components/coding-agent/CodingAgentSettingsEditorContext";
+import {
+  EmbeddingMigrationPanel,
+  embeddingMigrationInspectRefetchMs,
+} from "@/components/EmbeddingMigrationPanel";
 import { Modal } from "@/components/Modal";
+import { SettingRow } from "@/components/SettingRow";
+import { SettingsCheckboxRow } from "@/components/SettingsCheckboxRow";
 import { Toolbar } from "@/components/Toolbar";
 import type { SettingsDirtyControl } from "@/hooks/useSettingsDirty";
+import { errorMessage } from "@/lib/errorMessage";
 import type {
+  AutoIssuePolicy,
   BackgroundTaskKind,
+  ConnectionConfig,
   ConnectionMode,
   DataRootValidation,
+  EmbeddingBackup,
+  EmbeddingMigrationPlan,
   EmbeddingPreset,
   HfHomeMode,
+  IssueTrackerSettingsResponse,
   KvCacheType,
   LlmMode,
   LlmPreset,
   LogSource,
   LogStream,
+  MigrationBackupSettings,
   ModelState,
   ModelStatus,
   RedispatchEmbeddingsResult,
   SearchIndexMaintenanceStatus,
   SetEmbeddingSettingsRequest,
   SetHfHomeRequest,
+  SetIssueTrackerSettingsRequest,
   SetLlmSettingsRequest,
   SetMcpSettingsRequest,
   SetTimezoneRequest,
+  SummaryGuideProfile,
+  SummaryLengthGuide,
+  SummaryOutputGuidance,
 } from "@/types/api";
 import { CUSTOM_EMBEDDING_PRESET_ID, CUSTOM_LLM_PRESET_ID } from "@/types/api";
+import { AutoIssuePolicyCard } from "./AutoIssuePolicyCard";
+import { ConnectionCard } from "./ConnectionCard";
+import { IssueReviewPolicyCard } from "./IssueReviewPolicyCard";
+import { IssueWorkPolicyCard } from "./IssueWorkPolicyCard";
+import { MigrationBackupCard } from "./MigrationBackupCard";
 import { SettingsSaveBar } from "./SettingsSaveBar";
 import { TimezoneCard } from "./TimezoneCard";
 
@@ -68,10 +103,14 @@ export function Settings({
   dirty,
   embeddingFocus,
   onEmbeddingFocusConsumed,
+  experimentalIssuesEnabled = false,
+  issueTrackingConfigurable = false,
 }: {
   dirty?: SettingsDirtyControl;
   embeddingFocus?: EmbeddingFocus | null;
   onEmbeddingFocusConsumed?: () => void;
+  experimentalIssuesEnabled?: boolean;
+  issueTrackingConfigurable?: boolean;
 } = {}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -83,6 +122,11 @@ export function Settings({
     queryKey: ["connection-config"],
     queryFn: getConnectionConfig,
   });
+  // Embedding storage and its migration belong to memories, so the memories
+  // target decides whether they are managed locally.
+  const memoriesMode = connectionConfig.isError
+    ? null
+    : (connectionConfig.data?.memories.mode ?? null);
   const modelStatus = useQuery({
     queryKey: ["model-status"],
     queryFn: getModelStatus,
@@ -106,6 +150,14 @@ export function Settings({
   const [hfPayload, setHfPayload] = useState<SetHfHomeRequest | null>(null);
   const [tzPayload, setTzPayload] = useState<SetTimezoneRequest | null>(null);
   const [mcpPayload, setMcpPayload] = useState<SetMcpSettingsRequest | null>(null);
+  const [issueTrackerPayload, setIssueTrackerPayload] =
+    useState<SetIssueTrackerSettingsRequest | null>(null);
+  const [autoIssuePolicyPayload, setAutoIssuePolicyPayload] = useState<AutoIssuePolicy | null>(
+    null,
+  );
+  const [migrationBackupPayload, setMigrationBackupPayload] =
+    useState<MigrationBackupSettings | null>(null);
+  const [connPayload, setConnPayload] = useState<ConnectionConfig | null>(null);
   // "edited" tracks whether each card's form differs from the persisted
   // value regardless of validity. The leave-guard keys off this so an
   // invalid-but-edited form still blocks an unconfirmed navigation; the
@@ -115,19 +167,16 @@ export function Settings({
   const [hfEdited, setHfEdited] = useState(false);
   const [tzEdited, setTzEdited] = useState(false);
   const [mcpEdited, setMcpEdited] = useState(false);
-  // Connection / Data location are self-contained cards (their own Save
-  // button, NOT part of the unified save bar), but their in-progress edits
-  // must still arm the leave-guards — otherwise switching back to the basic
-  // view or to another tab unmounts them and drops the input silently. They
-  // report only an `edited` flag (no save payload) for that purpose.
+  const [issueTrackerEdited, setIssueTrackerEdited] = useState(false);
+  const [autoIssuePolicyEdited, setAutoIssuePolicyEdited] = useState(false);
+  const [migrationBackupEdited, setMigrationBackupEdited] = useState(false);
   const [connEdited, setConnEdited] = useState(false);
+  // Data location is a self-contained card (its own Save button, NOT part of
+  // the unified save bar), but its in-progress edits must still arm the
+  // leave-guards — otherwise switching back to the basic view or to another
+  // tab unmounts it and drops the input silently. It reports only an
+  // `edited` flag (no save payload) for that purpose.
   const [dataRootEdited, setDataRootEdited] = useState(false);
-  // Whether the pending embedding change will actually reset the vectordb
-  // (model id or vector dimension changes) — as opposed to a dtype / max-seq
-  // / tokenizer / multimodal-only tweak, which the backend's
-  // `needs_vectordb_reset` leaves false. Drives the destructive warning so it
-  // only fires when the index really will be evacuated / deleted.
-  const [embResetsVectordb, setEmbResetsVectordb] = useState(false);
   const [resetSignal, setResetSignal] = useState(0);
 
   // Adapters: each card reports (payload, edited); fan them into the two
@@ -141,7 +190,6 @@ export function Settings({
     setEmbPayload(p);
     setEmbEdited(edited);
   }, []);
-  const reportEmbResets = useCallback((resets: boolean) => setEmbResetsVectordb(resets), []);
   const reportHf = useCallback((p: SetHfHomeRequest | null, edited: boolean) => {
     setHfPayload(p);
     setHfEdited(edited);
@@ -154,12 +202,43 @@ export function Settings({
     setMcpPayload(p);
     setMcpEdited(edited);
   }, []);
-  // Stable identities so the self-contained cards' report effects don't loop.
-  const reportConnEdited = useCallback((edited: boolean) => setConnEdited(edited), []);
+  const reportIssueTracker = useCallback(
+    (p: SetIssueTrackerSettingsRequest | null, edited: boolean) => {
+      setIssueTrackerPayload(p);
+      setIssueTrackerEdited(edited);
+    },
+    [],
+  );
+  const reportAutoIssuePolicy = useCallback((p: AutoIssuePolicy | null, edited: boolean) => {
+    setAutoIssuePolicyPayload(p);
+    setAutoIssuePolicyEdited(edited);
+  }, []);
+  const reportMigrationBackup = useCallback(
+    (p: MigrationBackupSettings | null, edited: boolean) => {
+      setMigrationBackupPayload(p);
+      setMigrationBackupEdited(edited);
+    },
+    [],
+  );
+  const reportConn = useCallback((p: ConnectionConfig | null, edited: boolean) => {
+    setConnPayload(p);
+    setConnEdited(edited);
+  }, []);
   const reportDataRootEdited = useCallback((edited: boolean) => setDataRootEdited(edited), []);
   const [applyBusy, setApplyBusy] = useState(false);
+  const [applyingScope, setApplyingScope] = useState<"basic" | "advanced" | null>(null);
   const [applyError, setApplyError] = useState<string | null>(null);
-  const [backupPath, setBackupPath] = useState<string | null>(null);
+  const [savedMcpAuthToken, setSavedMcpAuthToken] = useState<string | null>(null);
+  const [embeddingPlan, setEmbeddingPlan] = useState<EmbeddingMigrationPlan | null>(null);
+  const [embeddingPlanSettings, setEmbeddingPlanSettings] =
+    useState<SetEmbeddingSettingsRequest | null>(null);
+  const [embeddingBackupDirectory, setEmbeddingBackupDirectory] = useState("");
+  const [embeddingNoBackupUnsafe, setEmbeddingNoBackupUnsafe] = useState(false);
+  const [embeddingMaintenanceAck, setEmbeddingMaintenanceAck] = useState(false);
+  const [embeddingSwitchBusy, setEmbeddingSwitchBusy] = useState(false);
+  const [codingAgentEditor, setCodingAgentEditor] = useState<CodingAgentSettingsEditor | null>(
+    null,
+  );
 
   // ── Sub-view ──
   // The advanced view holds the low-frequency, high-impact settings
@@ -209,28 +288,48 @@ export function Settings({
   // (an invalid form is not saveable, so it doesn't add to the count). The
   // leave-guards key off EDITED so an invalid-but-edited form still blocks
   // navigation. App-level tab leave-guard uses the combined `anyEdited`.
-  const basicDirtyCount = [llmPayload, hfPayload, tzPayload].filter(Boolean).length;
-  const advancedDirtyCount = [embPayload, mcpPayload].filter(Boolean).length;
-  // The destructive vectordb-reset warning must fire ONLY when the pending
-  // embedding change actually changes the model id / vector dimension (what
-  // the backend's `needs_vectordb_reset` keys off). A dtype / max-seq /
-  // tokenizer / multimodal-only edit produces a saveable payload but leaves
-  // the index intact, so warning "the vectordb will be reset" there is a
-  // false alarm. Gate on the payload too: a null payload won't be saved.
-  const advancedResetsVectordb = embPayload !== null && embResetsVectordb;
-  // The save bar / blocker modal always promise a sidecar restart for LLM
-  // changes. The backend DOES hot-reload some External-only swaps in place, but
-  // the frontend can't prove it: a Local target always restarts now (loading
-  // the GGUF in a fresh child — an in-process Release→Load crashed Metal), and
-  // an External target only hot-reloads when the child already carries the
-  // provider's key env, which the frontend can't see. Showing the restart copy
-  // is therefore a harmless over-warning (the user may wait less than implied),
-  // never a false "no restart". So no `hotReload` flag is passed below.
-  const basicEdited = llmEdited || hfEdited || tzEdited;
-  // Advanced view holds Embedding (save bar) AND the self-contained
-  // Connection / Data location cards — all three must arm the leave-guard.
-  const advancedEdited = embEdited || mcpEdited || connEdited || dataRootEdited;
+  const basicDirtyCount = [
+    llmPayload,
+    hfPayload,
+    tzPayload,
+    issueTrackerPayload,
+    autoIssuePolicyPayload,
+    codingAgentEditor?.dirty ? codingAgentEditor.settings : null,
+  ].filter(Boolean).length;
+  // An incomplete Connection edit still shows the bar, with saving disabled,
+  // so the user sees why the switch has not happened.
+  const advancedDirtyCount = [embPayload, mcpPayload, migrationBackupPayload, connEdited].filter(
+    Boolean,
+  ).length;
+  // The Memories plan is authoritative for all embedding impacts; do not
+  // render a pre-plan destructive prediction from a partial UI comparison.
+  const advancedResetsVectordb = false;
+  // The backend chooses whether an LLM update can be hot-reloaded safely. The
+  // UI therefore describes the interruption conditionally instead of claiming
+  // that every settings save restarts a sidecar.
+  const basicEdited =
+    llmEdited ||
+    hfEdited ||
+    tzEdited ||
+    issueTrackerEdited ||
+    autoIssuePolicyEdited ||
+    Boolean(codingAgentEditor?.dirty || codingAgentEditor?.editing);
+  // Advanced view holds the save-bar cards AND the self-contained Data
+  // location card — all must arm the leave-guard.
+  const advancedEdited =
+    embEdited || mcpEdited || migrationBackupEdited || connEdited || dataRootEdited;
   const anyEdited = basicEdited || advancedEdited;
+  const basicInvalidEdited =
+    (llmEdited && llmPayload === null) ||
+    (hfEdited && hfPayload === null) ||
+    (tzEdited && tzPayload === null) ||
+    (issueTrackerEdited && issueTrackerPayload === null) ||
+    (autoIssuePolicyEdited && autoIssuePolicyPayload === null);
+  const advancedInvalidEdited =
+    (embEdited && embPayload === null) ||
+    (mcpEdited && mcpPayload === null) ||
+    (migrationBackupEdited && migrationBackupPayload === null) ||
+    (connEdited && connPayload === null);
 
   // Mirror the aggregate edited flag up to App (drives the tab leave-guard).
   const setDirty = dirty?.setDirty;
@@ -247,9 +346,14 @@ export function Settings({
     setLlmPayload(null);
     setHfPayload(null);
     setTzPayload(null);
+    setIssueTrackerPayload(null);
+    setAutoIssuePolicyPayload(null);
     setLlmEdited(false);
     setHfEdited(false);
     setTzEdited(false);
+    setIssueTrackerEdited(false);
+    setAutoIssuePolicyEdited(false);
+    codingAgentEditor?.discard();
     setApplyError(null);
     setResetSignal((n) => n + 1);
   };
@@ -258,11 +362,20 @@ export function Settings({
     setEmbEdited(false);
     setMcpPayload(null);
     setMcpEdited(false);
+    setMigrationBackupPayload(null);
+    setMigrationBackupEdited(false);
+    setConnPayload(null);
+    setConnEdited(false);
     setApplyError(null);
+    setEmbeddingPlan(null);
+    setEmbeddingPlanSettings(null);
+    setEmbeddingBackupDirectory("");
+    setEmbeddingNoBackupUnsafe(false);
+    setEmbeddingMaintenanceAck(false);
+    setSavedMcpAuthToken(null);
     setResetSignal((n) => n + 1);
-    // Connection / Data location are not part of this batch and reset
-    // themselves via their unmount cleanup when the view switches; nothing
-    // to clear here.
+    // Data location is not part of this batch and resets itself via its
+    // unmount cleanup when the view switches; nothing to clear here.
   };
 
   // Apply only the payloads owned by the given view, so each view's save
@@ -270,48 +383,229 @@ export function Settings({
   // accepts null for the untouched scopes.
   const applyScope = async (scope: "basic" | "advanced") => {
     setApplyBusy(true);
+    setApplyingScope(scope);
     setApplyError(null);
-    setBackupPath(null);
+    setSavedMcpAuthToken(null);
+    const connectionToApply = scope === "advanced" ? connPayload : null;
+    let connectionSaved = false;
+    const scopeHasSidecarSettings =
+      scope === "basic"
+        ? llmPayload !== null ||
+          hfPayload !== null ||
+          tzPayload !== null ||
+          issueTrackerPayload !== null
+        : embPayload !== null || mcpPayload !== null || migrationBackupPayload !== null;
+    const scopeHasAutoIssuePolicy = scope === "basic" && autoIssuePolicyPayload !== null;
     try {
-      const res = await applySettings({
-        llm: scope === "basic" ? llmPayload : null,
-        embedding: scope === "advanced" ? embPayload : null,
-        hf_home: scope === "basic" ? hfPayload : null,
-        mcp: scope === "advanced" ? mcpPayload : null,
-        timezone: scope === "basic" ? tzPayload : null,
-      });
-      setBackupPath(res.backup_path);
+      if (scope === "basic" && basicInvalidEdited) {
+        throw new Error(
+          t("settingsSaveBar.invalidSettings", {
+            defaultValue: "入力内容を確認してから保存してください。",
+          }),
+        );
+      }
+      if (scope === "advanced" && advancedInvalidEdited) {
+        throw new Error(
+          t("settingsSaveBar.invalidSettings", {
+            defaultValue: "入力内容を確認してから保存してください。",
+          }),
+        );
+      }
+      if (scope === "basic" && codingAgentEditor?.dirty) {
+        if (!codingAgentEditor.valid) {
+          throw new Error(codingAgentEditor.error ?? t("codingAgent.settings.saveError"));
+        }
+        const saved = await codingAgentEditor.save();
+        if (!saved) throw new Error(t("codingAgent.settings.saveError"));
+      }
+      if (scope === "basic" && autoIssuePolicyPayload) {
+        const snapshot = await setAutoIssuePolicy({ policy: autoIssuePolicyPayload });
+        queryClient.setQueryData(["auto-issue-policy"], snapshot);
+        setAutoIssuePolicyPayload(null);
+        setAutoIssuePolicyEdited(false);
+      }
+      // The connection goes first: it restarts the sidecars on the new
+      // targets, and the embedding plan below depends on where memories is.
+      if (connectionToApply) {
+        await setConnectionConfig(connectionToApply);
+        connectionSaved = true;
+        setConnPayload(null);
+        setConnEdited(false);
+      }
+      if (scopeHasSidecarSettings) {
+        const planMemoriesMode = connectionToApply?.memories.mode ?? memoriesMode;
+        if (scope === "advanced" && embPayload && planMemoriesMode == null) {
+          throw new Error(t("settings.embedding.connectionModePending"));
+        }
+        if (scope === "advanced" && embPayload && planMemoriesMode === "local") {
+          const planned = await planEmbeddingChange(embPayload);
+          if (planned.kind === "failed") {
+            throw new Error(
+              `${planned.data.command} (${planned.data.stage}: ${planned.data.error_code})`,
+            );
+          }
+          if (planned.kind !== "plan") {
+            throw new Error(`Unexpected embedding plan result: ${planned.kind}`);
+          }
+          if (planned.data.decision === "reembed_required") {
+            if (!planned.data.executable) {
+              setApplyError(planned.data.reason ?? t("settings.embeddingMigration.manualRecovery"));
+              return;
+            }
+            setEmbeddingPlan(planned.data);
+            setEmbeddingPlanSettings(embPayload);
+            setEmbeddingBackupDirectory("");
+            setEmbeddingNoBackupUnsafe(false);
+            setEmbeddingMaintenanceAck(false);
+            return;
+          }
+        }
+        const res = await applySettings({
+          llm: scope === "basic" ? llmPayload : null,
+          embedding: scope === "advanced" ? embPayload : null,
+          hf_home: scope === "basic" ? hfPayload : null,
+          mcp: scope === "advanced" ? mcpPayload : null,
+          timezone: scope === "basic" ? tzPayload : null,
+          issue_tracker: scope === "basic" ? issueTrackerPayload : null,
+          migration_backup: scope === "advanced" ? migrationBackupPayload : null,
+        });
+        setSavedMcpAuthToken(res.mcp_auth_token ?? null);
+      }
       // Clear only the saved scope's payloads/edited; the other view's
       // unsaved edits survive (its cards re-report after reseed).
       if (scope === "basic") {
-        setLlmPayload(null);
-        setHfPayload(null);
-        setTzPayload(null);
-        setLlmEdited(false);
-        setHfEdited(false);
-        setTzEdited(false);
+        if (llmPayload !== null) {
+          setLlmPayload(null);
+          setLlmEdited(false);
+        }
+        if (hfPayload !== null) {
+          setHfPayload(null);
+          setHfEdited(false);
+        }
+        if (tzPayload !== null) {
+          setTzPayload(null);
+          setTzEdited(false);
+        }
+        if (issueTrackerPayload !== null) {
+          setIssueTrackerPayload(null);
+          setIssueTrackerEdited(false);
+        }
       } else {
         setEmbPayload(null);
         setEmbEdited(false);
         setMcpPayload(null);
         setMcpEdited(false);
+        setMigrationBackupPayload(null);
+        setMigrationBackupEdited(false);
       }
-      setResetSignal((n) => n + 1);
+      if (scopeHasSidecarSettings || scopeHasAutoIssuePolicy || connectionToApply) {
+        setResetSignal((n) => n + 1);
+      }
+      setEmbeddingPlan(null);
+      setEmbeddingPlanSettings(null);
+      // A connection change refreshes everything in `finally` instead.
+      if (connectionSaved) return;
       await Promise.all([
         refetch(),
         queryClient.invalidateQueries({ queryKey: ["model-status"] }),
         queryClient.invalidateQueries({ queryKey: ["llm-settings"] }),
         queryClient.invalidateQueries({ queryKey: ["embedding-settings"] }),
         queryClient.invalidateQueries({ queryKey: ["mcp-settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["issue-tracker-settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["app-capabilities"] }),
         queryClient.invalidateQueries({ queryKey: ["app-settings"] }),
         queryClient.invalidateQueries({ queryKey: ["settings"] }),
         queryClient.invalidateQueries({ queryKey: ["memory-embedding-stats"] }),
         queryClient.invalidateQueries({ queryKey: ["background-job-queue-status"] }),
         queryClient.invalidateQueries({ queryKey: ["reflection-intent-stats"] }),
+        queryClient.invalidateQueries({ queryKey: ["auto-issue-policy"] }),
       ]);
     } catch (e) {
-      setApplyError((e as Error).message);
+      setApplyError(errorMessage(e));
     } finally {
+      setApplyBusy(false);
+      setApplyingScope(null);
+      // Every server-derived cache (threads, memories, summaries, ...) may
+      // now point at the wrong instance, even when a later step stopped
+      // early; listing one instance's threads while detail queries hit
+      // another is the half-broken state this avoids.
+      if (connectionSaved) void queryClient.invalidateQueries();
+    }
+  };
+
+  const chooseEmbeddingBackupDirectory = async () => {
+    try {
+      const selected = await openDialog({ directory: true, multiple: false });
+      if (typeof selected === "string") {
+        setEmbeddingBackupDirectory(selected);
+        setEmbeddingNoBackupUnsafe(false);
+      }
+    } catch (reason) {
+      setApplyError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const approveEmbeddingMigration = async () => {
+    if (!embeddingPlan || !embeddingPlanSettings) return;
+    if ((!embeddingBackupDirectory && !embeddingNoBackupUnsafe) || !embeddingMaintenanceAck) return;
+    const backup: EmbeddingBackup = embeddingBackupDirectory
+      ? { mode: "directory", path: embeddingBackupDirectory }
+      : { mode: "no_backup_unsafe" };
+    setEmbeddingSwitchBusy(true);
+    setApplyBusy(true);
+    setApplyError(null);
+    try {
+      const switched = await switchEmbeddingSpace({
+        settings: embeddingPlanSettings,
+        expected_space: embeddingPlan.current_space,
+        backup,
+      });
+      if (switched.result.kind !== "switched") {
+        throw new Error(`Embedding migration did not switch (${switched.result.kind})`);
+      }
+      // Apply the other dirty settings only after memories accepted the switch.
+      // Keep embedding:null so the ordinary batch path cannot bypass or repeat
+      // the migration that was just approved.
+      const response = await applySettings({
+        llm: null,
+        embedding: null,
+        hf_home: null,
+        mcp: mcpPayload,
+        timezone: null,
+        issue_tracker: null,
+        migration_backup: migrationBackupPayload,
+      });
+      setSavedMcpAuthToken(response.mcp_auth_token ?? null);
+      setEmbPayload(null);
+      setEmbEdited(false);
+      setMcpPayload(null);
+      setMcpEdited(false);
+      setMigrationBackupPayload(null);
+      setMigrationBackupEdited(false);
+      setEmbeddingPlan(null);
+      setEmbeddingPlanSettings(null);
+      setResetSignal((value) => value + 1);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["embedding-space"] }),
+        queryClient.invalidateQueries({ queryKey: ["embedding-migration-inspect"] }),
+        queryClient.invalidateQueries({ queryKey: ["model-status"] }),
+        queryClient.invalidateQueries({ queryKey: ["embedding-settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-embedding-stats"] }),
+      ]);
+    } catch (reason) {
+      // The switch may have completed even if its response was lost. Discard
+      // this plan and require a fresh inspect/plan before another action, while
+      // retaining every unsaved form draft for the user.
+      setEmbeddingPlan(null);
+      setEmbeddingPlanSettings(null);
+      setApplyError(reason instanceof Error ? reason.message : String(reason));
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["embedding-space"] }),
+        queryClient.invalidateQueries({ queryKey: ["embedding-migration-inspect"] }),
+      ]);
+    } finally {
+      setEmbeddingSwitchBusy(false);
       setApplyBusy(false);
     }
   };
@@ -329,7 +623,6 @@ export function Settings({
       return;
     }
     setApplyError(null);
-    setBackupPath(null);
     setView(next);
   };
 
@@ -369,8 +662,17 @@ export function Settings({
     }
   };
 
+  const basicSidecarDirty =
+    llmPayload !== null || hfPayload !== null || tzPayload !== null || issueTrackerPayload !== null;
+  const codingAgentSaveDisabled = Boolean(
+    codingAgentEditor?.editing ||
+      codingAgentEditor?.saving ||
+      (codingAgentEditor?.dirty && !codingAgentEditor.valid) ||
+      basicInvalidEdited,
+  );
+
   return (
-    <>
+    <CodingAgentSettingsEditorProvider onChange={setCodingAgentEditor}>
       <Toolbar
         title={view === "basic" ? t("settings.title") : t("settings.titleAdvanced")}
         actions={
@@ -402,25 +704,58 @@ export function Settings({
             <TimezoneCard
               onDirtyChange={reportTz}
               resetSignal={resetSignal}
-              disabled={connectionConfig.data?.mode === "remote"}
+              disabled={connectionConfig.data?.jobworkerp.mode === "remote"}
             />
 
-            <LogsCard />
-
             <SearchIndexMaintenanceCard />
+
+            {issueTrackingConfigurable && (
+              <IssueTrackerToggleCard
+                onDirtyChange={reportIssueTracker}
+                resetSignal={resetSignal}
+              />
+            )}
+
+            <section
+              className="settings-card issues-settings-card"
+              aria-label={t(
+                experimentalIssuesEnabled
+                  ? "settings.issues.experimentalTitle"
+                  : "settings.issues.title",
+              )}
+            >
+              <div className="settings-card-title">
+                {t(
+                  experimentalIssuesEnabled
+                    ? "settings.issues.experimentalTitle"
+                    : "settings.issues.title",
+                )}
+              </div>
+              <div className="settings-card-desc">{t("settings.issues.description")}</div>
+              <CodingAgentIssuePolicyCard issueEnabled={experimentalIssuesEnabled} />
+              {experimentalIssuesEnabled && (
+                <>
+                  <IssueWorkPolicyCard embedded />
+                  <IssueReviewPolicyCard embedded />
+                  <AutoIssuePolicyCard
+                    embedded
+                    onDirtyChange={reportAutoIssuePolicy}
+                    resetSignal={resetSignal}
+                  />
+                </>
+              )}
+            </section>
+
+            <CodingAgentSettingsCard
+              editor={codingAgentEditor ?? undefined}
+              showIssuePolicies={false}
+              showLocalSaveControls={false}
+              showInlineSetupGuide={false}
+            />
 
             {applyError && (
               <div className="settings-card" style={{ borderColor: "var(--danger)" }}>
                 <div style={{ color: "var(--danger)", fontSize: 12 }}>{applyError}</div>
-              </div>
-            )}
-            {backupPath && (
-              <div className="settings-card">
-                <div style={{ color: "var(--label-secondary)", fontSize: 11 }}>
-                  {t("settings.vectordbBackup.evacuated")} <code>{backupPath}</code>
-                  <br />
-                  {t("settings.vectordbBackup.manualDelete")}
-                </div>
               </div>
             )}
 
@@ -447,7 +782,8 @@ export function Settings({
             <ConnectionCard
               localJobworkerpUrl={data?.jobworkerp_url ?? null}
               localMemoriesUrl={data?.memories_url ?? null}
-              onEditedChange={reportConnEdited}
+              onDirtyChange={reportConn}
+              resetSignal={resetSignal}
             />
 
             <div ref={embeddingCardRef}>
@@ -456,20 +792,30 @@ export function Settings({
                 status={modelStatus.data?.embedding}
                 onRetry={handleRetry}
                 onDirtyChange={reportEmb}
-                onResetsVectordbChange={reportEmbResets}
+                memoriesMode={memoriesMode}
                 resetSignal={resetSignal}
               />
             </div>
 
-            <McpServerCard onDirtyChange={reportMcp} resetSignal={resetSignal} />
+            <EmbeddingMigrationPanel mode={memoriesMode ?? "unknown"} />
+
+            <McpServerCard
+              onDirtyChange={reportMcp}
+              resetSignal={resetSignal}
+              savedAuthToken={savedMcpAuthToken}
+              saveError={applyError}
+            />
 
             <DataRootCard
               sqlitePath={data?.sqlite_path ?? null}
-              lancedbPath={data?.lancedb_path ?? null}
               pluginsPath={data?.plugins_path ?? null}
               logPath={data?.log_path ?? null}
               onEditedChange={reportDataRootEdited}
             />
+
+            <MigrationBackupCard onDirtyChange={reportMigrationBackup} resetSignal={resetSignal} />
+
+            <LogsCard />
 
             <div className="settings-card">
               <div className="settings-card-title">{t("settings.purge.title")}</div>
@@ -493,15 +839,6 @@ export function Settings({
                 <div style={{ color: "var(--danger)", fontSize: 12 }}>{applyError}</div>
               </div>
             )}
-            {backupPath && (
-              <div className="settings-card">
-                <div style={{ color: "var(--label-secondary)", fontSize: 11 }}>
-                  {t("settings.vectordbBackup.evacuated")} <code>{backupPath}</code>
-                  <br />
-                  {t("settings.vectordbBackup.manualDelete")}
-                </div>
-              </div>
-            )}
           </>
         )}
       </div>
@@ -519,6 +856,21 @@ export function Settings({
           saving={applyBusy}
           onDiscard={discardBasic}
           onSave={() => void applyScope("basic")}
+          showRestartHint={basicSidecarDirty}
+          saveDisabled={codingAgentSaveDisabled}
+          saveDisabledReason={
+            codingAgentSaveDisabled
+              ? codingAgentEditor?.saving
+                ? t("codingAgent.settings.saving")
+                : codingAgentEditor?.editing
+                  ? t("codingAgent.settings.saveDialogOpen", {
+                      defaultValue: "編集ダイアログを確定または破棄してから保存してください。",
+                    })
+                  : t("settingsSaveBar.invalidSettings", {
+                      defaultValue: "入力内容を確認してから保存してください。",
+                    })
+              : undefined
+          }
         />
       ) : (
         <SettingsSaveBar
@@ -527,6 +879,14 @@ export function Settings({
           saving={applyBusy}
           onDiscard={discardAdvanced}
           onSave={() => void applyScope("advanced")}
+          saveDisabled={advancedInvalidEdited}
+          saveDisabledReason={
+            advancedInvalidEdited
+              ? t("settingsSaveBar.invalidSettings", {
+                  defaultValue: "入力内容を確認してから保存してください。",
+                })
+              : undefined
+          }
         />
       )}
 
@@ -534,9 +894,13 @@ export function Settings({
         <SavingBlockerModal
           title={t("settings.savingModal.title")}
           description={
-            advancedResetsVectordb
-              ? t("settings.savingModal.descWithVectordbReset")
-              : t("settings.savingModal.desc")
+            applyingScope === "basic" && !basicSidecarDirty
+              ? t("settings.savingModal.descNoRestart", {
+                  defaultValue: "設定を保存しています。",
+                })
+              : advancedResetsVectordb
+                ? t("settings.savingModal.descWithVectordbReset")
+                : t("settings.savingModal.desc")
           }
         />
       )}
@@ -550,7 +914,6 @@ export function Settings({
             if (view === "basic") discardBasic();
             else discardAdvanced();
             setApplyError(null);
-            setBackupPath(null);
             setView(pendingView);
             setPendingView(null);
           }}
@@ -596,7 +959,193 @@ export function Settings({
           </div>
         </Modal>
       )}
-    </>
+
+      {embeddingPlan && embeddingPlanSettings && (
+        <Modal
+          wide
+          onClose={() => {
+            if (embeddingSwitchBusy) return;
+            setEmbeddingPlan(null);
+            setEmbeddingPlanSettings(null);
+          }}
+          ariaLabel={t("settings.embeddingPlan.title")}
+        >
+          <div className="modal-head">
+            <div className="modal-title">{t("settings.embeddingPlan.title")}</div>
+          </div>
+          <div className="modal-body" style={{ fontSize: 12 }}>
+            <p>{t("settings.embeddingPlan.description")}</p>
+            <p>
+              {t("settings.embeddingPlan.counts", {
+                memoryText: embeddingPlan.memory_text,
+                memoryMedia: embeddingPlan.memory_media,
+                thread: embeddingPlan.thread,
+                reflectionIntent: embeddingPlan.reflection_intent,
+              })}
+            </p>
+            <p>
+              {t("settings.embeddingPlan.failures", {
+                failedTransient:
+                  embeddingPlan.failed_transient ?? t("settings.embeddingMigration.unknown"),
+                failedPermanent:
+                  embeddingPlan.failed_permanent ?? t("settings.embeddingMigration.unknown"),
+              })}
+            </p>
+            <div style={{ marginTop: 12, fontWeight: 600 }}>
+              {t("settings.embeddingPlan.backupTitle")}
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                {t("settings.embeddingPlan.backupDirectory")}
+              </div>
+              <input
+                value={embeddingBackupDirectory}
+                readOnly
+                aria-label={t("settings.embeddingPlan.backupDirectory")}
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                className="btn"
+                disabled={embeddingSwitchBusy}
+                onClick={() => void chooseEmbeddingBackupDirectory()}
+              >
+                {t("settings.embeddingPlan.chooseDirectory")}
+              </button>
+            </div>
+            <label className="settings-row" style={{ justifyContent: "flex-start" }}>
+              <input
+                type="checkbox"
+                checked={embeddingNoBackupUnsafe}
+                disabled={embeddingSwitchBusy || Boolean(embeddingBackupDirectory)}
+                onChange={(event) => setEmbeddingNoBackupUnsafe(event.target.checked)}
+              />
+              <span>{t("settings.embeddingPlan.noBackupUnsafe")}</span>
+            </label>
+            {!embeddingBackupDirectory && !embeddingNoBackupUnsafe && (
+              <div role="alert" style={{ color: "var(--warning)" }}>
+                {t("settings.embeddingPlan.requiresBackup")}
+              </div>
+            )}
+            <label className="settings-row" style={{ justifyContent: "flex-start" }}>
+              <input
+                type="checkbox"
+                checked={embeddingMaintenanceAck}
+                disabled={embeddingSwitchBusy}
+                onChange={(event) => setEmbeddingMaintenanceAck(event.target.checked)}
+              />
+              <span>{t("settings.embeddingPlan.maintenanceAck")}</span>
+            </label>
+            {applyError && (
+              <div role="alert" style={{ color: "var(--danger)" }}>
+                {applyError}
+              </div>
+            )}
+          </div>
+          <div className="modal-foot">
+            <button
+              type="button"
+              className="btn"
+              disabled={embeddingSwitchBusy}
+              onClick={() => {
+                setEmbeddingPlan(null);
+                setEmbeddingPlanSettings(null);
+              }}
+            >
+              {t("settings.embeddingPlan.cancel")}
+            </button>
+            <button
+              type="button"
+              className="btn danger"
+              disabled={
+                embeddingSwitchBusy ||
+                (!embeddingBackupDirectory && !embeddingNoBackupUnsafe) ||
+                !embeddingMaintenanceAck
+              }
+              onClick={() => void approveEmbeddingMigration()}
+            >
+              {embeddingSwitchBusy
+                ? t("settings.embeddingPlan.switching")
+                : t("settings.embeddingPlan.switch")}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </CodingAgentSettingsEditorProvider>
+  );
+}
+
+/**
+ * Controls the persisted Issue Tracker feature toggle. The card is rendered
+ * only when the build permits configuration; in a plain release, the saved
+ * value cannot affect the effective feature state.
+ */
+export function IssueTrackerToggleCard({
+  onDirtyChange,
+  resetSignal,
+}: DirtyReporter<SetIssueTrackerSettingsRequest>) {
+  const { t } = useTranslation();
+  const { data } = useQuery<IssueTrackerSettingsResponse>({
+    queryKey: ["issue-tracker-settings"],
+    queryFn: getIssueTrackerSettings,
+  });
+  const [enabled, setEnabled] = useState(false);
+
+  const seedFromData = useCallback(() => {
+    if (!data) return;
+    setEnabled(data.effective_enabled);
+  }, [data]);
+
+  useEffect(() => {
+    seedFromData();
+  }, [seedFromData]);
+
+  // `resetSignal` is the parent save-bar discard trigger.
+  useEffect(() => {
+    if (resetSignal === 0) return;
+    seedFromData();
+  }, [resetSignal, seedFromData]);
+
+  const payload = useMemo<SetIssueTrackerSettingsRequest | null>(() => {
+    if (!data || enabled === data.effective_enabled) return null;
+    return { enabled };
+  }, [data, enabled]);
+
+  useEffect(() => {
+    onDirtyChange(payload, payload !== null);
+  }, [onDirtyChange, payload]);
+
+  const effectiveState = data?.effective_enabled
+    ? t("settings.issueTracker.on")
+    : t("settings.issueTracker.off");
+  const explicitState =
+    data?.enabled == null
+      ? t("settings.issueTracker.buildDefault")
+      : data.enabled
+        ? t("settings.issueTracker.on")
+        : t("settings.issueTracker.off");
+
+  return (
+    <section className="settings-card" aria-label={t("settings.issueTracker.title")}>
+      <div className="settings-card-title">{t("settings.issueTracker.title")}</div>
+      <div className="settings-card-desc">{t("settings.issueTracker.desc")}</div>
+      <div style={{ color: "var(--label-tertiary)", fontSize: 11, marginTop: 4 }}>
+        {t("settings.issueTracker.effectiveState", { state: effectiveState })}
+        {" · "}
+        {t("settings.issueTracker.savedState", { state: explicitState })}
+      </div>
+      <div style={{ color: "var(--label-tertiary)", fontSize: 11, marginTop: 4 }}>
+        {t("settings.issueTracker.restartTarget")}
+      </div>
+      <SettingsCheckboxRow
+        id="issue-tracker-enabled"
+        checked={enabled}
+        disabled={data == null}
+        onCheckedChange={setEnabled}
+        title={t("settings.issueTracker.enabled")}
+        description={t("settings.issueTracker.enabledDescription")}
+      />
+    </section>
   );
 }
 
@@ -703,15 +1252,12 @@ function SearchIndexMaintenanceCard() {
           <div>{tableStatus("thread")}</div>
         </div>
       )}
-      <div className="settings-row" style={{ marginTop: 10 }}>
-        <label className="settings-row-label" htmlFor="maintenance-schedule-enabled">
-          未使用時間帯に定期最適化
-        </label>
-        <input
+      <div style={{ marginTop: 10 }}>
+        <SettingsCheckboxRow
           id="maintenance-schedule-enabled"
-          type="checkbox"
           checked={scheduleEnabled}
-          onChange={(event) => setScheduleEnabled(event.target.checked)}
+          onCheckedChange={setScheduleEnabled}
+          title="未使用時間帯に定期最適化"
         />
       </div>
       {scheduleEnabled && (
@@ -755,15 +1301,6 @@ function SearchIndexMaintenanceCard() {
           onCancel={() => setConfirming(false)}
         />
       )}
-    </div>
-  );
-}
-
-function SettingRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="settings-row">
-      <div className="settings-row-label">{label}</div>
-      <input type="text" value={value} readOnly style={{ flex: 1, opacity: 0.7 }} />
     </div>
   );
 }
@@ -958,6 +1495,113 @@ function isValidHfRepoShape(s: string): boolean {
   return /^[A-Za-z0-9_.-]+$/.test(org) && /^[A-Za-z0-9_.-]+$/.test(name);
 }
 
+function SummaryOutputGuidanceEditor({
+  value,
+  onChange,
+}: {
+  value: SummaryOutputGuidance;
+  onChange: (next: SummaryOutputGuidance) => void;
+}) {
+  const { t } = useTranslation();
+  const profiles: Array<keyof Pick<SummaryOutputGuidance, "small" | "standard" | "large">> = [
+    "small",
+    "standard",
+    "large",
+  ];
+  const periods: Array<keyof SummaryGuideProfile> = ["daily", "weekly", "monthly"];
+  const updateLength = (
+    profile: (typeof profiles)[number],
+    period: (typeof periods)[number],
+    field: keyof SummaryLengthGuide,
+    raw: string,
+  ) => {
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) return;
+    onChange({
+      ...value,
+      [profile]: {
+        ...value[profile],
+        [period]: { ...value[profile][period], [field]: parsed },
+      },
+    });
+  };
+  const updateLimit = (field: keyof SummaryOutputGuidance["limits"], raw: string) => {
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) return;
+    onChange({ ...value, limits: { ...value.limits, [field]: parsed } });
+  };
+
+  return (
+    <div style={{ display: "grid", gap: 8, fontSize: 12 }}>
+      {profiles.map((profile) => (
+        <div key={profile}>
+          <div style={{ fontWeight: 600, textTransform: "capitalize", marginBottom: 3 }}>
+            {t(`settings.llm.summaryGuide.profiles.${profile}`)}
+          </div>
+          {periods.map((period) => (
+            <div className="settings-row" key={period} style={{ minHeight: 28 }}>
+              <div className="settings-row-label">
+                {t(`settings.llm.summaryGuide.periods.${period}`)}
+              </div>
+              <label>
+                {t("settings.llm.summaryGuide.item")}
+                <input
+                  aria-label={`${profile}-${period}-item-chars`}
+                  type="number"
+                  min={1}
+                  value={value[profile][period].item_chars}
+                  onChange={(event) =>
+                    updateLength(profile, period, "item_chars", event.target.value)
+                  }
+                  style={{ width: 84, marginLeft: 4 }}
+                />
+              </label>
+              <label style={{ marginLeft: 10 }}>
+                {t("settings.llm.summaryGuide.total")}
+                <input
+                  aria-label={`${profile}-${period}-total-chars`}
+                  type="number"
+                  min={1}
+                  value={value[profile][period].total_chars}
+                  onChange={(event) =>
+                    updateLength(profile, period, "total_chars", event.target.value)
+                  }
+                  style={{ width: 96, marginLeft: 4 }}
+                />
+              </label>
+            </div>
+          ))}
+        </div>
+      ))}
+      <div className="settings-row" style={{ minHeight: 28 }}>
+        <div className="settings-row-label">{t("settings.llm.summaryGuide.purposeGroups")}</div>
+        {(["daily", "weekly", "monthly"] as const).map((period) => (
+          <input
+            aria-label={`max-purpose-groups-${period}`}
+            key={period}
+            type="number"
+            min={1}
+            value={value.limits[period]}
+            onChange={(event) => updateLimit(period, event.target.value)}
+            style={{ width: 58, marginLeft: 4 }}
+          />
+        ))}
+        <label style={{ marginLeft: 10 }}>
+          {t("settings.llm.summaryGuide.sourceIds")}
+          <input
+            aria-label="max-source-memory-ids"
+            type="number"
+            min={1}
+            value={value.limits.max_source_memory_ids}
+            onChange={(event) => updateLimit("max_source_memory_ids", event.target.value)}
+            style={{ width: 58, marginLeft: 4 }}
+          />
+        </label>
+      </div>
+    </div>
+  );
+}
+
 export function LlmProviderCard({
   retrying,
   status,
@@ -998,6 +1642,7 @@ export function LlmProviderCard({
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [maxTokens, setMaxTokens] = useState("");
+  const [modelMaxOutputTokens, setModelMaxOutputTokens] = useState("");
   const [temperature, setTemperature] = useState("");
   // Explicit "delete the stored key" intent. Routed through the unified
   // save (api_key = "") rather than an immediate restart so it batches
@@ -1010,6 +1655,7 @@ export function LlmProviderCard({
   const [localHfRepo, setLocalHfRepo] = useState("");
   const [localCtxSize, setLocalCtxSize] = useState("");
   const [localKvCacheType, setLocalKvCacheType] = useState<KvCacheType>(DEFAULT_KV_CACHE_TYPE);
+  const [summaryGuidance, setSummaryGuidance] = useState<SummaryOutputGuidance | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const seedFromData = useCallback(() => {
@@ -1020,11 +1666,15 @@ export function LlmProviderCard({
     setDeleteKey(false);
     setBaseUrl(data.base_url ?? "");
     setMaxTokens(data.max_tokens != null ? String(data.max_tokens) : "");
+    setModelMaxOutputTokens(
+      data.model_max_output_tokens != null ? String(data.model_max_output_tokens) : "",
+    );
     setTemperature(data.temperature != null ? String(data.temperature) : "");
     setLocalModelFile(data.local_model_file ?? "");
     setLocalHfRepo(data.local_hf_repo ?? "");
     setLocalCtxSize(data.local_ctx_size != null ? String(data.local_ctx_size) : "");
     setLocalKvCacheType(data.local_kv_cache_type ?? DEFAULT_KV_CACHE_TYPE);
+    setSummaryGuidance(data.summary_output_guidance);
   }, [data]);
 
   // Re-seed when the server data (re)loads OR the parent fires a discard.
@@ -1106,6 +1756,8 @@ export function LlmProviderCard({
   // when the form matches the persisted value (so the card is "clean").
   const buildPayload = useCallback((): SetLlmSettingsRequest | null => {
     if (!data) return null;
+    if (!summaryGuidance) return null;
+    const summaryOutputGuidance = summaryGuidance;
     const isLocal = mode === "local";
     // api_key contract: null = no change, "" = delete, "x" = set.
     const apiKeyPayload: string | null = deleteKey
@@ -1121,6 +1773,7 @@ export function LlmProviderCard({
       api_key: apiKeyPayload,
       base_url: isLocal ? (data.base_url ?? null) : baseUrl.trim() || null,
       max_tokens: parseOptionalNonNegativeNumber(maxTokens),
+      model_max_output_tokens: parseOptionalNonNegativeNumber(modelMaxOutputTokens),
       temperature: parseOptionalNonNegativeNumber(temperature),
       local_preset_id: isLocal ? localPresetId || null : (data.local_preset_id ?? null),
       local_model_file: isLocal
@@ -1135,6 +1788,7 @@ export function LlmProviderCard({
         : (data.local_hf_repo ?? null),
       local_ctx_size: parseOptionalNonNegativeNumber(localCtxSize),
       local_kv_cache_type: isLocal ? localKvCacheType : (data.local_kv_cache_type ?? null),
+      summary_output_guidance: summaryOutputGuidance,
     };
     // Dirty check: compare each field against the persisted snapshot. The
     // api_key is dirty only when a delete is requested or a new key typed
@@ -1155,12 +1809,15 @@ export function LlmProviderCard({
       payload.api_key === null &&
       payload.base_url === (data.base_url ?? null) &&
       payload.max_tokens === (data.max_tokens ?? null) &&
+      payload.model_max_output_tokens === (data.model_max_output_tokens ?? null) &&
       payload.temperature === (data.temperature ?? null) &&
       payload.local_preset_id === cleanPresetId &&
       payload.local_model_file === (data.local_model_file ?? null) &&
       payload.local_hf_repo === (data.local_hf_repo ?? null) &&
       payload.local_ctx_size === (data.local_ctx_size ?? null) &&
-      payload.local_kv_cache_type === cleanKvCacheType;
+      payload.local_kv_cache_type === cleanKvCacheType &&
+      JSON.stringify(payload.summary_output_guidance) ===
+        JSON.stringify(data.summary_output_guidance);
     return clean ? null : payload;
   }, [
     data,
@@ -1170,17 +1827,25 @@ export function LlmProviderCard({
     model,
     baseUrl,
     maxTokens,
+    modelMaxOutputTokens,
     temperature,
     localPresetId,
     localModelFile,
     localHfRepo,
     localCtxSize,
     localKvCacheType,
+    summaryGuidance,
     isCustomPreset,
     presets,
   ]);
 
   const externalIncomplete = mode === "external" && model.trim() === "";
+  const summaryGuidanceInvalid =
+    summaryGuidance === null ||
+    (modelMaxOutputTokens !== "" &&
+      (!Number.isInteger(Number(modelMaxOutputTokens)) ||
+        Number(modelMaxOutputTokens) < 1024 ||
+        Number(modelMaxOutputTokens) > 1048576));
   // Inline custom-mode validation: backend rejects the same shapes; gating
   // the dirty report prevents a needless sidecar restart.
   const customIncomplete =
@@ -1200,14 +1865,17 @@ export function LlmProviderCard({
   useEffect(() => {
     const built = buildPayload();
     const edited = built !== null;
-    const payload = externalIncomplete || customIncomplete ? null : built;
+    const payload = externalIncomplete || customIncomplete || summaryGuidanceInvalid ? null : built;
     onDirtyChange(payload, edited);
-  }, [buildPayload, externalIncomplete, customIncomplete, onDirtyChange]);
+  }, [buildPayload, externalIncomplete, customIncomplete, summaryGuidanceInvalid, onDirtyChange]);
 
   return (
     <div className="settings-card">
       <div className="settings-card-title">{t("settings.llm.title")}</div>
       <div className="settings-card-desc">{t("settings.llm.desc")}</div>
+      <div style={{ color: "var(--label-tertiary)", fontSize: 11, marginTop: 4 }}>
+        {t("settings.llm.restartTarget")}
+      </div>
       <ModelStatusSection
         purpose={t("settings.llm.modelPurpose")}
         status={status}
@@ -1338,7 +2006,6 @@ export function LlmProviderCard({
         <input
           type="number"
           value={temperature}
-          placeholder="0.3"
           step="0.1"
           min="0"
           max="2"
@@ -1350,6 +2017,36 @@ export function LlmProviderCard({
         {t("settings.llm.genParamsHintPre")} <strong>{t("settings.llm.genParamsHintChat")}</strong>{" "}
         {t("settings.llm.genParamsHintPost")}
       </div>
+
+      <div className="settings-row">
+        <label className="settings-row-label" htmlFor="model-max-output-tokens">
+          {t("settings.llm.modelMaxOutputTokens")}
+        </label>
+        <input
+          id="model-max-output-tokens"
+          type="number"
+          min="1024"
+          max="1048576"
+          value={modelMaxOutputTokens}
+          placeholder={t("settings.llm.modelMaxOutputAuto")}
+          onChange={(e) => setModelMaxOutputTokens(e.target.value)}
+          style={{ width: 140 }}
+        />
+      </div>
+      <div style={{ color: "var(--label-tertiary)", fontSize: 11 }}>
+        {t("settings.llm.modelMaxOutputHint")}
+      </div>
+      <details style={{ marginTop: 12 }}>
+        <summary style={{ cursor: "pointer", color: "var(--label-secondary)", fontSize: 12 }}>
+          {t("settings.llm.summaryGuide.title")}
+        </summary>
+        <div style={{ color: "var(--label-tertiary)", fontSize: 11, margin: "6px 0" }}>
+          {t("settings.llm.summaryGuide.description")}
+        </div>
+        {summaryGuidance && (
+          <SummaryOutputGuidanceEditor value={summaryGuidance} onChange={setSummaryGuidance} />
+        )}
+      </details>
 
       {mode === "external" && (
         <div className="settings-row">
@@ -1532,214 +2229,13 @@ export function LlmProviderCard({
   );
 }
 
-const CONNECTION_MODES: { value: ConnectionMode; labelKey: string }[] = [
-  { value: "local", labelKey: "settings.connection.modeLocal" },
-  { value: "remote", labelKey: "settings.connection.modeRemote" },
-];
-
-/**
- * Connection-target override. Local mode shows the live sidecar
- * URLs read-only (the dynamic ports are never persisted); remote mode
- * exposes editable URL fields persisted via set_connection_config.
- */
-export function ConnectionCard({
-  localJobworkerpUrl,
-  localMemoriesUrl,
-  onEditedChange,
-}: {
-  localJobworkerpUrl: string | null;
-  localMemoriesUrl: string | null;
-  /** Reports whether the form differs from the persisted config, so the
-   *  parent can arm its leave-guards. This card saves itself (not via the
-   *  unified save bar), so only the edited flag is lifted — no payload. */
-  onEditedChange?: (edited: boolean) => void;
-}) {
-  const { t } = useTranslation();
-  const queryClient = useQueryClient();
-  const { data } = useQuery({ queryKey: ["connection-config"], queryFn: getConnectionConfig });
-
-  const [mode, setMode] = useState<ConnectionMode>("local");
-  const [jobworkerpUrl, setJobworkerpUrl] = useState("");
-  const [memoriesUrl, setMemoriesUrl] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
-
-  // Seed the form from the persisted config once it loads.
-  useEffect(() => {
-    if (!data) return;
-    setMode(data.mode);
-    setJobworkerpUrl(data.remote_jobworkerp_url ?? "");
-    setMemoriesUrl(data.remote_memories_url ?? "");
-  }, [data]);
-
-  const remoteIncomplete =
-    mode === "remote" && (jobworkerpUrl.trim() === "" || memoriesUrl.trim() === "");
-
-  // Dirty when the form differs from the persisted config. Compared against
-  // the same normalisation `handleSave` sends (trim; local mode treats blank
-  // URLs as null) so a no-op edit doesn't arm the guard. Until `data` loads
-  // there is nothing to diff against, so it's clean.
-  const edited =
-    data != null &&
-    (mode !== data.mode ||
-      jobworkerpUrl.trim() !== (data.remote_jobworkerp_url ?? "") ||
-      memoriesUrl.trim() !== (data.remote_memories_url ?? ""));
-  useEffect(() => {
-    onEditedChange?.(edited);
-  }, [edited, onEditedChange]);
-  // Clear the flag on unmount (view switch / tab change) so a stale "edited"
-  // doesn't keep the guard armed after the card is gone.
-  useEffect(() => {
-    return () => onEditedChange?.(false);
-  }, [onEditedChange]);
-
-  const currentConnectionPayload = () => ({
-    mode,
-    remote_jobworkerp_url: mode === "remote" ? jobworkerpUrl.trim() : jobworkerpUrl.trim() || null,
-    remote_memories_url: mode === "remote" ? memoriesUrl.trim() : memoriesUrl.trim() || null,
-  });
-
-  const handleSave = async () => {
-    setSaving(true);
-    setError(null);
-    setTestResult(null);
-    setSaved(false);
-    try {
-      await setConnectionConfig(currentConnectionPayload());
-      setSaved(true);
-      // The connection target changed, so every server-derived cache (threads,
-      // memories, summaries, reflections, personality, search) now points at
-      // the wrong instance. Invalidate everything so the next render refetches
-      // from the new target — listing one instance's threads while the
-      // detail/link queries hit another is exactly the half-broken state this
-      // avoids. The connection-config / settings snapshots are refetched too,
-      // which is harmless (they return the correct current values).
-      await queryClient.invalidateQueries();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleTest = async () => {
-    setTesting(true);
-    setError(null);
-    setTestResult(null);
-    try {
-      await testConnectionConfig(currentConnectionPayload());
-      setTestResult(t("settings.connection.testOk"));
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  return (
-    <div className="settings-card">
-      <div className="settings-card-title">{t("settings.connection.title")}</div>
-      <div className="settings-card-desc">{t("settings.connection.desc")}</div>
-      <div className="settings-row">
-        <div className="settings-row-label">{t("settings.connection.target")}</div>
-        <div className="segment">
-          {CONNECTION_MODES.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              className={`segment-btn${mode === opt.value ? " active" : ""}`}
-              onClick={() => setMode(opt.value)}
-            >
-              {t(opt.labelKey)}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {mode === "local" ? (
-        <>
-          <SettingRow
-            label="jobworkerp"
-            value={localJobworkerpUrl ?? t("settings.connection.starting")}
-          />
-          <SettingRow
-            label="memories"
-            value={localMemoriesUrl ?? t("settings.connection.starting")}
-          />
-        </>
-      ) : (
-        <>
-          <div className="settings-row">
-            <div className="settings-row-label">jobworkerp</div>
-            <input
-              type="text"
-              value={jobworkerpUrl}
-              placeholder="http://host:9000"
-              onChange={(e) => setJobworkerpUrl(e.target.value)}
-              style={{ flex: 1 }}
-            />
-          </div>
-          <div className="settings-row">
-            <div className="settings-row-label">memories</div>
-            <input
-              type="text"
-              value={memoriesUrl}
-              placeholder="http://host:9010"
-              onChange={(e) => setMemoriesUrl(e.target.value)}
-              style={{ flex: 1 }}
-            />
-          </div>
-        </>
-      )}
-
-      <div className="settings-row">
-        <div className="settings-row-label" />
-        <button
-          type="button"
-          className="btn primary"
-          onClick={() => void handleSave()}
-          disabled={saving || remoteIncomplete}
-        >
-          {saving ? t("settings.connection.saving") : t("settings.connection.save")}
-        </button>
-        {saved && !error && (
-          <span style={{ color: "var(--success, #2ea043)", fontSize: 11, marginLeft: 8 }}>
-            {t("settings.connection.saved")}
-          </span>
-        )}
-      </div>
-      {mode === "remote" && (
-        <div className="settings-row">
-          <div className="settings-row-label" />
-          <button
-            type="button"
-            className="btn"
-            onClick={() => void handleTest()}
-            disabled={testing || remoteIncomplete}
-          >
-            {testing ? t("settings.connection.testing") : t("settings.connection.test")}
-          </button>
-          {testResult && !error && (
-            <span style={{ color: "var(--success, #2ea043)", fontSize: 11, marginLeft: 8 }}>
-              {testResult}
-            </span>
-          )}
-        </div>
-      )}
-      {error && <div style={{ color: "var(--danger)", fontSize: 11 }}>{error}</div>}
-    </div>
-  );
-}
-
 const LOG_SOURCES: { value: LogSource; label: string }[] = [
   // `app` first / default: it carries the memories-import child output, so it's
   // where an import failure (e.g. a remote TLS error) shows up.
   { value: "app", label: "app" },
   { value: "jobworkerp", label: "jobworkerp" },
   { value: "memories", label: "memories" },
+  { value: "issue_tracker", label: "issue-tracker" },
 ];
 
 const LOG_STREAMS: { value: LogStream; label: string }[] = [
@@ -1753,7 +2249,7 @@ const LOG_STREAMS: { value: LogStream; label: string }[] = [
  * refresh button is enough for the MVP (no live streaming). `app` is Lookback's
  * own combined log (single file — the stream selector is hidden for it).
  */
-function LogsCard() {
+export function LogsCard() {
   const { t } = useTranslation();
   const [source, setSource] = useState<LogSource>("app");
   const [stream, setStream] = useState<LogStream>("stdout");
@@ -1859,12 +2355,10 @@ function LogsCard() {
 /**
  * Embedding model selection card. Mirrors `LlmProviderCard` (preset
  * dropdown + Custom row + save → sidecar restart) but for the embedding
- * runner. Changing the vector dimension renames the existing lancedb
- * into a timestamped backup or deletes it; the choice is exposed as a
- * checkbox so a user comfortable with the previous behaviour can opt
- * out.
+ * runner. Storage migration decisions belong to memories and are shown from
+ * its plan before applying a local embedding change.
  *
- * Still editable when `connection.mode === "remote"`: local article embeddings
+ * Still editable while memories is remote: local article embeddings
  * are not regenerated then, but semantic query embedding must match the remote
  * memories vector space.
  */
@@ -1874,19 +2368,18 @@ export function EmbeddingProviderCard({
   onRetry,
   onDirtyChange,
   onResetsVectordbChange,
-  suppressResetWarning = false,
+  memoriesMode,
   preferredDefaultLanguage,
   resetSignal,
 }: {
   retrying: boolean;
   status?: ModelStatus;
   onRetry: () => void;
-  /** Reports whether the pending change will actually reset the vectordb
-   *  (model id / vector dimension changes vs the persisted effective
-   *  runtime). Mirrors the backend's `needs_vectordb_reset` so the parent's
-   *  destructive warning only fires for a real index reset. */
+  /** A form-side comparison cannot predict whether Memories requires a rebuild. */
   onResetsVectordbChange?: (resets: boolean) => void;
-  /** First-run setup starts with an empty vectordb, so reset warnings would be noise. */
+  /** Null means it has not been resolved. */
+  memoriesMode?: ConnectionMode | null;
+  /** Legacy first-run prop; the plan-authority notice is never suppressed. */
   suppressResetWarning?: boolean;
   /** First-run only: choose a language-recommended preset when no selection
    *  has been persisted. Normal Settings deliberately leaves this unset. */
@@ -1902,11 +2395,37 @@ export function EmbeddingProviderCard({
     queryFn: listEmbeddingPresets,
     staleTime: Number.POSITIVE_INFINITY,
   });
+  const resolvedConnectionMode =
+    memoriesMode === undefined
+      ? data == null
+        ? null
+        : data.connection_remote
+          ? "remote"
+          : "local"
+      : memoriesMode;
+  const localManagementEnabled = resolvedConnectionMode === "local";
+  const embeddingSpace = useQuery({
+    queryKey: ["embedding-space", "settings"],
+    queryFn: getEmbeddingSpace,
+    enabled: localManagementEnabled,
+    refetchInterval: 5000,
+  });
+  const migrationInspection = useQuery({
+    queryKey: ["embedding-migration-inspect"],
+    queryFn: inspectEmbeddingMigration,
+    enabled: localManagementEnabled,
+    refetchInterval: (query) => embeddingMigrationInspectRefetchMs(query.state.data),
+  });
 
-  const remote = data?.connection_remote ?? false;
+  const remote =
+    resolvedConnectionMode === "remote" ||
+    (resolvedConnectionMode == null && data?.connection_remote === true);
   const initialPresetId = data?.preset_id ?? null;
   const [presetId, setPresetId] = useState<string>(initialPresetId ?? presets.data?.[0]?.id ?? "");
   const [customModel, setCustomModel] = useState(data?.custom_model_id ?? "");
+  const [customModelRevision, setCustomModelRevision] = useState(
+    data?.model_revision ?? data?.effective.model_revision ?? "",
+  );
   const [customTokenizer, setCustomTokenizer] = useState(data?.custom_tokenizer_id ?? "");
   const [customVectorSize, setCustomVectorSize] = useState<string>(
     data?.custom_vector_size != null ? String(data.custom_vector_size) : "",
@@ -1918,35 +2437,65 @@ export function EmbeddingProviderCard({
   const [customMultimodal, setCustomMultimodal] = useState<boolean>(
     data?.custom_is_multimodal ?? false,
   );
-  const [evacuate, setEvacuate] = useState<boolean>(true);
 
   // Stable reference so a render churn during loading doesn't force the
   // reseed effect to fire repeatedly with the same data.
   const presetList: EmbeddingPreset[] = useMemo(() => presets.data ?? [], [presets.data]);
-  const defaultPresetId = useMemo(
-    () =>
+  const defaultPresetId = useMemo(() => {
+    if (!remote && data?.effective) {
+      return (
+        presetList.find(
+          (preset) =>
+            preset.hf_repo === data.effective.model_id &&
+            preset.vector_size === data.effective.vector_size,
+        )?.id ?? CUSTOM_EMBEDDING_PRESET_ID
+      );
+    }
+    return (
       presetList.find((preset) =>
         preset.recommended_languages?.some(
           (language) => language.toLowerCase() === preferredDefaultLanguage?.toLowerCase(),
         ),
       )?.id ??
       presetList[0]?.id ??
-      "",
-    [presetList, preferredDefaultLanguage],
-  );
+      ""
+    );
+  }, [presetList, preferredDefaultLanguage, remote, data]);
 
   const seedFromData = useCallback(() => {
     if (!data) return;
     setPresetId(data.preset_id ?? defaultPresetId);
-    setCustomModel(data.custom_model_id ?? "");
-    setCustomTokenizer(data.custom_tokenizer_id ?? "");
-    setCustomVectorSize(data.custom_vector_size != null ? String(data.custom_vector_size) : "");
-    setCustomDtype(data.custom_dtype ?? "F16");
-    setCustomMaxSeq(
-      data.custom_max_sequence_length != null ? String(data.custom_max_sequence_length) : "",
+    setCustomModelRevision(data.model_revision ?? data.effective.model_revision ?? "");
+    setCustomModel(
+      data.custom_model_id ??
+        (defaultPresetId === CUSTOM_EMBEDDING_PRESET_ID ? data.effective.model_id : ""),
     );
-    setCustomMultimodal(data.custom_is_multimodal ?? false);
-    setEvacuate(true);
+    setCustomTokenizer(
+      data.custom_tokenizer_id ??
+        (defaultPresetId === CUSTOM_EMBEDDING_PRESET_ID ? (data.effective.tokenizer_id ?? "") : ""),
+    );
+    setCustomVectorSize(
+      data.custom_vector_size != null
+        ? String(data.custom_vector_size)
+        : defaultPresetId === CUSTOM_EMBEDDING_PRESET_ID
+          ? String(data.effective.vector_size)
+          : "",
+    );
+    setCustomDtype(
+      data.custom_dtype ??
+        (defaultPresetId === CUSTOM_EMBEDDING_PRESET_ID ? data.effective.dtype : "F16"),
+    );
+    setCustomMaxSeq(
+      data.custom_max_sequence_length != null
+        ? String(data.custom_max_sequence_length)
+        : defaultPresetId === CUSTOM_EMBEDDING_PRESET_ID
+          ? String(data.effective.max_sequence_length)
+          : "",
+    );
+    setCustomMultimodal(
+      data.custom_is_multimodal ??
+        (defaultPresetId === CUSTOM_EMBEDDING_PRESET_ID ? data.effective.is_multimodal : false),
+    );
   }, [data, defaultPresetId]);
 
   // Re-seed when the server data (re)loads OR the parent fires a discard.
@@ -2004,11 +2553,9 @@ export function EmbeddingProviderCard({
       custom_max_sequence_length:
         isCustom && customMaxSeq ? Number.parseInt(customMaxSeq, 10) || null : null,
       custom_is_multimodal: isCustom ? customMultimodal : null,
-      evacuate_vectordb: evacuate,
+      model_revision: customModelRevision,
     };
-    // Dirty check against the persisted snapshot. `evacuate_vectordb` is a
-    // save-time policy, not persisted state, so it is excluded from the
-    // diff (toggling it alone is not "dirty").
+    // Compare only the configuration persisted by the application.
     const clean =
       payload.preset_id === (data.preset_id ?? (defaultPresetId || null)) &&
       payload.custom_model_id === (data.custom_model_id ?? null) &&
@@ -2017,18 +2564,21 @@ export function EmbeddingProviderCard({
       payload.custom_dtype === (isCustom ? (data.custom_dtype ?? "F16") : null) &&
       payload.custom_max_sequence_length === (data.custom_max_sequence_length ?? null) &&
       payload.custom_is_multimodal === (isCustom ? (data.custom_is_multimodal ?? false) : null);
-    return clean ? null : payload;
+    return clean &&
+      payload.model_revision === (data.model_revision ?? data.effective.model_revision ?? "")
+      ? null
+      : payload;
   }, [
     data,
     isCustom,
     presetId,
     customModel,
+    customModelRevision,
     customTokenizer,
     customVectorSize,
     customDtype,
     customMaxSeq,
     customMultimodal,
-    evacuate,
     defaultPresetId,
   ]);
 
@@ -2047,13 +2597,15 @@ export function EmbeddingProviderCard({
       (isCustom && customMaxSeq ? Number.parseInt(customMaxSeq, 10) || null : null) ===
         (data.custom_max_sequence_length ?? null) &&
       (isCustom ? customMultimodal : null) ===
-        (isCustom ? (data.custom_is_multimodal ?? false) : null)
+        (isCustom ? (data.custom_is_multimodal ?? false) : null) &&
+      customModelRevision === (data.model_revision ?? data.effective.model_revision ?? "")
     );
   }, [
     data,
     isCustom,
     presetId,
     customModel,
+    customModelRevision,
     customTokenizer,
     customVectorSize,
     customDtype,
@@ -2066,27 +2618,27 @@ export function EmbeddingProviderCard({
     onDirtyChange(buildPayload(), edited);
   }, [buildPayload, edited, onDirtyChange]);
 
-  // Whether saving will actually reset the vectordb. Mirrors the backend's
-  // `needs_vectordb_reset` (model id OR vector dimension changes) so the
-  // parent's destructive warning fires only for a real index reset, not for
-  // a dtype / max-seq / tokenizer / multimodal-only edit. Compared against
-  // the persisted effective runtime; only meaningful while the form is
-  // actually edited (a clean form resets nothing). Note: the backend
-  // additionally factors in `LOOKBACK_EMBEDDING_*` dev env overrides; this UI
-  // prediction is preset/custom-only, which matches the production (no-env)
-  // path the warning targets.
-  const resetsVectordb = useMemo(() => {
-    if (remote) return false;
-    if (!edited || !effective) return false;
-    const nextModelId = isCustom ? customModel.trim() : (selectedPreset?.hf_repo ?? "");
-    const nextVectorSize = isCustom
-      ? Number.parseInt(customVectorSize, 10) || 0
-      : (selectedPreset?.vector_size ?? 0);
-    return nextModelId !== effective.model_id || nextVectorSize !== effective.vector_size;
-  }, [remote, edited, effective, isCustom, customModel, customVectorSize, selectedPreset]);
+  // The Memories plan considers tokenizer, revision, distance and effective
+  // overrides as well as the visible model/dimension. The card must not infer
+  // that a rebuild is or is not needed from a partial form comparison.
+  const hasLocalEmbeddingDraft = !remote && buildPayload() !== null;
+  const pendingMigrationMarker = (embeddingSpace.data?.tables ?? []).some((table) => {
+    const marker = table.record?.migration_marker;
+    return marker?.state === "pending";
+  });
+  const migrationAttemptStage = migrationInspection.isError
+    ? undefined
+    : migrationInspection.data?.kind === "inspect"
+      ? migrationInspection.data.data.attempt?.stage
+      : migrationInspection.data?.kind === "failed"
+        ? migrationInspection.data.data.attempt?.stage
+        : undefined;
+  const embeddingChunkConfigLocked =
+    !remote && (pendingMigrationMarker || migrationAttemptStage === "rebuild_pending");
+  const embeddingWorkerPending = embeddingSpace.data?.registration_state === "pending";
   useEffect(() => {
-    onResetsVectordbChange?.(resetsVectordb);
-  }, [resetsVectordb, onResetsVectordbChange]);
+    onResetsVectordbChange?.(false);
+  }, [onResetsVectordbChange]);
 
   return (
     <div className="settings-card">
@@ -2094,27 +2646,19 @@ export function EmbeddingProviderCard({
       <div className="settings-card-desc">
         {t(remote ? "settings.embedding.remoteDesc" : "settings.embedding.desc")}
       </div>
+      <div style={{ color: "var(--label-tertiary)", fontSize: 11, marginTop: 4 }}>
+        {t("settings.embedding.restartTarget")}
+      </div>
       <ModelStatusSection
         purpose={t("settings.embedding.modelPurpose")}
         status={status}
         retrying={retrying}
         onRetry={onRetry}
       />
-      {/* Prominent destructive warning, shown ONLY when the pending change
-          actually resets the vectordb (model id / vector dimension change).
-          A dtype / max-seq / tokenizer / multimodal-only edit is saveable but
-          leaves the index intact, so it gets a milder note instead — warning
-          "the vectordb will be reset" there would be a false alarm. */}
-      {resetsVectordb && !suppressResetWarning ? (
-        <div className="settings-destructive-banner">{t("settings.embedding.resetBanner")}</div>
-      ) : (
-        buildPayload() !== null &&
-        !remote &&
-        !suppressResetWarning && (
-          <div style={{ color: "var(--label-tertiary)", fontSize: 11, marginBottom: 8 }}>
-            {t("settings.embedding.noResetNote")}
-          </div>
-        )
+      {hasLocalEmbeddingDraft && (
+        <div role="status" style={{ color: "var(--warning)", fontSize: 11, marginBottom: 8 }}>
+          {t("settings.embedding.planAuthorityNote")}
+        </div>
       )}
       {remote && (
         <div
@@ -2128,6 +2672,16 @@ export function EmbeddingProviderCard({
           }}
         >
           {t("settings.embedding.remoteCaution")}
+        </div>
+      )}
+      {embeddingWorkerPending && !remote && (
+        <div role="status" style={{ color: "var(--warning)", fontSize: 11, marginBottom: 8 }}>
+          {t("settings.embedding.workerPending")}
+        </div>
+      )}
+      {embeddingChunkConfigLocked && !remote && (
+        <div role="status" style={{ color: "var(--warning)", fontSize: 11, marginBottom: 8 }}>
+          {t("settings.embedding.chunkSettingsLocked")}
         </div>
       )}
       {effective && (
@@ -2167,6 +2721,18 @@ export function EmbeddingProviderCard({
           </div>
         </div>
       )}
+      <div className="settings-row">
+        <div className="settings-row-label">{t("settings.embedding.modelRevision")}</div>
+        <input
+          type="text"
+          aria-label={t("settings.embedding.modelRevision")}
+          value={customModelRevision}
+          disabled={disabled}
+          placeholder={t("settings.embedding.modelRevisionPlaceholder")}
+          onChange={(event) => setCustomModelRevision(event.target.value)}
+          style={{ flex: 1 }}
+        />
+      </div>
       {isCustom && (
         <>
           <div className="settings-row">
@@ -2207,6 +2773,7 @@ export function EmbeddingProviderCard({
             <select
               value={customDtype}
               disabled={disabled}
+              aria-label={t("settings.embedding.dtype")}
               onChange={(e) => setCustomDtype(e.target.value)}
               style={{ flex: 1 }}
             >
@@ -2220,43 +2787,22 @@ export function EmbeddingProviderCard({
             <input
               type="number"
               value={customMaxSeq}
-              disabled={disabled}
+              disabled={disabled || embeddingChunkConfigLocked}
+              aria-label={t("settings.embedding.maxSequenceLength")}
               placeholder="e.g. 8192"
               onChange={(e) => setCustomMaxSeq(e.target.value)}
               style={{ flex: 1 }}
             />
           </div>
-          <div className="settings-row">
-            <div className="settings-row-label">{t("settings.embedding.multimodal")}</div>
-            <label style={{ flex: 1, fontSize: 12 }}>
-              <input
-                type="checkbox"
-                checked={customMultimodal}
-                disabled={disabled}
-                onChange={(e) => setCustomMultimodal(e.target.checked)}
-              />{" "}
-              {t("settings.embedding.multimodalLabel")}
-            </label>
-          </div>
+          <SettingsCheckboxRow
+            id="embedding-custom-multimodal"
+            checked={customMultimodal}
+            disabled={disabled}
+            onCheckedChange={setCustomMultimodal}
+            title={t("settings.embedding.multimodal")}
+            description={t("settings.embedding.multimodalLabel")}
+          />
         </>
-      )}
-      {/* The evacuate-vs-delete choice only matters when the save actually
-          resets the vectordb; for a dtype/max-seq/tokenizer/multimodal-only
-          edit the index is untouched, so hide it to avoid implying the index
-          is at risk. */}
-      {resetsVectordb && !suppressResetWarning && (
-        <div className="settings-row">
-          <div className="settings-row-label">{t("settings.embedding.existingVectordb")}</div>
-          <label style={{ flex: 1, fontSize: 12 }}>
-            <input
-              type="checkbox"
-              checked={evacuate}
-              disabled={disabled}
-              onChange={(e) => setEvacuate(e.target.checked)}
-            />{" "}
-            {t("settings.embedding.evacuateLabel")}
-          </label>
-        </div>
       )}
       {isCustom && !customRequiredOk && (
         <div style={{ color: "var(--danger)", fontSize: 11 }}>
@@ -2278,9 +2824,11 @@ const MCP_TIMEOUT_SEC_MAX = 3600;
  * Expose Lookback's RAG retrieval (`lookback_recall`) as MCP tools
  * so an external MCP client (e.g. Claude Desktop) can search the user's
  * memories. jobworkerp boots its in-process MCP HTTP server alongside the
- * gRPC front when `MCP_ENABLED=true`, narrowed to the `lookback-mcp-rag`
- * function-set via `MCP_SET_NAME`. The toggle is read at sidecar spawn time,
- * so saving restarts the sidecar (handled by the unified `apply_settings`).
+ * gRPC front when `MCP_ENABLED=true`, narrowed to the composite `lookback-mcp`
+ * function-set via `MCP_SET_NAME`. The set currently exposes RAG targets only;
+ * Issue Gateway tools are deferred until the Phase 3 readiness gate passes.
+ * The toggle is read at sidecar spawn time, so saving restarts the sidecar
+ * (handled by the unified `apply_settings`).
  *
  * Works in both local and remote connection modes — the MCP server runs in the
  * local sidecar (always up), and the memories endpoint the exposed
@@ -2289,7 +2837,14 @@ const MCP_TIMEOUT_SEC_MAX = 3600;
 export function McpServerCard({
   onDirtyChange,
   resetSignal,
-}: DirtyReporter<SetMcpSettingsRequest>) {
+  savedAuthToken = null,
+  saveError = null,
+}: DirtyReporter<SetMcpSettingsRequest> & {
+  /** One-shot token returned by a successfully coordinated settings save. */
+  savedAuthToken?: string | null;
+  /** Save-bar error to show while a token rotation remains pending. */
+  saveError?: string | null;
+}) {
   const { t } = useTranslation();
   const { data } = useQuery({
     queryKey: ["mcp-settings"],
@@ -2297,16 +2852,29 @@ export function McpServerCard({
   });
 
   const [enabled, setEnabled] = useState(false);
+  const [allowUnauthenticatedRequests, setAllowUnauthenticatedRequests] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   // Advanced overrides. Empty string ⇒ "leave jobworkerp default" (null).
   const [streaming, setStreaming] = useState<"" | "true" | "false">("");
   const [timeoutSec, setTimeoutSec] = useState("");
+  const [ragDefaultPeriodScope, setRagDefaultPeriodScope] = useState<
+    "overall_only" | "overall_and_path"
+  >("overall_only");
+  const [authTokenConfiguredOverride, setAuthTokenConfiguredOverride] = useState<boolean | null>(
+    null,
+  );
+  const [visibleAuthToken, setVisibleAuthToken] = useState<string | null>(null);
+  const [authTokenAction, setAuthTokenAction] = useState<"generate" | "rotate" | null>(null);
+  const [authTokenError, setAuthTokenError] = useState<string | null>(null);
+  const [rotateAuthToken, setRotateAuthToken] = useState(false);
 
   const seedFromData = useCallback(() => {
     if (!data) return;
     setEnabled(data.enabled);
+    setAllowUnauthenticatedRequests(data.allow_unauthenticated_requests);
     setStreaming(data.streaming == null ? "" : data.streaming ? "true" : "false");
     setTimeoutSec(data.request_timeout_sec != null ? String(data.request_timeout_sec) : "");
+    setRagDefaultPeriodScope(data.rag_default_period_scope ?? "overall_only");
   }, [data]);
 
   useEffect(() => {
@@ -2316,7 +2884,46 @@ export function McpServerCard({
   useEffect(() => {
     if (resetSignal === 0) return;
     seedFromData();
+    setAuthTokenConfiguredOverride(null);
+    setVisibleAuthToken(null);
+    setAuthTokenError(null);
+    setRotateAuthToken(false);
   }, [resetSignal]);
+
+  useEffect(() => {
+    if (savedAuthToken == null) return;
+    setAuthTokenConfiguredOverride(true);
+    setVisibleAuthToken(savedAuthToken);
+  }, [savedAuthToken]);
+
+  const authTokenConfigured = authTokenConfiguredOverride ?? data?.auth_token_configured ?? false;
+
+  const handleEnabledChange = useCallback((nextEnabled: boolean) => {
+    setEnabled(nextEnabled);
+    if (!nextEnabled) {
+      setRotateAuthToken(false);
+    }
+  }, []);
+
+  const handleAuthTokenAction = useCallback(async () => {
+    if (authTokenConfigured && data?.enabled) {
+      setRotateAuthToken(true);
+      setAuthTokenError(null);
+      return;
+    }
+    const action = authTokenConfigured ? "rotate" : "generate";
+    setAuthTokenAction(action);
+    setAuthTokenError(null);
+    try {
+      const token = action === "rotate" ? await rotateMcpAuthToken() : await generateMcpAuthToken();
+      setAuthTokenConfiguredOverride(true);
+      setVisibleAuthToken(token);
+    } catch (error) {
+      setAuthTokenError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAuthTokenAction(null);
+    }
+  }, [authTokenConfigured, data?.enabled]);
 
   // Parse the timeout once and share it between the payload and the validity
   // gate. Empty ⇒ null (use the jobworkerp default); otherwise an integer in
@@ -2338,19 +2945,33 @@ export function McpServerCard({
     const streamingVal: boolean | null = streaming === "" ? null : streaming === "true";
     const payload: SetMcpSettingsRequest = {
       enabled,
+      allow_unauthenticated_requests: allowUnauthenticatedRequests,
       // exclude_runner/worker are not surfaced in the UI yet (the set already
       // scopes the tools); pass through the persisted values verbatim.
       exclude_runner_as_tool: data.exclude_runner_as_tool,
       exclude_worker_as_tool: data.exclude_worker_as_tool,
       streaming: streamingVal,
       request_timeout_sec: timeoutVal,
+      rag_default_period_scope: ragDefaultPeriodScope,
+      ...(rotateAuthToken ? { rotate_auth_token: true } : {}),
     };
     const clean =
       payload.enabled === data.enabled &&
+      payload.allow_unauthenticated_requests === data.allow_unauthenticated_requests &&
       payload.streaming === (data.streaming ?? null) &&
-      payload.request_timeout_sec === (data.request_timeout_sec ?? null);
+      payload.request_timeout_sec === (data.request_timeout_sec ?? null) &&
+      payload.rag_default_period_scope === (data.rag_default_period_scope ?? "overall_only") &&
+      !rotateAuthToken;
     return clean ? null : payload;
-  }, [data, enabled, streaming, timeoutVal]);
+  }, [
+    data,
+    enabled,
+    allowUnauthenticatedRequests,
+    streaming,
+    timeoutVal,
+    ragDefaultPeriodScope,
+    rotateAuthToken,
+  ]);
 
   useEffect(() => {
     const built = buildPayload();
@@ -2372,10 +2993,26 @@ export function McpServerCard({
   }, [buildPayload, data, timeoutSec, timeoutInvalid, onDirtyChange]);
 
   const activePort = data?.active_port ?? null;
-  const setName = data?.set_name ?? "lookback-mcp-rag";
+  const mcpUnavailable = data?.enabled === true && data.runtime_status === "unavailable";
+  const setName = data?.set_name ?? "lookback-mcp";
   const mcpUrl = activePort != null ? `http://127.0.0.1:${activePort}/mcp` : null;
   const clientConfigExample =
-    mcpUrl != null ? JSON.stringify({ mcpServers: { lookback: { url: mcpUrl } } }, null, 2) : null;
+    mcpUrl != null
+      ? JSON.stringify(
+          {
+            mcpServers: {
+              lookback: {
+                url: mcpUrl,
+                ...(allowUnauthenticatedRequests
+                  ? {}
+                  : { headers: { Authorization: "Bearer <copied-token>" } }),
+              },
+            },
+          },
+          null,
+          2,
+        )
+      : null;
 
   return (
     <div className="settings-card">
@@ -2385,19 +3022,139 @@ export function McpServerCard({
         {t("settings.mcp.descMid")} <code style={{ fontSize: 10 }}>{setName}</code>{" "}
         {t("settings.mcp.descPost")}
       </div>
+      <div style={{ color: "var(--label-tertiary)", fontSize: 11, marginTop: 4 }}>
+        {t("settings.mcp.restartTarget")}
+      </div>
+
+      <SettingsCheckboxRow
+        id="mcp-server-enabled"
+        checked={enabled}
+        onCheckedChange={handleEnabledChange}
+        title={t("settings.mcp.server")}
+        description={t("settings.mcp.enable")}
+      />
+
+      <SettingsCheckboxRow
+        id="mcp-allow-unauthenticated-requests"
+        checked={allowUnauthenticatedRequests}
+        onCheckedChange={setAllowUnauthenticatedRequests}
+        title={t("settings.mcp.allowUnauthenticatedRequests")}
+        description={t("settings.mcp.allowUnauthenticatedRequestsDescription")}
+      />
+      {allowUnauthenticatedRequests && (
+        <p style={{ margin: "4px 0 0", fontSize: 11, color: "var(--warning)" }}>
+          {t("settings.mcp.allowUnauthenticatedRequestsWarning")}
+        </p>
+      )}
 
       <div className="settings-row">
-        <div className="settings-row-label">{t("settings.mcp.server")}</div>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
-          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
-          {t("settings.mcp.enable")}
+        <label className="settings-row-label" htmlFor="mcp-rag-default-period-scope">
+          {t("settings.mcp.ragDefaultPeriodScope")}
         </label>
+        <select
+          id="mcp-rag-default-period-scope"
+          value={ragDefaultPeriodScope}
+          onChange={(e) =>
+            setRagDefaultPeriodScope(e.target.value as "overall_only" | "overall_and_path")
+          }
+          style={{ width: 180 }}
+        >
+          <option value="overall_only">{t("settings.mcp.ragDefaultPeriodScopeOverallOnly")}</option>
+          <option value="overall_and_path">
+            {t("settings.mcp.ragDefaultPeriodScopeOverallAndPath")}
+          </option>
+        </select>
+        <span style={{ marginLeft: 8, color: "var(--label-tertiary)", fontSize: 11 }}>
+          {t("settings.mcp.ragDefaultPeriodScopeHint")}
+        </span>
       </div>
+
+      <div className="settings-row">
+        <div className="settings-row-label">
+          {t("settings.mcp.authToken", { defaultValue: "MCP auth token" })}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 11 }}>
+            {data == null
+              ? t("settings.mcp.authTokenLoading", { defaultValue: "Loading…" })
+              : authTokenConfigured
+                ? t("settings.mcp.authTokenConfigured", { defaultValue: "Configured" })
+                : t("settings.mcp.authTokenNotConfigured", { defaultValue: "Not configured" })}
+          </span>
+          <button
+            type="button"
+            className="btn"
+            onClick={handleAuthTokenAction}
+            disabled={data == null || authTokenAction != null}
+            style={{ fontSize: 11 }}
+          >
+            {authTokenAction != null
+              ? t("settings.mcp.authTokenWorking", { defaultValue: "Working…" })
+              : authTokenConfigured
+                ? t("settings.mcp.authTokenRotate", { defaultValue: "Regenerate auth token" })
+                : t("settings.mcp.authTokenGenerate", { defaultValue: "Generate auth token" })}
+          </button>
+        </div>
+      </div>
+
+      {!allowUnauthenticatedRequests && data?.auth_token_configured === false && (
+        <p style={{ margin: "4px 0 0", fontSize: 11, color: "var(--warning)" }}>
+          {t("settings.mcp.authTokenRequiredBeforeEnable", {
+            defaultValue: "Generate and copy a token before enabling MCP.",
+          })}
+        </p>
+      )}
+
+      {rotateAuthToken && (
+        <p style={{ margin: "4px 0 0", fontSize: 11, color: "var(--warning)" }}>
+          {t("settings.mcp.authTokenRotatePending")}
+        </p>
+      )}
+
+      {visibleAuthToken != null && (
+        <div
+          style={{
+            marginTop: 4,
+            padding: 8,
+            border: "1px solid var(--warning)",
+            borderRadius: 6,
+          }}
+        >
+          <div style={{ fontSize: 11, color: "var(--warning)" }}>
+            {t("settings.mcp.authTokenOneTime", {
+              defaultValue: "Copy this token now. It will not be shown again.",
+            })}
+          </div>
+          <code style={{ display: "block", marginTop: 4, userSelect: "all" }}>
+            {visibleAuthToken}
+          </code>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => setVisibleAuthToken(null)}
+            style={{ marginTop: 6, fontSize: 11 }}
+          >
+            {t("settings.mcp.authTokenHide", { defaultValue: "Hide token" })}
+          </button>
+        </div>
+      )}
+
+      {authTokenError != null && (
+        <div style={{ color: "var(--danger)", fontSize: 11, marginTop: 4 }}>{authTokenError}</div>
+      )}
+      {rotateAuthToken && saveError != null && (
+        <div style={{ color: "var(--danger)", fontSize: 11, marginTop: 4 }}>{saveError}</div>
+      )}
 
       {enabled && (
         <div className="settings-row">
           <div className="settings-row-label">{t("settings.mcp.url")}</div>
-          {mcpUrl != null ? (
+          {mcpUnavailable ? (
+            <span style={{ fontSize: 11, color: "var(--danger)" }}>
+              {t("settings.mcp.unavailable")}
+              {data?.unavailable_reason ? `: ${data.unavailable_reason}` : ""}
+            </span>
+          ) : mcpUrl != null ? (
             <code style={{ fontSize: 11, userSelect: "all" }}>{mcpUrl}</code>
           ) : (
             <span style={{ fontSize: 11, color: "var(--label-tertiary)" }}>
@@ -2517,6 +3274,7 @@ const BACKGROUND_JOB_KIND_KEYS: Record<BackgroundTaskKind, string> = {
   summary: "settings.backgroundJobs.kind.summary",
   personality: "settings.backgroundJobs.kind.personality",
   reflection: "settings.backgroundJobs.kind.reflection",
+  issue_resolution: "settings.backgroundJobs.kind.issueResolution",
   llm_other: "settings.backgroundJobs.kind.llmOther",
 };
 
@@ -2795,6 +3553,9 @@ export function HfHomeCard({ onDirtyChange, resetSignal, previewDataRoot }: HfHo
     <div className="settings-card">
       <div className="settings-card-title">{t("settings.hfHome.title")}</div>
       <div className="settings-card-desc">{t("settings.hfHome.desc")}</div>
+      <div style={{ color: "var(--label-tertiary)", fontSize: 11, marginTop: 4 }}>
+        {t("settings.hfHome.restartTarget")}
+      </div>
       <div className="settings-row">
         <div className="settings-row-label">{t("settings.hfHome.location")}</div>
         <div className="segment">
@@ -2860,13 +3621,11 @@ export function HfHomeCard({ onDirtyChange, resetSignal, previewDataRoot }: HfHo
  */
 export function DataRootCard({
   sqlitePath,
-  lancedbPath,
   pluginsPath,
   logPath,
   onEditedChange,
 }: {
   sqlitePath: string | null;
-  lancedbPath: string | null;
   pluginsPath: string | null;
   logPath: string | null;
   /** Reports whether the App data dir field differs from the persisted
@@ -3046,7 +3805,6 @@ export function DataRootCard({
         )}
       </div>
       <SettingRow label="SQLite" value={sqlitePath ?? "—"} />
-      <SettingRow label="LanceDB" value={lancedbPath ?? "—"} />
       <SettingRow label="Plugins" value={pluginsPath ?? "—"} />
       <SettingRow label="Logs" value={logPath ?? "—"} />
       <div className="settings-row">

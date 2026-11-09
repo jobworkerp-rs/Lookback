@@ -1,5 +1,7 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { defaultSnapshot, IMPORT_STEPS } from "@/hooks/useImportProgress";
 import type { SidecarStatus } from "@/hooks/useSidecarStatus";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
@@ -18,15 +20,24 @@ const listThreads = vi.fn();
 const findDistinctLabels = vi.fn();
 const findCoOccurringLabels = vi.fn();
 const deleteThread = vi.fn();
+const findThread = vi.fn();
+const resolveMemoryReference = vi.fn();
 const searchMemoriesKeyword = vi.fn();
 const searchMemoriesSemantic = vi.fn();
 const searchMemoriesHybrid = vi.fn();
+const getThreadGroupRecoveryStatus = vi.fn();
 
 vi.mock("@/api", () => ({
+  listThreadGroups: undefined,
+  findThreadGroup: undefined,
+  findThreadGroupSummary: undefined,
+  getThreadGroupRecoveryStatus: (req: unknown) => getThreadGroupRecoveryStatus(req),
   listThreads: (req: unknown) => listThreads(req),
   findDistinctLabels: (req: unknown) => findDistinctLabels(req),
   findCoOccurringLabels: (req: unknown) => findCoOccurringLabels(req),
   deleteThread: (id: unknown) => deleteThread(id),
+  findThread: (id: unknown) => findThread(id),
+  resolveMemoryReference: (id: unknown) => resolveMemoryReference(id),
   searchMemoriesKeyword: (req: unknown) => searchMemoriesKeyword(req),
   searchMemoriesSemantic: (req: unknown) => searchMemoriesSemantic(req),
   searchMemoriesHybrid: (req: unknown) => searchMemoriesHybrid(req),
@@ -74,6 +85,8 @@ describe("Threads page label filter", () => {
     searchMemoriesKeyword.mockReset();
     searchMemoriesSemantic.mockReset();
     searchMemoriesHybrid.mockReset();
+    findThread.mockReset();
+    resolveMemoryReference.mockReset();
     // Default safe response so the co-occurring query doesn't crash when
     // a test triggers AND but doesn't explicitly mock the call.
     findCoOccurringLabels.mockResolvedValue([]);
@@ -204,6 +217,64 @@ describe("Threads page label filter", () => {
       const lastReq = listThreads.mock.calls.at(-1)?.[0] as ListThreadsRequest;
       expect(lastReq?.labels_any).toEqual(["lookback"]);
     });
+  });
+
+  it("shows independent Thread and Memory candidates for a bare numeric browse filter", async () => {
+    listThreads.mockResolvedValue([thread("1", [])]);
+    findDistinctLabels.mockResolvedValue([]);
+    findThread.mockResolvedValue(thread("42", [], "Direct thread"));
+    resolveMemoryReference.mockResolvedValue({
+      memory: {
+        id: "42",
+        role: 1,
+        content_type: 0,
+        content: "Direct memory content",
+        created_at_ms: 1700000000000,
+      },
+      locations: [],
+    });
+
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
+    fireEvent.change(screen.getByPlaceholderText("スレッドをフィルタ（ID・キーワード）"), {
+      target: { value: "42" },
+    });
+
+    await screen.findByText("Thread ID 一致");
+    expect(findThread).toHaveBeenCalledWith("42");
+    expect(resolveMemoryReference).toHaveBeenCalledWith("42");
+    expect(screen.getByText("Memory ID 一致")).toBeInTheDocument();
+    expect(screen.getByText("このメモリに表示可能なスレッドはありません")).toBeInTheDocument();
+  });
+
+  it("uses an explicit prefix to avoid the other ID lookup", async () => {
+    listThreads.mockResolvedValue([]);
+    findDistinctLabels.mockResolvedValue([]);
+    findThread.mockResolvedValue(null);
+
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
+    fireEvent.change(screen.getByPlaceholderText("スレッドをフィルタ（ID・キーワード）"), {
+      target: { value: "thread:42" },
+    });
+
+    await waitFor(() => expect(findThread).toHaveBeenCalledWith("42"));
+    expect(resolveMemoryReference).not.toHaveBeenCalled();
+  });
+
+  it("hides an ID candidate immediately when the browse input changes", async () => {
+    listThreads.mockResolvedValue([]);
+    findDistinctLabels.mockResolvedValue([]);
+    findThread.mockResolvedValue(thread("42", [], "Direct thread"));
+    resolveMemoryReference.mockResolvedValue(null);
+
+    renderWithProviders(<Threads onOpenImport={() => {}} sidecar={readySidecar} />);
+    const input = screen.getByPlaceholderText("スレッドをフィルタ（ID・キーワード）");
+    fireEvent.change(input, { target: { value: "42" } });
+    await screen.findByText("Thread ID 一致");
+
+    fireEvent.change(input, { target: { value: "43" } });
+
+    expect(screen.queryByText("Thread ID 一致")).toBeNull();
+    expect(screen.queryByText("Direct thread")).toBeNull();
   });
 
   it("fetches co-occurring labels in default AND mode and stops when OR is chosen", async () => {
@@ -348,7 +419,7 @@ describe("Threads page vector-degraded gating", () => {
 
   it("keeps embedding modes enabled in remote mode even when the local sidecar is degraded", async () => {
     renderWithProviders(
-      <Threads onOpenImport={() => {}} sidecar={degradedSidecar} connectionMode="remote" />,
+      <Threads onOpenImport={() => {}} sidecar={degradedSidecar} memoriesMode="remote" />,
     );
     await screen.findByRole("button", { name: "一覧" });
     expect(screen.getByRole("button", { name: "Semantic" })).not.toBeDisabled();
@@ -357,10 +428,143 @@ describe("Threads page vector-degraded gating", () => {
 
   it("does not apply local degraded gating before the connection mode is known", async () => {
     renderWithProviders(
-      <Threads onOpenImport={() => {}} sidecar={degradedSidecar} connectionMode={null} />,
+      <Threads onOpenImport={() => {}} sidecar={degradedSidecar} memoriesMode={null} />,
     );
     await screen.findByRole("button", { name: "一覧" });
     expect(screen.getByRole("button", { name: "Semantic" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Hybrid" })).not.toBeDisabled();
+  });
+});
+
+describe("Threads import progress controls", () => {
+  beforeEach(() => {
+    i18n.changeLanguage("ja");
+    listThreads.mockReset().mockResolvedValue([]);
+    findDistinctLabels.mockReset().mockResolvedValue([]);
+    findCoOccurringLabels.mockReset().mockResolvedValue([]);
+  });
+
+  it("shows cancellation requested state and prevents duplicate requests", async () => {
+    let resolveCancel: (() => void) | undefined;
+    const onCancelImport = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveCancel = resolve;
+        }),
+    );
+    renderWithProviders(
+      <Threads
+        onOpenImport={() => {}}
+        sidecar={readySidecar}
+        importSnapshot={defaultSnapshot("job-cancel")}
+        importBusy
+        onCancelImport={onCancelImport}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "中断" }));
+
+    expect(screen.getByRole("button", { name: "中断を要求中…" })).toBeDisabled();
+    expect(onCancelImport).toHaveBeenCalledTimes(1);
+    await act(async () => resolveCancel?.());
+    expect(await screen.findByText("中断要求済み。停止を待機中…")).toBeInTheDocument();
+  });
+
+  it("shows cancellation errors and allows retry", async () => {
+    const onCancelImport = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("IPC unavailable"))
+      .mockResolvedValueOnce(undefined);
+    renderWithProviders(
+      <Threads
+        onOpenImport={() => {}}
+        sidecar={readySidecar}
+        importSnapshot={defaultSnapshot("job-cancel-retry")}
+        importBusy
+        onCancelImport={onCancelImport}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "中断" }));
+    expect(
+      await screen.findByText("中断要求を送信できませんでした: IPC unavailable"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "中断" }));
+    await waitFor(() => expect(onCancelImport).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("中断要求済み。停止を待機中…")).toBeInTheDocument();
+  });
+
+  it("resets details for a new job and ignores a late cancellation result from the old job", async () => {
+    let rejectOldCancel: ((error: Error) => void) | undefined;
+    let resolveNewCancel: (() => void) | undefined;
+    const onCancelImport = vi
+      .fn<() => Promise<void>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectOldCancel = reject;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveNewCancel = resolve;
+          }),
+      );
+    const oldSnapshot = defaultSnapshot("job-old");
+    oldSnapshot.steps["thread-import"] = { status: "failed", message: "old failure\ntrace" };
+    let replaceSnapshot: (snapshot: ReturnType<typeof defaultSnapshot>) => void = () => {};
+    function Harness() {
+      const [snapshot, setSnapshot] = useState(oldSnapshot);
+      replaceSnapshot = setSnapshot;
+      return (
+        <Threads
+          onOpenImport={() => {}}
+          sidecar={readySidecar}
+          importSnapshot={snapshot}
+          importBusy
+          onCancelImport={onCancelImport}
+        />
+      );
+    }
+    renderWithProviders(<Harness />);
+
+    fireEvent.click(screen.getByRole("button", { name: "詳細" }));
+    expect(screen.getByRole("dialog").querySelector("pre")?.textContent).toBe("old failure\ntrace");
+    fireEvent.click(screen.getByRole("button", { name: "中断" }));
+
+    await act(async () => replaceSnapshot(defaultSnapshot("job-new")));
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "中断" }));
+    expect(screen.getByRole("button", { name: "中断を要求中…" })).toBeDisabled();
+
+    await act(async () => rejectOldCancel?.(new Error("old job failure")));
+    expect(screen.queryByText(/old job failure/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "中断を要求中…" })).toBeDisabled();
+
+    await act(async () => resolveNewCancel?.());
+    expect(await screen.findByText("中断要求済み。停止を待機中…")).toBeInTheDocument();
+  });
+
+  it("hides cancellation when complete and clears the progress panel", () => {
+    const snapshot = defaultSnapshot("job-complete");
+    for (const step of IMPORT_STEPS) {
+      snapshot.steps[step] = { status: "done", message: null };
+    }
+    const onClearImportProgress = vi.fn();
+    renderWithProviders(
+      <Threads
+        onOpenImport={() => {}}
+        sidecar={readySidecar}
+        importSnapshot={snapshot}
+        onClearImportProgress={onClearImportProgress}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "中断" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "閉じる" }));
+    expect(onClearImportProgress).toHaveBeenCalledTimes(1);
   });
 });

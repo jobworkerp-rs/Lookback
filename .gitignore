@@ -7,6 +7,7 @@ dist/
 # Rust
 /target/
 src-tauri/target/
+scripts/mcp-description-check/target/
 src-tauri/gen/schemas/
 
 # Tauri build artifacts
@@ -20,6 +21,9 @@ src-tauri/bin/
 src-tauri/plugins/
 src-tauri/migration-bundle/*
 !src-tauri/migration-bundle/.gitkeep
+# Temporary build / staging / rollback state of the migration bundle swap.
+src-tauri/.migration-bundle-*
+src-tauri/migration-bundle.lock/
 
 # Local data / logs
 log/
@@ -53,6 +57,7 @@ log/
 /dict
 /ops/*
 /.serena/
+/scripts/mcp-description-check/target
 
+# Local-only specifications
 /specs
-

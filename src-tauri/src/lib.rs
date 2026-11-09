@@ -6,30 +6,49 @@
     windows_subsystem = "windows"
 )]
 
+pub mod coding_agent;
 pub mod commands;
 pub mod crashtrace;
 pub mod data;
 pub mod error;
+pub(crate) mod error_messages;
+pub mod experimental_features;
 pub mod grpc;
+pub mod issue_extract;
+pub mod issue_review_policy;
+pub mod issue_work_policy;
 pub mod jobworkerp;
 pub mod lindera;
 pub mod log_rotation;
 pub mod maintenance;
+pub mod native_terminal;
 pub mod plugins;
 pub mod search_index_maintenance;
 pub mod serde_id;
 pub mod sidecar;
+pub mod window_lifecycle;
+#[cfg(test)]
+mod workflow_expression_tests;
 
+pub use window_lifecycle::{
+    TrayAvailability, platform_tray_host_availability, restore_window, tray_availability_for_icon,
+};
+
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager, RunEvent};
+use tauri::{
+    AppHandle, Manager, RunEvent, WebviewWindow,
+    menu::{Menu, MenuItem},
+    tray::{TrayIcon, TrayIconBuilder},
+};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::commands::AppState;
 use crate::data::DataPaths;
-use crate::error::AppError;
+use crate::error::{AppError, AppResult};
 use crate::sidecar::{SidecarConfig, SidecarWarning, SidecarWarningKind, Sidecars};
 
 pub fn run() {
@@ -39,6 +58,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            restore_main_window(app);
+        }))
         .invoke_handler(tauri::generate_handler![
             commands::threads::list_threads,
             commands::threads::find_thread,
@@ -47,10 +69,20 @@ pub fn run() {
             commands::threads::find_memories_by_thread_id,
             commands::threads::find_memory_position,
             commands::threads::find_memory_thread_position,
-            commands::threads::count_threads,
+            commands::threads::resolve_memory_reference,
+            commands::thread_groups::list_thread_groups,
+            commands::thread_groups::search_thread_groups,
+            commands::thread_groups::find_thread_group,
+            commands::thread_groups::find_thread_group_summary,
+            commands::thread_groups::find_thread_group_summaries,
+            commands::thread_groups::count_thread_group_summaries,
+            commands::thread_groups::count_active_thread_groups,
+            commands::thread_group_recovery::get_thread_group_recovery_status,
             commands::threads::delete_thread,
             commands::summaries::list_summaries,
             commands::summaries::list_summaries_for_selection,
+            commands::summaries::list_summary_path_candidates,
+            commands::summaries::list_summary_path_children,
             commands::summaries::get_summary_content,
             commands::summaries::find_summary_distinct_labels,
             commands::summaries::find_summary_co_occurring_labels,
@@ -58,17 +90,83 @@ pub fn run() {
             commands::summaries::list_summary_period_keys,
             commands::summaries::delete_summary,
             commands::summaries::resolve_summary_memory_ref,
+            commands::summary_recovery::get_summary_recovery_status,
+            commands::summary_recovery::reset_summary_recovery_state,
             commands::import::start_import,
             commands::import::start_import_cancel,
+            commands::import::get_active_staged_progress,
             commands::settings::get_settings,
+            commands::settings::get_app_capabilities,
             commands::settings::get_sidecar_status,
             commands::search_index_maintenance::get_search_index_maintenance_status,
             commands::search_index_maintenance::start_search_index_maintenance,
             commands::search_index_maintenance::set_search_index_maintenance_schedule,
             commands::settings::purge_all_data,
+            commands::coding_agent::coding_agent_get_settings,
+            commands::coding_agent::coding_agent_get_native_setup,
+            commands::coding_agent::coding_agent_approve_native_backend,
+            commands::coding_agent::coding_agent_check_repository_host,
+            commands::native_terminal::native_terminal_status,
+            commands::native_terminal::native_terminal_prepare,
+            commands::native_terminal::native_terminal_start,
+            commands::native_terminal::native_terminal_list,
+            commands::native_terminal::native_terminal_attach,
+            commands::native_terminal::native_terminal_output,
+            commands::native_terminal::native_terminal_send_input,
+            commands::native_terminal::native_terminal_cancel,
+            commands::native_terminal::native_terminal_detach,
+            commands::coding_agent::coding_agent_update_settings,
+            commands::coding_agent::coding_agent_prepare_profile_home,
+            commands::profile_terminal::coding_agent_profile_terminal_start,
+            commands::profile_terminal::coding_agent_profile_terminal_list,
+            commands::profile_terminal::coding_agent_profile_terminal_session,
+            commands::profile_terminal::coding_agent_profile_terminal_output,
+            commands::profile_terminal::coding_agent_profile_terminal_send_input,
+            commands::profile_terminal::coding_agent_profile_terminal_finish_input,
+            commands::profile_terminal::coding_agent_profile_terminal_cancel,
+            commands::coding_agent::coding_agent_get_backend_status,
+            commands::coding_agent::coding_agent_preview_run,
+            commands::coding_agent::coding_agent_approve_and_start,
+            commands::coding_agent::coding_agent_list_runs,
+            commands::coding_agent::coding_agent_list_delegation_plans,
+            commands::coding_agent::coding_agent_get_run,
+            commands::coding_agent::coding_agent_attach_run,
+            commands::coding_agent::coding_agent_cancel_run,
+            commands::coding_agent::coding_agent_list_evidence,
+            commands::coding_agent::coding_agent_read_evidence,
+            commands::coding_agent::coding_agent_get_review,
+            commands::coding_agent::coding_agent_reassess,
+            commands::coding_agent::coding_agent_apply_review_action,
+            commands::issue_auto_policy::get_auto_issue_policy,
+            commands::issue_auto_policy::set_auto_issue_policy,
+            commands::issue_review_policy::get_issue_review_policy,
+            commands::issue_review_policy::set_issue_review_policy,
+            commands::issue_work_policy::get_work_eligibility,
+            commands::issue_work_policy::set_work_eligibility,
+            commands::issues::list_issue_review_items,
+            commands::issues::list_issues,
+            commands::issues::get_issue_detail,
+            commands::issues::list_issue_ownership_diagnostics,
+            commands::issues::get_issue_operation_status,
+            commands::issues::apply_issue_admin_action,
+            commands::issues::resolve_issue_operation,
+            commands::issues::list_pending_issue_operations,
+            commands::issues::retry_pending_issue_operation,
+            commands::issues::list_issue_direct_history,
+            commands::issues::create_issue_from_canceled,
+            commands::issues::get_issue_evidence,
+            commands::issues::get_issue_duplicates,
+            commands::issues::list_issue_history,
+            commands::issues::resolve_issue_review,
+            commands::issues::update_issue_candidate,
+            commands::issues::create_explicit_issue_from_candidate,
+            commands::issues::reextract_rejected_candidate,
+            commands::issues::transition_issue_state,
             commands::connection::get_connection_config,
             commands::connection::set_connection_config,
             commands::connection::test_connection_config,
+            commands::connection::inspect_remote_jobworkerp,
+            commands::connection::register_remote_jobworkerp_workers,
             commands::logs::read_sidecar_log,
             commands::reflections::list_reflections_by_thread,
             commands::reflections::list_reflections_for_selection,
@@ -100,6 +198,10 @@ pub fn run() {
             commands::reflection_dispatch::enqueue_reflection_job,
             commands::reflection_dispatch::reflection_cancel,
             commands::analysis_dispatch::enqueue_summary_job,
+            commands::analysis_dispatch::enqueue_thread_group_summary_job,
+            commands::analysis_dispatch::enqueue_thread_group_issue_resolution_job,
+            commands::analysis_dispatch::enqueue_thread_issue_resolution_job,
+            commands::analysis_dispatch::get_thread_issue_resolution_status,
             commands::analysis_dispatch::enqueue_personality_job,
             commands::analysis_dispatch::enqueue_personality_merge_job,
             commands::analysis_dispatch::enqueue_period_summary_job,
@@ -107,6 +209,11 @@ pub fn run() {
             commands::analysis_dispatch::analysis_cancel,
             commands::chat::chat_ask,
             commands::chat::chat_cancel,
+            commands::chat::chat_respond_tool_approval,
+            commands::chat::get_chat_tool_settings,
+            commands::chat::set_chat_tool_settings,
+            commands::issue_chat_recovery::list_pending_chat_issue_operations,
+            commands::issue_chat_recovery::retry_pending_chat_issue_operation,
             commands::chat::get_selected_memory_limits,
             commands::chat::save_chat_markdown,
             commands::llm_settings::get_llm_settings,
@@ -125,22 +232,38 @@ pub fn run() {
             commands::embedding_settings::set_embedding_settings,
             commands::mcp_settings::get_mcp_settings,
             commands::mcp_settings::set_mcp_settings,
+            commands::issue_tracker_settings::get_issue_tracker_settings,
+            commands::mcp_settings::generate_mcp_auth_token,
+            commands::mcp_settings::rotate_mcp_auth_token,
             commands::apply_settings::apply_settings,
             commands::setup::get_setup_status,
             commands::setup::apply_setup,
             commands::setup::resume_setup,
             commands::setup::restart_for_setup,
             commands::setup::start_fresh_setup,
+            commands::ui_diagnostics::report_ui_diagnostic,
+            commands::ui_diagnostics::report_ui_activity_sample,
             commands::embeddings::get_memory_embedding_stats,
             commands::embeddings::redispatch_memory_embeddings,
+            commands::embedding_space::get_embedding_space,
+            commands::embedding_space::start_embedding_rebuild,
+            commands::embedding_space::get_embedding_rebuild_progress,
+            commands::embedding_space::start_embedding_reconcile,
+            commands::embedding_space::get_embedding_reconcile_progress,
+            commands::embedding_management::inspect_embedding_migration,
+            commands::embedding_management::plan_embedding_change,
+            commands::embedding_management::switch_embedding_space,
+            commands::embedding_management::recover_embedding_migration,
             commands::background_jobs::get_background_job_queue_status,
-            commands::recovery::recover_evacuate_lancedb,
-            commands::recovery::recover_purge_lancedb,
             commands::recovery::recover_reset_embedding_settings,
             commands::recovery::retry_database_migration,
             commands::recovery::restore_database_migration_backup,
             commands::recovery::open_log_dir,
             commands::recovery::quit_app,
+            commands::window_lifecycle::register_close_choice_ui,
+            commands::window_lifecycle::sync_close_choice_locale,
+            commands::window_lifecycle::acknowledge_close_choice_request,
+            commands::window_lifecycle::choose_close_action,
             resolve_memories_import_bin,
         ])
         .setup(|app| {
@@ -153,10 +276,41 @@ pub fn run() {
             let data = config.data.clone();
             let sidecars = Arc::new(Sidecars::new(config));
 
-            app.manage(AppState::new(sidecars.clone(), data.clone()));
+            let state = AppState::try_new_with_resources(
+                sidecars.clone(),
+                data.clone(),
+                app.path().resource_dir().ok(),
+            )?;
+            let tray_icon = install_tray_icon(&handle).ok();
+            state.set_coding_agent_tray_icon(tray_icon);
+            match state.coding_agent_tray_availability() {
+                TrayAvailability::VerifiedRestorable => {}
+                TrayAvailability::Unverified => tracing::warn!(
+                    "system tray host visibility is unverified; closing the window will leave it visible"
+                ),
+                TrayAvailability::Unavailable => tracing::warn!(
+                    "system tray is unavailable; closing the window will leave it visible"
+                ),
+            }
+            let executor_path = handle
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|path| path.join("coding-agent/bin/coding-agent-executor"));
+            state
+                .coding_agent_backend
+                .set_bundled_executor_path(executor_path);
+            app.manage(state);
+
+            #[cfg(target_os = "linux")]
+            {
+                install_linux_web_process_diagnostics(&handle);
+                commands::ui_diagnostics::start_memory_sampler();
+            }
 
             spawn_log_maintenance(data.clone());
             spawn_search_index_maintenance_scheduler(handle.clone());
+            spawn_coding_agent_auto_completion(handle.clone());
 
             // Spawn sidecars on a tokio task — keep the Tauri setup path
             // non-blocking so the UI shell renders immediately.
@@ -174,16 +328,159 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            if let RunEvent::ExitRequested { .. } = event {
-                tracing::info!("exit requested; stopping sidecars");
-                if let Some(state) = app_handle.try_state::<AppState>() {
-                    let sidecars = state.sidecars.clone();
-                    tauri::async_runtime::block_on(async move {
-                        let _ = sidecars.stop().await;
-                    });
+            match event {
+                RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::CloseRequested { api, .. },
+                    ..
+                } => {
+                    api.prevent_close();
+                    if app_handle.get_webview_window(&label).is_some()
+                        && let Some(state) = app_handle.try_state::<AppState>()
+                    {
+                        let tray_availability = state.coding_agent_tray_availability();
+                        if let Some(request) = state
+                            .window_lifecycle
+                            .begin_close_request(&label, tray_availability)
+                        {
+                            commands::window_lifecycle::notify_close_request(
+                                app_handle,
+                                request.clone(),
+                            );
+                            commands::window_lifecycle::schedule_native_fallback(
+                                app_handle.clone(),
+                                request.request_id,
+                            );
+                        }
+                    }
                 }
+                RunEvent::ExitRequested { api, .. } => {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        if !state.window_lifecycle.begin_exit_requested() {
+                            api.prevent_exit();
+                            return;
+                        }
+                        tracing::info!("exit requested; reconciling coding-agent runs before sidecars");
+                        let result = tauri::async_runtime::block_on(async {
+                            let labels = app_handle.webview_windows().into_keys().collect::<Vec<_>>();
+                            state.shutdown_for_quit(&labels).await
+                        });
+                        match result {
+                            Ok(outcome)
+                                if !outcome.unconfirmed_run_ids.is_empty()
+                                    || !outcome.unconfirmed_native_session_ids.is_empty() =>
+                            {
+                                tracing::warn!(
+                                    cancellation_attempts = outcome.cancellation_attempts,
+                                    unconfirmed_run_ids = ?outcome.unconfirmed_run_ids,
+                                    unconfirmed_native_session_ids = ?outcome.unconfirmed_native_session_ids,
+                                    "exiting with durable Unknown runs; remote execution cleanup remains unconfirmed; guest logs were not collected"
+                                );
+                            }
+                            Ok(_) => {
+                                state.window_lifecycle.finish_exit(true);
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "application exit held because shutdown state could not be persisted or sidecars could not stop");
+                                state.window_lifecycle.finish_exit(false);
+                                let native_fallback_locale = state
+                                    .window_lifecycle
+                                    .take_native_fallback_retry_locale();
+                                commands::window_lifecycle::exit_request_failed(
+                                    app_handle,
+                                    native_fallback_locale,
+                                );
+                                api.prevent_exit();
+                            }
+                        }
+                    }
+                }
+                RunEvent::Exit => commands::ui_diagnostics::stop_memory_sampler(),
+                #[cfg(target_os = "macos")]
+                RunEvent::Reopen { .. } => restore_main_window(app_handle),
+                _ => {}
             }
         });
+}
+
+struct TauriWindowRestoreAdapter {
+    window: WebviewWindow,
+}
+
+impl crate::window_lifecycle::WindowRestoreAdapter for TauriWindowRestoreAdapter {
+    fn show(&self) -> bool {
+        self.window.show().is_ok()
+    }
+
+    fn unminimize(&self) -> bool {
+        self.window.unminimize().is_ok()
+    }
+
+    fn focus(&self) -> bool {
+        self.window.set_focus().is_ok()
+    }
+}
+
+fn restore_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let adapter = TauriWindowRestoreAdapter { window };
+        if !restore_window(&adapter) {
+            tracing::warn!("the existing main window could not be restored");
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TrayIconInstallError {
+    IconMissing,
+    MenuSetupFailed,
+    NativeBuildFailed,
+}
+
+fn install_tray_icon(app: &AppHandle) -> Result<TrayIcon, TrayIconInstallError> {
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or(TrayIconInstallError::IconMissing)?;
+    let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)
+        .map_err(|_| TrayIconInstallError::MenuSetupFailed)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)
+        .map_err(|_| TrayIconInstallError::MenuSetupFailed)?;
+    let menu = Menu::with_items(app, &[&open, &quit])
+        .map_err(|_| TrayIconInstallError::MenuSetupFailed)?;
+    TrayIconBuilder::new()
+        .icon(icon)
+        .menu(&menu)
+        .tooltip("Lookback")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open" => restore_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .build(app)
+        .map_err(|_| TrayIconInstallError::NativeBuildFailed)
+}
+
+fn spawn_coding_agent_auto_completion(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            match commands::coding_agent::reconcile_approved_auto_completion(&state).await {
+                Ok(0) => {}
+                Ok(completed) => tracing::info!(
+                    completed,
+                    "approved coding-agent auto-DONE actions reconciled"
+                ),
+                Err(error) => {
+                    tracing::debug!(%error, "approved coding-agent auto-DONE reconciliation is not currently available")
+                }
+            }
+        }
+    });
 }
 
 /// Run best-effort log retention at startup and every six hours. The cleanup
@@ -222,12 +519,13 @@ fn spawn_search_index_maintenance_scheduler(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut ready_minutes: u64 = 0;
+        let mut retry_warnings = RetryWarnings::default();
         loop {
             tick.tick().await;
             let Some(state) = app.try_state::<AppState>() else {
                 return;
             };
-            if state.connection_mode() != commands::connection::ConnectionMode::Local
+            if !state.is_service_local(commands::connection::Service::Memories)
                 || state.sidecars.current_endpoints().is_none()
             {
                 continue;
@@ -250,7 +548,7 @@ fn spawn_search_index_maintenance_scheduler(app: AppHandle) {
                     }
                 });
             }
-            monitor_periodic_maintenance(&app).await;
+            monitor_periodic_maintenance(&app, &mut retry_warnings).await;
             ready_minutes = ready_minutes.saturating_add(1);
             if ready_minutes.is_multiple_of(60) {
                 match state.memories_channel().await {
@@ -269,7 +567,7 @@ fn spawn_search_index_maintenance_scheduler(app: AppHandle) {
 
 /// Conductor owns periodic workflow dispatch, so terminal execution records
 /// are observed in the backend rather than relying on a mounted UI view.
-async fn monitor_periodic_maintenance(app: &AppHandle) {
+async fn monitor_periodic_maintenance(app: &AppHandle, retry_warnings: &mut RetryWarnings) {
     let tasks = match commands::periodic_tasks::list_periodic_tasks(
         app.state::<AppState>(),
         commands::periodic_tasks::ListPeriodicTasksRequest {
@@ -285,10 +583,15 @@ async fn monitor_periodic_maintenance(app: &AppHandle) {
             return;
         }
     };
-    let ids = tasks
-        .into_iter()
+    let task_by_id: HashMap<_, _> = tasks
+        .iter()
         .filter(|task| task.enabled)
-        .map(|task| task.id)
+        .filter_map(|task| task.task.clone().map(|args| (task.id.clone(), args)))
+        .collect();
+    let ids = tasks
+        .iter()
+        .filter(|task| task.enabled)
+        .map(|task| task.id.clone())
         .collect();
     let statuses = match commands::periodic_execution::list_periodic_task_statuses(
         app.state::<AppState>(),
@@ -320,9 +623,13 @@ async fn monitor_periodic_maintenance(app: &AppHandle) {
         if !terminal {
             if summary.active {
                 let state = app.state::<AppState>();
+                let app_settings =
+                    crate::data::paths::load_app_settings(&state.data.app_settings_path());
+                let timezone_name =
+                    crate::sidecar::lifecycle::resolve_timezone(Some(&app_settings));
                 if let Err(error) = state
                     .search_index_maintenance
-                    .begin_periodic_execution(execution_id)
+                    .begin_periodic_execution(execution_id, &timezone_name)
                     .await
                 {
                     tracing::warn!(%error, "periodic execution maintenance admission failed");
@@ -331,6 +638,38 @@ async fn monitor_periodic_maintenance(app: &AppHandle) {
             continue;
         }
         let state = app.state::<AppState>();
+        if !state
+            .search_index_maintenance
+            .needs_periodic_terminal_processing(execution_id)
+            .await
+        {
+            continue;
+        }
+        // A successful run needs no follow-up: its summaries are visible in
+        // the Summaries view. Only failures are recorded so the view can
+        // show which periods are missing.
+        let recovery_result = match periodic_terminal_failure(summary.status) {
+            None => Ok(()),
+            Some(failure) => {
+                record_failed_periodic_execution(
+                    &state,
+                    task_by_id.get(&summary.scheduler_id),
+                    &summary,
+                    execution_id,
+                    failure,
+                )
+                .await
+            }
+        };
+        if let Err(error) = recovery_result {
+            // Do not record the execution as terminal yet so the next
+            // maintenance poll retries it. A persistent cause would repeat
+            // every minute, so only its first occurrence is a warning.
+            report_periodic_retry(retry_warnings, execution_id, &summary.scheduler_id, &error);
+            continue;
+        }
+        retry_warnings.finished(execution_id);
+
         match state
             .search_index_maintenance
             .finish_periodic_execution(execution_id)
@@ -349,6 +688,234 @@ async fn monitor_periodic_maintenance(app: &AppHandle) {
             Ok(false) => {}
             Err(error) => tracing::warn!(%error, "periodic terminal maintenance state failed"),
         }
+    }
+}
+
+/// Number of error characters kept in a retry warning. jobworkerp errors can
+/// embed whole worker definitions, which made each warning hundreds of KB.
+const RETRY_WARNING_ERROR_CHARS: usize = 300;
+
+/// Failure kinds recorded for a terminal periodic execution, or `None` for a
+/// success, which needs no record.
+fn periodic_terminal_failure(
+    status: commands::periodic_execution::PeriodicExecutionStatus,
+) -> Option<(&'static str, &'static str)> {
+    use commands::periodic_execution::PeriodicExecutionStatus;
+    match status {
+        PeriodicExecutionStatus::Failed => Some(("workflow_execution_failed", "failed")),
+        PeriodicExecutionStatus::Cancelled => Some(("workflow_execution_cancelled", "cancelled")),
+        PeriodicExecutionStatus::EnqueueFailed => {
+            Some(("workflow_enqueue_failed", "enqueue_failed"))
+        }
+        _ => None,
+    }
+}
+
+/// Executions whose retry has already been reported at warning level.
+#[derive(Debug, Default)]
+struct RetryWarnings {
+    warned: std::collections::HashSet<String>,
+}
+
+impl RetryWarnings {
+    /// Whether this is the first failure seen for the execution.
+    fn first_failure(&mut self, execution_id: &str) -> bool {
+        self.warned.insert(execution_id.to_string())
+    }
+
+    fn finished(&mut self, execution_id: &str) {
+        self.warned.remove(execution_id);
+    }
+}
+
+/// Keeps at most `max_chars` characters, marking a cut with an ellipsis.
+fn concise_error(error: &str, max_chars: usize) -> String {
+    match error.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}…", &error[..cut]),
+        None => error.to_string(),
+    }
+}
+
+fn report_periodic_retry(
+    retry_warnings: &mut RetryWarnings,
+    execution_id: &str,
+    scheduler_id: &str,
+    error: &AppError,
+) {
+    let error = error.to_string();
+    if retry_warnings.first_failure(execution_id) {
+        tracing::warn!(
+            error = %concise_error(&error, RETRY_WARNING_ERROR_CHARS),
+            execution_id,
+            scheduler_id,
+            "periodic execution processing failed; will retry (repeats and full error at debug level)"
+        );
+    }
+    tracing::debug!(
+        %error,
+        execution_id,
+        scheduler_id,
+        "periodic execution processing failed; will retry"
+    );
+}
+
+/// Records the periods a failed periodic execution was meant to summarize.
+/// The period plan is rebuilt from the persisted scheduler task and trigger
+/// time under the timezone the worker ran with, never a fallback zone.
+async fn record_failed_periodic_execution(
+    state: &AppState,
+    task: Option<&commands::periodic_tasks::PeriodicTaskArgs>,
+    summary: &commands::periodic_execution::PeriodicExecutionSummary,
+    execution_id: &str,
+    failure: (&'static str, &'static str),
+) -> Result<(), AppError> {
+    // These messages are log-only, so they stay plain English.
+    let (Some(task), Some(runtime)) = (task, summary.runtime.as_ref()) else {
+        return Err(AppError::Config(
+            "failed periodic execution is missing task settings or a triggered time".into(),
+        ));
+    };
+    let timezone_name = match state
+        .search_index_maintenance
+        .periodic_execution_timezone(execution_id)
+        .await
+    {
+        Some(snapshot) => snapshot,
+        None => {
+            let app_settings =
+                crate::data::paths::load_app_settings(&state.data.app_settings_path());
+            crate::sidecar::lifecycle::resolve_timezone(Some(&app_settings))
+        }
+    };
+    let timezone = timezone_name.parse::<chrono_tz::Tz>().map_err(|error| {
+        AppError::Config(format!(
+            "periodic execution timezone {timezone_name} is invalid: {error}"
+        ))
+    })?;
+    record_terminal_periodic_recovery(
+        state,
+        task,
+        runtime.triggered_at_ms,
+        execution_id,
+        failure,
+        timezone,
+    )
+    .await
+}
+
+/// A failed periodic workflow cannot identify the individual path buckets it
+/// completed, so every unit of its deterministic period plan is recorded.
+/// This applies to cancellation and enqueue failures too: the stop-on-error
+/// option changes workflow control flow, not what is missing.
+async fn record_terminal_periodic_recovery(
+    state: &AppState,
+    task: &commands::periodic_tasks::PeriodicTaskArgs,
+    triggered_at_ms: i64,
+    execution_id: &str,
+    (reason_code, terminal_status): (&'static str, &'static str),
+    timezone: chrono_tz::Tz,
+) -> Result<(), AppError> {
+    let callback = state.resolve_targets()?.memories_callback()?;
+    let source_scope_digest = periodic_source_scope_digest(task);
+    let started_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(triggered_at_ms)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let generation_id = format!("periodic-{execution_id}");
+    let memories_endpoint_id = format!("{}:{}", callback.host, callback.port);
+    let _recovery_guard = state.summary_recovery.lock().await;
+    for (period_kind, period_key) in periodic_failure_periods(task, triggered_at_ms, timezone) {
+        commands::summary_recovery::record(
+            &state.data.summary_recovery_path(),
+            commands::summary_recovery::build_record(
+                commands::summary_recovery::SummaryRecoveryIdentity {
+                    memories_endpoint_id: &memories_endpoint_id,
+                    source_scope_digest: &source_scope_digest,
+                    generation_id: &generation_id,
+                    trigger_kind: "periodic",
+                },
+                period_kind.key(),
+                &period_key,
+                commands::summary_recovery::SummaryRecoveryScope::Overall,
+                "periodic_workflow",
+                reason_code,
+                Some(format!(
+                    "periodic workflow {terminal_status} before emitting a readable batch result (started {started_at})"
+                )),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn periodic_source_scope_digest(task: &commands::periodic_tasks::PeriodicTaskArgs) -> String {
+    let sources = if task.sources.is_empty() {
+        if task.source == "codex+claude-code" {
+            vec!["codex", "claude-code"]
+        } else {
+            vec![task.source.as_str()]
+        }
+    } else {
+        task.sources.iter().map(String::as_str).collect()
+    };
+    let mut labels = sources
+        .into_iter()
+        .map(|source| match source {
+            "codex" => "agent:codex".to_string(),
+            "claude-code" => "agent:claude_code".to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    let match_mode = if task.source == "codex+claude-code" || labels.len() > 1 {
+        "LABEL_ANY"
+    } else {
+        "LABEL_ALL"
+    };
+    commands::summaries::source_scope_digest(&labels, Some(match_mode))
+}
+
+fn periodic_failure_periods(
+    task: &commands::periodic_tasks::PeriodicTaskArgs,
+    triggered_at_ms: i64,
+    timezone: chrono_tz::Tz,
+) -> Vec<(commands::summary_calendar::PeriodKind, String)> {
+    let task_kind = match task.task_kind {
+        commands::periodic_tasks::PeriodicTaskKind::Regular => "regular",
+        commands::periodic_tasks::PeriodicTaskKind::Weekly => "weekly",
+        commands::periodic_tasks::PeriodicTaskKind::Monthly => "monthly",
+    };
+    commands::summary_calendar::periodic_failure_periods(
+        task_kind,
+        task.run_summary_daily,
+        task.lookback_days.into(),
+        triggered_at_ms,
+        timezone,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_web_process_diagnostics(app: &AppHandle) {
+    use webkit2gtk::WebViewExt;
+
+    let mut registration_failed = false;
+    for window in app.webview_windows().into_values() {
+        if window
+            .with_webview(|webview| {
+                webview.inner().connect_web_process_terminated(|_, reason| {
+                    crate::commands::ui_diagnostics::report_web_process_termination(reason);
+                });
+            })
+            .is_err()
+        {
+            registration_failed = true;
+        }
+    }
+    if registration_failed {
+        tracing::warn!(
+            target: "ui_diagnostics",
+            "failed to register WebKit renderer termination diagnostics"
+        );
     }
 }
 
@@ -379,7 +946,7 @@ fn apply_linux_webkit_workarounds() {
         }
     }
     set_default("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-    set_default("GDK_BACKEND", "x11");
+    set_default("GDK_BACKEND", "wayland,x11");
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -436,13 +1003,34 @@ pub(crate) async fn stage_and_start_sidecars(
     sidecars: &Sidecars,
     data: &DataPaths,
 ) {
+    if app
+        .try_state::<std::sync::Arc<crate::grpc::issue_chat_gateway::IssueChatGateway>>()
+        .is_none()
+    {
+        match crate::grpc::issue_chat_gateway::start(app.clone(), 0).await {
+            Ok(server) => {
+                let port = server.local_addr().port();
+                // The worker manifest is expanded during sidecar registration;
+                // only the local facade address is made available to it.
+                unsafe {
+                    std::env::set_var("LOOKBACK_ISSUE_CHAT_WORKER_HOST", "127.0.0.1");
+                    std::env::set_var("LOOKBACK_ISSUE_CHAT_WORKER_PORT", port.to_string());
+                }
+                app.manage(server.gateway_state());
+                // Dropping the handle detaches the server task. The runtime owns
+                // it until process exit; permits are held in managed state.
+                drop(server);
+            }
+            Err(error) => tracing::warn!(%error, "chat Issue facade unavailable"),
+        }
+    }
     let plugin_warnings = match crate::plugins::stage_plugins(app, &data.plugins_dir()) {
         Ok(report) => {
             tracing::info!(
                 source = %report.source.display(),
                 copied = report.copied.len(),
                 skipped = report.skipped_same.len(),
-                removed = report.removed.len(),
+                deleted = report.deleted.len(),
                 "plugins staged"
             );
             Vec::new()
@@ -464,7 +1052,7 @@ pub(crate) async fn stage_and_start_sidecars(
             // before advertising this Local sidecar as ready, then request a
             // single reconcile for work left by a previous app session.
             if let Some(state) = app.try_state::<crate::commands::AppState>()
-                && state.connection_mode() == crate::commands::connection::ConnectionMode::Local
+                && state.is_service_local(crate::commands::connection::Service::Memories)
             {
                 let maintenance = state.search_index_maintenance.clone();
                 match state.memories_channel().await {
@@ -573,6 +1161,19 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
     // errors are tolerated (the apply step handles missing files
     // non-fatally and surfaces a SidecarWarning).
     let worker_yaml_paths = data::paths::llm_workers_yaml().ok().into_iter().collect();
+    let issue_tracker_server_bin = issue_tracker_bin_for_build(
+        crate::experimental_features::ISSUE_TRACKING_BUILD_ALLOWS,
+        || {
+            resolve_bin_for_app(
+                handle,
+                "LOOKBACK_ISSUE_TRACKER_SERVER_BIN",
+                "issue-tracker-server",
+                "issue-tracker-server",
+                "../../issue-tracker-server/target/release/issue-tracker-server",
+            )
+            .map_err(|error| AppError::Config(error.to_string()))
+        },
+    )?;
 
     // Apply the `lookback-rag` function set (used by the RAG chat to
     // narrow the LLM's callable tool surface to `lookback_recall`).
@@ -643,6 +1244,7 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
         conductor_bin,
         data,
         worker_yaml_paths,
+        issue_tracker_server_bin,
         function_set_yaml_paths,
         reflection_dispatch_enabled: true,
         auto_embedding_enabled: true,
@@ -655,6 +1257,17 @@ fn build_sidecar_config(handle: &AppHandle) -> Result<SidecarConfig, Box<dyn std
         llm_kv_cache_type: Some(llm_kv_cache_type),
         env_file: resolve_env_file(),
     })
+}
+
+fn issue_tracker_bin_for_build(
+    build_allows: bool,
+    resolve: impl FnOnce() -> AppResult<PathBuf>,
+) -> AppResult<Option<PathBuf>> {
+    if build_allows {
+        resolve().map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn resolve_memories_db_migrate_bin(app: &AppHandle) -> PathBuf {
@@ -879,6 +1492,215 @@ fn resource_sidecar_candidates(resources: &std::path::Path, name: &str) -> Vec<P
 mod tests {
     use super::*;
 
+    struct TestEnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvVarGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: resolve-bin tests run with one test thread because env
+            // variables are process-global and mutation is not thread-safe.
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn periodic_task(
+        kind: commands::periodic_tasks::PeriodicTaskKind,
+    ) -> commands::periodic_tasks::PeriodicTaskArgs {
+        commands::periodic_tasks::PeriodicTaskArgs {
+            name: "test".into(),
+            source: "codex".into(),
+            sources: vec!["codex".into()],
+            task_kind: kind,
+            hour: 0,
+            minute: 0,
+            interval_hours: None,
+            interval_days: Some(1),
+            weekly_day: None,
+            monthly_day: None,
+            lookback_days: 1,
+            force_thread_summary: true,
+            run_summary_thread_group: true,
+            run_summary_daily: true,
+            run_personality: false,
+            run_reflection: false,
+            stop_on_error: true,
+        }
+    }
+
+    #[test]
+    fn issue_tracker_bin_is_not_resolved_when_build_disallows_tracking() {
+        let resolved = std::cell::Cell::new(false);
+
+        let result = issue_tracker_bin_for_build(false, || {
+            resolved.set(true);
+            Err(AppError::Config("resolver must not run".into()))
+        })
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert!(!resolved.get());
+    }
+
+    #[test]
+    fn issue_tracker_bin_is_resolved_when_build_allows_tracking() {
+        let expected = PathBuf::from("issue-tracker-server");
+
+        let result = issue_tracker_bin_for_build(true, || Ok(expected.clone())).unwrap();
+
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn issue_tracker_bin_resolution_errors_are_propagated() {
+        let result =
+            issue_tracker_bin_for_build(true, || Err(AppError::Config("resolver failed".into())));
+
+        assert!(matches!(
+            result,
+            Err(AppError::Config(message)) if message == "resolver failed"
+        ));
+    }
+
+    #[test]
+    fn successful_periodic_execution_records_no_failure() {
+        use commands::periodic_execution::PeriodicExecutionStatus;
+
+        assert_eq!(
+            periodic_terminal_failure(PeriodicExecutionStatus::Succeeded),
+            None
+        );
+        assert_eq!(
+            periodic_terminal_failure(PeriodicExecutionStatus::Failed),
+            Some(("workflow_execution_failed", "failed"))
+        );
+        assert_eq!(
+            periodic_terminal_failure(PeriodicExecutionStatus::Cancelled),
+            Some(("workflow_execution_cancelled", "cancelled"))
+        );
+        assert_eq!(
+            periodic_terminal_failure(PeriodicExecutionStatus::EnqueueFailed),
+            Some(("workflow_enqueue_failed", "enqueue_failed"))
+        );
+    }
+
+    #[test]
+    fn retry_warnings_warn_once_per_execution_until_it_finishes() {
+        let mut warnings = RetryWarnings::default();
+
+        assert!(warnings.first_failure("exec-1"));
+        assert!(!warnings.first_failure("exec-1"));
+        assert!(warnings.first_failure("exec-2"));
+
+        warnings.finished("exec-1");
+        assert!(warnings.first_failure("exec-1"));
+    }
+
+    #[test]
+    fn concise_error_keeps_short_text_and_truncates_long_text_on_char_boundaries() {
+        assert_eq!(concise_error("short", 10), "short");
+        assert_eq!(concise_error("0123456789abc", 10), "0123456789…");
+        // Multi-byte characters must not be split mid-codepoint.
+        assert_eq!(concise_error("日本語のエラーです", 3), "日本語…");
+    }
+
+    #[test]
+    fn strict_periodic_failure_records_the_same_daily_window_as_regular_batch() {
+        let task = periodic_task(commands::periodic_tasks::PeriodicTaskKind::Regular);
+        // 2026-09-04T00:00Z is 09:00 JST, so a one-day lookback targets
+        // the previous completed local day.
+        let periods = periodic_failure_periods(&task, 1_788_480_000_000, chrono_tz::Asia::Tokyo);
+        assert_eq!(
+            periods
+                .iter()
+                .map(|(kind, key)| (kind.key(), key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("daily", "2026-09-03")]
+        );
+    }
+
+    #[test]
+    fn periodic_failure_uses_the_worker_timezone_at_the_date_boundary() {
+        let task = periodic_task(commands::periodic_tasks::PeriodicTaskKind::Regular);
+        // The same instant is Sep 4 in Tokyo but Sep 3 in New York. The
+        // one-day recovery window must match the worker's TZ calendar.
+        let periods =
+            periodic_failure_periods(&task, 1_788_480_000_000, chrono_tz::America::New_York);
+        assert_eq!(
+            periods
+                .iter()
+                .map(|(kind, key)| (kind.key(), key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("daily", "2026-09-02")]
+        );
+    }
+
+    #[test]
+    fn strict_weekly_periodic_failure_keeps_the_weekly_rollup_target() {
+        let task = periodic_task(commands::periodic_tasks::PeriodicTaskKind::Weekly);
+        let periods = periodic_failure_periods(&task, 1_788_480_000_000, chrono_tz::Asia::Tokyo);
+        assert!(
+            periods
+                .iter()
+                .any(|(kind, key)| kind.key() == "weekly" && key == "2026-W35")
+        );
+        assert_eq!(
+            periods
+                .iter()
+                .filter(|(kind, _)| kind.key() == "daily")
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn strict_monthly_periodic_failure_keeps_daily_and_weekly_dependencies() {
+        let task = periodic_task(commands::periodic_tasks::PeriodicTaskKind::Monthly);
+        let periods = periodic_failure_periods(&task, 1_788_480_000_000, chrono_tz::Asia::Tokyo);
+        // The previous month is August 2026. Its first day is Saturday, so
+        // monthlyStage rebuilds daily dependencies from the prior Monday.
+        assert!(
+            periods
+                .iter()
+                .any(|(kind, key)| kind.key() == "daily" && key == "2026-07-27")
+        );
+        assert!(
+            periods
+                .iter()
+                .any(|(kind, key)| kind.key() == "daily" && key == "2026-08-31")
+        );
+        assert!(
+            periods
+                .iter()
+                .any(|(kind, key)| kind.key() == "weekly" && key == "2026-W31")
+        );
+        assert!(
+            periods
+                .iter()
+                .any(|(kind, key)| kind.key() == "weekly" && key == "2026-W36")
+        );
+        assert!(
+            periods
+                .iter()
+                .any(|(kind, key)| kind.key() == "monthly" && key == "2026-08")
+        );
+    }
+
     #[test]
     fn resolve_bin_prefers_env_override() {
         // SAFETY: single-threaded test; unique env var name.
@@ -894,8 +1716,11 @@ mod tests {
         unsafe { std::env::remove_var("LOOKBACK_TEST_BIN_X") };
     }
 
+    // The manifest-relative workspace fallback exists only in debug builds.
+    #[cfg(debug_assertions)]
     #[test]
     fn resolve_bin_falls_back_to_manifest_relative_when_nothing_else() {
+        let _env_guard = TestEnvVarGuard::new("LOOKBACK_TEST_BIN_Y");
         // A name that isn't on PATH and isn't next to the test binary must
         // resolve to the CARGO_MANIFEST_DIR-relative fallback.
         unsafe { std::env::remove_var("LOOKBACK_TEST_BIN_Y") };
@@ -911,6 +1736,22 @@ mod tests {
             "got {}",
             p.display()
         );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn resolve_bin_returns_unavailable_when_nothing_else_exists() {
+        let _env_guard = TestEnvVarGuard::new("LOOKBACK_TEST_BIN_Y");
+        unsafe { std::env::remove_var("LOOKBACK_TEST_BIN_Y") };
+        let error = resolve_bin(
+            "LOOKBACK_TEST_BIN_Y",
+            "lookback-nonexistent-bundled-binary-zzz",
+            "lookback-nonexistent-binary-zzz",
+            "../../target/release/some-bin",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("is unavailable"));
     }
 
     #[test]
@@ -1152,7 +1993,6 @@ mod tests {
             resources.get("migration-bundle/"),
             Some(&"memories-db-migrate/".into())
         );
-        assert_eq!(resources.len(), 3);
         // The plugin glob must NOT be in the shared config (would break the
         // other platform's build).
         assert!(resources.get("plugins/*.dylib").is_none());

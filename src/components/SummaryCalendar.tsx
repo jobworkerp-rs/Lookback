@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { MONDAY_FIRST_WEEKDAY_KEYS } from "@/lib/calendarWeekdays";
 import {
   buildMonthGrid,
   epochMsToDailyKey,
@@ -9,19 +10,7 @@ import {
 } from "@/lib/summaryPeriod";
 import type { SummaryKind } from "@/types/api";
 
-type CalendarKind = Exclude<SummaryKind, "per-thread">;
-
-// ISO weekday order (Mon-first). i18n keys are resolved with `t` at render so
-// the header row localizes; the order is fixed regardless of locale.
-const WEEKDAY_KEYS = [
-  "calendar.weekdayMon",
-  "calendar.weekdayTue",
-  "calendar.weekdayWed",
-  "calendar.weekdayThu",
-  "calendar.weekdayFri",
-  "calendar.weekdaySat",
-  "calendar.weekdaySun",
-];
+type CalendarKind = Exclude<SummaryKind, "per-thread" | "thread-group">;
 
 export interface SummaryCalendarProps {
   kind: CalendarKind;
@@ -29,6 +18,8 @@ export interface SummaryCalendarProps {
   month: string;
   /** period_keys that have a summary (from list_summary_period_keys). */
   periodKeys: string[];
+  /** Periods retained in durable recovery state but with no overall row. */
+  warningPeriodKeys?: string[];
   /** Selected period_key, driving the detail panel and cell highlight. */
   selectedKey: string | null;
   onSelectKey: (key: string) => void;
@@ -41,6 +32,7 @@ export function SummaryCalendar({
   kind,
   month,
   periodKeys,
+  warningPeriodKeys = [],
   selectedKey,
   onSelectKey,
   onMonthChange,
@@ -51,10 +43,12 @@ export function SummaryCalendar({
   const ym = useMemo(() => monthKeyToYearMonth(month), [month]);
   const grid = useMemo(() => (ym ? buildMonthGrid(ym.y, ym.m) : []), [ym]);
   const keySet = useMemo(() => new Set(periodKeys), [periodKeys]);
+  const warningKeySet = useMemo(() => new Set(warningPeriodKeys), [warningPeriodKeys]);
 
   if (!ym) return null;
 
   const hasMonth = kind === "monthly" && keySet.has(month);
+  const hasMonthWarning = kind === "monthly" && !hasMonth && warningKeySet.has(month);
 
   function shiftMonth(delta: number) {
     if (!ym) return;
@@ -87,18 +81,23 @@ export function SummaryCalendar({
         {kind === "monthly" && (
           <button
             type="button"
-            className={`segment-btn ${selectedKey === month ? "active" : ""}`}
-            disabled={!hasMonth}
+            className={`segment-btn ${selectedKey === month ? "active" : ""} ${hasMonthWarning ? "warning" : ""}`}
+            disabled={!hasMonth && !hasMonthWarning}
             onClick={() => onSelectKey(month)}
             style={{ marginLeft: "auto" }}
+            title={hasMonthWarning ? t("summaries.calendar.incomplete") : undefined}
           >
-            {hasMonth ? t("calendar.monthSummary") : t("calendar.noSummary")}
+            {hasMonth
+              ? t("calendar.monthSummary")
+              : hasMonthWarning
+                ? t("summaries.calendar.incomplete")
+                : t("calendar.noSummary")}
           </button>
         )}
       </div>
 
       <div className="sum-cal-grid">
-        {WEEKDAY_KEYS.map((wk) => (
+        {MONDAY_FIRST_WEEKDAY_KEYS.map((wk) => (
           <div key={wk} className="sum-cal-weekday">
             {t(wk)}
           </div>
@@ -116,6 +115,7 @@ export function SummaryCalendar({
               kind={kind}
               monthKey={month}
               keySet={keySet}
+              warningKeySet={warningKeySet}
               selectedKey={selectedKey}
               onSelectKey={onSelectKey}
             />
@@ -131,6 +131,7 @@ interface CalendarCellProps {
   kind: CalendarKind;
   monthKey: string;
   keySet: Set<string>;
+  warningKeySet: Set<string>;
   selectedKey: string | null;
   onSelectKey: (key: string) => void;
 }
@@ -144,9 +145,11 @@ function CalendarCell({
   kind,
   monthKey,
   keySet,
+  warningKeySet,
   selectedKey,
   onSelectKey,
 }: CalendarCellProps) {
+  const { t } = useTranslation();
   const day = cell.getDate();
   const periodKey =
     kind === "daily"
@@ -155,15 +158,20 @@ function CalendarCell({
         ? isoWeekOfDate(cell)
         : monthKey;
   const has = keySet.has(periodKey);
+  // An existing overall always wins visually. A warning represents a period
+  // with no persisted overall, so it must not turn a normal card into an
+  // error state merely because a stale recovery record exists.
+  const hasWarning = !has && warningKeySet.has(periodKey);
   const selected = selectedKey === periodKey;
 
   if (kind === "monthly") {
     return (
       <button
         type="button"
-        className={`sum-cal-cell month ${has ? "has" : "empty"} ${selected ? "selected" : ""}`}
-        disabled={!has}
+        className={`sum-cal-cell month ${has ? "has" : hasWarning ? "warning" : "empty"} ${selected ? "selected" : ""}`}
+        disabled={!has && !hasWarning}
         onClick={() => onSelectKey(periodKey)}
+        title={hasWarning ? t("summaries.calendar.incomplete") : undefined}
       >
         <span className="sum-cal-day">{day}</span>
       </button>
@@ -173,13 +181,20 @@ function CalendarCell({
   return (
     <button
       type="button"
-      className={`sum-cal-cell ${has ? "has" : "empty"} ${selected ? "selected" : ""}`}
-      disabled={!has}
+      className={`sum-cal-cell ${has ? "has" : hasWarning ? "warning" : "empty"} ${selected ? "selected" : ""}`}
+      disabled={!has && !hasWarning}
       onClick={() => onSelectKey(periodKey)}
-      title={has && kind === "weekly" ? periodKey : undefined}
+      title={
+        hasWarning
+          ? t("summaries.calendar.incomplete")
+          : has && kind === "weekly"
+            ? periodKey
+            : undefined
+      }
     >
       <span className="sum-cal-day">{day}</span>
       {has && <span className="sum-cal-dot" />}
+      {hasWarning && <span className="sum-cal-warning" />}
     </button>
   );
 }

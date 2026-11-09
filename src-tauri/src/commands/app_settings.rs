@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::paths::{self, AppSettings, DataPaths, HfHomeMode, bootstrap_path, default_root};
+use crate::data::paths::{
+    self, AppSettings, DataPaths, HfHomeMode, MigrationBackupSettings, bootstrap_path, default_root,
+};
 use crate::error::{AppError, AppResult};
 
 use super::AppState;
@@ -44,6 +46,8 @@ pub struct AppSettingsResponse {
     /// Shown as the card's "current effective" preview so an Auto selection
     /// still tells the user which zone is in force.
     pub effective_timezone: String,
+    /// Backup choice handed to the memories migration tool at startup.
+    pub migration_backup: MigrationBackupSettings,
     /// Resolved paths for the UI preview.
     pub resolved: ResolvedAppPaths,
 }
@@ -118,6 +122,7 @@ pub fn get_app_settings(state: tauri::State<'_, AppState>) -> AppResult<AppSetti
         data_root_override,
         timezone,
         effective_timezone,
+        migration_backup: app_settings.migration_backup,
         resolved: ResolvedAppPaths {
             current_data_root: state.data.root.clone(),
             default_data_root: default,
@@ -350,6 +355,22 @@ pub fn apply_timezone_to_disk(data: &DataPaths, request: SetTimezoneRequest) -> 
     Ok(changed)
 }
 
+/// Persist the migration backup choice into `app-settings.json`, preserving
+/// the unrelated fields sharing the file. Returns whether the value changed.
+pub fn apply_migration_backup_to_disk(
+    data: &DataPaths,
+    backup: MigrationBackupSettings,
+) -> AppResult<bool> {
+    let app_settings_path = data.app_settings_path();
+    let old = paths::load_app_settings(&app_settings_path);
+    let cfg = AppSettings {
+        migration_backup: backup,
+        ..old.clone()
+    };
+    paths::save_app_settings(&app_settings_path, &cfg)?;
+    Ok(old.migration_backup != cfg.migration_backup)
+}
+
 /// List the selectable IANA timezone names from the host tz database. Walks
 /// the first existing zoneinfo root, keeps only the `Area/Location` zones
 /// under [`ZONEINFO_AREAS`] plus `UTC`, and returns them sorted. Empty when no
@@ -408,6 +429,8 @@ pub async fn set_timezone(
             hf_home: None,
             mcp: None,
             timezone: Some(request),
+            issue_tracker: None,
+            migration_backup: None,
         },
     )
     .await
@@ -770,15 +793,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_data_root_recognises_existing_lookback_root_by_lancedb() {
-        let dir = tempdir();
-        std::fs::create_dir_all(dir.path().join("lancedb")).unwrap();
-        let v = validate_data_root(dir.path().display().to_string()).unwrap();
-        assert!(v.ok);
-        assert!(v.is_existing_lookback_root);
-    }
-
-    #[test]
     fn validate_data_root_path_strict_errors_on_typo() {
         let err = validate_data_root_path(Path::new("/tmp/lookback-typo-xxxxx")).unwrap_err();
         assert!(matches!(err, AppError::Config(_)));
@@ -1010,6 +1024,45 @@ mod tests {
             Some("en"),
             "output_language must survive a timezone write"
         );
+    }
+
+    #[test]
+    fn migration_backup_defaults_to_one_backup_for_old_settings_files() {
+        let dir = tempdir();
+        let data = DataPaths::with_root(dir.path().to_path_buf());
+        std::fs::write(data.app_settings_path(), r#"{"timezone":"Asia/Tokyo"}"#).unwrap();
+
+        let loaded = paths::load_app_settings(&data.app_settings_path());
+
+        assert_eq!(
+            loaded.migration_backup,
+            MigrationBackupSettings {
+                enabled: true,
+                keep: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_migration_backup_to_disk_reports_change_and_preserves_unrelated_fields() {
+        let dir = tempdir();
+        let data = DataPaths::with_root(dir.path().to_path_buf());
+        let seed = AppSettings {
+            timezone: Some("Asia/Tokyo".into()),
+            ..Default::default()
+        };
+        paths::save_app_settings(&data.app_settings_path(), &seed).unwrap();
+        let disabled = MigrationBackupSettings {
+            enabled: false,
+            keep: 0,
+        };
+
+        assert!(apply_migration_backup_to_disk(&data, disabled).unwrap());
+        assert!(!apply_migration_backup_to_disk(&data, disabled).unwrap());
+
+        let saved = paths::load_app_settings(&data.app_settings_path());
+        assert_eq!(saved.migration_backup, disabled);
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Tokyo"));
     }
 
     #[test]

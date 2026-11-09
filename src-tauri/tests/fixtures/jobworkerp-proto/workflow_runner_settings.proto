@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package jobworkerp.runner;
+
+// # Workflow Runner Settings
+// Settings for the unified WORKFLOW runner
+// Workflow definition can be specified at settings time (optional for 'run' method)
+// If specified here, 'run' method execution can use pre-configured workflow
+// 'create' method does not use settings (workflow_source is in args)
+message WorkflowRunnerSettings {
+  // # Workflow Source (optional)
+  // Workflow definition for 'run' method
+  // If not specified here, workflow_source must be provided in WorkflowRunArgs
+  oneof workflow_source {
+    // # Workflow URL
+    // Path or URL to the workflow definition file (JSON or YAML)
+    string workflow_url = 1;
+    // # Workflow Data
+    // The workflow definition as a JSON or YAML string
+    string workflow_data = 2;
+  }
+
+  // # Workflow Context (optional)
+  // Context variables for workflow execution (JSON object string).
+  // If set, merged with WorkflowRunArgs.workflow_context at runtime (settings keys take precedence on conflict).
+  optional string workflow_context = 3;
+}

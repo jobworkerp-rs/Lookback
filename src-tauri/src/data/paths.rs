@@ -23,6 +23,25 @@ pub struct DataPaths {
     pub root: PathBuf,
 }
 
+/// Environment values that participate in HuggingFace cache resolution.
+///
+/// Keeping this snapshot separate from resolution makes the precedence rules
+/// deterministic for callers that need to supply an isolated environment.
+#[derive(Debug, Default)]
+struct HfHomeEnvironment {
+    hf_home: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+}
+
+impl HfHomeEnvironment {
+    fn from_process() -> Self {
+        Self {
+            hf_home: std::env::var_os("HF_HOME").map(PathBuf::from),
+            xdg_cache_home: std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        }
+    }
+}
+
 impl DataPaths {
     /// Keep every local memories process on one complete SQLite pool config.
     pub const MEMORIES_SQLITE_MAX_CONNECTIONS: u32 = 5;
@@ -69,13 +88,7 @@ impl DataPaths {
 
     pub fn ensure(&self) -> AppResult<()> {
         self.ensure_runtime()?;
-        for sub in [
-            self.lancedb_dir(),
-            self.lancedb_backup_dir(),
-            self.memories_data_dir(),
-        ] {
-            std::fs::create_dir_all(sub)?;
-        }
+        std::fs::create_dir_all(self.memories_data_dir())?;
         Ok(())
     }
 
@@ -101,8 +114,46 @@ impl DataPaths {
         self.root.join("db")
     }
 
+    /// Dedicated SQLite state and VM-external evidence storage for coding-agent
+    /// runs. Kept separate from jobworkerp, tracker, and memories databases.
+    pub fn coding_agent_runs_db_path(&self) -> PathBuf {
+        self.db_dir().join("coding-agent-runs.sqlite3")
+    }
+
+    /// Durable evidence root. Individual run directories are created only
+    /// when evidence is written, so preparing this feature never creates a
+    /// run record or touches another store.
+    pub fn coding_agent_runs_dir(&self) -> PathBuf {
+        self.root.join("coding-agent-runs")
+    }
+
+    /// Versioned private settings for coding-agent profiles and repository policy.
+    pub fn coding_agent_settings_path(&self) -> PathBuf {
+        self.root.join("coding-agent").join("settings.json")
+    }
+
+    /// Create only the parent database directory and the dedicated evidence
+    /// root; opening or migrating SQLite remains the run store's responsibility.
+    pub fn ensure_coding_agent_runs(&self) -> AppResult<()> {
+        std::fs::create_dir_all(self.db_dir())?;
+        std::fs::create_dir_all(self.coding_agent_runs_dir())?;
+        Ok(())
+    }
+
     pub fn import_pending_path(&self) -> PathBuf {
         self.root.join("import-pending.json")
+    }
+
+    /// Durable, app-owned diagnostics for summary dispatches which could not
+    /// reach a complete period rollup. Kept separate from import sessions so
+    /// either state can be recovered without rewriting the other.
+    pub fn summary_recovery_path(&self) -> PathBuf {
+        self.root.join("summary-recovery-state.json")
+    }
+
+    /// Durable retry identities for ThreadGroup summary generation.
+    pub fn thread_group_recovery_path(&self) -> PathBuf {
+        self.root.join("thread-group-recovery-state.json")
     }
 
     pub fn sqlite_path(&self) -> PathBuf {
@@ -115,6 +166,68 @@ impl DataPaths {
 
     pub fn plugins_dir(&self) -> PathBuf {
         self.root.join("plugins")
+    }
+
+    /// Private roots owned by the Lookback Issue integration. Keeping every
+    /// component below one root makes lifecycle cleanup and backup admission
+    /// unambiguous without exposing backend paths to MCP callers.
+    pub fn issue_tracker_dir(&self) -> PathBuf {
+        self.root.join("issue-tracker")
+    }
+
+    /// Private storage generation for the Issue Tracker integration. This is
+    /// intentionally separate from the shared MCP runtime directory.
+    pub fn issue_tracker_v3_dir(&self) -> PathBuf {
+        self.issue_tracker_dir().join("v3")
+    }
+
+    pub fn issue_tracker_taskchampion_root(&self) -> PathBuf {
+        // The v3 client root is intentionally incompatible with the legacy
+        // v2 root. Do not read, migrate, or delete the legacy tree.
+        self.issue_tracker_v3_dir().join("taskchampion")
+    }
+
+    pub fn issue_tracker_manager_sqlite_path(&self) -> PathBuf {
+        self.issue_tracker_taskchampion_root()
+            .join("issue-tracker-manager.sqlite3")
+    }
+
+    pub fn issue_tracker_artifacts_dir(&self) -> PathBuf {
+        self.issue_tracker_v3_dir().join("artifacts")
+    }
+
+    pub fn issue_tracker_backup_dir(&self) -> PathBuf {
+        self.issue_tracker_v3_dir().join("backups")
+    }
+
+    pub fn issue_tracker_export_dir(&self) -> PathBuf {
+        self.issue_tracker_v3_dir().join("exports")
+    }
+
+    pub fn issue_tracker_pending_operations_path(&self) -> PathBuf {
+        self.issue_tracker_v3_dir().join("pending-operations.json")
+    }
+
+    /// Short-lived files passed to local child processes. Secrets in this
+    /// directory are never part of settings or persistent Issue data.
+    pub fn mcp_runtime_dir(&self) -> PathBuf {
+        self.root.join("runtime").join("mcp")
+    }
+
+    /// Materialize only directories that are safe to prepare before the
+    /// tracker opens its canonical SQLite stores. Opening or migrating either
+    /// store remains the runner/manager's responsibility.
+    pub fn ensure_issue_tracker_runtime(&self) -> AppResult<()> {
+        for sub in [
+            self.issue_tracker_taskchampion_root(),
+            self.issue_tracker_artifacts_dir(),
+            self.issue_tracker_backup_dir(),
+            self.issue_tracker_export_dir(),
+            self.mcp_runtime_dir(),
+        ] {
+            std::fs::create_dir_all(sub)?;
+        }
+        Ok(())
     }
 
     pub fn models_dir(&self) -> PathBuf {
@@ -151,6 +264,19 @@ impl DataPaths {
         env_file: Option<&Path>,
         app_settings: Option<&AppSettings>,
     ) -> PathBuf {
+        self.effective_hf_home_with_environment(
+            env_file,
+            app_settings,
+            &HfHomeEnvironment::from_process(),
+        )
+    }
+
+    fn effective_hf_home_with_environment(
+        &self,
+        env_file: Option<&Path>,
+        app_settings: Option<&AppSettings>,
+        environment: &HfHomeEnvironment,
+    ) -> PathBuf {
         if let Some(s) = app_settings {
             match s.hf_home_mode {
                 HfHomeMode::Custom => {
@@ -163,14 +289,14 @@ impl DataPaths {
                     }
                     // Misconfigured custom (empty path): fall through.
                 }
-                HfHomeMode::Global => return global_hf_home(env_file),
+                HfHomeMode::Global => return global_hf_home(env_file, environment),
                 HfHomeMode::DataRoot => return self.models_dir(),
             }
         }
         // No app-settings AND no caller-supplied mode (defensive). Treat
         // as Global so this branch agrees with what `load_app_settings`'s
         // default returns.
-        global_hf_home(env_file)
+        global_hf_home(env_file, environment)
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -181,19 +307,29 @@ impl DataPaths {
         self.root.join("lancedb")
     }
 
+    /// `MEMORY_LANCEDB_URI` handed to memories. Pinned under the data root
+    /// because memories otherwise resolves a cwd-relative default; the
+    /// tables and their layout inside it are memories' concern.
+    pub fn memories_lancedb_uri(&self) -> PathBuf {
+        self.lancedb_dir().join("memories.lancedb")
+    }
+
     pub fn workers_dir(&self) -> PathBuf {
         self.root.join("workers")
     }
 
     /// Heuristic: a directory is "an existing Lookback root" if it
-    /// contains the sqlite file or the LanceDB subdir at the canonical
-    /// sub-paths the running app uses. Lives next to the sub-path
-    /// methods (not in `commands::app_settings`) so the canonical layout
-    /// stays owned by `DataPaths` — a future rename of `db/` or `lancedb/`
-    /// only needs to change this file.
+    /// contains the sqlite file or the memories data dir at the canonical
+    /// sub-paths the running app uses. `lancedb/` is deliberately not a
+    /// marker: it only exists once memories has created vector storage,
+    /// which always happens after `memories/`. Lives next to the sub-path
+    /// methods (not in
+    /// `commands::app_settings`) so the canonical layout stays owned by
+    /// `DataPaths` — a future rename of `db/` or `memories/` only needs to
+    /// change this file.
     pub fn looks_like_existing_root(dir: &Path) -> bool {
         let probe = Self::with_root(dir);
-        probe.sqlite_path().exists() || probe.lancedb_dir().exists()
+        probe.sqlite_path().exists() || probe.memories_data_dir().exists()
     }
 
     pub fn memories_data_dir(&self) -> PathBuf {
@@ -208,8 +344,8 @@ impl DataPaths {
     /// `SQLITE_MAX_CONNECTIONS` required by memories' RDB config and the
     /// sidecar silently used its default filename instead. Therefore this is
     /// the existing production store, not a rename from `memory.sqlite3`.
-    /// All local-sidecar, startup-gate, and migration code must share this
-    /// path so they cannot create or inspect a parallel empty database.
+    /// The local sidecar and the memories migration tool must share this path
+    /// so neither can create or inspect a parallel empty database.
     pub fn memories_sqlite_path(&self) -> PathBuf {
         self.memories_data_dir().join("default.sqlite3")
     }
@@ -218,14 +354,21 @@ impl DataPaths {
         sqlite_url(&self.memories_sqlite_path())
     }
 
+    /// Receipt of the removed startup migration gate. Only located so the
+    /// first migration run by the memories tool can delete the stale file.
     pub fn database_migration_receipt_path(&self) -> PathBuf {
         self.root.join("database-migration-receipt.json")
     }
 
+    /// Attempt journal of the removed startup migration gate; see
+    /// [`Self::database_migration_receipt_path`].
     pub fn database_migration_attempt_path(&self) -> PathBuf {
         self.root.join("database-migration-attempt.json")
     }
 
+    /// Parent directory handed to the memories migration tool for its
+    /// pre-migration backups. Backups made by the removed startup gate may
+    /// also remain here; the tool never prunes files it did not create.
     pub fn database_migration_backups_dir(&self) -> PathBuf {
         self.root.join("database-migration-backups")
     }
@@ -288,12 +431,24 @@ impl DataPaths {
         self.root.join("mcp-settings.json")
     }
 
+    /// Issue Tracker feature toggle. Kept beside the other per-app settings
+    /// so purging the data root also removes the user's explicit override.
+    pub fn issue_tracker_settings_path(&self) -> PathBuf {
+        self.root.join("issue-tracker-settings.json")
+    }
+
     /// Marker that records the one-time insertion of disabled default
     /// periodic schedules. It lives under the data root so "delete all data"
     /// resets the first-run experience while a user-deleted template is not
     /// recreated on the next launch.
     pub fn periodic_defaults_seed_path(&self) -> PathBuf {
         self.root.join("periodic-defaults-seeded.json")
+    }
+
+    /// Fingerprints of the workers this app registered on each remote
+    /// jobworkerp, keyed by its URL.
+    pub fn remote_jobworkerp_registrations_path(&self) -> PathBuf {
+        self.root.join("remote-jobworkerp-registrations.json")
     }
 
     pub fn jobworkerp_maintenance_marker_path(&self) -> PathBuf {
@@ -307,14 +462,6 @@ impl DataPaths {
     /// Lookback's admission and scheduling state.
     pub fn search_index_maintenance_path(&self) -> PathBuf {
         self.root.join("search-index-maintenance.json")
-    }
-
-    /// Where pre-resize LanceDB directories are renamed to when the user
-    /// switches embedding model (= vector dimension changes). The actual
-    /// per-resize directory under here is suffixed with a timestamp so
-    /// repeated swaps do not collide.
-    pub fn lancedb_backup_dir(&self) -> PathBuf {
-        self.root.join("lancedb-backup")
     }
 
     /// Staged worker YAML dir for runtime-rendered files (e.g. the
@@ -402,6 +549,30 @@ pub struct AppSettings {
     /// launch. Resolved by `sidecar::lifecycle::resolve_timezone`.
     #[serde(default)]
     pub timezone: Option<String>,
+    /// Backup choice passed to the memories migration tool before it changes
+    /// the database. Missing in older files, which must keep the safe default.
+    #[serde(default)]
+    pub migration_backup: MigrationBackupSettings,
+}
+
+/// User choice for the backup the memories migration tool takes before a
+/// migration that changes data. Disabling it is allowed for low-disk machines,
+/// at the cost of having no restore point if that migration fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MigrationBackupSettings {
+    pub enabled: bool,
+    /// Completed backups the tool keeps after a successful migration.
+    pub keep: u32,
+}
+
+impl Default for MigrationBackupSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep: 1,
+        }
+    }
 }
 
 /// Bootstrap-time config: lives at a fixed path (`<os-default>/bootstrap.json`)
@@ -647,14 +818,16 @@ pub fn save_app_settings(path: &Path, cfg: &AppSettings) -> AppResult<()> {
 ///      on macOS and would silently miss the user's existing cache).
 ///
 /// Source: huggingface_hub env-vars docs, "HF_HOME" + "XDG_CACHE_HOME".
-fn global_hf_home(env_file: Option<&Path>) -> PathBuf {
-    if let Some(p) = lookup_external_hf_home(env_file) {
+fn global_hf_home(env_file: Option<&Path>, environment: &HfHomeEnvironment) -> PathBuf {
+    if let Some(p) = lookup_external_hf_home(env_file, environment) {
         return p;
     }
-    if let Some(v) = std::env::var_os("XDG_CACHE_HOME")
-        && !v.is_empty()
+    if let Some(v) = environment
+        .xdg_cache_home
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
     {
-        return PathBuf::from(v).join("huggingface");
+        return v.join("huggingface");
     }
     if let Some(home) = dirs::home_dir() {
         return home.join(".cache").join("huggingface");
@@ -674,11 +847,16 @@ pub fn purge(root: &Path) -> AppResult<()> {
 /// `HF_HOME` value supplied from outside the app: shell env first, then a
 /// `HF_HOME=` line in the optional `.env` template. Empty values are
 /// treated as "not set" so a `.env` author can explicitly clear the var.
-fn lookup_external_hf_home(env_file: Option<&Path>) -> Option<PathBuf> {
-    if let Some(v) = std::env::var_os("HF_HOME")
-        && !v.is_empty()
+fn lookup_external_hf_home(
+    env_file: Option<&Path>,
+    environment: &HfHomeEnvironment,
+) -> Option<PathBuf> {
+    if let Some(v) = environment
+        .hf_home
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
     {
-        return Some(PathBuf::from(v));
+        return Some(v.clone());
     }
     let env_file = env_file?;
     let iter = dotenvy::from_path_iter(env_file).ok()?;
@@ -755,7 +933,11 @@ pub fn stage_workers_env(app: &AppHandle) {
 ///   2. `<CARGO_MANIFEST_DIR>/../workers` for `cargo run` / `pnpm tauri
 ///      dev`, where `CARGO_MANIFEST_DIR = agent-app/src-tauri/`.
 pub fn workers_bundle_dir() -> AppResult<PathBuf> {
-    if let Ok(p) = std::env::var("LOOKBACK_WORKERS_DIR") {
+    workers_bundle_dir_with_override(std::env::var("LOOKBACK_WORKERS_DIR").ok())
+}
+
+fn workers_bundle_dir_with_override(override_dir: Option<String>) -> AppResult<PathBuf> {
+    if let Some(p) = override_dir {
         let pb = PathBuf::from(p);
         if pb.exists() {
             return Ok(pb);
@@ -792,6 +974,22 @@ pub fn function_sets_yaml() -> AppResult<PathBuf> {
     Ok(workers_bundle_dir()?.join("function-sets.yaml"))
 }
 
+/// Curated Issue Gateway GRPC workers. Registered only after tracker health is READY.
+pub fn lookback_issue_gateway_workers_yaml() -> AppResult<PathBuf> {
+    Ok(workers_bundle_dir()?.join("lookback-issue-gateway-workers.yaml"))
+}
+
+/// Read-only Issue workers for the chat's private local gRPC facade.
+pub fn lookback_issue_chat_workers_yaml() -> AppResult<PathBuf> {
+    Ok(workers_bundle_dir()?.join("lookback-issue-chat-workers.yaml"))
+}
+
+/// Issue extract WORKFLOW worker. Registered even when the tracker is not
+/// READY so `skipIfDisabled` can run instead of failing with WorkerNotFound.
+pub fn lookback_issue_extract_workers_yaml() -> AppResult<PathBuf> {
+    Ok(workers_bundle_dir()?.join("lookback-issue-extract-workers.yaml"))
+}
+
 /// `<workers>/workflows/` — root of the LLMPromptRunner-routed workflow
 /// YAMLs (thread-summary / thread-personality / thread-reflection /
 /// auto-embedding-workers). Used both by the
@@ -814,34 +1012,83 @@ pub fn lang_workers_repo_root() -> AppResult<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// Return a task's sequence position and configuration by its workflow
-    /// task name, so tests stay coupled to the task contract rather than
-    /// incidental sequence order.
-    fn find_named_task<'a>(
-        tasks: &'a [serde_yaml::Value],
+    /// Finds the task named `name` anywhere in a workflow document.
+    pub(crate) fn find_workflow_task<'a>(
+        value: &'a serde_yaml::Value,
         name: &str,
-    ) -> (usize, &'a serde_yaml::Value) {
-        let key = serde_yaml::Value::String(name.to_owned());
-        tasks
-            .iter()
-            .enumerate()
-            .find_map(|(index, task)| {
-                task.as_mapping()
-                    .and_then(|mapping| mapping.get(&key).map(|value| (index, value)))
-            })
-            .unwrap_or_else(|| panic!("workflow task `{name}` must exist"))
+    ) -> Option<&'a serde_yaml::Value> {
+        match value {
+            serde_yaml::Value::Sequence(items) => {
+                items.iter().find_map(|item| find_workflow_task(item, name))
+            }
+            serde_yaml::Value::Mapping(mapping) => {
+                if let Some(task) = mapping.get(serde_yaml::Value::String(name.to_string())) {
+                    return Some(task);
+                }
+                mapping
+                    .values()
+                    .find_map(|item| find_workflow_task(item, name))
+            }
+            _ => None,
+        }
     }
 
-    /// Return a task's configuration by its workflow task name.
-    fn task_named<'a>(tasks: &'a [serde_yaml::Value], name: &str) -> &'a serde_yaml::Value {
-        find_named_task(tasks, name).1
+    fn workflow_jq_expression(value: &serde_yaml::Value) -> &str {
+        let raw = value.as_str().expect("workflow expression").trim();
+        raw.strip_prefix("${")
+            .and_then(|expression| expression.strip_suffix('}'))
+            .unwrap_or(raw)
+            .trim()
     }
 
-    fn task_index_named(tasks: &[serde_yaml::Value], name: &str) -> usize {
-        find_named_task(tasks, name).0
+    /// Evaluates a `${ ... }` workflow expression with the engine's jaq.
+    pub(crate) fn evaluate_workflow_jq(
+        expression: &serde_yaml::Value,
+        context: &std::collections::BTreeMap<String, std::sync::Arc<serde_json::Value>>,
+    ) -> anyhow::Result<serde_json::Value> {
+        command_utils::util::jq::execute_jq(
+            serde_json::Value::Null,
+            workflow_jq_expression(expression),
+            context,
+        )
+    }
+
+    fn hf_home_environment(
+        hf_home: Option<&str>,
+        xdg_cache_home: Option<&str>,
+    ) -> HfHomeEnvironment {
+        HfHomeEnvironment {
+            hf_home: hf_home.map(Into::into),
+            xdg_cache_home: xdg_cache_home.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn existing_root_is_recognised_by_lookback_owned_paths_only() {
+        let sqlite_root = tempfile::tempdir().unwrap();
+        let sqlite = DataPaths::with_root(sqlite_root.path());
+        std::fs::create_dir_all(sqlite.db_dir()).unwrap();
+        std::fs::write(sqlite.sqlite_path(), b"").unwrap();
+        assert!(DataPaths::looks_like_existing_root(sqlite_root.path()));
+
+        let memories_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(memories_root.path().join("memories")).unwrap();
+        assert!(DataPaths::looks_like_existing_root(memories_root.path()));
+
+        let lancedb_only = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lancedb_only.path().join("lancedb")).unwrap();
+        assert!(!DataPaths::looks_like_existing_root(lancedb_only.path()));
+    }
+
+    #[test]
+    fn issue_tracker_settings_path_is_under_root() {
+        let paths = DataPaths::with_root("/tmp/lookback-test-root");
+        let path = paths.issue_tracker_settings_path();
+
+        assert!(path.starts_with(&paths.root));
     }
 
     #[test]
@@ -864,8 +1111,11 @@ mod tests {
         assert!(paths.plugins_dir().exists());
         assert!(paths.models_dir().exists());
         assert!(paths.log_dir().exists());
-        assert!(paths.lancedb_dir().exists());
-        assert!(paths.lancedb_backup_dir().exists());
+        assert!(
+            !paths.lancedb_dir().exists(),
+            "memories creates its own vector storage"
+        );
+        assert!(!paths.root.join("lancedb-backup").exists());
         assert!(paths.workers_dir().exists());
         assert!(paths.staged_workers_dir().exists());
 
@@ -953,17 +1203,6 @@ mod tests {
     }
 
     #[test]
-    fn lancedb_backup_dir_is_sibling_of_lancedb_dir() {
-        // Important for "delete all data" semantics — backup must live
-        // under the same root so a single rm -rf wipes the user's data.
-        let paths = DataPaths::with_root("/tmp/lookback-emb-test");
-        assert_eq!(
-            paths.lancedb_backup_dir(),
-            PathBuf::from("/tmp/lookback-emb-test/lancedb-backup")
-        );
-    }
-
-    #[test]
     fn staged_workers_dir_is_under_workers_dir() {
         // Keep staged YAMLs separate from the committed bundle so a
         // future `LOOKBACK_WORKERS_DIR` pointed at staged/ would fail
@@ -1000,39 +1239,153 @@ mod tests {
     }
 
     #[test]
+    fn issue_tracker_paths_are_derived_from_one_private_root() {
+        let paths = DataPaths::with_root("/tmp/lookback-issue-data");
+        let issue_root = std::path::PathBuf::from("/tmp/lookback-issue-data/issue-tracker");
+
+        assert_eq!(paths.issue_tracker_dir(), issue_root);
+        assert_eq!(
+            paths.issue_tracker_taskchampion_root(),
+            paths.issue_tracker_dir().join("v3").join("taskchampion")
+        );
+        assert_eq!(
+            paths.issue_tracker_manager_sqlite_path(),
+            paths
+                .issue_tracker_taskchampion_root()
+                .join("issue-tracker-manager.sqlite3")
+        );
+        assert_eq!(
+            paths.issue_tracker_artifacts_dir(),
+            paths.issue_tracker_v3_dir().join("artifacts")
+        );
+        assert_eq!(
+            paths.issue_tracker_backup_dir(),
+            paths.issue_tracker_v3_dir().join("backups")
+        );
+        assert_eq!(
+            paths.issue_tracker_export_dir(),
+            paths.issue_tracker_v3_dir().join("exports")
+        );
+        assert_eq!(
+            paths.mcp_runtime_dir(),
+            std::path::PathBuf::from("/tmp/lookback-issue-data/runtime/mcp")
+        );
+    }
+
+    #[test]
+    fn ensure_issue_tracker_runtime_creates_only_its_required_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::with_root(dir.path());
+
+        paths.ensure_issue_tracker_runtime().unwrap();
+
+        assert!(paths.issue_tracker_taskchampion_root().is_dir());
+        assert!(
+            !paths.issue_tracker_dir().join("taskchampion").exists(),
+            "v3 setup must not recreate the legacy tracker root"
+        );
+        assert!(paths.issue_tracker_artifacts_dir().is_dir());
+        assert!(paths.issue_tracker_backup_dir().is_dir());
+        assert!(paths.issue_tracker_export_dir().is_dir());
+        assert!(paths.mcp_runtime_dir().is_dir());
+        assert!(
+            !paths.issue_tracker_manager_sqlite_path().exists(),
+            "directory setup must not create a second canonical store"
+        );
+    }
+
+    #[test]
+    fn coding_agent_paths_are_isolated_and_ensure_only_runtime_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::with_root(dir.path());
+
+        assert_eq!(
+            paths.coding_agent_runs_db_path(),
+            paths.db_dir().join("coding-agent-runs.sqlite3")
+        );
+        assert_eq!(
+            paths.coding_agent_runs_dir(),
+            paths.root.join("coding-agent-runs")
+        );
+
+        paths.ensure_coding_agent_runs().unwrap();
+
+        assert!(paths.db_dir().is_dir());
+        assert!(paths.coding_agent_runs_dir().is_dir());
+        assert!(!paths.coding_agent_runs_db_path().exists());
+        assert!(!paths.memories_data_dir().exists());
+        assert!(!paths.lancedb_dir().exists());
+    }
+
+    #[test]
+    fn issue_tracker_v3_setup_preserves_a_legacy_tracker_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::with_root(dir.path());
+        let legacy_marker = paths
+            .issue_tracker_dir()
+            .join("taskchampion")
+            .join("marker");
+        std::fs::create_dir_all(legacy_marker.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_marker, "legacy").unwrap();
+
+        paths.ensure_issue_tracker_runtime().unwrap();
+
+        assert_eq!(std::fs::read_to_string(legacy_marker).unwrap(), "legacy");
+        assert!(paths.issue_tracker_taskchampion_root().is_dir());
+    }
+
+    #[test]
+    fn issue_tracker_runner_worker_yaml_is_not_in_the_worker_bundle() {
+        let path = workers_bundle_dir()
+            .unwrap()
+            .join("issue-tracker-workers.yaml");
+        assert!(
+            !path.exists(),
+            "retired IssueTrackerRunner YAML must not ship: {}",
+            path.display()
+        );
+    }
+
+    #[test]
     fn effective_hf_home_no_settings_no_env_falls_back_to_dot_cache_huggingface() {
         // Pre-feature / no-Settings path with no shell HF_HOME and no
         // `.env` HF_HOME: must land in `~/.cache/huggingface` (HF Hub's
         // canonical default), NOT in `<data>/models`. This pins the
         // fresh-install agreement between the UI's "OS グローバル"
         // default and the sidecar's resolved cache.
-        unsafe { std::env::remove_var("HF_HOME") };
-        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let paths = DataPaths::with_root("/tmp/lookback-hf-test");
         let expected = dirs::home_dir().unwrap().join(".cache").join("huggingface");
-        assert_eq!(paths.effective_hf_home(None, None), expected);
+        assert_eq!(
+            paths.effective_hf_home_with_environment(None, None, &hf_home_environment(None, None)),
+            expected
+        );
     }
 
     #[test]
     fn effective_hf_home_honours_shell_env() {
-        unsafe { std::env::set_var("HF_HOME", "/tmp/shared-hf-cache") };
         let paths = DataPaths::with_root("/tmp/lookback-hf-test");
         assert_eq!(
-            paths.effective_hf_home(None, None),
+            paths.effective_hf_home_with_environment(
+                None,
+                None,
+                &hf_home_environment(Some("/tmp/shared-hf-cache"), None)
+            ),
             PathBuf::from("/tmp/shared-hf-cache")
         );
-        unsafe { std::env::remove_var("HF_HOME") };
     }
 
     #[test]
     fn effective_hf_home_honours_env_file_when_shell_unset() {
-        unsafe { std::env::remove_var("HF_HOME") };
         let tmp = tempdir_in_target();
         let env_file = tmp.join(".env");
         std::fs::write(&env_file, "HF_HOME=/tmp/dotenv-hf\n").unwrap();
         let paths = DataPaths::with_root(&tmp);
         assert_eq!(
-            paths.effective_hf_home(Some(&env_file), None),
+            paths.effective_hf_home_with_environment(
+                Some(&env_file),
+                None,
+                &hf_home_environment(None, None)
+            ),
             PathBuf::from("/tmp/dotenv-hf")
         );
         std::fs::remove_dir_all(&tmp).ok();
@@ -1046,51 +1399,62 @@ mod tests {
         // `Sidecars` constructed from such an env file would inject
         // `HF_HOME=""` into the child and llama.cpp would download into
         // cwd.
-        unsafe { std::env::remove_var("HF_HOME") };
-        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let tmp = tempdir_in_target();
         let env_file = tmp.join(".env");
         std::fs::write(&env_file, "HF_HOME=\n").unwrap();
         let paths = DataPaths::with_root(&tmp);
         let expected = dirs::home_dir().unwrap().join(".cache").join("huggingface");
-        assert_eq!(paths.effective_hf_home(Some(&env_file), None), expected);
+        assert_eq!(
+            paths.effective_hf_home_with_environment(
+                Some(&env_file),
+                None,
+                &hf_home_environment(None, None)
+            ),
+            expected
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn effective_hf_home_data_root_mode_uses_models_dir_regardless_of_env() {
-        unsafe { std::env::set_var("HF_HOME", "/tmp/shell-hf-cache") };
         let paths = DataPaths::with_root("/tmp/lookback-mode-test");
         let app = AppSettings {
             hf_home_mode: HfHomeMode::DataRoot,
             hf_home_path: None,
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
         // Explicit `data_root` mode must beat the shell env — that's the
         // whole point of the user opting in to Lookback-owned storage.
         assert_eq!(
-            paths.effective_hf_home(None, Some(&app)),
+            paths.effective_hf_home_with_environment(
+                None,
+                Some(&app),
+                &hf_home_environment(Some("/tmp/shell-hf-cache"), None)
+            ),
             paths.models_dir()
         );
-        unsafe { std::env::remove_var("HF_HOME") };
     }
 
     #[test]
     fn effective_hf_home_global_mode_honours_shell_env() {
-        unsafe { std::env::set_var("HF_HOME", "/tmp/user-global-hf") };
         let paths = DataPaths::with_root("/tmp/lookback-mode-test");
         let app = AppSettings {
             hf_home_mode: HfHomeMode::Global,
             hf_home_path: None,
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
         assert_eq!(
-            paths.effective_hf_home(None, Some(&app)),
+            paths.effective_hf_home_with_environment(
+                None,
+                Some(&app),
+                &hf_home_environment(Some("/tmp/user-global-hf"), None)
+            ),
             PathBuf::from("/tmp/user-global-hf")
         );
-        unsafe { std::env::remove_var("HF_HOME") };
     }
 
     #[test]
@@ -1101,16 +1465,19 @@ mod tests {
         // `huggingface-cli` / `transformers` is the whole point of Global mode,
         // and macOS would silently miss the user's existing cache without
         // this fix.
-        unsafe { std::env::remove_var("HF_HOME") };
-        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let paths = DataPaths::with_root("/tmp/lookback-mode-test");
         let app = AppSettings {
             hf_home_mode: HfHomeMode::Global,
             hf_home_path: None,
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
-        let got = paths.effective_hf_home(None, Some(&app));
+        let got = paths.effective_hf_home_with_environment(
+            None,
+            Some(&app),
+            &hf_home_environment(None, None),
+        );
         let expected = dirs::home_dir().unwrap().join(".cache").join("huggingface");
         assert_eq!(got, expected);
     }
@@ -1123,8 +1490,6 @@ mod tests {
         // because `Global` mode short-circuited before consulting the
         // env file. Both the explicit-Global save and the fresh-install
         // default (which is Global) must walk the same path.
-        unsafe { std::env::remove_var("HF_HOME") };
-        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let tmp = tempdir_in_target();
         let env_file = tmp.join(".env");
         std::fs::write(&env_file, "HF_HOME=/tmp/workspace-env-hf\n").unwrap();
@@ -1134,9 +1499,14 @@ mod tests {
             hf_home_path: None,
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
         assert_eq!(
-            paths.effective_hf_home(Some(&env_file), Some(&app)),
+            paths.effective_hf_home_with_environment(
+                Some(&env_file),
+                Some(&app),
+                &hf_home_environment(None, None)
+            ),
             PathBuf::from("/tmp/workspace-env-hf")
         );
         std::fs::remove_dir_all(&tmp).ok();
@@ -1148,35 +1518,40 @@ mod tests {
         // when `HF_HOME` is unset. Pinning this so a Linux user with the
         // XDG var set lands in the cache they actually share with other HF
         // tools, not in `~/.cache/huggingface`.
-        unsafe { std::env::remove_var("HF_HOME") };
-        unsafe { std::env::set_var("XDG_CACHE_HOME", "/tmp/xdg-cache-root") };
         let paths = DataPaths::with_root("/tmp/lookback-mode-test");
         let app = AppSettings {
             hf_home_mode: HfHomeMode::Global,
             hf_home_path: None,
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
-        let got = paths.effective_hf_home(None, Some(&app));
+        let got = paths.effective_hf_home_with_environment(
+            None,
+            Some(&app),
+            &hf_home_environment(None, Some("/tmp/xdg-cache-root")),
+        );
         assert_eq!(got, PathBuf::from("/tmp/xdg-cache-root/huggingface"));
-        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
     }
 
     #[test]
     fn effective_hf_home_custom_mode_uses_specified_path() {
-        unsafe { std::env::set_var("HF_HOME", "/tmp/ignored-shell-hf") };
         let paths = DataPaths::with_root("/tmp/lookback-mode-test");
         let app = AppSettings {
             hf_home_mode: HfHomeMode::Custom,
             hf_home_path: Some(PathBuf::from("/Volumes/Ext/hf")),
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
         assert_eq!(
-            paths.effective_hf_home(None, Some(&app)),
+            paths.effective_hf_home_with_environment(
+                None,
+                Some(&app),
+                &hf_home_environment(Some("/tmp/ignored-shell-hf"), None)
+            ),
             PathBuf::from("/Volumes/Ext/hf")
         );
-        unsafe { std::env::remove_var("HF_HOME") };
     }
 
     #[test]
@@ -1184,17 +1559,23 @@ mod tests {
         // Defensive: a Custom selection with an unfilled path must NOT
         // resolve to "" (which would make llama.cpp download into cwd).
         // Falls through to Global resolution.
-        unsafe { std::env::remove_var("HF_HOME") };
-        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let paths = DataPaths::with_root("/tmp/lookback-mode-test");
         let app = AppSettings {
             hf_home_mode: HfHomeMode::Custom,
             hf_home_path: None,
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
         let expected = dirs::home_dir().unwrap().join(".cache").join("huggingface");
-        assert_eq!(paths.effective_hf_home(None, Some(&app)), expected);
+        assert_eq!(
+            paths.effective_hf_home_with_environment(
+                None,
+                Some(&app),
+                &hf_home_environment(None, None)
+            ),
+            expected
+        );
     }
 
     #[test]
@@ -1456,14 +1837,16 @@ mod tests {
         // "OS グローバル" default and the actual resolution agree. The
         // Global branch consults shell `HF_HOME` first, so a user with
         // a pre-existing `HF_HOME` keeps using their cache.
-        unsafe { std::env::set_var("HF_HOME", "/tmp/fresh-install-shell-hf") };
         let paths = DataPaths::with_root("/tmp/lookback-fresh-install-test");
         let default = AppSettings::default();
         assert_eq!(
-            paths.effective_hf_home(None, Some(&default)),
+            paths.effective_hf_home_with_environment(
+                None,
+                Some(&default),
+                &hf_home_environment(Some("/tmp/fresh-install-shell-hf"), None)
+            ),
             PathBuf::from("/tmp/fresh-install-shell-hf")
         );
-        unsafe { std::env::remove_var("HF_HOME") };
     }
 
     #[test]
@@ -1472,19 +1855,22 @@ mod tests {
         // their choice wins even though `HF_HOME` is set in the shell.
         // Pins that the saved mode is authoritative once the user has
         // touched Settings.
-        unsafe { std::env::set_var("HF_HOME", "/tmp/shell-should-be-ignored") };
         let paths = DataPaths::with_root("/tmp/lookback-explicit-data-root-test");
         let explicit_data_root = AppSettings {
             hf_home_mode: HfHomeMode::DataRoot,
             hf_home_path: None,
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
         assert_eq!(
-            paths.effective_hf_home(None, Some(&explicit_data_root)),
+            paths.effective_hf_home_with_environment(
+                None,
+                Some(&explicit_data_root),
+                &hf_home_environment(Some("/tmp/shell-should-be-ignored"), None)
+            ),
             paths.models_dir()
         );
-        unsafe { std::env::remove_var("HF_HOME") };
     }
 
     #[test]
@@ -1505,6 +1891,7 @@ mod tests {
             hf_home_path: Some(PathBuf::from("/Volumes/Ext/hf")),
             output_language: None,
             timezone: None,
+            ..Default::default()
         };
         save_app_settings(&path, &cfg).unwrap();
         assert_eq!(load_app_settings(&path), cfg);
@@ -1534,6 +1921,7 @@ mod tests {
             hf_home_path: None,
             output_language: Some("en".into()),
             timezone: None,
+            ..Default::default()
         };
         save_app_settings(&path, &cfg).unwrap();
         assert_eq!(
@@ -1577,6 +1965,7 @@ mod tests {
                 hf_home_path: None,
                 output_language: None,
                 timezone: None,
+                ..Default::default()
             };
             let json = serde_json::to_value(&s).unwrap();
             assert_eq!(json["hf_home_mode"], wire);
@@ -1607,6 +1996,18 @@ mod tests {
         assert!(dir.exists());
         assert!(dir.join("llm-workers.yaml").exists());
         assert!(dir.join("workflows").is_dir());
+    }
+
+    #[test]
+    fn issue_chat_worker_yaml_is_resolved_from_the_workers_bundle() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        let path = lookback_issue_chat_workers_yaml().expect("chat Issue worker YAML path");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("lookback-issue-chat-workers.yaml")
+        );
+        assert!(path.is_file(), "expected bundled workers file at {path:?}");
     }
 
     /// Both reflection embedding pipelines (summary F-G11a + intent
@@ -1729,6 +2130,54 @@ mod tests {
     }
 
     #[test]
+    fn embedding_workflows_keep_try_task_lists() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        let workflows = workers_bundle_dir().unwrap().join("workflows");
+        fn assert_try_tasks_are_lists(value: &serde_yaml::Value, label: &str) {
+            match value {
+                serde_yaml::Value::Mapping(mapping) => {
+                    if let Some(try_tasks) = mapping.get(serde_yaml::Value::String("try".into())) {
+                        assert!(
+                            try_tasks.is_sequence(),
+                            "{label}: `try` must deserialize directly as a task list"
+                        );
+                    }
+                    for child in mapping.values() {
+                        assert_try_tasks_are_lists(child, label);
+                    }
+                }
+                serde_yaml::Value::Sequence(items) => {
+                    for child in items {
+                        assert_try_tasks_are_lists(child, label);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (relative, label) in [
+            ("auto-embedding.yaml", "memory text embedding"),
+            ("auto-image-embedding.yaml", "memory image embedding"),
+            ("auto-thread-embedding.yaml", "thread embedding"),
+            (
+                "thread-reflection/auto-reflection-intent-embedding.yaml",
+                "reflection intent embedding",
+            ),
+            (
+                "thread-reflection/auto-reflection-summary-embedding.yaml",
+                "reflection summary embedding",
+            ),
+        ] {
+            let path = workflows.join(relative);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(
+                &std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())),
+            )
+            .unwrap_or_else(|error| panic!("{label} does not deserialize as YAML: {error}"));
+            assert_try_tasks_are_lists(&parsed, label);
+        }
+    }
+
+    #[test]
     fn reflection_embedding_workflows_pin_grpc_runner_method() {
         unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
         let dir = workers_bundle_dir()
@@ -1800,6 +2249,472 @@ mod tests {
         );
     }
 
+    /// Vendored copy of jobworkerp's runtime validation schema (upstream
+    /// `runner/schema/workflow_minimal_fix.json`).
+    const RUNTIME_WORKFLOW_SCHEMA: &str = "schema/jobworkerp/workflow_minimal_fix.json";
+    /// Vendored copy of jobworkerp's canonical schema used for code generation
+    /// (upstream `runner/schema/workflow.yaml`, identical to `workflow.json`).
+    const CANONICAL_WORKFLOW_SCHEMA: &str = "schema/jobworkerp/workflow.yaml";
+
+    // Schemas are read from the vendored copies under `workers/` only: CI
+    // checks out agent-app alone, so the upstream jobworkerp tree is absent.
+    fn workflow_schema_validator(schema_name: &str) -> jsonschema::Validator {
+        let schema_path = workers_bundle_dir().unwrap().join(schema_name);
+        let body = std::fs::read_to_string(&schema_path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", schema_path.display()));
+        let mut schema: serde_json::Value = serde_yaml::from_str(&body)
+            .unwrap_or_else(|error| panic!("cannot parse {}: {error}", schema_path.display()));
+        if schema_name == CANONICAL_WORKFLOW_SCHEMA {
+            relax_canonical_flow_directive(&mut schema);
+        }
+        jsonschema::draft202012::new(&schema)
+            .unwrap_or_else(|error| panic!("cannot compile {}: {error}", schema_path.display()))
+    }
+
+    /// The canonical schema keeps `flowDirective` as `oneOf` because typify
+    /// generates jobworkerp's `FlowDirective` enum from that shape. Reserved
+    /// keywords (`exit`, `end`, ...) also match the free-form string branch,
+    /// so `oneOf` rejects every `then: exit` under a validator. Open Workflow
+    /// v1.0.0 defines it as `anyOf`, which is what the runtime schema uses.
+    fn relax_canonical_flow_directive(schema: &mut serde_json::Value) {
+        let directive = schema
+            .pointer_mut("/$defs/flowDirective")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("canonical schema must define $defs.flowDirective");
+        let branches = directive.remove("oneOf").expect(
+            "canonical flowDirective is no longer oneOf; drop this relaxation and validate as-is",
+        );
+        directive.insert("anyOf".into(), branches);
+    }
+
+    fn parsed_workflow(path: &Path) -> serde_yaml::Value {
+        let body = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        serde_yaml::from_str(&expand_env_defaults(&body))
+            .unwrap_or_else(|error| panic!("cannot parse {}: {error}", path.display()))
+    }
+
+    fn workflow_schema_errors(validator: &jsonschema::Validator, path: &Path) -> Vec<String> {
+        let definition = serde_json::to_value(parsed_workflow(path)).unwrap();
+        validator
+            .iter_errors(&definition)
+            .map(|error| format!("{}: {error}", error.instance_path()))
+            .collect()
+    }
+
+    /// Workflow documents (not worker-definition YAML) shipped under
+    /// `workers/workflows` and `workers/lang-workers/workers`.
+    fn shipped_workflow_documents() -> Vec<PathBuf> {
+        let workers = workers_bundle_dir().unwrap();
+        let mut documents: Vec<PathBuf> = [
+            workers.join("workflows"),
+            workers.join("lang-workers/workers"),
+        ]
+        .iter()
+        .flat_map(|root| walkdir(root))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
+        .filter(|path| parsed_workflow(path).get("document").is_some())
+        .collect();
+        documents.sort();
+        documents
+    }
+
+    use crate::jobworkerp::job_timeouts::{self, HOUR, MINUTE};
+
+    /// Seconds of a `timeout: { after: {...} }` mapping, `None` when absent.
+    fn timeout_seconds(task: &serde_yaml::Value) -> Option<u64> {
+        let after = task
+            .get("timeout")?
+            .get("after")
+            .unwrap_or_else(|| panic!("timeout must use an inline `after` duration: {task:?}"));
+        let unit = |key: &str, seconds: u64| {
+            after
+                .get(key)
+                .and_then(serde_yaml::Value::as_u64)
+                .unwrap_or(0)
+                * seconds
+        };
+        Some(
+            unit("days", 24 * HOUR)
+                + unit("hours", HOUR)
+                + unit("minutes", MINUTE)
+                + unit("seconds", 1),
+        )
+    }
+
+    /// Summary workflows whose timeouts follow the sizing in workers/README.md.
+    const SUMMARY_WORKFLOWS: &[&str] = &[
+        "lang-workers/workers/thread-summary/thread-summary-single.yaml",
+        "lang-workers/workers/thread-group-summary/thread-group-summary-single.yaml",
+        "lang-workers/workers/thread-reflection/thread-reflection-single.yaml",
+        "lang-workers/workers/personality/thread-personality-single.yaml",
+        "lang-workers/workers/personality/user-personality-merge.yaml",
+        "lang-workers/workers/daily-work-summary/daily-work-summary-single.yaml",
+        "lang-workers/workers/weekly-work-summary/weekly-work-summary-single.yaml",
+        "lang-workers/workers/monthly-work-summary/monthly-work-summary-single.yaml",
+        "workflows/thread-summary/thread-summary-batch.yaml",
+        "workflows/thread-group-summary/thread-group-summary-batch.yaml",
+        "workflows/daily-work-summary/daily-work-summary-batch.yaml",
+        "workflows/weekly-work-summary/weekly-work-summary-batch.yaml",
+        "workflows/monthly-work-summary/monthly-work-summary-batch.yaml",
+        "workflows/personality/thread-personality-batch.yaml",
+        "workflows/thread-reflection/thread-reflection-batch.yaml",
+        "workflows/lookback-periodic-run.yaml",
+    ];
+
+    /// The only explicit timeouts allowed in the summary workflows: run tasks
+    /// whose child legitimately exceeds the one-hour run/call default that
+    /// the app configures (`WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC`). Values are
+    /// sized in workers/README.md.
+    const PERIODIC: &str = "workflows/lookback-periodic-run.yaml";
+    const THREAD_GROUP_SINGLE: &str =
+        "lang-workers/workers/thread-group-summary/thread-group-summary-single.yaml";
+    const THREAD_SUMMARY_SINGLE: &str =
+        "lang-workers/workers/thread-summary/thread-summary-single.yaml";
+    const LONG_RUNNING_CALLS: &[(&str, &[(&str, u64)])] = &[
+        (
+            PERIODIC,
+            &[
+                ("runImportCodex", 2 * HOUR),
+                ("runImportClaudeCode", 2 * HOUR),
+                ("runImportOpenCode", 2 * HOUR),
+                ("runThreadBatch", 115 * HOUR),
+                ("threadGroupForPeriodic", 121 * HOUR),
+                ("runDailyBatch", 11 * HOUR),
+                ("runPersonalityBatch", 19 * HOUR),
+                ("runReflectionBatch", 27 * HOUR),
+                ("runWeeklyBatch", 11 * HOUR),
+                ("runMonthlyBatch", 7 * HOUR),
+            ],
+        ),
+        // Fire-and-forget: the timeout is the enqueued child's job deadline,
+        // matching the resolution document's own limit.
+        (
+            THREAD_GROUP_SINGLE,
+            &[("invokeCrossThreadResolution", 24 * HOUR)],
+        ),
+        (
+            THREAD_SUMMARY_SINGLE,
+            &[("invokeCrossThreadResolution", 24 * HOUR)],
+        ),
+    ];
+
+    /// Every sized call of `file` with its timeout.
+    fn long_running_calls(file: &str) -> impl Iterator<Item = &'static (&'static str, u64)> {
+        LONG_RUNNING_CALLS
+            .iter()
+            .filter(move |(candidate, _)| *candidate == file)
+            .flat_map(|(_, calls)| calls.iter())
+    }
+
+    /// Sized timeout of `task` in `file`, `None` when it must not carry one.
+    fn long_running_call(file: &str, task: &str) -> Option<u64> {
+        long_running_calls(file)
+            .find(|(name, _)| *name == task)
+            .map(|(_, seconds)| *seconds)
+    }
+
+    /// Visits every named task of a workflow, nested tasks included.
+    fn for_each_task(
+        document: &serde_yaml::Value,
+        visit: &mut dyn FnMut(&str, &serde_yaml::Value),
+    ) {
+        fn walk(tasks: &serde_yaml::Value, visit: &mut dyn FnMut(&str, &serde_yaml::Value)) {
+            for item in tasks.as_sequence().into_iter().flatten() {
+                for (name, task) in item.as_mapping().into_iter().flatten() {
+                    visit(name.as_str().unwrap_or("?"), task);
+                    let lists = [
+                        task.get("do"),
+                        task.get("try"),
+                        task.get("catch").and_then(|catch| catch.get("do")),
+                        task.get("fork").and_then(|fork| fork.get("branches")),
+                    ];
+                    for list in lists.into_iter().flatten() {
+                        walk(list, visit);
+                    }
+                }
+            }
+        }
+        walk(&document["do"], visit);
+    }
+
+    /// Every `(task name, timeout seconds)` in a workflow, the document-level
+    /// timeout reported under the empty name.
+    fn workflow_timeouts(document: &serde_yaml::Value) -> Vec<(String, u64)> {
+        let mut found: Vec<(String, u64)> = timeout_seconds(document)
+            .map(|seconds| (String::new(), seconds))
+            .into_iter()
+            .collect();
+        for_each_task(document, &mut |name, task| {
+            if let Some(seconds) = timeout_seconds(task) {
+                found.push((name.to_owned(), seconds));
+            }
+        });
+        found
+    }
+
+    /// The first task (at any depth) named `name`.
+    fn named_task<'a>(value: &'a serde_yaml::Value, name: &str) -> Option<&'a serde_yaml::Value> {
+        match value {
+            serde_yaml::Value::Mapping(map) => map
+                .get(name)
+                .or_else(|| map.values().find_map(|child| named_task(child, name))),
+            serde_yaml::Value::Sequence(items) => {
+                items.iter().find_map(|child| named_task(child, name))
+            }
+            _ => None,
+        }
+    }
+
+    /// A constrained thinking model can return a schema-shaped object with
+    /// blank fields. Each summary LLM call validates its output inside a try
+    /// that retries only that contract violation and then fails, so a blank
+    /// summary is never persisted.
+    #[test]
+    fn summary_llm_outputs_are_validated_retried_and_then_rejected() {
+        const CASES: &[(&str, &str, &str)] = &[
+            (
+                "lang-workers/workers/thread-summary/thread-summary-single.yaml",
+                "generateSummary",
+                "validateThreadSummaryOutput",
+            ),
+            (
+                "lang-workers/workers/thread-group-summary/thread-group-summary-single.yaml",
+                "generateSummary",
+                "validateGroupSummaryOutput",
+            ),
+            (
+                "lang-workers/workers/daily-work-summary/daily-work-summary-single.yaml",
+                "generateDailySummary",
+                "validateDailySummaryShape",
+            ),
+            (
+                "lang-workers/workers/weekly-work-summary/weekly-work-summary-single.yaml",
+                "generateWeeklySummary",
+                "validateWeeklySummaryShape",
+            ),
+            (
+                "lang-workers/workers/monthly-work-summary/monthly-work-summary-single.yaml",
+                "generateMonthlySummary",
+                "validateMonthlySummaryShape",
+            ),
+        ];
+        let workers = workers_bundle_dir().unwrap();
+        for (file, generate, validate) in CASES {
+            let document = parsed_workflow(&workers.join(file));
+            let wrapper = format!("{generate}WithRetry");
+            let task = named_task(&document, &wrapper)
+                .unwrap_or_else(|| panic!("{file}: {wrapper} is missing"));
+            let try_steps = task["try"]
+                .as_sequence()
+                .unwrap_or_else(|| panic!("{file}: {wrapper} is not a try"));
+            let steps: Vec<&str> = try_steps
+                .iter()
+                .filter_map(|item| item.as_mapping()?.keys().next()?.as_str())
+                .collect();
+            assert_eq!(steps, [*generate, *validate], "{file}");
+            // Constrained JSON plus thinking is what yields the blank output.
+            let options = &try_steps[0][*generate]["run"]["function"]["arguments"]["options"];
+            assert_eq!(
+                options["extract_reasoning_content"].as_bool(),
+                Some(false),
+                "{file}: summaries must ask the runner for no thinking"
+            );
+
+            // The error namespace is the workflow's directory name.
+            let kind = Path::new(file)
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap();
+            let error_type = format!("https://memories.local/errors/{kind}/invalid-output");
+            assert_eq!(
+                try_steps[1][*validate]["raise"]["error"]["type"].as_str(),
+                Some(error_type.as_str()),
+                "{file}"
+            );
+            let catch = &task["catch"];
+            assert_eq!(
+                catch["errors"]["with"]["type"].as_str(),
+                Some(error_type.as_str()),
+                "{file}: only the invalid-output contract may be retried"
+            );
+            assert_eq!(
+                catch["retry"]["limit"]["attempt"]["count"].as_u64(),
+                Some(2),
+                "{file}"
+            );
+            let rejection = catch["do"]
+                .as_sequence()
+                .and_then(|tasks| tasks.first())
+                .and_then(|item| item.as_mapping()?.values().next())
+                .unwrap_or_else(|| panic!("{file}: exhausted retries must raise"));
+            assert_eq!(
+                rejection["raise"]["error"]["type"].as_str(),
+                Some(error_type.as_str()),
+                "{file}"
+            );
+        }
+    }
+
+    /// jobworkerp gives containers no deadline and run/call tasks the app's
+    /// one-hour default, so a summary workflow only states the timeouts of the
+    /// child calls that legitimately run longer.
+    #[test]
+    fn summary_workflows_only_time_out_their_long_running_calls() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        let workers = workers_bundle_dir().unwrap();
+        for relative in SUMMARY_WORKFLOWS {
+            let document = parsed_workflow(&workers.join(relative));
+            for (task, seconds) in workflow_timeouts(&document) {
+                assert_eq!(
+                    Some(seconds),
+                    long_running_call(relative, &task),
+                    "{relative}: `{task}` must not carry a timeout other than its sized long-running value"
+                );
+            }
+        }
+        for (relative, calls) in LONG_RUNNING_CALLS {
+            let document = parsed_workflow(&workers.join(relative));
+            let timeouts = workflow_timeouts(&document);
+            for (task, _) in *calls {
+                assert!(
+                    timeouts.iter().any(|(name, _)| name == task),
+                    "{relative}: `{task}` lost its long-running timeout"
+                );
+            }
+        }
+    }
+
+    /// Periodic jobs wait for child calls with sized limits, so their app-side
+    /// deadlines must leave enough time for the relevant stage timeout.
+    #[test]
+    fn periodic_job_deadlines_outlive_the_child_calls_they_wait_on() {
+        let periodic = |task: &str| long_running_call(PERIODIC, task).unwrap();
+        for (deadline, call_timeout, label) in [
+            (
+                job_timeouts::PERSONALITY_BATCH,
+                periodic("runPersonalityBatch"),
+                "personality",
+            ),
+            (
+                job_timeouts::REFLECTION_BATCH,
+                periodic("runReflectionBatch"),
+                "reflection",
+            ),
+            (
+                job_timeouts::THREAD_GROUP_SUMMARY_BATCH,
+                periodic("threadGroupForPeriodic"),
+                "thread group",
+            ),
+        ] {
+            assert!(
+                deadline > call_timeout,
+                "{label}: job deadline {deadline}s must exceed {call_timeout}s"
+            );
+        }
+    }
+
+    /// The periodic run reports only between stages, so one stage must fit.
+    #[test]
+    fn periodic_run_job_timeout_outlives_every_stage_it_waits_on() {
+        for (task, call_timeout) in long_running_calls(PERIODIC) {
+            assert!(
+                job_timeouts::PERIODIC_RUN > *call_timeout,
+                "{task}: periodic run timeout {}s must exceed {call_timeout}s",
+                job_timeouts::PERIODIC_RUN
+            );
+        }
+    }
+
+    /// The group batch refreshes each member through the thread single (one
+    /// call per thread, bounded by the run/call default) before aggregating.
+    /// The member volume follows the thread batch's sizing, so the group call
+    /// waits for that volume plus the aggregation.
+    #[test]
+    fn thread_group_callers_outlive_the_member_refresh_and_aggregation() {
+        let periodic_thread_batch = long_running_call(PERIODIC, "runThreadBatch").unwrap();
+        let periodic_group = long_running_call(PERIODIC, "threadGroupForPeriodic").unwrap();
+        assert_eq!(periodic_group, periodic_thread_batch + 6 * HOUR);
+        assert!(job_timeouts::THREAD_GROUP_SUMMARY_BATCH > periodic_group);
+    }
+
+    #[test]
+    fn workflow_schemas_reject_invalid_and_accept_flow_directives() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid.yaml");
+        std::fs::write(
+            &valid,
+            "document: { dsl: 1.0.0, namespace: t, name: t, version: 1.0.0 }\n\
+             do:\n  - stop:\n      set: { done: true }\n      then: exit\n",
+        )
+        .unwrap();
+        let invalid = dir.path().join("invalid.yaml");
+        std::fs::write(
+            &invalid,
+            "document: { dsl: 1.0.0, namespace: t, name: t, version: 1.0.0 }\n\
+             do:\n  - stop:\n      set: { done: true }\n      unknownKey: 1\n",
+        )
+        .unwrap();
+        for schema in [RUNTIME_WORKFLOW_SCHEMA, CANONICAL_WORKFLOW_SCHEMA] {
+            let validator = workflow_schema_validator(schema);
+            assert_eq!(
+                workflow_schema_errors(&validator, &valid),
+                Vec::<String>::new(),
+                "{schema}"
+            );
+            assert!(
+                !workflow_schema_errors(&validator, &invalid).is_empty(),
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_workflow_documents_follow_both_workflow_schemas() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        let documents = shipped_workflow_documents();
+        assert!(
+            documents.len() > 20,
+            "too few workflow documents scanned (path wrong?): {}",
+            documents.len()
+        );
+        let workers = workers_bundle_dir().unwrap();
+        let mut violations = Vec::new();
+        for schema in [RUNTIME_WORKFLOW_SCHEMA, CANONICAL_WORKFLOW_SCHEMA] {
+            let validator = workflow_schema_validator(schema);
+            for path in &documents {
+                for error in workflow_schema_errors(&validator, path) {
+                    violations.push(format!(
+                        "[{schema}] {}: {error}",
+                        path.strip_prefix(&workers).unwrap_or(path).display()
+                    ));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "{} workflow schema violation(s):\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn same_thread_resolution_assessment_has_valid_nested_tasks() {
+        let workers = workers_bundle_dir().unwrap();
+        let workflow =
+            workers.join("workflows/thread-issue-resolution/thread-issue-resolution.yaml");
+        let document: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(workflow).unwrap()).unwrap();
+        let catch_task = named_task(&document, "markCurrentIssueReadIncomplete")
+            .expect("catch task must deserialize as a nested set task");
+        assert!(catch_task.get("set").is_some());
+        let read_issue = named_task(&document, "recheckIssueClaimAndMapping").unwrap();
+        let args = &read_issue["run"]["function"]["arguments"];
+        assert_eq!(args["as_json"], true);
+    }
+
     #[test]
     fn retired_agent_chat_pipeline_is_not_shipped_as_an_executable_workflow() {
         let path = workers_bundle_dir()
@@ -1852,24 +2767,61 @@ mod tests {
     }
 
     #[test]
-    fn thread_summary_batch_filters_up_to_date_summaries_before_single_dispatch() {
+    fn period_path_fanout_honors_stop_on_error_after_recording_failures() {
         unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
-        let body = std::fs::read_to_string(
-            workers_bundle_dir()
-                .unwrap()
-                .join("workflows/thread-summary/thread-summary-batch.yaml"),
-        )
-        .unwrap();
-        assert!(body.contains("method: \"/llm_memory.service.MemoryService/FindListByCondition\""));
-        assert!(body.contains("memory_kinds: [\"MEMORY_KIND_THREAD_SUMMARY\"]"));
-        assert!(body.contains("external_id_prefix: \"summary:\""));
-        assert!(body.contains("$workflow.input.force_resummarize"));
-        assert!(body.contains("$thread.data.lastMessageAt"));
-        assert!(body.contains("$existing_summary.memory.data.updatedAt"));
-        assert!(!body.contains("$thread.data.updatedAt"));
-        assert!(body.contains("$required_labels"));
-        assert!(body.contains("$existing_summary_thread.data.labels"));
-        assert!(body.contains("pre_skipped_threads:"));
+        let workflows_dir = workers_bundle_dir().unwrap().join("workflows");
+        for feature in [
+            "daily-work-summary",
+            "weekly-work-summary",
+            "monthly-work-summary",
+        ] {
+            let body = std::fs::read_to_string(
+                workflows_dir
+                    .join(feature)
+                    .join(format!("{feature}-batch.yaml")),
+            )
+            .unwrap();
+            assert!(
+                body.contains("stop_on_error: { type: boolean, default: false }"),
+                "{feature} must remain best-effort by default"
+            );
+            assert!(
+                body.contains("recordPathFailure:") && body.contains("failed_path_buckets"),
+                "{feature} must report individual path failures"
+            );
+            assert!(
+                body.contains("abortBeforeOverallOnPathFailure:")
+                    && body.contains("abortBatchOnPathFailure:"),
+                "{feature} must stop both its period and its batch when requested"
+            );
+            assert!(
+                body.matches("(($workflow.input.stop_on_error and").count() >= 3,
+                "{feature} must fence later dispatches after a strict failure"
+            );
+            assert!(
+                body.contains("planned_path_bucket_digests:"),
+                "{feature} must pass the authoritative Path identities to Overall"
+            );
+
+            let single = std::fs::read_to_string(
+                workers_bundle_dir()
+                    .unwrap()
+                    .join("lang-workers/workers")
+                    .join(feature)
+                    .join(format!("{feature}-single.yaml")),
+            )
+            .unwrap();
+            assert!(
+                single.contains("applyPlannedPathBucketDigests:")
+                    && single.contains("endswith(\":path:\" + $digest)"),
+                "{feature} Overall must exclude stale Path children"
+            );
+            assert!(
+                single.contains("- exitAfterPathPlan:\n      if:")
+                    && single.contains("set:\n        result: \"${ \\\"path plan completed\\\" }\"\n      then: exit"),
+                "{feature} path-plan exit must include a concrete DSL task"
+            );
+        }
     }
 
     #[test]
@@ -1916,230 +2868,6 @@ mod tests {
     }
 
     #[test]
-    fn summary_pipeline_keeps_dependency_order_and_allows_skipped_successes() {
-        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
-        let body = std::fs::read_to_string(
-            workers_bundle_dir()
-                .unwrap()
-                .join("workflows/summaries-pipeline/summaries-pipeline.yaml"),
-        )
-        .unwrap();
-        let per_thread = body.find("  - perThreadStage:").unwrap();
-        let daily = body.find("  - dailyStage:").unwrap();
-        let weekly = body.find("  - weeklyStage:").unwrap();
-        let monthly = body.find("  - monthlyStage:").unwrap();
-        assert!(per_thread < daily && daily < weekly && weekly < monthly);
-        for (name, start, end, timeout) in [
-            ("perThreadStage", per_thread, daily, "hours: 24"),
-            ("dailyStage", daily, weekly, "days: 31"),
-            ("weeklyStage", weekly, monthly, "days: 7"),
-            ("monthlyStage", monthly, body.len(), "days: 31"),
-        ] {
-            let stage = &body[start..end];
-            assert!(
-                stage.starts_with(&format!(
-                    "  - {name}:\n      timeout:\n        after:\n          {timeout}"
-                )),
-                "{name} must override the nested-do default 1-hour timeout with its stage budget"
-            );
-        }
-        assert!(body.contains("($per_thread_result.failed_count // 0) > 0"));
-        assert!(body.contains("($daily_result.failed_count // 0) > 0"));
-        assert!(body.contains("($weekly_result.failed_count // 0) > 0"));
-        assert!(body.contains("stop_on_error: { type: boolean, default: false }"));
-        for (wrapper, failure_flag) in [
-            ("runPerThreadBatch", "per_thread_execution_failed"),
-            ("runDailyBatch", "daily_execution_failed"),
-            ("runWeeklyBatch", "weekly_execution_failed"),
-            ("runMonthlyBatch", "monthly_execution_failed"),
-        ] {
-            assert!(
-                body.contains(&format!("- {wrapper}:\n            timeout:"))
-                    && body.contains(&format!("- record{}", {
-                        let mut parts = wrapper
-                            .trim_start_matches("run")
-                            .trim_end_matches("Batch")
-                            .chars();
-                        let first = parts.next().unwrap().to_ascii_uppercase();
-                        format!("{first}{}ExecutionFailure", parts.as_str())
-                    }))
-                    && body.contains(failure_flag),
-                "{wrapper} must catch child execution errors into {failure_flag}"
-            );
-        }
-        assert!(
-            body.contains("and ($per_thread_execution_failed | not)")
-                && body.contains("or $per_thread_execution_failed")
-                && body
-                    .contains("per_thread_execution_failed: \"${ $per_thread_execution_failed }\""),
-            "execution failures must make the terminal output partial and observable"
-        );
-        let per_day = body
-            .split_once("  - perDayDependencyStage:")
-            .and_then(|(_, tail)| {
-                tail.split_once("  # ========================= Stage 2")
-                    .map(|(stage, _)| stage)
-            })
-            .expect("combined generation must process each day before weekly rollups");
-        assert!(per_day.contains("for:\n        each: target_date"));
-        assert!(per_day.contains("- runPerThreadBatchForDate:"));
-        assert!(per_day.contains("- runDailyBatchForDate:"));
-        assert!(per_day.contains("- recordPerDayFailure:"));
-        assert!(
-            per_day.contains("stage: \"per_day_thread\"")
-                && per_day.contains("stage: \"per_day_daily\""),
-            "per-day execution failures must preserve their stage and error detail"
-        );
-        assert!(
-            per_day.contains("- recordPerDayThreadExecutionFailure:")
-                && per_day.contains("- recordPerDayDailyExecutionFailure:")
-                && per_day.contains("per_day_execution_failed")
-                && !per_day.contains("      onError: continue"),
-            "child execution errors must be recorded per day instead of being silently continued"
-        );
-        assert!(
-            per_day.contains("($per_day_thread_result.failed_count // 0) > 0")
-                && per_day.contains("($per_day_result.failed_count // 0) > 0"),
-            "a per-day partial failure must include both thread and daily summary failures"
-        );
-        assert!(
-            per_day.contains("(env.TZ // \"\") != \"\"")
-                && per_day.contains("localtime | mktime")
-                && per_day.contains("strflocaltime(\"%Y-%m-%d\")"),
-            "per-day thread windows must use the IANA TZ path for DST-aware day boundaries"
-        );
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
-        let workflow_tasks = parsed["do"].as_sequence().unwrap();
-        let per_day_task = task_named(workflow_tasks, "perDayDependencyStage")["do"]
-            .as_sequence()
-            .unwrap();
-        let per_day_thread_index = task_index_named(per_day_task, "runPerThreadBatchForDate");
-        let per_day_failure_check_index =
-            task_index_named(per_day_task, "perDayThreadFailureCheck");
-        let per_day_daily_index = task_index_named(per_day_task, "runDailyBatchForDate");
-        assert!(
-            per_day_thread_index < per_day_failure_check_index
-                && per_day_failure_check_index < per_day_daily_index,
-            "stop_on_error must abort a failed per-day thread batch before daily runs"
-        );
-        let per_day_failure_check = task_named(per_day_task, "perDayThreadFailureCheck")
-            .as_mapping()
-            .expect("per-day thread failure check must be a mapping");
-        let failure_condition = per_day_failure_check
-            .get(serde_yaml::Value::String("if".to_owned()))
-            .and_then(serde_yaml::Value::as_str)
-            .expect("per-day thread failure check must have an if condition");
-        assert!(
-            failure_condition.contains("$workflow.input.stop_on_error")
-                && failure_condition.contains("$per_day_execution_failed")
-                && failure_condition.contains("$per_day_thread_result.failed_count"),
-            "per-day thread failure check must gate both execution and summary failures on stop_on_error"
-        );
-        assert!(
-            per_day_failure_check
-                .get(serde_yaml::Value::String("raise".to_owned()))
-                .is_some_and(serde_yaml::Value::is_mapping),
-            "per-day thread failure check must raise before the daily batch"
-        );
-        let per_day_thread_wrapper = task_named(per_day_task, "runPerThreadBatchForDate")
-            .as_mapping()
-            .expect("per-day thread batch wrapper must exist");
-        assert_eq!(
-            per_day_thread_wrapper
-                .get(serde_yaml::Value::String("timeout".to_owned()))
-                .and_then(|timeout| timeout["after"]["hours"].as_i64()),
-            Some(24),
-            "the per-day thread batch wrapper must override the 1-hour default before its catch block"
-        );
-        for task_name in ["runPerThreadBatchForDate", "runDailyBatchForDate"] {
-            let invocation = task_named(per_day_task, task_name)["try"]
-                .as_sequence()
-                .and_then(|try_tasks| try_tasks.first())
-                .and_then(|task| task.as_mapping())
-                .and_then(|task| task.values().next())
-                .and_then(|task| task["run"]["function"].as_mapping())
-                .expect("per-day child invocation must provide a function configuration");
-            assert_eq!(
-                invocation.len(),
-                4,
-                "{task_name} function configuration must not leak input fields beside arguments"
-            );
-            assert!(
-                invocation
-                    .get(serde_yaml::Value::String("arguments".to_owned()))
-                    .and_then(serde_yaml::Value::as_mapping)
-                    .and_then(|arguments| {
-                        arguments.get(serde_yaml::Value::String("input".to_owned()))
-                    })
-                    .and_then(serde_yaml::Value::as_str)
-                    .is_some_and(|input| {
-                        input.starts_with("${ {") && input.ends_with("} | tojson }")
-                    }),
-                "{task_name} input must remain one folded JSON expression"
-            );
-        }
-        assert!(
-            per_day.starts_with("\n      timeout:\n        after:\n          days: 31"),
-            "the per-day stage must remain a bounded operational guardrail"
-        );
-        assert!(
-            body.contains("timeout:\n  after:\n    days: 72"),
-            "the workflow deadline must bound long-running backfills"
-        );
-        assert!(
-            body.contains("operational latency caps for normal real-time")
-                && body.contains("summary volume. A child's cap is a failure guard"),
-            "the pipeline must document why its parent timeout is not the sum of every child cap"
-        );
-        assert!(body.contains("outcome:"));
-        assert!(body.contains("per_day_failed_dates"));
-        assert!(
-            body.contains("has_explicit_daily_range"),
-            "an empty legacy date range must select the standalone stages rather than skip all work"
-        );
-        assert!(
-            body.contains("$workflow.input.run_per_thread and ((($workflow.input.run_daily) | not) or ($has_explicit_daily_range | not))"),
-            "per-thread fallback must run when the combined request has no explicit date range"
-        );
-        assert!(
-            body.contains("$workflow.input.run_daily and ((($workflow.input.run_per_thread) | not) or ($has_explicit_daily_range | not))"),
-            "daily fallback must run when the combined request has no explicit date range"
-        );
-        assert!(
-            body.contains("$workflow.input.run_per_thread and $workflow.input.run_daily and $has_explicit_daily_range"),
-            "per-day dependency processing requires an explicit bounded date range"
-        );
-        assert!(
-            !body.contains("skipped_count // 0) > 0"),
-            "skips must never gate a downstream summary stage"
-        );
-    }
-
-    #[test]
-    fn periodic_weekly_stage_has_timeout_margin_over_its_children() {
-        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
-        let body = std::fs::read_to_string(
-            workers_bundle_dir()
-                .unwrap()
-                .join("workflows/lookback-periodic-run.yaml"),
-        )
-        .unwrap();
-        let weekly = body
-            .split_once("  - weeklyStage:")
-            .and_then(|(_, tail)| tail.split_once("  - monthlyStage:").map(|(stage, _)| stage))
-            .expect("periodic workflow must define a weekly stage");
-        assert!(
-            weekly.starts_with("\n      timeout:\n        after:\n          days: 15"),
-            "weekly parent timeout must leave one day of overhead beyond two seven-day children"
-        );
-        assert_eq!(
-            weekly.matches("after:\n                days: 7").count(),
-            2,
-            "weekly stage has one seven-day timeout for each sequential child"
-        );
-    }
-
-    #[test]
     fn period_summary_workers_use_fixed_size_source_snapshots() {
         unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
         let root = lang_workers_repo_root().unwrap();
@@ -2171,12 +2899,46 @@ mod tests {
                 "{feature} must persist the fixed-size source fingerprint"
             );
             assert!(
-                !body.contains("source_memory_ids: ($target_memories"),
-                "{feature} must not persist every source memory ID in metadata"
+                !body.contains("\n                source_memory_ids: ($target_memories"),
+                "{feature} must not persist every source memory ID in metadata (the bounded omitted_source_memory_ids diagnostic is allowed)"
             );
             assert!(
                 !body.contains("source_thread_ids: ($target_memories"),
                 "{feature} must not persist every source thread ID in metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn path_summary_batches_clean_only_stale_v2_memory_rows() {
+        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        let workflows_dir = workers_bundle_dir().unwrap().join("workflows");
+        for (feature, external_id_prefix) in [
+            ("daily-work-summary", "daily:v2:"),
+            ("weekly-work-summary", "weekly:v2:"),
+            ("monthly-work-summary", "monthly:v2:"),
+        ] {
+            let body = std::fs::read_to_string(
+                workflows_dir
+                    .join(feature)
+                    .join(format!("{feature}-batch.yaml")),
+            )
+            .unwrap();
+            assert!(
+                body.contains("cleanupStalePathMemories:"),
+                "{feature} must reconcile stale path derived data"
+            );
+            assert!(
+                body.contains("/llm_memory.service.MemoryService/Delete"),
+                "{feature} must remove stale derived Memory rows"
+            );
+            assert!(
+                body.contains(external_id_prefix),
+                "{feature} must scope cleanup to its v2 namespace"
+            );
+            assert!(
+                !body.contains("ThreadService/Delete"),
+                "{feature} must retain orphan summary threads for manual cleanup"
             );
         }
     }
@@ -2202,7 +2964,7 @@ mod tests {
     }
 
     #[test]
-    fn lookback_summary_recall_expands_threads_only_for_explicit_labels() {
+    fn lookback_summary_recall_expands_group_rows_only_for_explicit_labels() {
         let workflow = std::fs::read_to_string(
             workers_bundle_dir()
                 .unwrap()
@@ -2210,11 +2972,14 @@ mod tests {
         )
         .unwrap();
         let summary_step = workflow
-            .split_once("  - searchSummaries:")
-            .and_then(|(_, rest)| rest.split_once("  - searchRaw:").map(|(step, _)| step))
-            .expect("lookback recall must contain distinct summary and raw-search steps");
+            .split_once("  - searchThreadGroupSummaries:")
+            .and_then(|(_, rest)| {
+                rest.split_once("  - searchPeriodSummaries:")
+                    .map(|(step, _)| step)
+            })
+            .expect("lookback recall must contain distinct group and period summary searches");
 
-        assert!(summary_step.contains("memory_kinds: [\"MEMORY_KIND_THREAD_SUMMARY\""));
+        assert!(summary_step.contains("memory_kinds: [\"MEMORY_KIND_DERIVED_SUMMARY\"]"));
         assert!(
             summary_step.contains("if $has then {"),
             "only an explicit summary_labels request may add a thread filter"
@@ -2223,6 +2988,8 @@ mod tests {
             summary_step.contains("thread_filter:"),
             "explicit summary labels must remain searchable through thread labels"
         );
+        assert!(!workflow.contains("searchThreadSummaries:"));
+        assert!(!workflow.contains("MEMORY_KIND_THREAD_SUMMARY"));
     }
 
     #[test]
@@ -2343,6 +3110,7 @@ mod tests {
         let root = lang_workers_repo_root().unwrap();
         for (feature, single_name) in [
             ("thread-summary", "thread-summary-single.yaml"),
+            ("thread-group-summary", "thread-group-summary-single.yaml"),
             ("daily-work-summary", "daily-work-summary-single.yaml"),
             ("weekly-work-summary", "weekly-work-summary-single.yaml"),
             ("monthly-work-summary", "monthly-work-summary-single.yaml"),
@@ -2380,34 +3148,6 @@ mod tests {
             merge.exists(),
             "missing language generation merge YAML: {}",
             merge.display()
-        );
-    }
-
-    #[test]
-    fn personality_merge_timeouts_allow_slow_local_llm() {
-        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
-
-        let merge_path = lang_workers_repo_root()
-            .unwrap()
-            .join("workers/personality/user-personality-merge.yaml");
-        let merge_body = std::fs::read_to_string(&merge_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", merge_path.display()));
-        assert_yaml_timeout_hours(&merge_body, 6, "user-personality-merge top-level timeout");
-        assert_eq!(
-            timeout_hours_after_marker(&merge_body, "  - mergeProfile:"),
-            Some(3),
-            "user-personality-merge inner memories-llm timeout"
-        );
-
-        let batch_path = workers_bundle_dir()
-            .unwrap()
-            .join("workflows/personality/thread-personality-batch.yaml");
-        let batch_body = std::fs::read_to_string(&batch_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", batch_path.display()));
-        assert_eq!(
-            timeout_hours_after_marker(&batch_body, "  - userPersonalityMerge:"),
-            Some(3),
-            "thread-personality-batch userPersonalityMerge timeout"
         );
     }
 
@@ -2509,28 +3249,6 @@ mod tests {
     }
 
     #[test]
-    fn thread_reflection_timeouts_allow_slow_local_llm() {
-        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
-
-        let batch_path = workers_bundle_dir()
-            .unwrap()
-            .join("workflows/thread-reflection/thread-reflection-batch.yaml");
-        let batch_body = std::fs::read_to_string(&batch_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", batch_path.display()));
-        assert_yaml_timeout_hours(&batch_body, 24, "thread-reflection-batch top-level timeout");
-        assert_eq!(
-            timeout_hours_after_marker(&batch_body, "  - reflectEach:"),
-            Some(24),
-            "thread-reflection-batch fan-out timeout"
-        );
-        assert_eq!(
-            timeout_after_marker(&batch_body, "              - invokeSingle:"),
-            Some(TimeoutAfter::Hours(3)),
-            "thread-reflection-batch invokeSingle timeout"
-        );
-    }
-
-    #[test]
     fn thread_personality_filters_non_conversation_scaffolding() {
         unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
         // The single moved under lang-workers (it's registered as a language
@@ -2589,7 +3307,7 @@ mod tests {
     /// to valid YAML on its DEFAULTS alone). Sufficient to validate that the
     /// post-substitution document the runtime parses is well-formed; it is NOT
     /// the production expander.
-    fn expand_env_defaults(input: &str) -> String {
+    pub(crate) fn expand_env_defaults(input: &str) -> String {
         let mut out = String::with_capacity(input.len());
         let mut rest = input;
         while let Some(start) = rest.find("%{") {
@@ -2643,61 +3361,6 @@ mod tests {
         }
     }
 
-    fn assert_yaml_timeout_hours(body: &str, expected_hours: i64, context: &str) {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(body).unwrap_or_else(|e| {
-            panic!("{context}: YAML parse failed: {e}");
-        });
-        let hours = yaml
-            .get("timeout")
-            .and_then(|v| v.get("after"))
-            .and_then(|v| v.get("hours"))
-            .and_then(|v| v.as_i64());
-        assert_eq!(hours, Some(expected_hours), "{context}");
-    }
-
-    fn timeout_hours_after_marker(body: &str, marker: &str) -> Option<i64> {
-        match timeout_after_marker(body, marker)? {
-            TimeoutAfter::Hours(hours) => Some(hours),
-            TimeoutAfter::Minutes(_) => None,
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum TimeoutAfter {
-        Hours(i64),
-        Minutes(i64),
-    }
-
-    fn timeout_after_marker(body: &str, marker: &str) -> Option<TimeoutAfter> {
-        let start = body.find(marker)?;
-        let mut after_timeout = false;
-        let mut after_after = false;
-        for line in body[start + marker.len()..].lines() {
-            let trimmed = line.trim();
-            if trimmed == "timeout:" {
-                after_timeout = true;
-                after_after = false;
-                continue;
-            }
-            if after_timeout && trimmed == "after:" {
-                after_after = true;
-                continue;
-            }
-            if after_timeout && after_after {
-                if let Some(raw) = trimmed.strip_prefix("hours:") {
-                    return raw.trim().parse().ok().map(TimeoutAfter::Hours);
-                }
-                if let Some(raw) = trimmed.strip_prefix("minutes:") {
-                    return raw.trim().parse().ok().map(TimeoutAfter::Minutes);
-                }
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    return None;
-                }
-            }
-        }
-        None
-    }
-
     fn prompt_for_language_exists(prompts: &std::path::Path, lang: &str) -> bool {
         let suffix = format!(".{lang}.txt");
         let Ok(rd) = std::fs::read_dir(prompts) else {
@@ -2707,7 +3370,7 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().ends_with(&suffix))
     }
 
-    fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    pub(crate) fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(p) = stack.pop() {
@@ -2729,18 +3392,15 @@ mod tests {
     #[test]
     fn workers_bundle_dir_honors_env_override() {
         let tmp = tempdir_in_target();
-        unsafe { std::env::set_var("LOOKBACK_WORKERS_DIR", &tmp) };
-        let dir = workers_bundle_dir().unwrap();
+        let dir = workers_bundle_dir_with_override(Some(tmp.display().to_string())).unwrap();
         assert_eq!(dir, tmp.path());
-        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn workers_bundle_dir_errors_on_missing_env_path() {
-        unsafe { std::env::set_var("LOOKBACK_WORKERS_DIR", "/tmp/lookback-nonexistent-xxx") };
-        let err = workers_bundle_dir().unwrap_err();
-        unsafe { std::env::remove_var("LOOKBACK_WORKERS_DIR") };
+        let err = workers_bundle_dir_with_override(Some("/tmp/lookback-nonexistent-xxx".into()))
+            .unwrap_err();
         assert!(matches!(err, AppError::Config(_)));
     }
 

@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import type { SummaryContent, SummaryValue } from "@/types/api";
 import {
   extractSummaryTitle,
@@ -115,5 +116,79 @@ describe("SummaryBody reference chips", () => {
     expect(screen.queryAllByRole("button")).toHaveLength(0);
     expect(screen.getByText("1")).toBeTruthy();
     expect(screen.getByText("2")).toBeTruthy();
+  });
+});
+
+describe("SummaryBody period collections", () => {
+  const periodSummary = {
+    overall_purpose: "概要は常に読めます",
+    purpose_groups: [
+      { purpose: "リリース準備", status: "ongoing", bullets: ["検証を完了"] },
+      { purpose: "品質改善", bullets: ["回帰を確認"] },
+    ],
+    by_topic: [{ topic: "API", bullets: ["契約を更新"] }],
+  } as Record<string, SummaryValue>;
+
+  it("starts structured period items collapsed while retaining the overview", () => {
+    i18n.changeLanguage("ja");
+    const { container } = render(
+      <SummaryBody parsed={periodSummary} raw="{}" periodDisplay={{ initialMode: "collapsed" }} />,
+    );
+
+    expect(screen.getByText("概要は常に読めます")).toBeTruthy();
+    expect(screen.getByText("リリース準備")).toBeTruthy();
+    expect(container.querySelectorAll(".summary-structured-card[open]")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "すべて展開" })).toBeTruthy();
+  });
+
+  it("expands and collapses all structured items inside one period summary", () => {
+    i18n.changeLanguage("ja");
+    const { container } = render(
+      <SummaryBody parsed={periodSummary} raw="{}" periodDisplay={{ initialMode: "collapsed" }} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "すべて展開" }));
+    expect(screen.getByText("検証を完了")).toBeTruthy();
+    expect(screen.getByText("契約を更新")).toBeTruthy();
+    expect(container.querySelectorAll(".summary-structured-card[open]")).toHaveLength(3);
+
+    fireEvent.click(screen.getByRole("button", { name: "すべて折りたたむ" }));
+    expect(container.querySelectorAll(".summary-structured-card[open]")).toHaveLength(0);
+  });
+
+  it("keeps generic rendering for non-period summaries", () => {
+    render(<SummaryBody parsed={periodSummary} raw="{}" />);
+    expect(screen.getByText("検証を完了")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "すべて展開" })).toBeNull();
+  });
+
+  it("keeps every value visible when a structured collection contains a scalar", () => {
+    render(
+      <SummaryBody
+        parsed={{
+          purpose_groups: [{ purpose: "確認", bullets: ["詳細"] }, "補足の本文"],
+        }}
+        raw="{}"
+        periodDisplay={{ initialMode: "collapsed" }}
+      />,
+    );
+
+    expect(screen.getByText("詳細")).toBeTruthy();
+    expect(screen.getByText("補足の本文")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "すべて展開" })).toBeNull();
+  });
+
+  it("renders structured item counts in English", () => {
+    i18n.changeLanguage("en");
+    render(
+      <SummaryBody
+        parsed={{ purpose_groups: [{ purpose: "Purpose", bullets: ["one", "two"] }] }}
+        raw="{}"
+        periodDisplay={{ initialMode: "collapsed" }}
+      />,
+    );
+
+    expect(screen.getByText("2 items")).toBeTruthy();
+    i18n.changeLanguage("ja");
   });
 });

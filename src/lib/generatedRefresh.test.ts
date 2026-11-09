@@ -1,6 +1,19 @@
 import { QueryClient } from "@tanstack/react-query";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { incrementUiMemoryCounterMock } = vi.hoisted(() => ({
+  incrementUiMemoryCounterMock: vi.fn(),
+}));
+
+vi.mock("@/lib/uiMemoryDiagnostics", () => ({
+  incrementUiMemoryCounter: incrementUiMemoryCounterMock,
+}));
+
 import { refreshGeneratedCaches, refreshImportedThreadCaches } from "./generatedRefresh";
+
+beforeEach(() => {
+  incrementUiMemoryCounterMock.mockClear();
+});
 
 function clientWithSpies() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -13,7 +26,18 @@ function invalidatedKeys(spy: { mock: { calls: readonly (readonly unknown[])[] }
 }
 
 describe("refreshGeneratedCaches", () => {
-  it("refreshes thread and summary caches for per-thread summary output", () => {
+  it("counts each actual summary-list invalidation request and no unrelated key", () => {
+    const { client } = clientWithSpies();
+
+    refreshGeneratedCaches(client, ["thread_summary", "thread_group_summary"]);
+
+    expect(incrementUiMemoryCounterMock.mock.calls).toEqual([
+      ["summaries_invalidated_total"],
+      ["summaries_invalidated_total"],
+    ]);
+  });
+
+  it("refreshes public summary caches when per-thread inputs are regenerated", () => {
     const { client, invalidate } = clientWithSpies();
 
     refreshGeneratedCaches(client, ["thread_summary"]);
@@ -25,10 +49,12 @@ describe("refreshGeneratedCaches", () => {
         ["distinct-labels"],
         ["co-occurring-labels"],
         ["summaries"],
-        ["count-summaries"],
+        ["count-thread-group-summaries"],
         ["summary-search"],
         ["summary-hit"],
         ["memories"],
+        ["thread-row"],
+        ["memory-reference"],
       ]),
     );
   });
@@ -43,11 +69,29 @@ describe("refreshGeneratedCaches", () => {
         ["summaries"],
         ["summary-period-keys"],
         ["summary-search"],
-        ["count-summaries"],
+        ["count-thread-group-summaries"],
         ["summary-hit"],
+        ["summary-recovery-status"],
       ]),
     );
     expect(invalidatedKeys(invalidate)).not.toContainEqual(["threads"]);
+  });
+
+  it("refreshes group and summary caches for group-summary output", () => {
+    const { client, invalidate } = clientWithSpies();
+
+    refreshGeneratedCaches(client, ["thread_group_summary"]);
+
+    expect(invalidatedKeys(invalidate)).toEqual(
+      expect.arrayContaining([
+        ["thread-groups"],
+        ["thread-group"],
+        ["thread-group-summary"],
+        ["count-thread-groups"],
+        ["summaries"],
+        ["count-thread-group-summaries"],
+      ]),
+    );
   });
 
   it("refreshes personality profile and signal caches", () => {
@@ -80,11 +124,15 @@ describe("refreshImportedThreadCaches", () => {
     expect(invalidatedKeys(invalidate)).toEqual(
       expect.arrayContaining([
         ["threads"],
+        ["thread-groups"],
+        ["count-thread-groups"],
         ["thread-search"],
         ["distinct-labels"],
         ["co-occurring-labels"],
         ["personality", 1],
         ["memories"],
+        ["thread-row"],
+        ["memory-reference"],
       ]),
     );
   });

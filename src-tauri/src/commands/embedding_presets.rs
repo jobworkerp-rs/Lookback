@@ -1,8 +1,10 @@
-//! Curated, version-locked embedding model presets surfaced in the Settings UI.
+//! Curated embedding model presets surfaced in the Settings UI.
 //! Mirrors [`super::llm_presets`] in shape so the frontend can render both with
 //! the same dropdown + custom-entry pattern. Custom (free-text) is the escape
 //! hatch; it lets the user point at any HuggingFace repo at the cost of having
 //! to specify `vector_size`, `max_sequence_length`, and `is_multimodal` by hand.
+//! Preset and repository names are not revision identifiers: this table does
+//! not manufacture a model revision or guarantee that the runner pins one.
 
 use serde::Serialize;
 
@@ -21,6 +23,7 @@ use serde::Serialize;
 pub struct EmbeddingPreset {
     pub id: &'static str,
     pub display_name: &'static str,
+    /// Repository identity only, not an immutable model revision.
     pub hf_repo: &'static str,
     /// Optional separate tokenizer repo. `None` means the runner reuses
     /// `hf_repo` as both the weights and tokenizer source — Qwen / Ruri
@@ -139,6 +142,14 @@ pub fn find_preset(id: &str) -> Option<&'static EmbeddingPreset> {
     PRESETS.iter().find(|p| p.id == id)
 }
 
+/// Identify a preset from an embedding space. The dimension is part of the
+/// identity because the same repository at another size is another space.
+pub fn find_preset_by_model(model_id: &str, dimension: u32) -> Option<&'static EmbeddingPreset> {
+    PRESETS
+        .iter()
+        .find(|p| p.hf_repo == model_id && p.vector_size == dimension)
+}
+
 pub fn default_preset() -> &'static EmbeddingPreset {
     &PRESETS[0]
 }
@@ -175,6 +186,19 @@ mod tests {
     #[test]
     fn find_preset_returns_none_for_unknown_id() {
         assert!(find_preset("there-is-no-such-preset").is_none());
+    }
+
+    #[test]
+    fn find_preset_by_model_matches_repo_and_dimension() {
+        let preset = find_preset_by_model("Qwen/Qwen3-VL-Embedding-2B", 2048)
+            .expect("the multimodal preset is identified by its repo and dimension");
+        assert_eq!(preset.id, "qwen3-vl-embedding-2b");
+    }
+
+    #[test]
+    fn find_preset_by_model_rejects_other_dimensions_and_unknown_models() {
+        assert!(find_preset_by_model("Qwen/Qwen3-VL-Embedding-2B", 1024).is_none());
+        assert!(find_preset_by_model("example/unknown-embedding", 2048).is_none());
     }
 
     #[test]

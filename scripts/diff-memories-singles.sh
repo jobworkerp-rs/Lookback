@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Review drift between memories' generation single/batch YAML and agent-app's
 # local-merged copies. This does NOT overwrite anything — agent-app keeps a
-# hand-merged variant that must preserve two things memories does not have:
+# hand-merged variant that must preserve things memories does not have:
 #   1. the LLM call on `workerName: memories-llm` (NOT `runnerName: LLM` + ollama)
-#   2. the batch progress-report steps (`reportProgress` / progress_processed)
+#   2. issue-tracking inputs and steps (issue_tracker_* / policy_json, issue
+#      extraction and resolution, `has_unfinished_issue_candidates`)
+#   3. the explicit group-owner validation in thread-group-summary-batch
 # so the YAML can only be merged by hand. Use this to spot upstream changes.
+# Prompts of hand-merged features are diffed too, because
+# sync-memories-prompts.sh skips them.
 #
 # Usage: scripts/diff-memories-singles.sh [MEMORIES_REPO_ROOT]
 set -euo pipefail
@@ -21,6 +25,7 @@ APP_WF="${AGENT_APP_ROOT}/workers/workflows"
 # feature  single-rel-path                       batch-rel-path
 SINGLES=(
   "thread-summary|thread-summary/thread-summary-single.yaml|thread-summary/thread-summary-batch.yaml"
+  "thread-group-summary|thread-group-summary/thread-group-summary-single.yaml|thread-group-summary/thread-group-summary-batch.yaml"
   "thread-reflection|thread-reflection/thread-reflection-single.yaml|thread-reflection/thread-reflection-batch.yaml"
   "personality|personality/thread-personality-single.yaml|personality/thread-personality-batch.yaml"
   "personality-merge|personality/user-personality-merge.yaml|"
@@ -52,7 +57,15 @@ for row in "${SINGLES[@]}"; do
   fi
 done
 
+# shellcheck source=lib/hand-merged-features.sh
+source "${SCRIPT_DIR}/lib/hand-merged-features.sh"
+for feature in "${HAND_MERGED_FEATURES[@]}"; do
+  echo "================================================================"
+  echo "## ${feature} (prompts)"
+  diff -r "${MEM_WORKERS}/${feature}/prompts" "${APP_LANG}/${feature}/prompts" || true
+done
+
 echo "================================================================"
 echo "Review intent: a memories-side change to a non-LLM step (GRPC method,"
-echo "schema, validate) should be ported by hand; LLM-call and progress lines"
-echo "are agent-app-specific and SHOULD differ."
+echo "schema, validate) should be ported by hand; LLM-call and issue-tracking"
+echo "lines are agent-app-specific and SHOULD differ."

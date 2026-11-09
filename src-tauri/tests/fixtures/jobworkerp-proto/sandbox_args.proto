@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package jobworkerp.runner;
+
+import "jobworkerp/runner/sandbox_common.proto";
+
+message SandboxExecArgs {
+  string command = 1;
+  repeated string args = 2;
+  optional string working_dir = 3;
+  map<string, string> env = 4;
+  optional string user = 5;
+  optional uint64 timeout_ms = 6;
+  bool treat_nonzero_as_error = 7;
+  repeated int32 success_exit_codes = 8;
+  optional bytes stdin = 9;
+  optional bool tty = 10;
+  SandboxVmConfig vm = 11;
+  SandboxNetworkConfig network = 12;
+}

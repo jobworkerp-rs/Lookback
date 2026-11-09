@@ -1,21 +1,14 @@
-//! Embedding-model settings: persisted preset / custom override, runtime
-//! resolution, and the sidecar-restart pipeline with vectordb evacuation
-//! and auto-rollback.
+//! Embedding worker configuration and application-settings rollback.
 //!
-//! Mirrors [`super::llm_settings`] in shape so the two settings cards in
-//! the UI share their pattern (load → resolve → env-inject → restart). The
-//! single extra responsibility on the embedding side is that changing the
-//! vector dimension invalidates every existing LanceDB row, so the change
-//! pipeline either renames the lancedb dir into a timestamped backup or
-//! deletes it before the sidecar comes back up.
+//! Storage migrations belong to memories. Ordinary local settings saves reject
+//! embedding-space changes; only a separately CLI-approved reconcile/adopt
+//! permit may authorize persistence without a rebuild.
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-use tauri::Emitter;
-
 use crate::data::DataPaths;
 use crate::error::{AppError, AppResult};
+use serde::{Deserialize, Serialize};
 
 use super::embedding_presets::{self, EmbeddingPreset};
 
@@ -29,6 +22,10 @@ const MAX_SEQ_LEN_MAX: u32 = 131_072;
 /// Supported dtype values. `MultimodalEmbeddingRunner` rejects anything
 /// else at registration time with `UnsupportedDType`.
 const SUPPORTED_DTYPES: &[&str] = &["F16", "BF16", "F32"];
+/// Canonical values accepted by memories' `DistanceType` vocabulary.
+const SUPPORTED_DISTANCE_TYPES: &[&str] = &["cosine", "l2", "dot"];
+const DEFAULT_DISTANCE_TYPE: &str = "cosine";
+const UNVERSIONED_MODEL_REVISION: &str = "unversioned";
 
 /// Single source of truth for embedding env managed by Lookback. Runner
 /// overrides use `LOOKBACK_EMBEDDING_*`; memories-owned retrieval prefixes
@@ -43,16 +40,18 @@ pub const EMBEDDING_ENV_KEYS: &[&str] = &[
     "LOOKBACK_EMBEDDING_DTYPE",
     "LOOKBACK_EMBEDDING_MAX_SEQ_LEN",
     "LOOKBACK_EMBEDDING_VECTOR_SIZE",
+    "MEMORY_EMBEDDING_MODEL_REVISION",
+    "MEMORY_DISTANCE_TYPE",
     "MEMORY_EMBEDDING_DOCUMENT_PREFIX",
     "MEMORY_EMBEDDING_QUERY_PREFIX",
 ];
 
 /// Persisted (non-secret) embedding-model config.
 ///
-/// All fields are `Option<…>` so a `embedding-settings.json` written before
-/// this feature deserialises unchanged into `None` everywhere — the
-/// resolver then falls back to the default preset, which the previous
-/// release hardcoded as `Qwen/Qwen3-VL-Embedding-2B`.
+/// All fields are `Option<…>` so settings written before a field was added
+/// deserialize unchanged. Missing model revision stays undeclared and
+/// resolves to `unversioned`; the resolver does not infer a revision from
+/// preset/model names or the application release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct EmbeddingSettings {
     /// Curated preset id (see `embedding_presets::PRESETS`), the sentinel
@@ -75,6 +74,9 @@ pub struct EmbeddingSettings {
     /// (the preset's own flag wins).
     #[serde(default)]
     pub custom_is_multimodal: Option<bool>,
+    /// Explicit user declaration only. Presets do not imply a pinned revision.
+    #[serde(default)]
+    pub model_revision: Option<String>,
 }
 
 /// Frontend-facing response. Adds derived fields the UI uses to render
@@ -88,6 +90,7 @@ pub struct EmbeddingSettingsResponse {
     pub custom_dtype: Option<String>,
     pub custom_max_sequence_length: Option<u32>,
     pub custom_is_multimodal: Option<bool>,
+    pub model_revision: Option<String>,
     /// Resolved runtime — the values the sidecar will actually use on the
     /// next restart. Saves the UI a second roundtrip for "what's
     /// effective right now".
@@ -97,9 +100,7 @@ pub struct EmbeddingSettingsResponse {
     pub connection_remote: bool,
 }
 
-/// Request from the frontend. `evacuate_vectordb = true` renames the
-/// existing `<root>/lancedb` into `<root>/lancedb-backup/<ts>` instead of
-/// deleting it. Has no effect when the new runtime matches the old.
+/// Embedding worker configuration submitted by the frontend.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetEmbeddingSettingsRequest {
     pub preset_id: Option<String>,
@@ -115,21 +116,17 @@ pub struct SetEmbeddingSettingsRequest {
     pub custom_max_sequence_length: Option<u32>,
     #[serde(default)]
     pub custom_is_multimodal: Option<bool>,
-    /// Whether to keep the pre-resize LanceDB as a timestamped backup
-    /// (default: true) or delete it outright.
-    #[serde(default = "default_evacuate")]
-    pub evacuate_vectordb: bool,
+    /// Optional explicit revision; never manufactured from preset, repository,
+    /// or application version metadata.
+    #[serde(default)]
+    pub model_revision: Option<String>,
 }
 
-fn default_evacuate() -> bool {
-    true
-}
-
-/// Response of a successful save. `backup_path` is `Some(...)` only when a
-/// dimension-changing swap happened AND `evacuate_vectordb` was true.
+/// Result of saving application-owned embedding configuration.
 #[derive(Debug, Clone, Serialize)]
 pub struct SetEmbeddingSettingsResponse {
     pub runtime: EmbeddingRuntime,
+    /// Retained for response compatibility; the app no longer creates storage backups.
     pub backup_path: Option<PathBuf>,
     pub restarted: bool,
 }
@@ -159,6 +156,11 @@ pub struct EmbeddingRuntime {
     /// `MEMORY_IMAGE_SEARCH_MODE` on the memories side, which agent-app
     /// keeps unset (= the safe `none` default).
     pub is_multimodal: bool,
+    /// Explicit revision declaration, or `unversioned` when no declaration
+    /// exists. This pass-through does not imply a runner-level pinning guarantee.
+    pub model_revision: String,
+    /// Effective memories distance type (`cosine`, `l2`, or `dot`).
+    pub distance_type: String,
 }
 
 /// Map a curated preset into runtime values.
@@ -174,7 +176,74 @@ fn runtime_from_preset(preset: &EmbeddingPreset) -> EmbeddingRuntime {
         document_prefix: preset.document_prefix.map(str::to_string),
         query_prefix: preset.query_prefix.map(str::to_string),
         is_multimodal: preset.is_multimodal,
+        model_revision: UNVERSIONED_MODEL_REVISION.to_string(),
+        distance_type: DEFAULT_DISTANCE_TYPE.to_string(),
     }
+}
+
+/// Runner settings for an embedding space reported by Memories, which only
+/// names the model and dimension. The local settings win when they describe
+/// the same space so custom dtype or ONNX choices are kept; otherwise a
+/// curated preset fills in the rest. `None` means the space cannot be run
+/// from what this app knows.
+pub fn runtime_for_embedding_space(
+    model_id: &str,
+    dimension: u32,
+    local: &EmbeddingRuntime,
+) -> Option<EmbeddingRuntime> {
+    if local.model_id == model_id && local.vector_size == dimension {
+        return Some(local.clone());
+    }
+    embedding_presets::find_preset_by_model(model_id, dimension).map(runtime_from_preset)
+}
+
+fn valid_revision_value(revision: &str) -> bool {
+    !revision.trim().is_empty() && !revision.chars().any(char::is_control)
+}
+
+fn resolve_model_revision<F>(settings: &EmbeddingSettings, env_lookup: &F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(revision) = settings
+        .model_revision
+        .as_deref()
+        .filter(|revision| valid_revision_value(revision))
+    {
+        return revision.trim().to_string();
+    }
+    env_lookup("MEMORY_EMBEDDING_MODEL_REVISION")
+        .filter(|revision| valid_revision_value(revision))
+        .map(|revision| revision.trim().to_string())
+        .unwrap_or_else(|| UNVERSIONED_MODEL_REVISION.to_string())
+}
+
+fn resolve_distance_type<F>(env_lookup: &F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup("MEMORY_DISTANCE_TYPE")
+        .filter(|distance| SUPPORTED_DISTANCE_TYPES.contains(&distance.as_str()))
+        .unwrap_or_else(|| DEFAULT_DISTANCE_TYPE.to_string())
+}
+
+fn apply_memories_identity<F>(
+    mut runtime: EmbeddingRuntime,
+    settings: &EmbeddingSettings,
+    env_lookup: &F,
+) -> EmbeddingRuntime
+where
+    F: Fn(&str) -> Option<String>,
+{
+    runtime.model_revision = resolve_model_revision(settings, env_lookup);
+    runtime.distance_type = resolve_distance_type(env_lookup);
+    runtime.document_prefix = env_lookup("MEMORY_EMBEDDING_DOCUMENT_PREFIX")
+        .filter(|prefix| !prefix.is_empty())
+        .or(runtime.document_prefix);
+    runtime.query_prefix = env_lookup("MEMORY_EMBEDDING_QUERY_PREFIX")
+        .filter(|prefix| !prefix.is_empty())
+        .or(runtime.query_prefix);
+    runtime
 }
 
 /// Project `EmbeddingSettings` into the runtime values the sidecar /
@@ -190,7 +259,9 @@ fn runtime_from_preset(preset: &EmbeddingPreset) -> EmbeddingRuntime {
 ///
 /// Unknown / retired preset ids degrade gracefully to the default preset
 /// rather than producing an empty `model_id` (which would make the
-/// embedding runner refuse to register at startup).
+/// embedding runner refuse to register at startup). An explicit stored/env
+/// revision is still passed through; otherwise runtime identity is
+/// `unversioned`, not a revision inferred from the fallback preset.
 pub fn resolve_embedding_runtime_with_env<F>(
     settings: &EmbeddingSettings,
     env_lookup: F,
@@ -200,7 +271,7 @@ where
 {
     if settings.preset_id.as_deref() == Some(embedding_presets::CUSTOM_EMBEDDING_PRESET_ID) {
         let default = runtime_from_preset(embedding_presets::default_preset());
-        return EmbeddingRuntime {
+        let runtime = EmbeddingRuntime {
             model_id: settings
                 .custom_model_id
                 .clone()
@@ -235,7 +306,10 @@ where
             // claiming text+image support would render the image search
             // UI without a backing model.
             is_multimodal: settings.custom_is_multimodal.unwrap_or(false),
+            model_revision: UNVERSIONED_MODEL_REVISION.to_string(),
+            distance_type: DEFAULT_DISTANCE_TYPE.to_string(),
         };
+        return apply_memories_identity(runtime, settings, &env_lookup);
     }
     let preset_runtime = runtime_from_preset(
         settings
@@ -245,13 +319,13 @@ where
             .unwrap_or_else(embedding_presets::default_preset),
     );
     if settings.preset_id.is_some() {
-        return preset_runtime;
+        return apply_memories_identity(preset_runtime, settings, &env_lookup);
     }
     // No saved preset → honour the dev shell env overrides. Anything
     // unset falls through to the default preset values; preserving the
     // preset's `is_multimodal` flag because that's a property of the
     // weights, not something a shell var can sensibly toggle.
-    EmbeddingRuntime {
+    let runtime = EmbeddingRuntime {
         model_id: env_lookup("LOOKBACK_EMBEDDING_MODEL_ID")
             .filter(|s| !s.is_empty())
             .unwrap_or(preset_runtime.model_id),
@@ -276,13 +350,16 @@ where
             .filter(|s| !s.is_empty())
             .or(preset_runtime.query_prefix),
         is_multimodal: preset_runtime.is_multimodal,
-    }
+        model_revision: UNVERSIONED_MODEL_REVISION.to_string(),
+        distance_type: DEFAULT_DISTANCE_TYPE.to_string(),
+    };
+    apply_memories_identity(runtime, settings, &env_lookup)
 }
 
-/// Pure projection that ignores any environment overrides. Used by the UI
-/// display path (`get_embedding_settings` response, `embedding_identity`
-/// for the Settings model card) where dev env overrides should not bleed
-/// into "what the user thinks the saved value is".
+/// Pure projection that ignores any environment overrides. Useful for callers
+/// that intentionally want only the persisted settings and preset defaults;
+/// runtime status paths should use `resolve_embedding_runtime_with_env` with
+/// the Sidecars external-environment snapshot instead.
 pub fn resolve_embedding_runtime(settings: &EmbeddingSettings) -> EmbeddingRuntime {
     resolve_embedding_runtime_with_env(settings, |_| None)
 }
@@ -310,6 +387,11 @@ pub fn resolve_embedding_env_vars_from_runtime(
         "LOOKBACK_EMBEDDING_VECTOR_SIZE",
         runtime.vector_size.to_string(),
     ));
+    out.push((
+        "MEMORY_EMBEDDING_MODEL_REVISION",
+        runtime.model_revision.clone(),
+    ));
+    out.push(("MEMORY_DISTANCE_TYPE", runtime.distance_type.clone()));
     if let Some(prefix) = runtime.document_prefix.as_ref() {
         out.push(("MEMORY_EMBEDDING_DOCUMENT_PREFIX", prefix.clone()));
     }
@@ -337,6 +419,42 @@ use super::is_valid_hf_repo;
 
 pub fn is_valid_dtype(s: &str) -> bool {
     SUPPORTED_DTYPES.contains(&s)
+}
+
+/// Purely project a request into the persisted shape. Callers must validate
+/// the request first; this function performs no I/O and invents no revision.
+pub fn settings_from_request(req: &SetEmbeddingSettingsRequest) -> EmbeddingSettings {
+    EmbeddingSettings {
+        preset_id: req.preset_id.clone(),
+        custom_model_id: req.custom_model_id.clone(),
+        custom_tokenizer_id: req.custom_tokenizer_id.clone(),
+        custom_vector_size: req.custom_vector_size,
+        custom_dtype: req.custom_dtype.clone(),
+        custom_max_sequence_length: req.custom_max_sequence_length,
+        custom_is_multimodal: req.custom_is_multimodal,
+        model_revision: req
+            .model_revision
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_string),
+    }
+}
+
+/// Resolve a validated request into the runtime candidate without persisting
+/// anything. CLI migration planning uses this exact projection so the
+/// preflight identity and subsequent settings apply cannot disagree.
+pub fn prepare_embedding_candidate_runtime<F>(
+    req: &SetEmbeddingSettingsRequest,
+    env_lookup: F,
+) -> AppResult<EmbeddingRuntime>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    validate_set_request(req).map_err(AppError::Config)?;
+    Ok(resolve_embedding_runtime_with_env(
+        &settings_from_request(req),
+        env_lookup,
+    ))
 }
 
 /// Validate a Custom-mode request. Returns the offending field's error
@@ -399,6 +517,13 @@ fn validate_custom_fields(req: &SetEmbeddingSettingsRequest) -> Result<(), Strin
 }
 
 pub fn validate_set_request(req: &SetEmbeddingSettingsRequest) -> Result<(), String> {
+    if let Some(revision) = req.model_revision.as_deref()
+        && !valid_revision_value(revision)
+    {
+        return Err(
+            "invalid model_revision: must be non-empty and contain no control characters".into(),
+        );
+    }
     if req.preset_id.as_deref() == Some(embedding_presets::CUSTOM_EMBEDDING_PRESET_ID) {
         return validate_custom_fields(req);
     }
@@ -431,111 +556,36 @@ pub fn save_embedding_settings(path: &Path, settings: &EmbeddingSettings) -> App
     Ok(())
 }
 
-// ── vectordb evacuation ─────────────────────────────────────────────
-
-/// Whether to keep the pre-resize LanceDB as a backup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvacuateMode {
-    /// Rename `<root>/lancedb` → `<root>/lancedb-backup/<ts>/`.
-    Evacuate,
-    /// `remove_dir_all(<root>/lancedb)`.
-    Delete,
+/// Whether the vector identity changes. An omitted tokenizer is the empty
+/// identity component and intentionally differs from explicitly naming the
+/// model repo as tokenizer. Dtype and max-sequence tweaks do not alter vector
+/// identity; pending chunk configuration is checked separately below.
+pub fn embedding_space_changed(old: &EmbeddingRuntime, new: &EmbeddingRuntime) -> bool {
+    old.model_id != new.model_id
+        || old.tokenizer_id.as_deref().unwrap_or("") != new.tokenizer_id.as_deref().unwrap_or("")
+        || old.model_revision != new.model_revision
+        || old.vector_size != new.vector_size
+        || old.distance_type != new.distance_type
 }
 
-/// Reset the LanceDB directory ahead of a sidecar restart that will land
-/// on a new vector dimension. The source is replaced with an empty
-/// directory either way so memories' startup probe creates fresh tables.
-///
-/// Returns `Some(backup_path)` only on the `Evacuate` path; `Delete`
-/// returns `None`. A missing source is a no-op (returns `None`) — this
-/// happens on a fresh install where the user changes the preset before
-/// the first import.
-pub fn evacuate_vectordb(data: &DataPaths, mode: EvacuateMode) -> AppResult<Option<PathBuf>> {
-    let src = data.lancedb_dir();
-    if !src.exists() {
-        return Ok(None);
-    }
-    match mode {
-        EvacuateMode::Delete => {
-            std::fs::remove_dir_all(&src).map_err(|e| {
-                AppError::Config(format!("delete lancedb dir {}: {e}", src.display()))
-            })?;
-            std::fs::create_dir_all(&src).map_err(|e| {
-                AppError::Config(format!("recreate empty lancedb dir {}: {e}", src.display()))
-            })?;
-            Ok(None)
-        }
-        EvacuateMode::Evacuate => {
-            let backup_root = data.lancedb_backup_dir();
-            std::fs::create_dir_all(&backup_root).map_err(|e| {
-                AppError::Config(format!(
-                    "create lancedb backup root {}: {e}",
-                    backup_root.display()
-                ))
-            })?;
-            let dst = backup_root.join(unique_backup_name());
-            // `rename` is atomic on the same filesystem and is what we
-            // want for safety. The cross-device fallback (copy + remove)
-            // is documented for completeness but not implemented in this
-            // initial cut — both source and target live under the same
-            // data root, which is on a single volume by construction.
-            std::fs::rename(&src, &dst).map_err(|e| {
-                AppError::Config(format!("rename {} → {}: {e}", src.display(), dst.display()))
-            })?;
-            std::fs::create_dir_all(&src).map_err(|e| {
-                AppError::Config(format!("recreate empty lancedb dir {}: {e}", src.display()))
-            })?;
-            Ok(Some(dst))
-        }
-    }
+/// The staged workers YAML maps `max_sequence_length` directly to
+/// `chunking_config.max_chunk_tokens`. Changing it can affect pending chunk
+/// inputs; dtype-only changes do not alter that configuration.
+pub fn pending_chunk_configuration_changed(old: &EmbeddingRuntime, new: &EmbeddingRuntime) -> bool {
+    old.max_sequence_length != new.max_sequence_length
 }
 
-/// Backup directory leaf name. Includes nanos so two saves within the
-/// same second land on distinct paths.
-fn unique_backup_name() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("lancedb-{}-{}", now.as_secs(), now.subsec_nanos(),)
-}
-
-/// Whether the runtime change between `old` and `new` requires the
-/// existing LanceDB to be evacuated / reset before the sidecar restarts.
-/// True when either the dimension or the model id changes; tokenizer /
-/// dtype / max-seq tweaks alone don't invalidate the on-disk index.
-/// Pure so the env-aware-comparison contract is unit-testable without
-/// having to construct an `AppState`.
-pub fn needs_vectordb_reset(old: &EmbeddingRuntime, new: &EmbeddingRuntime) -> bool {
-    old.vector_size != new.vector_size || old.model_id != new.model_id
-}
-
-/// Restore the most recent backup directory back to `<root>/lancedb`,
-/// used by the rollback path when a sidecar restart fails.
-///
-/// Returns `Ok(true)` when a restore happened, `Ok(false)` when no
-/// matching backup was found (already-deleted, Delete-mode swap).
-pub fn restore_vectordb_backup(data: &DataPaths, backup_path: &Path) -> AppResult<bool> {
-    let src = data.lancedb_dir();
-    if !backup_path.exists() {
-        return Ok(false);
+pub fn validate_pending_chunk_configuration_change(
+    old: &EmbeddingRuntime,
+    new: &EmbeddingRuntime,
+    rebuild_pending: bool,
+) -> AppResult<()> {
+    if rebuild_pending && pending_chunk_configuration_changed(old, new) {
+        return Err(AppError::Config(
+            "max sequence length cannot change while an embedding rebuild is pending".into(),
+        ));
     }
-    // Make sure the destination doesn't already hold an empty staged
-    // dir from the failed restart — rename refuses to clobber a
-    // non-empty target on macOS.
-    if src.exists() {
-        std::fs::remove_dir_all(&src).map_err(|e| {
-            AppError::Config(format!("remove staged lancedb dir {}: {e}", src.display()))
-        })?;
-    }
-    std::fs::rename(backup_path, &src).map_err(|e| {
-        AppError::Config(format!(
-            "restore backup {} → {}: {e}",
-            backup_path.display(),
-            src.display()
-        ))
-    })?;
-    Ok(true)
+    Ok(())
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────
@@ -545,11 +595,13 @@ pub fn get_embedding_settings(
     state: tauri::State<'_, super::AppState>,
 ) -> AppResult<EmbeddingSettingsResponse> {
     let settings = load_embedding_settings(&state.data.embedding_settings_path());
-    let connection_remote = matches!(
-        super::connection::load_connection_config(&state.data.connection_config_path()).mode,
-        super::connection::ConnectionMode::Remote
-    );
-    let effective = resolve_embedding_runtime(&settings);
+    let connection_remote =
+        !super::connection::load_connection_config(&state.data.connection_config_path())
+            .memories
+            .is_local();
+    let effective = resolve_embedding_runtime_with_env(&settings, |key| {
+        state.sidecars.embedding_env_lookup(key)
+    });
     Ok(EmbeddingSettingsResponse {
         preset_id: settings.preset_id,
         custom_model_id: settings.custom_model_id,
@@ -558,22 +610,31 @@ pub fn get_embedding_settings(
         custom_dtype: settings.custom_dtype,
         custom_max_sequence_length: settings.custom_max_sequence_length,
         custom_is_multimodal: settings.custom_is_multimodal,
+        model_revision: settings.model_revision,
         effective,
         connection_remote,
     })
 }
 
 /// Outcome of persisting embedding settings to disk WITHOUT restarting
-/// the sidecar. Carries everything the caller needs to drive evacuation,
+/// the sidecar. Carries everything the caller needs for a configuration
 /// restart, and rollback. Returned by [`apply_embedding_settings_to_disk`].
 pub struct EmbeddingApplyOutcome {
     pub new_runtime: EmbeddingRuntime,
     /// `false` ⇒ no-op (old == new); the caller should skip the restart.
     pub changed: bool,
-    /// `true` ⇒ the LanceDB must be evacuated/reset before restart.
-    pub needs_vectordb_reset: bool,
     /// Pre-save settings, retained so the caller can roll back the file.
     pub old_settings: EmbeddingSettings,
+}
+
+/// CLI-approved local settings outcomes that may persist a changed embedding
+/// identity. `Reembed` is intentionally absent: approved rebuilds must use
+/// their dedicated save/rollback transaction, not this generic helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingPlanPermit {
+    NoChange,
+    Reconcile,
+    Adopt,
 }
 
 /// Validate an embedding request WITHOUT persisting. Split out so the unified
@@ -584,10 +645,27 @@ pub fn validate_embedding_request(req: &SetEmbeddingSettingsRequest) -> AppResul
     Ok(())
 }
 
-/// Validate and persist `embedding-settings.json` WITHOUT evacuating the
-/// vectordb or restarting the sidecar. The caller
+pub(crate) fn validate_embedding_settings_pending_change_with_env<F>(
+    data: &DataPaths,
+    req: &SetEmbeddingSettingsRequest,
+    rebuild_pending: bool,
+    env_lookup: F,
+) -> AppResult<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    validate_embedding_request(req)?;
+    let old = load_embedding_settings(&data.embedding_settings_path());
+    let new = settings_from_request(req);
+    let old_runtime = resolve_embedding_runtime_with_env(&old, &env_lookup);
+    let new_runtime = resolve_embedding_runtime_with_env(&new, &env_lookup);
+    validate_pending_chunk_configuration_change(&old_runtime, &new_runtime, rebuild_pending)
+}
+
+/// Validate and persist `embedding-settings.json` without changing service
+/// storage or restarting the sidecar. The caller
 /// (the individual command or the unified `apply_settings`) owns the
-/// stop → evacuate → restart → rollback sequence so several settings can
+/// stop → restart → configuration rollback sequence so several settings can
 /// share a single restart.
 ///
 /// When `changed == false` the file is left untouched (it equals the old
@@ -596,54 +674,90 @@ pub fn apply_embedding_settings_to_disk(
     data: &DataPaths,
     req: &SetEmbeddingSettingsRequest,
 ) -> AppResult<EmbeddingApplyOutcome> {
+    apply_embedding_settings_to_disk_with_permit(data, req, None, false)
+}
+
+/// Persist settings only after the Memories CLI has explicitly approved one
+/// of the non-rebuild plans. The typed permit deliberately has no `Reembed`
+/// variant; rebuild persistence belongs to the migration transaction's own
+/// save/rollback path.
+pub fn apply_embedding_settings_to_disk_approved(
+    data: &DataPaths,
+    req: &SetEmbeddingSettingsRequest,
+    permit: EmbeddingPlanPermit,
+) -> AppResult<EmbeddingApplyOutcome> {
+    apply_embedding_settings_to_disk_with_permit(data, req, Some(permit), false)
+}
+
+fn apply_embedding_settings_to_disk_with_permit(
+    data: &DataPaths,
+    req: &SetEmbeddingSettingsRequest,
+    permit: Option<EmbeddingPlanPermit>,
+    rebuild_pending: bool,
+) -> AppResult<EmbeddingApplyOutcome> {
+    apply_embedding_settings_to_disk_with_env(
+        data,
+        req,
+        permit,
+        rebuild_pending,
+        super::process_env_lookup,
+    )
+}
+
+pub(crate) fn apply_embedding_settings_to_disk_with_env<F>(
+    data: &DataPaths,
+    req: &SetEmbeddingSettingsRequest,
+    permit: Option<EmbeddingPlanPermit>,
+    rebuild_pending: bool,
+    env_lookup: F,
+) -> AppResult<EmbeddingApplyOutcome>
+where
+    F: Fn(&str) -> Option<String>,
+{
     validate_embedding_request(req)?;
 
     let path = data.embedding_settings_path();
     let old_settings = load_embedding_settings(&path);
-    let connection_remote = matches!(
-        super::connection::load_connection_config(&data.connection_config_path()).mode,
-        super::connection::ConnectionMode::Remote
-    );
-    // Resolve OLD and NEW runtimes with the same env-aware projection
-    // the sidecar lifecycle uses. Without this, a dev shell override
-    // (e.g. `LOOKBACK_EMBEDDING_VECTOR_SIZE=2048`) makes the sidecar
-    // run at 2048 dim while old_runtime reports the env-blind default
-    // dim, so `needs_vectordb_reset` would see "no change" when
-    // saving the default preset and skip evacuation — the next launch
-    // then opens the existing LanceDB at the new default dim and crashes.
-    // NEW also takes the env-aware path so the comparison happens in
-    // the SAME projection; a saved `preset_id = Some(_)` makes
-    // `resolve_embedding_runtime_with_env` ignore env anyway, so this
-    // does not let the dev shell silently drive the saved value.
-    let old_runtime = resolve_embedding_runtime_with_env(&old_settings, super::process_env_lookup);
+    let connection_remote =
+        !super::connection::load_connection_config(&data.connection_config_path())
+            .memories
+            .is_local();
+    // Compare the same effective configuration that the child actually uses;
+    // environment overrides must not bypass the embedding-space guard.
+    let old_runtime = resolve_embedding_runtime_with_env(&old_settings, &env_lookup);
 
-    let new_settings = EmbeddingSettings {
-        preset_id: req.preset_id.clone(),
-        custom_model_id: req.custom_model_id.clone(),
-        custom_tokenizer_id: req.custom_tokenizer_id.clone(),
-        custom_vector_size: req.custom_vector_size,
-        custom_dtype: req.custom_dtype.clone(),
-        custom_max_sequence_length: req.custom_max_sequence_length,
-        custom_is_multimodal: req.custom_is_multimodal,
-    };
-    let new_runtime = resolve_embedding_runtime_with_env(&new_settings, super::process_env_lookup);
+    let new_settings = settings_from_request(req);
+    let new_runtime = resolve_embedding_runtime_with_env(&new_settings, &env_lookup);
+
+    validate_pending_chunk_configuration_change(&old_runtime, &new_runtime, rebuild_pending)?;
 
     if old_runtime == new_runtime && old_settings == new_settings {
         return Ok(EmbeddingApplyOutcome {
             new_runtime,
             changed: false,
-            needs_vectordb_reset: false,
             old_settings,
         });
     }
 
+    // The ordinary Settings/apply-settings path has no migration proof and
+    // therefore remains conservative. Only a CLI-approved reconcile/adopt
+    // decision can authorize changing local vector identity here.
+    let permit_authorizes_local_identity_change = matches!(
+        permit,
+        Some(EmbeddingPlanPermit::Reconcile | EmbeddingPlanPermit::Adopt)
+    );
+    if !connection_remote
+        && embedding_space_changed(&old_runtime, &new_runtime)
+        && !permit_authorizes_local_identity_change
+    {
+        return Err(AppError::Config(
+            "embedding model, tokenizer, revision, dimension, or distance change requires a Memories-approved migration plan; settings and data were not changed".into(),
+        ));
+    }
     save_embedding_settings(&path, &new_settings)?;
-
-    let needs_reset = !connection_remote && needs_vectordb_reset(&old_runtime, &new_runtime);
     Ok(EmbeddingApplyOutcome {
         new_runtime,
         changed: true,
-        needs_vectordb_reset: needs_reset,
         old_settings,
     })
 }
@@ -654,119 +768,65 @@ pub async fn set_embedding_settings(
     state: tauri::State<'_, super::AppState>,
     req: SetEmbeddingSettingsRequest,
 ) -> AppResult<SetEmbeddingSettingsResponse> {
-    let path = state.data.embedding_settings_path();
-    let outcome = apply_embedding_settings_to_disk(&state.data, &req)?;
-    let EmbeddingApplyOutcome {
-        new_runtime,
-        changed,
-        needs_vectordb_reset,
-        old_settings,
-    } = outcome;
-
-    if !changed {
-        return Ok(SetEmbeddingSettingsResponse {
-            runtime: new_runtime,
-            backup_path: None,
-            restarted: false,
-        });
-    }
-
-    let evacuate_mode = if req.evacuate_vectordb {
-        EvacuateMode::Evacuate
-    } else {
-        EvacuateMode::Delete
-    };
-
-    state.invalidate_clients().await;
-    state.sidecars.stop().await?;
-
-    let backup_path = if needs_vectordb_reset {
-        match evacuate_vectordb(&state.data, evacuate_mode) {
-            Ok(p) => p,
-            Err(e) => {
-                // Restore settings file to old value so the failed swap
-                // doesn't leave the on-disk config disagreeing with the
-                // (still-old) lancedb dir on the next launch.
-                let _ = save_embedding_settings(&path, &old_settings);
-                // Restart the sidecar with the OLD config so the user is
-                // not left with a stopped backend.
-                let sidecars = state.sidecars.clone();
-                let data = state.data.clone();
-                crate::stage_and_start_sidecars(&app, &sidecars, &data).await;
-                return Err(e);
-            }
-        }
-    } else {
-        None
-    };
-
-    // Try the new config; on failure roll back to the old settings + old
-    // lancedb. The `start_with_warnings` Err path covers the cases we care
-    // about (spawn failure, port pick, TCP health check timeout). A model-
-    // download failure surfaces later through `get_model_status` and is
-    // NOT caught here — the sidecar process IS up, just unable to load
-    // the embedding model. That case is handled by the user re-opening
-    // Settings.
-    //
-    // This path mirrors `stage_and_start_sidecars` (lib.rs) but keeps
-    // control of the Err branch so the rollback can run. The plugin
-    // staging warning is preserved so a regression that follows an
-    // embedding swap still surfaces to the UI.
-    let plugin_warnings = match crate::plugins::stage_plugins(&app, &state.data.plugins_dir()) {
-        Ok(_) => Vec::new(),
-        Err(e) => vec![crate::sidecar::SidecarWarning {
-            kind: crate::sidecar::SidecarWarningKind::PluginsStageFailed,
-            message: e.to_string(),
-            detail: None,
-        }],
-    };
-    match state.sidecars.start_with_warnings(plugin_warnings).await {
-        Ok(report) => {
-            let _ = app.emit("sidecar://ready", &report);
-            Ok(SetEmbeddingSettingsResponse {
-                runtime: new_runtime,
-                backup_path,
-                restarted: true,
-            })
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "sidecar failed to start with new embedding settings; rolling back");
-            // Surface a typed payload so the frontend keeps a single
-            // shape on `sidecar://error`. The rollback isn't a
-            // structured startup-error (the *previous* settings are
-            // about to come back up), so a Raw envelope is appropriate.
-            super::emit_event(
-                &app,
-                "sidecar://error",
-                crate::sidecar::startup_error::SidecarErrorPayload::Raw {
-                    message: format!(
-                        "embedding swap failed: {e}; rolling back to previous settings"
-                    ),
-                },
-            );
-            // 1. Stop whatever partial state the failed start may have left.
-            let _ = state.sidecars.stop().await;
-            // 2. Restore the settings file.
-            let _ = save_embedding_settings(&path, &old_settings);
-            // 3. Restore the lancedb backup if one was made.
-            if let Some(backup) = backup_path.as_deref() {
-                let _ = restore_vectordb_backup(&state.data, backup);
-            }
-            // 4. Restart with the old config. Best-effort; emit error if
-            //    this also fails.
-            let sidecars = state.sidecars.clone();
-            let data = state.data.clone();
-            crate::stage_and_start_sidecars(&app, &sidecars, &data).await;
-            Err(AppError::Config(format!(
-                "embedding model 適用に失敗しました。元の設定にロールバックしました: {e}"
-            )))
-        }
-    }
+    let response = super::apply_settings::apply_settings(
+        app,
+        state,
+        super::apply_settings::ApplySettingsRequest {
+            llm: None,
+            embedding: Some(req),
+            hf_home: None,
+            mcp: None,
+            timezone: None,
+            issue_tracker: None,
+            migration_backup: None,
+        },
+    )
+    .await?;
+    let runtime = response.embedding_runtime.ok_or_else(|| {
+        AppError::Config("embedding settings apply did not return its effective runtime".into())
+    })?;
+    Ok(SetEmbeddingSettingsResponse {
+        runtime,
+        backup_path: None,
+        restarted: response.restarted,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn space_runtime_prefers_matching_local_settings() {
+        let mut local =
+            runtime_from_preset(embedding_presets::find_preset("qwen3-vl-embedding-2b").unwrap());
+        local.dtype = "BF16".into();
+        let runtime = runtime_for_embedding_space("Qwen/Qwen3-VL-Embedding-2B", 2048, &local)
+            .expect("matching local settings identify the runtime");
+        assert_eq!(runtime, local);
+    }
+
+    #[test]
+    fn space_runtime_falls_back_to_the_matching_preset() {
+        let local = runtime_from_preset(embedding_presets::default_preset());
+        let runtime = runtime_for_embedding_space("sirasagi62/ruri-v3-310m-ONNX", 768, &local)
+            .expect("a preset identifies the runtime");
+        assert_eq!(runtime.model_id, "sirasagi62/ruri-v3-310m-ONNX");
+        assert_eq!(runtime.vector_size, 768);
+        assert_eq!(
+            runtime.onnx_model_file.as_deref(),
+            Some("onnx/model_int8.onnx")
+        );
+        assert_eq!(runtime.query_prefix.as_deref(), Some("検索クエリ: "));
+    }
+
+    #[test]
+    fn space_runtime_is_unknown_without_a_matching_source() {
+        let local = runtime_from_preset(embedding_presets::default_preset());
+        assert!(runtime_for_embedding_space("example/unknown-embedding", 1024, &local).is_none());
+        // Same repo but another dimension is a different space.
+        assert!(runtime_for_embedding_space("Qwen/Qwen3-Embedding-0.6B", 768, &local).is_none());
+    }
 
     #[test]
     fn load_missing_file_returns_default() {
@@ -790,16 +850,20 @@ mod tests {
         let path = dir.path().join("embedding-settings.json");
         let settings = EmbeddingSettings {
             preset_id: Some("qwen3-embedding-0-6b".into()),
+            model_revision: Some("stable-v2".into()),
             ..Default::default()
         };
         save_embedding_settings(&path, &settings).unwrap();
         assert_eq!(load_embedding_settings(&path), settings);
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(json.contains("\"model_revision\": \"stable-v2\""));
     }
 
     #[test]
     fn serde_fills_defaults_for_missing_fields() {
         let back: EmbeddingSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(back, EmbeddingSettings::default());
+        assert_eq!(back.model_revision, None);
     }
 
     #[test]
@@ -853,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_embedding_workflows_route_document_and_query_prefixes() {
+    fn bundled_embedding_workflows_preserve_offsets_and_route_query_prefixes() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../workers/workflows");
         for relative in [
             "auto-embedding.yaml",
@@ -861,10 +925,27 @@ mod tests {
             "thread-reflection/auto-reflection-summary-embedding.yaml",
         ] {
             let yaml = std::fs::read_to_string(root.join(relative)).unwrap();
-            assert!(
-                yaml.contains("prefix: \"%{MEMORY_EMBEDDING_DOCUMENT_PREFIX:-}\""),
-                "document prefix missing from {relative}"
-            );
+            let workflow: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+            fn assert_no_document_prefix(value: &serde_yaml::Value, relative: &str) {
+                match value {
+                    serde_yaml::Value::Mapping(mapping) => {
+                        assert!(
+                            !mapping.contains_key(serde_yaml::Value::String("prefix".into())),
+                            "document prefix would invalidate chunk offsets in {relative}"
+                        );
+                        for child in mapping.values() {
+                            assert_no_document_prefix(child, relative);
+                        }
+                    }
+                    serde_yaml::Value::Sequence(sequence) => {
+                        for child in sequence {
+                            assert_no_document_prefix(child, relative);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert_no_document_prefix(&workflow, relative);
         }
         let rag = std::fs::read_to_string(root.join("rag/lookback-recall.yaml")).unwrap();
         assert!(rag.contains("prefix: \"%{MEMORY_EMBEDDING_QUERY_PREFIX:-}\""));
@@ -935,6 +1016,198 @@ mod tests {
         };
         let rt = resolve_embedding_runtime(&s);
         assert!(rt.tokenizer_id.is_none());
+    }
+
+    #[test]
+    fn model_revision_is_explicit_and_legacy_settings_resolve_as_unversioned() {
+        let legacy = EmbeddingSettings {
+            preset_id: Some(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID.into()),
+            ..Default::default()
+        };
+        let runtime = resolve_embedding_runtime(&legacy);
+        assert_eq!(runtime.model_revision, "unversioned");
+
+        let declared = EmbeddingSettings {
+            model_revision: Some("release-2025-02".into()),
+            ..legacy
+        };
+        let runtime = resolve_embedding_runtime(&declared);
+        assert_eq!(runtime.model_revision, "release-2025-02");
+
+        let malformed_legacy = EmbeddingSettings {
+            model_revision: Some("bad\nrevision".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_embedding_runtime(&malformed_legacy).model_revision,
+            "unversioned"
+        );
+    }
+
+    #[test]
+    fn saved_revision_wins_over_env_but_explicit_env_is_used_when_unset() {
+        let settings = EmbeddingSettings {
+            preset_id: Some(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID.into()),
+            model_revision: Some("saved-ref".into()),
+            ..Default::default()
+        };
+        let runtime = resolve_embedding_runtime_with_env(&settings, |name| match name {
+            "MEMORY_EMBEDDING_MODEL_REVISION" => Some("environment-ref".into()),
+            _ => None,
+        });
+        assert_eq!(runtime.model_revision, "saved-ref");
+
+        let without_saved_revision = EmbeddingSettings {
+            model_revision: None,
+            ..settings
+        };
+        let runtime =
+            resolve_embedding_runtime_with_env(&without_saved_revision, |name| match name {
+                "MEMORY_EMBEDDING_MODEL_REVISION" => Some("environment-ref".into()),
+                _ => None,
+            });
+        assert_eq!(runtime.model_revision, "environment-ref");
+    }
+
+    #[test]
+    fn distance_type_uses_memories_vocabulary_and_is_managed_in_runtime_env() {
+        let settings = EmbeddingSettings {
+            preset_id: Some(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID.into()),
+            ..Default::default()
+        };
+        for expected in ["cosine", "l2", "dot"] {
+            let runtime = resolve_embedding_runtime_with_env(&settings, |name| match name {
+                "MEMORY_DISTANCE_TYPE" => Some(expected.into()),
+                _ => None,
+            });
+            assert_eq!(runtime.distance_type, expected);
+            let env: std::collections::HashMap<_, _> =
+                resolve_embedding_env_vars_from_runtime(&runtime)
+                    .into_iter()
+                    .collect();
+            assert_eq!(
+                env.get("MEMORY_DISTANCE_TYPE").map(String::as_str),
+                Some(expected)
+            );
+        }
+        let fallback = resolve_embedding_runtime_with_env(&settings, |_| None);
+        assert_eq!(fallback.distance_type, "cosine");
+    }
+
+    #[test]
+    fn settings_from_request_preserves_only_user_declared_revision() {
+        let req = SetEmbeddingSettingsRequest {
+            model_revision: Some("main".into()),
+            ..preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID)
+        };
+        let settings = settings_from_request(&req);
+        assert_eq!(settings.model_revision.as_deref(), Some("main"));
+
+        let old_request = preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID);
+        let settings = settings_from_request(&old_request);
+        assert_eq!(settings.model_revision, None);
+    }
+
+    #[test]
+    fn revision_request_rejects_blank_nul_and_control_characters() {
+        for revision in ["", "  ", "bad\0ref", "bad\nref"] {
+            let mut req = preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID);
+            req.model_revision = Some(revision.into());
+            assert!(validate_set_request(&req).is_err(), "revision {revision:?}");
+        }
+        let mut req = preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID);
+        req.model_revision = Some("feature/retrieval-v2".into());
+        assert!(validate_set_request(&req).is_ok());
+    }
+
+    #[test]
+    fn embedding_identity_includes_tokenizer_revision_distance_and_dimension() {
+        let old = resolve_embedding_runtime(&EmbeddingSettings {
+            preset_id: Some(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID.into()),
+            ..Default::default()
+        });
+        for changed in [
+            EmbeddingRuntime {
+                tokenizer_id: Some(old.model_id.clone()),
+                ..old.clone()
+            },
+            EmbeddingRuntime {
+                model_revision: "branch-a".into(),
+                ..old.clone()
+            },
+            EmbeddingRuntime {
+                distance_type: "l2".into(),
+                ..old.clone()
+            },
+            EmbeddingRuntime {
+                vector_size: old.vector_size + 1,
+                ..old.clone()
+            },
+        ] {
+            assert!(embedding_space_changed(&old, &changed));
+        }
+        assert!(!embedding_space_changed(
+            &old,
+            &EmbeddingRuntime {
+                dtype: "BF16".into(),
+                max_sequence_length: old.max_sequence_length + 1,
+                ..old.clone()
+            }
+        ));
+    }
+
+    #[test]
+    fn pending_chunk_configuration_guard_tracks_max_sequence_length_not_dtype() {
+        let old = resolve_embedding_runtime(&EmbeddingSettings::default());
+        let changed_max_sequence = EmbeddingRuntime {
+            max_sequence_length: old.max_sequence_length + 1,
+            ..old.clone()
+        };
+        let changed_dtype = EmbeddingRuntime {
+            dtype: "BF16".into(),
+            ..old.clone()
+        };
+        // The YAML renderer maps max_sequence_length to chunking_config.max_chunk_tokens.
+        assert!(pending_chunk_configuration_changed(
+            &old,
+            &changed_max_sequence
+        ));
+        assert!(!pending_chunk_configuration_changed(&old, &changed_dtype));
+    }
+
+    #[test]
+    fn pending_chunk_configuration_guard_allows_runtime_tuning_but_rejects_max_sequence_change() {
+        let old = resolve_embedding_runtime(&EmbeddingSettings::default());
+        let changed_dtype = EmbeddingRuntime {
+            dtype: "BF16".into(),
+            ..old.clone()
+        };
+        assert!(validate_pending_chunk_configuration_change(&old, &changed_dtype, true).is_ok());
+
+        let changed_chunking = EmbeddingRuntime {
+            max_sequence_length: old.max_sequence_length + 1,
+            ..old.clone()
+        };
+        assert!(
+            validate_pending_chunk_configuration_change(&old, &changed_chunking, true).is_err()
+        );
+        assert!(
+            validate_pending_chunk_configuration_change(&old, &changed_chunking, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn prepared_candidate_runtime_uses_the_same_env_projection_without_persisting() {
+        let mut req = preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID);
+        req.model_revision = Some("tag-v1".into());
+        let runtime = prepare_embedding_candidate_runtime(&req, |name| match name {
+            "MEMORY_DISTANCE_TYPE" => Some("dot".into()),
+            "MEMORY_EMBEDDING_MODEL_REVISION" => Some("env-ref".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(runtime.model_revision, "tag-v1");
+        assert_eq!(runtime.distance_type, "dot");
     }
 
     #[test]
@@ -1025,10 +1298,12 @@ mod tests {
         let rt = resolve_embedding_runtime_with_env(&s, |name| match name {
             "LOOKBACK_EMBEDDING_MODEL_ID" => Some("stale/override".into()),
             "LOOKBACK_EMBEDDING_VECTOR_SIZE" => Some("99999".into()),
+            "MEMORY_EMBEDDING_QUERY_PREFIX" => Some("env-query".into()),
             _ => None,
         });
         assert_eq!(rt.model_id, preset.hf_repo);
         assert_eq!(rt.vector_size, preset.vector_size);
+        assert_eq!(rt.query_prefix.as_deref(), Some("env-query"));
     }
 
     #[test]
@@ -1062,7 +1337,7 @@ mod tests {
             custom_dtype: None,
             custom_max_sequence_length: None,
             custom_is_multimodal: None,
-            evacuate_vectordb: true,
+            model_revision: None,
         };
         assert!(validate_set_request(&req).is_ok());
     }
@@ -1077,7 +1352,7 @@ mod tests {
             custom_dtype: None,
             custom_max_sequence_length: None,
             custom_is_multimodal: None,
-            evacuate_vectordb: true,
+            model_revision: None,
         };
         assert!(validate_set_request(&req).is_err());
     }
@@ -1097,7 +1372,7 @@ mod tests {
             custom_dtype: dtype.map(str::to_string),
             custom_max_sequence_length: max_seq,
             custom_is_multimodal: None,
-            evacuate_vectordb: true,
+            model_revision: None,
         }
     }
 
@@ -1182,153 +1457,49 @@ mod tests {
         assert!(!is_valid_hf_repo("space in/name"));
     }
 
-    // ── evacuate_vectordb ─────────────────────────────────────────────
-
     fn data_paths_in(tmp: &Path) -> DataPaths {
         DataPaths::with_root(tmp.to_path_buf())
     }
 
-    #[test]
-    fn evacuate_vectordb_noop_when_source_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = data_paths_in(tmp.path());
-        // Don't create lancedb/ — simulate fresh install before first
-        // import.
-        assert!(
-            evacuate_vectordb(&data, EvacuateMode::Evacuate)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            evacuate_vectordb(&data, EvacuateMode::Delete)
-                .unwrap()
-                .is_none()
-        );
-    }
+    // ── embedding_space_changed + env-aware old runtime ────────────────────
 
     #[test]
-    fn evacuate_vectordb_renames_existing_dir_in_evacuate_mode() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = data_paths_in(tmp.path());
-        std::fs::create_dir_all(data.lancedb_dir()).unwrap();
-        std::fs::write(data.lancedb_dir().join("marker"), b"x").unwrap();
-
-        let backup = evacuate_vectordb(&data, EvacuateMode::Evacuate)
-            .unwrap()
-            .expect("backup path returned");
-
-        assert!(backup.exists(), "backup dir exists");
-        assert!(backup.join("marker").exists(), "marker preserved");
-        assert!(data.lancedb_dir().exists(), "source recreated empty");
-        let leftover: Vec<_> = std::fs::read_dir(data.lancedb_dir()).unwrap().collect();
-        assert!(leftover.is_empty(), "source must be empty after move");
-    }
-
-    #[test]
-    fn evacuate_vectordb_deletes_in_delete_mode() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = data_paths_in(tmp.path());
-        std::fs::create_dir_all(data.lancedb_dir().join("nested")).unwrap();
-        std::fs::write(data.lancedb_dir().join("marker"), b"x").unwrap();
-
-        let backup = evacuate_vectordb(&data, EvacuateMode::Delete).unwrap();
-        assert!(backup.is_none(), "delete mode returns no backup path");
-        assert!(data.lancedb_dir().exists(), "source recreated");
-        let leftover: Vec<_> = std::fs::read_dir(data.lancedb_dir()).unwrap().collect();
-        assert!(leftover.is_empty(), "source must be empty after delete");
-    }
-
-    #[test]
-    fn evacuate_vectordb_two_calls_produce_distinct_backup_paths() {
-        // The nanos suffix protects against a same-second double-save
-        // collision. Without it the second rename would clobber the
-        // first backup's marker.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = data_paths_in(tmp.path());
-
-        std::fs::create_dir_all(data.lancedb_dir()).unwrap();
-        std::fs::write(data.lancedb_dir().join("marker1"), b"1").unwrap();
-        let b1 = evacuate_vectordb(&data, EvacuateMode::Evacuate)
-            .unwrap()
-            .unwrap();
-        std::fs::write(data.lancedb_dir().join("marker2"), b"2").unwrap();
-        let b2 = evacuate_vectordb(&data, EvacuateMode::Evacuate)
-            .unwrap()
-            .unwrap();
-
-        assert_ne!(b1, b2, "backup paths must be unique");
-        assert!(b1.join("marker1").exists());
-        assert!(b2.join("marker2").exists());
-    }
-
-    #[test]
-    fn restore_vectordb_backup_renames_backup_back_to_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = data_paths_in(tmp.path());
-        std::fs::create_dir_all(data.lancedb_dir()).unwrap();
-        std::fs::write(data.lancedb_dir().join("marker"), b"x").unwrap();
-        let backup = evacuate_vectordb(&data, EvacuateMode::Evacuate)
-            .unwrap()
-            .unwrap();
-
-        // Source is empty after evacuation; simulate a failed restart
-        // that has just been aborted by stop().
-        assert!(restore_vectordb_backup(&data, &backup).unwrap());
-        assert!(data.lancedb_dir().join("marker").exists());
-        assert!(!backup.exists(), "backup is moved, not copied");
-    }
-
-    #[test]
-    fn restore_vectordb_backup_returns_false_when_backup_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = data_paths_in(tmp.path());
-        std::fs::create_dir_all(data.lancedb_dir()).unwrap();
-        let phantom = data.lancedb_backup_dir().join("does-not-exist");
-        assert!(!restore_vectordb_backup(&data, &phantom).unwrap());
-    }
-
-    // ── needs_vectordb_reset + env-aware old runtime ────────────────────
-
-    #[test]
-    fn needs_vectordb_reset_true_when_vector_size_changes() {
+    fn embedding_space_changed_true_when_vector_size_changes() {
         let mut old = runtime_from_preset(embedding_presets::default_preset());
         let new = old.clone();
         old.vector_size += 1;
-        assert!(needs_vectordb_reset(&old, &new));
+        assert!(embedding_space_changed(&old, &new));
     }
 
     #[test]
-    fn needs_vectordb_reset_true_when_model_id_changes() {
+    fn embedding_space_changed_true_when_model_id_changes() {
         let mut old = runtime_from_preset(embedding_presets::default_preset());
         let new = old.clone();
         old.model_id = "other/model".into();
-        assert!(needs_vectordb_reset(&old, &new));
+        assert!(embedding_space_changed(&old, &new));
     }
 
     #[test]
-    fn needs_vectordb_reset_false_when_only_dtype_or_max_seq_changes() {
+    fn embedding_space_changed_false_when_only_dtype_or_max_seq_changes() {
         let old = runtime_from_preset(embedding_presets::default_preset());
         let new = EmbeddingRuntime {
             dtype: "BF16".into(),
             max_sequence_length: old.max_sequence_length + 1024,
             ..old.clone()
         };
-        // Dtype / max_seq tweaks alone do not invalidate the LanceDB,
-        // so the user's saved data must NOT be evacuated.
-        assert!(!needs_vectordb_reset(&old, &new));
+        // Dtype / max_seq tweaks alone do not change vector identity.
+        assert!(!embedding_space_changed(&old, &new));
     }
 
     #[test]
-    fn env_aware_old_runtime_triggers_reset_against_envless_default_save() {
-        // Regression for the headline review:
-        //   - sidecar runs with `LOOKBACK_EMBEDDING_VECTOR_SIZE=2048`
-        //   - LanceDB exists at 2048 dim
-        //   - user saves the default preset (preset_id: default)
+    fn env_aware_old_runtime_detects_change_against_envless_default_save() {
+        // The effective environment-driven dimension must be included in the
+        // old side of the safety comparison rather than assuming the preset.
         //
         // If we compared an env-BLIND old_runtime (which returns the
         // default preset's 1024) against the new default preset's 1024,
-        // `needs_vectordb_reset` would be `false` and the next start
-        // would crash trying to open the 2048-dim LanceDB at 1024.
+        // `embedding_space_changed` would be `false`, incorrectly treating
+        // the candidate settings as the same embedding space.
         //
         // Asserting via the same env-aware resolver the lifecycle uses:
         // the env override must surface in old_runtime so the comparison
@@ -1354,8 +1525,8 @@ mod tests {
             "saved preset wins over env"
         );
         assert!(
-            needs_vectordb_reset(&old_runtime, &new_runtime),
-            "evacuation MUST be required when env-driven old dim != new saved dim"
+            embedding_space_changed(&old_runtime, &new_runtime),
+            "the effective env-driven old space must differ from the saved candidate"
         );
     }
 
@@ -1370,7 +1541,7 @@ mod tests {
             custom_dtype: None,
             custom_max_sequence_length: None,
             custom_is_multimodal: None,
-            evacuate_vectordb: true,
+            model_revision: None,
         }
     }
 
@@ -1383,30 +1554,26 @@ mod tests {
         apply_embedding_settings_to_disk(&data, &preset_req(def)).unwrap();
         let outcome = apply_embedding_settings_to_disk(&data, &preset_req(def)).unwrap();
         assert!(!outcome.changed, "re-applying the same preset is a no-op");
-        assert!(!outcome.needs_vectordb_reset);
     }
 
     #[test]
-    fn apply_embedding_to_disk_detects_dimension_change() {
+    fn apply_embedding_to_disk_rejects_dimension_change_without_migration() {
         let tmp = tempfile::tempdir().unwrap();
         let data = data_paths_in(tmp.path());
-        // Start at the default 0.6B preset, switch to the VL-2B multimodal
-        // preset (2048 dim) — a dimension change must request a
-        // vectordb reset and persist the new preset.
+        // A rejected migration must preserve the previous worker configuration.
         apply_embedding_settings_to_disk(
             &data,
             &preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID),
         )
         .unwrap();
-        let outcome =
-            apply_embedding_settings_to_disk(&data, &preset_req("qwen3-vl-embedding-2b")).unwrap();
-        assert!(outcome.changed);
+        let before = std::fs::read(data.embedding_settings_path()).unwrap();
         assert!(
-            outcome.needs_vectordb_reset,
-            "switching to a different-dim preset must require a reset"
+            apply_embedding_settings_to_disk(&data, &preset_req("qwen3-vl-embedding-2b")).is_err()
         );
-        let saved = load_embedding_settings(&data.embedding_settings_path());
-        assert_eq!(saved.preset_id.as_deref(), Some("qwen3-vl-embedding-2b"));
+        assert_eq!(
+            std::fs::read(data.embedding_settings_path()).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -1417,21 +1584,127 @@ mod tests {
         // semantic query vectors can match the remote memories vector space.
         super::super::connection::save_connection_config(
             &data.connection_config_path(),
-            &super::super::connection::ConnectionConfig {
-                mode: super::super::connection::ConnectionMode::Remote,
-                remote_jobworkerp_url: Some("http://h:9000".into()),
-                remote_memories_url: Some("http://h:9010".into()),
-            },
+            &super::super::connection::ConnectionConfig::remote_pair(
+                "http://h:9000",
+                "http://h:9010",
+            ),
         )
         .unwrap();
         let outcome =
             apply_embedding_settings_to_disk(&data, &preset_req("qwen3-vl-embedding-2b")).unwrap();
         assert!(outcome.changed);
-        assert!(
-            !outcome.needs_vectordb_reset,
-            "remote mode must not reset the local vectordb"
-        );
         let saved = load_embedding_settings(&data.embedding_settings_path());
         assert_eq!(saved.preset_id.as_deref(), Some("qwen3-vl-embedding-2b"));
+
+        // Remote mode has no local vector table to protect, so explicit
+        // tokenizer identity changes are allowed as well.
+        let model = "Qwen/Qwen3-VL-Embedding-2B";
+        let tokenizer_change = custom_req(Some(model), Some(model), Some(2048), None, None);
+        apply_embedding_settings_to_disk(&data, &tokenizer_change).unwrap();
+        let saved = load_embedding_settings(&data.embedding_settings_path());
+        assert_eq!(saved.custom_tokenizer_id.as_deref(), Some(model));
+    }
+
+    #[test]
+    fn local_tokenizer_and_revision_changes_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_paths_in(tmp.path());
+        let original = preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID);
+        apply_embedding_settings_to_disk(&data, &original).unwrap();
+        let before = std::fs::read(data.embedding_settings_path()).unwrap();
+        let model = embedding_presets::default_preset().hf_repo;
+        let tokenizer_change = custom_req(Some(model), Some(model), Some(1024), None, None);
+        let mut revision_change = preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID);
+        revision_change.model_revision = Some("explicit-release".into());
+
+        for request in [tokenizer_change, revision_change] {
+            assert!(apply_embedding_settings_to_disk(&data, &request).is_err());
+            assert_eq!(
+                std::fs::read(data.embedding_settings_path()).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn local_identity_change_requires_explicit_cli_plan_permit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_paths_in(tmp.path());
+        let original = preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID);
+        apply_embedding_settings_to_disk(&data, &original).unwrap();
+        let before = std::fs::read(data.embedding_settings_path()).unwrap();
+        let candidate = custom_req(Some("other/model"), None, Some(1024), None, None);
+
+        assert!(apply_embedding_settings_to_disk(&data, &candidate).is_err());
+        assert!(
+            apply_embedding_settings_to_disk_approved(
+                &data,
+                &candidate,
+                EmbeddingPlanPermit::NoChange,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(data.embedding_settings_path()).unwrap(),
+            before
+        );
+
+        let outcome = apply_embedding_settings_to_disk_approved(
+            &data,
+            &candidate,
+            EmbeddingPlanPermit::Adopt,
+        )
+        .unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.new_runtime.model_id, "other/model");
+        let saved = load_embedding_settings(&data.embedding_settings_path());
+        assert_eq!(saved.custom_model_id.as_deref(), Some("other/model"));
+
+        let reconciled = apply_embedding_settings_to_disk_approved(
+            &data,
+            &original,
+            EmbeddingPlanPermit::Reconcile,
+        )
+        .unwrap();
+        assert!(reconciled.changed);
+        assert_eq!(
+            reconciled.new_runtime.model_id,
+            embedding_presets::default_preset().hf_repo
+        );
+    }
+
+    #[test]
+    fn local_space_changes_preserve_settings_and_service_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = data_paths_in(tmp.path());
+        let original = preset_req(embedding_presets::DEFAULT_EMBEDDING_PRESET_ID);
+        apply_embedding_settings_to_disk(&data, &original).unwrap();
+        let before = std::fs::read(data.embedding_settings_path()).unwrap();
+        let store = data.lancedb_dir().join("marker");
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, b"service-owned").unwrap();
+        let runtime =
+            resolve_embedding_runtime(&load_embedding_settings(&data.embedding_settings_path()));
+        for (model, dim) in [
+            ("other/model", runtime.vector_size),
+            (runtime.model_id.as_str(), runtime.vector_size + 1),
+        ] {
+            let request = SetEmbeddingSettingsRequest {
+                preset_id: Some(embedding_presets::CUSTOM_EMBEDDING_PRESET_ID.into()),
+                custom_model_id: Some(model.into()),
+                custom_vector_size: Some(dim),
+                ..original.clone()
+            };
+            let error = apply_embedding_settings_to_disk(&data, &request)
+                .err()
+                .expect("local space change must be rejected");
+            assert!(error.to_string().to_lowercase().contains("memories"));
+            assert_eq!(
+                std::fs::read(data.embedding_settings_path()).unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read(&store).unwrap(), b"service-owned");
+            assert!(!data.root.join("lancedb-backup").exists());
+        }
     }
 }

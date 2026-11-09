@@ -16,7 +16,7 @@ message ChannelConfig {
 
 // # Worker Instance ID
 // Unique identifier for a worker instance
-// Generated from IP address (upper 32 bits) and process ID (lower 32 bits)
+// Generated from an operating-system CSPRNG for each logical instance lifetime
 message WorkerInstanceId {
   int64 value = 1;
 }
@@ -45,6 +45,10 @@ message WorkerInstanceData {
   // Used for active status detection in Scalable configuration
   // Used for freeze detection in Standalone configuration
   int64 last_heartbeat = 5;
+
+  // # RDB Status Index Recovery Protocol Version
+  // Zero means this instance does not participate in RDB status-index recovery.
+  uint32 rdb_status_index_recovery_version = 6;
 }
 
 // # Worker Instance

@@ -1,0 +1,11 @@
+[package]
+name = "mcp-description-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+serde_yaml = "0.9"

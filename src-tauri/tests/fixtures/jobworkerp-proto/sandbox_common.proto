@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package jobworkerp.runner;
+
+message SandboxVmConfig {
+  optional string image = 1;
+  optional uint32 cpus = 2;
+  optional uint32 memory_mib = 3;
+  optional uint32 root_disk_mib = 4;
+  map<string, string> env = 5;
+  optional string working_dir = 6;
+  repeated SandboxBindMount mounts = 7;
+  optional uint64 max_duration_sec = 8;
+  optional uint64 idle_timeout_sec = 9;
+}
+
+message SandboxNetworkConfig {
+  optional bool enabled = 1;
+  repeated string profiles = 2;
+  repeated SandboxNetworkRule rules = 3;
+  optional uint32 max_tcp_connections = 4;
+  optional uint32 max_udp_connections = 5;
+}
+
+message SandboxBindMount {
+  string host_path = 1;
+  string guest_path = 2;
+  bool writable = 3;
+  bool executable = 4;
+}
+
+message SandboxAllowedHostMount {
+  string host_root = 1;
+  bool allow_write = 2;
+  bool allow_exec = 3;
+}
+
+message SandboxNetworkRule {
+  string action = 1;
+  SandboxNetworkDestination destination = 2;
+  repeated string protocols = 3;
+  repeated SandboxPortRange ports = 4;
+}
+
+message SandboxNetworkDestination {
+  oneof destination {
+    string group = 1;
+    string ip = 2;
+    string cidr = 3;
+    string domain = 4;
+    string domain_suffix = 5;
+    bool any = 6;
+  }
+}
+
+message SandboxPortRange {
+  uint32 start = 1;
+  uint32 end = 2;
+}

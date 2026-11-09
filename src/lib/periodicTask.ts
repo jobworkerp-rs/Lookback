@@ -2,36 +2,23 @@ import type { TFunction } from "i18next";
 import type { PeriodicExecutionStatus, PeriodicTaskArgs, PeriodicTaskKind } from "@/types/api";
 import { formatDateTime } from "./localeFormat";
 
-export const PERIODIC_COMBINED_SOURCE = "codex+claude-code";
-export const PERIODIC_SOURCE_OPTIONS = [
-  { value: "codex", label: "codex", sources: ["codex"] },
-  { value: "claude-code", label: "claude-code", sources: ["claude-code"] },
-  {
-    value: PERIODIC_COMBINED_SOURCE,
-    label: "codex + claude-code",
-    sources: ["codex", "claude-code"],
-  },
-] as const;
+export const PERIODIC_SOURCE_CHOICES = ["codex", "claude-code", "opencode"] as const;
+export type PeriodicSource = (typeof PERIODIC_SOURCE_CHOICES)[number];
 export const PERIODIC_INTERVAL_HOUR_OPTIONS = [1, 2, 3, 4, 6, 8, 12, 24] as const;
 
 const PERIODIC_INTERVAL_HOUR_VALUES = new Set<number>(PERIODIC_INTERVAL_HOUR_OPTIONS);
 
-const PERIODIC_SOURCE_VALUES = new Set<string>(
-  PERIODIC_SOURCE_OPTIONS.map((option) => option.value),
-);
+const PERIODIC_SOURCE_VALUES = new Set<string>(PERIODIC_SOURCE_CHOICES);
 
-const PERIODIC_COMBINED_LABEL =
-  PERIODIC_SOURCE_OPTIONS.find((option) => option.value === PERIODIC_COMBINED_SOURCE)?.label ??
-  PERIODIC_COMBINED_SOURCE;
-
-const PERIODIC_COMBINED_SOURCE_SET = new Set(
-  PERIODIC_SOURCE_OPTIONS.find((option) => option.value === PERIODIC_COMBINED_SOURCE)?.sources ??
-    [],
+// Vocabulary display order used to canonicalize any selection; the Rust side
+// (effective_sources) sorts with the same ranking, so both layers agree.
+const PERIODIC_SOURCE_ORDER = new Map<string, number>(
+  PERIODIC_SOURCE_CHOICES.map((source, index) => [source, index]),
 );
 
 export interface PeriodicTaskDraft {
   name: string;
-  source: string;
+  sources: string[];
   task_kind: PeriodicTaskKind;
   hour: number;
   minute: number;
@@ -41,14 +28,18 @@ export interface PeriodicTaskDraft {
   monthly_day: number;
   lookback_days: number;
   run_summary_thread: boolean;
+  run_summary_thread_group: boolean;
   run_summary_daily: boolean;
   run_personality: boolean;
   run_reflection: boolean;
+  stop_on_error: boolean;
 }
 
 export const DEFAULT_PERIODIC_DRAFT: PeriodicTaskDraft = {
   name: "",
-  source: "codex",
+  // Default to every supported source (codex + claude-code + opencode) so a
+  // name-only save imports all agent logs, matching the seeded combined tasks.
+  sources: [...PERIODIC_SOURCE_CHOICES],
   task_kind: "regular",
   hour: 9,
   minute: 0,
@@ -64,17 +55,31 @@ export const DEFAULT_PERIODIC_DRAFT: PeriodicTaskDraft = {
   // into. Mirrors the YAML schema defaults (force_thread_summary /
   // run_summary_daily both default true) and the Rust serde defaults.
   run_summary_thread: true,
+  run_summary_thread_group: true,
   run_summary_daily: true,
   run_personality: false,
   run_reflection: false,
+  stop_on_error: false,
 };
 
-export function periodicSourceLabels(source: string): string[] {
-  // Unknown sources (e.g. legacy schedulers) pass through as-is so the UI can
-  // still display them; validation rejects them before persistence.
-  return (
-    PERIODIC_SOURCE_OPTIONS.find((option) => option.value === source)?.sources ?? [source]
-  ).filter(Boolean);
+// Canonicalize any source list: keep known vocabulary items, dedupe, and sort
+// into the shared display order. Unknown entries are dropped because the
+// backend rejects them before persistence anyway.
+export function canonicalPeriodicSources(sources?: string[] | null): string[] {
+  return [...new Set(sources ?? [])]
+    .filter((source) => PERIODIC_SOURCE_VALUES.has(source))
+    .sort((a, b) => (PERIODIC_SOURCE_ORDER.get(a) ?? 99) - (PERIODIC_SOURCE_ORDER.get(b) ?? 99));
+}
+
+// Legacy persisted rows may omit `sources` and encode the selection in the
+// singular `source` field with "+" separators ("codex+claude-code").
+export function periodicSourceLabels(source?: string | null, sources?: string[] | null): string[] {
+  const canonical = canonicalPeriodicSources(sources);
+  if (canonical.length > 0) return canonical;
+  return (source ?? "")
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
 }
 
 export function periodicSourceLabel(
@@ -82,18 +87,23 @@ export function periodicSourceLabel(
   source: string,
   sources?: string[] | null,
 ): string {
-  if (isCombinedSource(source, sources)) return PERIODIC_COMBINED_LABEL;
-  return source || t("periodic.unknownSource");
+  const labels = periodicSourceLabels(source, sources);
+  if (labels.length === 0) return t("periodic.unknownSource");
+  return labels.join(" + ");
 }
 
 export function toTaskArgs(draft: PeriodicTaskDraft): PeriodicTaskArgs {
-  const sources = periodicSourceLabels(draft.source);
+  const sources = canonicalPeriodicSources(draft.sources);
   const regular = draft.task_kind === "regular";
   const runSummaryDaily = regular && draft.run_summary_daily;
-  const runSummaryThread = regular && (draft.run_summary_thread || runSummaryDaily);
+  const runSummaryThread = draft.run_summary_thread || runSummaryDaily;
+  const runSummaryThreadGroup = draft.run_summary_thread_group;
   return {
     name: draft.name.trim(),
-    source: draft.source,
+    // `source` is a display/legacy column: singular value when one source is
+    // selected, otherwise the "+"-joined selection (matches the backend
+    // validator and the legacy "codex+claude-code" combined token).
+    source: sources.join("+"),
     sources,
     task_kind: draft.task_kind,
     hour: draft.hour,
@@ -107,10 +117,14 @@ export function toTaskArgs(draft: PeriodicTaskDraft): PeriodicTaskArgs {
     weekly_day: draft.task_kind === "weekly" ? draft.weekly_day : null,
     monthly_day: draft.task_kind === "monthly" ? draft.monthly_day : null,
     lookback_days: draft.lookback_days,
-    force_thread_summary: runSummaryThread,
+    // ThreadGroup aggregation consumes thread summaries, so opting into that
+    // stage always keeps its dependency enabled.
+    force_thread_summary: runSummaryThread || runSummaryThreadGroup,
+    run_summary_thread_group: runSummaryThreadGroup,
     run_summary_daily: runSummaryDaily,
     run_personality: regular && draft.run_personality,
     run_reflection: regular && draft.run_reflection,
+    stop_on_error: draft.stop_on_error,
   };
 }
 
@@ -118,7 +132,7 @@ export function draftFromTask(task: PeriodicTaskArgs): PeriodicTaskDraft {
   return {
     ...DEFAULT_PERIODIC_DRAFT,
     name: task.name,
-    source: isCombinedSource(task.source, task.sources) ? PERIODIC_COMBINED_SOURCE : task.source,
+    sources: periodicSourceLabels(task.source, task.sources),
     task_kind: task.task_kind,
     hour: task.hour,
     minute: task.minute,
@@ -127,7 +141,10 @@ export function draftFromTask(task: PeriodicTaskArgs): PeriodicTaskDraft {
     weekly_day: task.weekly_day ?? 1,
     monthly_day: task.monthly_day ?? 1,
     lookback_days: task.lookback_days,
-    run_summary_thread: task.task_kind === "regular" ? task.force_thread_summary : false,
+    run_summary_thread: task.force_thread_summary,
+    run_summary_thread_group:
+      task.run_summary_thread_group ?? (task.task_kind === "regular" && task.force_thread_summary),
+    stop_on_error: task.stop_on_error ?? false,
     run_summary_daily: task.task_kind === "regular" ? (task.run_summary_daily ?? true) : true,
     run_personality: task.task_kind === "regular" ? (task.run_personality ?? false) : true,
     run_reflection: task.task_kind === "regular" ? (task.run_reflection ?? false) : true,
@@ -141,8 +158,11 @@ export function draftFromTask(task: PeriodicTaskArgs): PeriodicTaskDraft {
 export function validatePeriodicDraft(draft: PeriodicTaskDraft): string[] {
   const errors: string[] = [];
   if (!draft.name.trim()) errors.push("periodic.validation.nameRequired");
-  if (!draft.source.trim()) errors.push("periodic.validation.sourceRequired");
-  if (draft.source.trim() && !PERIODIC_SOURCE_VALUES.has(draft.source)) {
+  if (draft.sources.length === 0) errors.push("periodic.validation.sourceRequired");
+  if (
+    draft.sources.length > 0 &&
+    draft.sources.some((source) => !PERIODIC_SOURCE_VALUES.has(source))
+  ) {
     errors.push("periodic.validation.sourceInvalid");
   }
   if (draft.hour < 0 || draft.hour > 23) errors.push("periodic.validation.hourRange");
@@ -192,15 +212,6 @@ function hourListForInterval(startHour: number, intervalHours: number): number[]
 
 export function periodicKindLabel(t: TFunction, kind: PeriodicTaskKind): string {
   return t(`periodic.kindLabel.${kind}`);
-}
-
-function isCombinedSource(source: string, sources?: string[] | null): boolean {
-  if (source === PERIODIC_COMBINED_SOURCE) return true;
-  const set = new Set(sources ?? []);
-  return (
-    set.size === PERIODIC_COMBINED_SOURCE_SET.size &&
-    [...PERIODIC_COMBINED_SOURCE_SET].every((value) => set.has(value))
-  );
 }
 
 /** Variant suffix for the `.periodic-status-*` badge class (groups statuses by

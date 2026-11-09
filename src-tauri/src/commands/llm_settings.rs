@@ -10,15 +10,22 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    error::{AppError, AppResult},
+    sidecar::RestartPlan,
+};
 
 use super::AppState;
 use super::llm_presets;
 use super::llm_presets::KvCacheType;
 
 /// Range guards obvious typos; llama-cpp clamps to the model cap downstream.
-const LOCAL_CTX_SIZE_MIN: u32 = 512;
+const LOCAL_CTX_SIZE_MIN: u32 = 1024;
 const LOCAL_CTX_SIZE_MAX: u32 = 1_048_576;
+
+/// Context-size thresholds used to select the editable summary-writing guide.
+pub const SUMMARY_GUIDE_STANDARD_CONTEXT_TOKENS: u32 = 128_000;
+pub const SUMMARY_GUIDE_LARGE_CONTEXT_TOKENS: u32 = 300_000;
 
 const KEYRING_SERVICE: &str = "lookback";
 const KEYRING_ACCOUNT: &str = "llm-api-key";
@@ -29,6 +36,109 @@ pub enum LlmMode {
     #[default]
     Local,
     External,
+}
+
+/// A prompt-only writing target. These values never truncate a runner response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryLengthGuide {
+    pub item_chars: u32,
+    pub total_chars: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryGuideProfile {
+    pub daily: SummaryLengthGuide,
+    pub weekly: SummaryLengthGuide,
+    pub monthly: SummaryLengthGuide,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryPeriodLimits {
+    pub daily: u32,
+    pub weekly: u32,
+    pub monthly: u32,
+    pub max_source_memory_ids: u32,
+}
+
+/// User-editable prompt guidance selected from the model's effective context
+/// window. Counts remain common across profiles; only free-text length guides
+/// vary by context class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryOutputGuidance {
+    pub small: SummaryGuideProfile,
+    pub standard: SummaryGuideProfile,
+    pub large: SummaryGuideProfile,
+    pub limits: SummaryPeriodLimits,
+}
+
+impl Default for SummaryOutputGuidance {
+    fn default() -> Self {
+        Self {
+            small: SummaryGuideProfile {
+                daily: SummaryLengthGuide {
+                    item_chars: 200,
+                    total_chars: 8_000,
+                },
+                weekly: SummaryLengthGuide {
+                    item_chars: 350,
+                    total_chars: 18_000,
+                },
+                monthly: SummaryLengthGuide {
+                    item_chars: 500,
+                    total_chars: 40_000,
+                },
+            },
+            standard: SummaryGuideProfile {
+                daily: SummaryLengthGuide {
+                    item_chars: 300,
+                    total_chars: 12_000,
+                },
+                weekly: SummaryLengthGuide {
+                    item_chars: 500,
+                    total_chars: 30_000,
+                },
+                monthly: SummaryLengthGuide {
+                    item_chars: 800,
+                    total_chars: 80_000,
+                },
+            },
+            large: SummaryGuideProfile {
+                daily: SummaryLengthGuide {
+                    item_chars: 500,
+                    total_chars: 20_000,
+                },
+                weekly: SummaryLengthGuide {
+                    item_chars: 800,
+                    total_chars: 50_000,
+                },
+                monthly: SummaryLengthGuide {
+                    item_chars: 1_200,
+                    total_chars: 120_000,
+                },
+            },
+            limits: SummaryPeriodLimits {
+                daily: 10,
+                weekly: 20,
+                monthly: 50,
+                max_source_memory_ids: 10,
+            },
+        }
+    }
+}
+
+/// Resolve the profile from the effective model context length. This is a
+/// writing-usability choice, not a hard runner token budget.
+pub fn summary_guide_profile_for_context(
+    guidance: &SummaryOutputGuidance,
+    context_tokens: u32,
+) -> &SummaryGuideProfile {
+    if context_tokens < SUMMARY_GUIDE_STANDARD_CONTEXT_TOKENS {
+        &guidance.small
+    } else if context_tokens < SUMMARY_GUIDE_LARGE_CONTEXT_TOKENS {
+        &guidance.standard
+    } else {
+        &guidance.large
+    }
 }
 
 /// Persisted (non-secret) LLM provider config.
@@ -47,6 +157,10 @@ pub struct LlmSettings {
     pub base_url: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Explicit model output ceiling used by period summaries, separate from
+    /// the chat response preference and the combined context window.
+    #[serde(default)]
+    pub model_max_output_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
     /// Curated preset id (see `llm_presets::PRESETS`), or the sentinel
@@ -71,6 +185,10 @@ pub struct LlmSettings {
     /// current default from [`llm_presets::DEFAULT_KV_CACHE_TYPE`].
     #[serde(default)]
     pub local_kv_cache_type: Option<KvCacheType>,
+    /// Prompt-only summary writing guidance. Missing persisted settings use
+    /// the defaults so existing installations remain compatible.
+    #[serde(default)]
+    pub summary_output_guidance: SummaryOutputGuidance,
 }
 
 /// Frontend-facing response. Never exposes the actual API key — only
@@ -82,12 +200,15 @@ pub struct LlmSettingsResponse {
     pub api_key_set: bool,
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub model_max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub local_preset_id: Option<String>,
     pub local_model_file: Option<String>,
     pub local_hf_repo: Option<String>,
     pub local_ctx_size: Option<u32>,
     pub local_kv_cache_type: Option<KvCacheType>,
+    pub summary_output_guidance: SummaryOutputGuidance,
 }
 
 /// Request from the frontend. `api_key = null` means "don't change the
@@ -99,6 +220,8 @@ pub struct SetLlmSettingsRequest {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub model_max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
     #[serde(default)]
     pub local_preset_id: Option<String>,
@@ -110,14 +233,15 @@ pub struct SetLlmSettingsRequest {
     pub local_ctx_size: Option<u32>,
     #[serde(default)]
     pub local_kv_cache_type: Option<KvCacheType>,
+    /// `None` preserves the stored guide for older frontend clients.
+    #[serde(default)]
+    pub summary_output_guidance: Option<SummaryOutputGuidance>,
 }
 
-/// Resolved local-LLM runtime values. Produced by [`resolve_local_runtime`]
-/// from the persisted settings + the preset table; consumed by
-/// `lib.rs::build_sidecar_config` (to inject env into the jobworkerp
-/// child), `commands::model::llm_identity` (for the Settings card label),
-/// and `commands::chat::build_chat_args` (for the thinking-mode
-/// suppression kwarg).
+/// Resolved local-LLM settings and preset metadata. Produced by
+/// [`resolve_local_runtime`] from persisted settings and the preset table;
+/// the `thinking_kwarg` field retains a legacy preset preference and is not
+/// used to build current chat payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRuntime {
     pub model_file: String,
@@ -272,8 +396,9 @@ fn parse_bool_env(value: &str) -> Option<bool> {
     }
 }
 
-/// `chat_template_kwargs.enable_thinking` policy for the LLM the sidecar
-/// is actually loading right now.
+/// Resolve the retained legacy `chat_template_kwargs.enable_thinking`
+/// preference from the local-LLM settings. The result is preset metadata and
+/// is not used to build current chat payloads.
 ///
 /// Mirrors [`resolve_local_llm_env_triple`]'s precedence: when the user
 /// has saved a preset (`local_preset_id == Some(_)`) the curated kwarg is
@@ -569,15 +694,33 @@ pub enum Provider {
     Groq,
     XAi,
     OpenRouter,
+    Omlx,
     /// Unknown prefix — falls back to OpenAI-compatible behaviour so
     /// proxies (LiteLLM etc.) configured with an arbitrary model name
     /// still receive a usable API key env var.
     OpenAiCompatible,
 }
 
-/// Decide which provider `model` belongs to. A non-empty `base_url`
-/// overrides the prefix detection — an explicit proxy / OpenAI-compatible
-/// endpoint always reads `OPENAI_API_KEY`.
+/// genai adapter namespaces (`<namespace>::<model>`) and the provider whose
+/// key variable that adapter reads.
+const ADAPTER_NAMESPACES: &[(&str, Provider)] = &[
+    ("openai", Provider::OpenAi),
+    ("anthropic", Provider::Anthropic),
+    ("gemini", Provider::Gemini),
+    ("deepseek", Provider::DeepSeek),
+    ("cohere", Provider::Cohere),
+    ("zai", Provider::Zai),
+    ("groq", Provider::Groq),
+    ("xai", Provider::XAi),
+    ("open_router", Provider::OpenRouter),
+    ("omlx", Provider::Omlx),
+];
+
+/// Decide which provider `model` belongs to. An explicit genai adapter
+/// namespace (`groq::`, `omlx::`, …) wins: that adapter reads its own key
+/// variable and a `base_url` only redirects its endpoint. Otherwise a
+/// non-empty `base_url` overrides the prefix detection — an explicit proxy /
+/// OpenAI-compatible endpoint reads `OPENAI_API_KEY`.
 ///
 /// The empty-string guard is deliberate: `set_llm_settings` may persist
 /// `base_url: Some("")` for legacy callers (the frontend used to send an
@@ -585,10 +728,18 @@ pub enum Provider {
 /// model would be silently re-routed to `OPENAI_API_KEY` and report
 /// "API key not valid" against the real provider.
 pub fn detect_provider(model: &str, base_url: Option<&str>) -> Provider {
+    let m = model.to_ascii_lowercase();
+    if let Some(provider) = m.split_once("::").and_then(|(namespace, _)| {
+        ADAPTER_NAMESPACES
+            .iter()
+            .find(|(known, _)| *known == namespace)
+            .map(|(_, provider)| *provider)
+    }) {
+        return provider;
+    }
     if base_url.is_some_and(|u| !u.is_empty()) {
         return Provider::OpenAi;
     }
-    let m = model.to_ascii_lowercase();
     if m.starts_with("gpt") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
         Provider::OpenAi
     } else if m.starts_with("claude") {
@@ -601,12 +752,6 @@ pub fn detect_provider(model: &str, base_url: Option<&str>) -> Provider {
         Provider::Cohere
     } else if m.starts_with("glm") {
         Provider::Zai
-    } else if m.starts_with("groq::") {
-        Provider::Groq
-    } else if m.starts_with("xai::") {
-        Provider::XAi
-    } else if m.starts_with("open_router::") {
-        Provider::OpenRouter
     } else {
         Provider::OpenAiCompatible
     }
@@ -627,6 +772,7 @@ impl Provider {
             Provider::Groq => "GROQ_API_KEY",
             Provider::XAi => "XAI_API_KEY",
             Provider::OpenRouter => "OPEN_ROUTER_API_KEY",
+            Provider::Omlx => "OMLX_API_KEY",
         }
     }
 
@@ -642,6 +788,7 @@ impl Provider {
             Provider::Groq => "Groq",
             Provider::XAi => "xAI",
             Provider::OpenRouter => "OpenRouter",
+            Provider::Omlx => "oMLX",
             Provider::OpenAiCompatible => "OpenAI-compatible",
         }
     }
@@ -670,12 +817,14 @@ pub fn get_llm_settings(state: tauri::State<'_, AppState>) -> AppResult<LlmSetti
         api_key_set: load_api_key().is_some(),
         base_url: settings.base_url,
         max_tokens: settings.max_tokens,
+        model_max_output_tokens: settings.model_max_output_tokens,
         temperature: settings.temperature,
         local_preset_id: settings.local_preset_id,
         local_model_file: settings.local_model_file,
         local_hf_repo: settings.local_hf_repo,
         local_ctx_size: settings.local_ctx_size,
         local_kv_cache_type: settings.local_kv_cache_type,
+        summary_output_guidance: settings.summary_output_guidance,
     })
 }
 
@@ -706,6 +855,49 @@ pub fn validate_llm_request(req: &SetLlmSettingsRequest) -> AppResult<()> {
         }
     }
     validate_ctx_size(req.local_ctx_size).map_err(AppError::Config)?;
+    if req
+        .model_max_output_tokens
+        .is_some_and(|limit| !(1_024..=1_048_576).contains(&limit))
+    {
+        return Err(AppError::Config(
+            "model_max_output_tokens must be in [1024, 1048576]".into(),
+        ));
+    }
+    if let Some(guidance) = &req.summary_output_guidance {
+        validate_summary_output_guidance(guidance).map_err(AppError::Config)?;
+    }
+    Ok(())
+}
+
+fn validate_summary_output_guidance(guidance: &SummaryOutputGuidance) -> Result<(), String> {
+    for (name, value) in [
+        ("small.daily", &guidance.small.daily),
+        ("small.weekly", &guidance.small.weekly),
+        ("small.monthly", &guidance.small.monthly),
+        ("standard.daily", &guidance.standard.daily),
+        ("standard.weekly", &guidance.standard.weekly),
+        ("standard.monthly", &guidance.standard.monthly),
+        ("large.daily", &guidance.large.daily),
+        ("large.weekly", &guidance.large.weekly),
+        ("large.monthly", &guidance.large.monthly),
+    ] {
+        if value.item_chars == 0 || value.total_chars < value.item_chars {
+            return Err(format!(
+                "summary_output_guidance.{name} must have positive item_chars and total_chars >= item_chars"
+            ));
+        }
+    }
+    if [
+        guidance.limits.daily,
+        guidance.limits.weekly,
+        guidance.limits.monthly,
+        guidance.limits.max_source_memory_ids,
+    ]
+    .into_iter()
+    .any(|limit| limit == 0)
+    {
+        return Err("summary_output_guidance limits must be positive".into());
+    }
     Ok(())
 }
 
@@ -715,6 +907,10 @@ pub fn validate_llm_request(req: &SetLlmSettingsRequest) -> AppResult<()> {
 /// its env / worker upsert) if the new model fails to load.
 pub struct LlmApplyOutcome {
     pub reload_needed: bool,
+    /// The sidecar need not restart for prompt-only guidance, but conductor
+    /// persists period-summary inputs separately and must receive the new
+    /// snapshot before the next scheduled run.
+    pub periodic_runtime_refresh_needed: bool,
     pub old: LlmSettings,
     pub new: LlmSettings,
     /// True when this apply touched the Keychain API key (set or delete).
@@ -797,12 +993,16 @@ pub fn apply_llm_settings_to_disk(
         provider_model: req.provider_model,
         base_url: req.base_url,
         max_tokens: req.max_tokens,
+        model_max_output_tokens: req.model_max_output_tokens,
         temperature: req.temperature,
         local_preset_id: normalize_local_preset_id(req.local_preset_id),
         local_model_file: req.local_model_file,
         local_hf_repo: req.local_hf_repo,
         local_ctx_size: req.local_ctx_size,
         local_kv_cache_type: req.local_kv_cache_type,
+        summary_output_guidance: req
+            .summary_output_guidance
+            .unwrap_or(old.summary_output_guidance.clone()),
     };
     save_llm_settings(path, &new_settings)?;
 
@@ -821,13 +1021,19 @@ pub fn apply_llm_settings_to_disk(
         || old.local_hf_repo != new_settings.local_hf_repo
         || old.local_ctx_size != new_settings.local_ctx_size
         || old.local_kv_cache_type != new_settings.local_kv_cache_type;
+    // Periodic inputs are persisted by conductor and refreshed on restart.
+    let output_limit_changed = old.model_max_output_tokens != new_settings.model_max_output_tokens;
+    let periodic_runtime_refresh_needed =
+        old.summary_output_guidance != new_settings.summary_output_guidance;
 
     Ok(LlmApplyOutcome {
         reload_needed: model_changed
             || base_url_changed
             || key_changed
             || mode_changed
-            || local_changed,
+            || local_changed
+            || output_limit_changed,
+        periodic_runtime_refresh_needed,
         old,
         new: new_settings,
         key_changed,
@@ -1038,13 +1244,15 @@ pub(crate) async fn load_local_model_after_restart(
     if new.mode != LlmMode::Local {
         return;
     }
-    let Some(endpoints) = sidecars.current_endpoints() else {
+    let Some(jobworkerp_url) = sidecars
+        .current_endpoints()
+        .and_then(|endpoints| endpoints.jobworkerp_url())
+    else {
         return;
     };
     let target = reload_target_for_mode(LlmMode::Local);
     let result = async {
-        let handle =
-            crate::jobworkerp::JobworkerpHandle::connect(&endpoints.jobworkerp_url()).await?;
+        let handle = crate::jobworkerp::JobworkerpHandle::connect(&jobworkerp_url).await?;
         handle
             .load_worker(target.name, Some(LLM_LOAD_TIMEOUT_MS))
             .await
@@ -1130,61 +1338,122 @@ pub(crate) async fn connect_and_reload_llm_with_rollback(
     }
 }
 
+async fn restart_llm_sidecar(app: &tauri::AppHandle, state: &AppState) -> AppResult<()> {
+    if state.sidecars.current_endpoints().is_some() {
+        let warnings = super::stage_plugins_for_restart(app, &state.data.plugins_dir());
+        state
+            .sidecars
+            .restart_plan(RestartPlan::jobworkerp_only(), warnings)
+            .await?;
+        return Ok(());
+    }
+
+    crate::stage_and_start_sidecars(app, &state.sidecars, &state.data).await;
+    if let Some(error) = state.sidecars.last_start_error() {
+        return Err(AppError::Config(error));
+    }
+    state
+        .sidecars
+        .current_endpoints()
+        .ok_or_else(|| AppError::Config("sidecars did not start".into()))?;
+    Ok(())
+}
+
+async fn rollback_llm_restart(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    path: &Path,
+    outcome: &LlmApplyOutcome,
+    old_api_key: Option<String>,
+) -> AppResult<()> {
+    save_llm_settings(path, &outcome.old)?;
+    if outcome.key_changed {
+        restore_api_key(old_api_key)?;
+    }
+    state.invalidate_clients().await;
+    restart_llm_sidecar(app, state).await
+}
+
 #[tauri::command]
 pub async fn set_llm_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     req: SetLlmSettingsRequest,
 ) -> AppResult<()> {
+    let _dispatch_gate = state.lock_llm_settings_dispatch_gate().await;
+    if state.has_in_flight_dispatches().await {
+        return Err(AppError::Config(
+            super::LLM_SETTINGS_CHANGE_WHILE_GENERATING_ERROR.into(),
+        ));
+    }
     let path = state.data.llm_settings_path();
+    let old_api_key = req.api_key.is_some().then(load_api_key).flatten();
     let outcome = apply_llm_settings_to_disk(&path, req)?;
 
     if !outcome.reload_needed {
+        // Writing guidance does not alter the running worker, but each
+        // scheduler owns a persisted copy of its period-summary input. Update
+        // that copy immediately when conductor is available; startup performs
+        // the same refresh later if sidecars are currently offline.
+        if outcome.periodic_runtime_refresh_needed
+            && state.sidecars.current_endpoints().is_some()
+            && let Err(error) = super::periodic_tasks::refresh_lookback_periodic_runtime_from_state(
+                &state,
+                &std::collections::HashSet::new(),
+            )
+            .await
+        {
+            save_llm_settings(&path, &outcome.old)?;
+            if outcome.key_changed {
+                restore_api_key(old_api_key)?;
+            }
+            if let Err(rollback_error) =
+                super::periodic_tasks::refresh_lookback_periodic_runtime_from_state(
+                    &state,
+                    &std::collections::HashSet::new(),
+                )
+                .await
+            {
+                tracing::warn!(error = %rollback_error, "failed to restore periodic runtime after guidance refresh failure");
+            }
+            return Err(error);
+        }
         return Ok(());
     }
 
-    // Hot-reload is taken only for an External target whose provider key env
-    // the child was already spawned with (see `hot_reload_safe`). Local targets
-    // always restart so process exit releases any Metal-backed pages.
-    // Hot-reload only when the change is safe AND a live local sidecar exists;
-    // otherwise (unsafe change, or first-launch with no sidecar) fall back to
-    // the full (re)start so the child re-injects its spawn-time env. Binding
-    // `endpoints` with `let-else` here both gates the path and avoids a second
-    // `current_endpoints()` lookup + an unreachable `expect` below.
-    let spawned_key_env = state.sidecars.spawned_external_key_env();
-    let endpoints = state.sidecars.current_endpoints();
-    let Some(endpoints) = endpoints.filter(|_| outcome.hot_reload_safe(spawned_key_env.as_deref()))
-    else {
-        state.invalidate_clients().await;
-        let sidecars = state.sidecars.clone();
-        let data = state.data.clone();
-        sidecars.stop().await?;
-        crate::stage_and_start_sidecars(&app, &sidecars, &data).await;
-        load_local_model_after_restart(&app, &sidecars, &outcome.new).await;
-        return Ok(());
-    };
-    let worker_yaml = crate::data::paths::llm_workers_yaml()?;
-
-    // Shared connect → reload → rollback pipeline. The single-command rollback
-    // restores only this command's settings file (the batch path restores the
-    // whole batch + Keychain via its own closure).
-    let result = connect_and_reload_llm_with_rollback(
-        &app,
-        &endpoints.jobworkerp_url(),
-        &worker_yaml,
-        &outcome.new,
-        &outcome.old,
-        || {
-            let _ = save_llm_settings(&path, &outcome.old);
-        },
-    )
-    .await;
-    // Drop the cached jobworkerp client on success: the released static pool
-    // means the next dispatch should reconnect cleanly.
-    if result.is_ok() {
-        state.invalidate_clients().await;
+    // A summary workflow performs `token_count` and `completion` as separate
+    // jobs. Re-registering this shared worker between them can silently move
+    // the completion onto another model, invalidating its context contract.
+    // Process replacement is the boundary: in-flight jobs end with the old
+    // worker and every subsequent job starts against the new configuration.
+    let paused_periodic =
+        match super::periodic_execution::pause_periodic_schedules_for_restart(&state).await {
+            Ok(paused) => paused,
+            Err(error) => {
+                save_llm_settings(&path, &outcome.old)?;
+                if outcome.key_changed {
+                    restore_api_key(old_api_key)?;
+                }
+                return Err(error);
+            }
+        };
+    let restart_result = restart_llm_sidecar(&app, &state).await;
+    match restart_result {
+        Ok(()) => {
+            load_local_model_after_restart(&app, &state.sidecars, &outcome.new).await;
+            if let Err(error) = paused_periodic.resume_after_restart(&state).await {
+                rollback_llm_restart(&app, &state, &path, &outcome, old_api_key).await?;
+                paused_periodic.resume_after_restart(&state).await?;
+                return Err(error);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            rollback_llm_restart(&app, &state, &path, &outcome, old_api_key).await?;
+            paused_periodic.resume_after_restart(&state).await?;
+            Err(error)
+        }
     }
-    result
 }
 
 #[cfg(test)]
@@ -1208,6 +1477,7 @@ mod tests {
             provider_model: Some("gpt-4o".into()),
             base_url: None,
             max_tokens: Some(4000),
+            model_max_output_tokens: None,
             temperature: Some(0.3),
             ..Default::default()
         };
@@ -1223,12 +1493,52 @@ mod tests {
     }
 
     #[test]
+    fn summary_guide_profile_uses_effective_context_boundaries() {
+        let guidance = SummaryOutputGuidance::default();
+        assert_eq!(
+            summary_guide_profile_for_context(&guidance, 127_999)
+                .daily
+                .item_chars,
+            200
+        );
+        assert_eq!(
+            summary_guide_profile_for_context(&guidance, 128_000)
+                .weekly
+                .item_chars,
+            500
+        );
+        assert_eq!(
+            summary_guide_profile_for_context(&guidance, 299_999)
+                .monthly
+                .item_chars,
+            800
+        );
+        assert_eq!(
+            summary_guide_profile_for_context(&guidance, 300_000)
+                .monthly
+                .item_chars,
+            1_200
+        );
+    }
+
+    #[test]
+    fn summary_output_guidance_rejects_non_positive_limits_and_invalid_lengths() {
+        let mut guidance = SummaryOutputGuidance::default();
+        guidance.small.daily.total_chars = 1;
+        assert!(validate_summary_output_guidance(&guidance).is_err());
+        guidance = SummaryOutputGuidance::default();
+        guidance.limits.max_source_memory_ids = 0;
+        assert!(validate_summary_output_guidance(&guidance).is_err());
+    }
+
+    #[test]
     fn serde_roundtrips_external() {
         let s = LlmSettings {
             mode: LlmMode::External,
             provider_model: Some("claude-sonnet-4-20250514".into()),
             base_url: Some("https://proxy.example.com/v1".into()),
             max_tokens: Some(8000),
+            model_max_output_tokens: None,
             temperature: Some(0.7),
             ..Default::default()
         };
@@ -1320,6 +1630,28 @@ mod tests {
             provider_env_var_for_model("anything", Some("https://my-proxy.com/v1")),
             "OPENAI_API_KEY"
         );
+    }
+
+    #[test]
+    fn provider_env_var_follows_an_explicit_adapter_namespace_over_base_url() {
+        let lan = Some("http://192.168.0.2:11434/v1");
+        assert_eq!(
+            provider_env_var_for_model("omlx::Qwen3-8B", lan),
+            "OMLX_API_KEY"
+        );
+        assert_eq!(
+            provider_env_var_for_model("omlx::Qwen3-8B", None),
+            "OMLX_API_KEY"
+        );
+        assert_eq!(
+            provider_env_var_for_model("groq::llama-3.3-70b", lan),
+            "GROQ_API_KEY"
+        );
+        assert_eq!(
+            provider_env_var_for_model("openai::Qwen3-8B", lan),
+            "OPENAI_API_KEY"
+        );
+        assert_eq!(provider_display_name("omlx::Qwen3-8B"), "oMLX");
     }
 
     #[test]
@@ -1789,12 +2121,14 @@ mod tests {
             api_key: None,
             base_url: None,
             max_tokens: None,
+            model_max_output_tokens: None,
             temperature: None,
             local_preset_id: Some("gemma-4-e2b-it-ud-q4-k-xl".into()),
             local_model_file: None,
             local_hf_repo: None,
             local_ctx_size: None,
             local_kv_cache_type: None,
+            summary_output_guidance: None,
         };
         apply_llm_settings_to_disk(&path, req).unwrap();
         let settings = load_llm_settings(&path);
@@ -2004,12 +2338,14 @@ mod tests {
             api_key: None,
             base_url: None,
             max_tokens: None,
+            model_max_output_tokens: None,
             temperature: None,
             local_preset_id: Some(llm_presets::CUSTOM_PRESET_ID.into()),
             local_model_file: file.map(str::to_string),
             local_hf_repo: repo.map(str::to_string),
             local_ctx_size: None,
             local_kv_cache_type: None,
+            summary_output_guidance: None,
         }
     }
 
@@ -2157,12 +2493,14 @@ mod tests {
             api_key: None, // never touch the Keychain in unit tests
             base_url: None,
             max_tokens: None,
+            model_max_output_tokens: None,
             temperature: None,
             local_preset_id: None,
             local_model_file: None,
             local_hf_repo: None,
             local_ctx_size: None,
             local_kv_cache_type: None,
+            summary_output_guidance: None,
         }
     }
 
@@ -2175,6 +2513,28 @@ mod tests {
         assert!(validate_llm_request(&request).is_ok());
     }
 
+    #[test]
+    fn model_output_limit_is_validated_persisted_and_refreshes_periodic_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llm-settings.json");
+        let mut request = external_req("gpt-5.5");
+        request.model_max_output_tokens = Some(0);
+        assert!(validate_llm_request(&request).is_err());
+        request.model_max_output_tokens = Some(128_000);
+        apply_llm_settings_to_disk(&path, request).unwrap();
+        assert_eq!(
+            load_llm_settings(&path).model_max_output_tokens,
+            Some(128_000)
+        );
+        let mut request = external_req("gpt-5.5");
+        request.model_max_output_tokens = Some(64_000);
+        assert!(
+            apply_llm_settings_to_disk(&path, request)
+                .unwrap()
+                .reload_needed
+        );
+    }
+
     /// Build an outcome with explicit modes, key-change flag, and the new
     /// mode's provider model (only meaningful when `new_mode == External`).
     fn outcome_pm(
@@ -2185,6 +2545,7 @@ mod tests {
     ) -> LlmApplyOutcome {
         LlmApplyOutcome {
             reload_needed: true,
+            periodic_runtime_refresh_needed: false,
             old: LlmSettings {
                 mode: old_mode,
                 ..Default::default()
@@ -2298,12 +2659,14 @@ mod tests {
             api_key: None,
             base_url: None,
             max_tokens: None,
+            model_max_output_tokens: None,
             temperature: None,
             local_preset_id: Some("qwen3-5-9b-ud-q4-k-xl".into()),
             local_model_file: None,
             local_hf_repo: None,
             local_ctx_size: None,
             local_kv_cache_type: None,
+            summary_output_guidance: None,
         };
         let out = apply_llm_settings_to_disk(&path, req).unwrap();
         assert!(out.reload_needed);
@@ -2339,6 +2702,23 @@ mod tests {
             !outcome.reload_needed,
             "re-saving the same value must not reload"
         );
+    }
+
+    #[test]
+    fn guidance_only_change_refreshes_periodic_runtime_without_restarting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llm-settings.json");
+        apply_llm_settings_to_disk(&path, external_req("gpt-4o")).unwrap();
+
+        let mut request = external_req("gpt-4o");
+        let mut guidance = SummaryOutputGuidance::default();
+        guidance.standard.daily.item_chars = 420;
+        guidance.standard.daily.total_chars = 16_000;
+        request.summary_output_guidance = Some(guidance);
+
+        let outcome = apply_llm_settings_to_disk(&path, request).unwrap();
+        assert!(!outcome.reload_needed);
+        assert!(outcome.periodic_runtime_refresh_needed);
     }
 
     #[test]

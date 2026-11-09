@@ -1,0 +1,154 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: issue-resolution-origin
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [candidate_id, source_evidence_refs, memories_grpc_host, memories_grpc_port]
+      properties:
+        candidate_id: { type: string, minLength: 1 }
+        source_evidence_refs: { type: array }
+        memories_grpc_host: { type: string }
+        memories_grpc_port: { type: integer }
+        memories_grpc_tls: { type: boolean, default: false }
+
+timeout:
+  after:
+    hours: 1
+
+do:
+  - initState:
+      set:
+        candidate_id: "${ $workflow.input.candidate_id }"
+        source_evidence_refs: "${ $workflow.input.source_evidence_refs }"
+        candidate_origin_memories: "${ [] }"
+        source_origin_memory_ids: "${ [] }"
+        expected_source_memory_ids: "${ [] }"
+        source_origin_complete: "${ false }"
+        candidate_source_time_complete: "${ false }"
+        candidate_source_latest_at: "${ null }"
+        origin_fetch_errors: "${ [] }"
+        candidate_outcome_recorded: "${ false }"
+        skipped_candidate_ids: "${ [] }"
+        skipped_candidates: "${ [] }"
+        protected_candidates: "${ [] }"
+        failed_candidates: "${ [] }"
+
+  # Candidate origin memories are fetched by id so source timestamps never come from a summary.
+  - fetchCandidateOriginMemories:
+      if: >-
+        ${ ($candidate_outcome_recorded | not) }
+      for:
+        each: source_evidence_ref
+        in: "${ $source_evidence_refs // [] }"
+      onError: continue
+      do:
+        - initOriginFetch:
+            set:
+              origin_memory_response: "${ null }"
+        - fetchOriginMemory:
+            if: "${ ($source_evidence_ref.memoryId // $source_evidence_ref.memory_id // \"\") != \"\" }"
+            try:
+              - findOriginMemory:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: unary
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.MemoryService/Find"
+                        json_body: >-
+                          ${ { value: ($source_evidence_ref.memoryId // $source_evidence_ref.memory_id) } | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      origin_memory_response: "${ .jsonBody | fromjson | .data // null }"
+              - collectOriginMemory:
+                  if: "${ $origin_memory_response != null }"
+                  set:
+                    candidate_origin_memories: "${ $candidate_origin_memories + [$origin_memory_response] }"
+            catch:
+              as: origin_error
+              do:
+                - recordOriginFetchError:
+                    set:
+                      origin_fetch_errors: "${ $origin_fetch_errors + [{ memory_id: ($source_evidence_ref.memoryId // $source_evidence_ref.memory_id), reason: ($origin_error | tostring) }] }"
+
+  - shapeCandidateSourceTime:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        expected_source_memory_ids: >-
+          ${ ($source_evidence_refs // [])
+             | map(.memoryId // .memory_id // "")
+             | map(select(. != ""))
+             | map(tostring)
+             | unique }
+        source_origin_memory_ids: >-
+          ${ ($candidate_origin_memories // [])
+             | map(.id.value // .id // "")
+             | map(select(. != ""))
+             | map(tostring)
+             | unique }
+        candidate_source_time_complete: >-
+          ${ (($candidate_origin_memories | length) > 0)
+             and all($candidate_origin_memories[];
+               ((.data.createdAt // .data.created_at // null) != null)
+               and ((try ((.data.createdAt // .data.created_at) | tonumber) catch null) != null)) }
+
+  # A separate step: keys of one set read each other's previous values.
+  - shapeCandidateSourceLatestAt:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        candidate_source_latest_at: >-
+          ${ if ($candidate_source_time_complete)
+             then (($candidate_origin_memories
+                    | map((.data.createdAt // .data.created_at) | tonumber)
+                    | max) // null)
+             else null end }
+
+  - skipWithoutCandidateTimestamp:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($candidate_source_time_complete // false) | not) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "candidate_timestamp_missing" }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - verifyCandidateOriginCompleteness:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        source_origin_complete: >-
+          ${ (($expected_source_memory_ids | length) > 0)
+             and all($expected_source_memory_ids[];
+               (. as $source_memory_id | ($source_origin_memory_ids | index($source_memory_id)) != null)) }
+
+  - skipWithoutCandidateOrigin:
+      if: >-
+           ${ ($candidate_outcome_recorded | not)
+           and ((($candidate_origin_memories | length) == 0)
+                or (($source_origin_complete // false) | not)
+                or (($origin_fetch_errors | length) > 0)) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "source_origin_memory_unavailable" }] }
+        candidate_outcome_recorded: "${ true }"
+
+output:
+  as:
+    candidate_outcome_recorded: "${ $candidate_outcome_recorded }"
+    skipped_candidate_ids: "${ $skipped_candidate_ids }"
+    skipped_candidates: "${ $skipped_candidates }"
+    protected_candidates: "${ $protected_candidates }"
+    failed_candidates: "${ $failed_candidates }"
+    candidate_source_latest_at: "${ $candidate_source_latest_at }"

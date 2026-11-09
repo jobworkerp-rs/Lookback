@@ -297,35 +297,51 @@ pub async fn search_reflections_hybrid(
     req: SearchReflectionsHybridRequest,
 ) -> AppResult<Vec<ReflectionEntry>> {
     state.ensure_local_embedding_available()?;
-    let handle = state.jobworkerp().await?;
-    let vector = crate::jobworkerp::embedding::embed_query(&handle, &req.query_text).await?;
-    let request = build_hybrid_search_request(&req, vector);
-
-    let mut memory_client = MemoryVectorServiceClient::new(state.memories_channel().await?);
-    let mut stream = memory_client.hybrid_search(request).await?.into_inner();
-    let mut hits = Vec::new();
-    while let Some(item) = stream.next().await {
-        hits.push(item?);
-    }
-
-    let ids = reflection_memory_ids_from_hits(hits);
-    let mut reflection_client = ReflectionServiceClient::new(state.memories_channel().await?);
-    let mut out = Vec::new();
-    for id in ids {
-        let resp = reflection_client
-            .find(mem_svc::FindReflectionRequest {
-                id: Some(mem_data::ReflectionId { value: id }),
-            })
-            .await?
-            .into_inner();
-        if let Some(refl) = resp.reflection
-            && let Some(entry) = entry_from_proto(refl)
-            && (req.outcomes.is_empty() || req.outcomes.contains(&entry.outcome))
-        {
-            out.push(entry);
+    super::embedding_space::with_query_embedding(&state, &req.query_text, |vector| async {
+        let request = build_hybrid_search_request(&req, vector);
+        let mut memory_client = MemoryVectorServiceClient::new(state.memories_channel().await?);
+        let mut stream = memory_client.hybrid_search(request).await?.into_inner();
+        let mut hits = Vec::new();
+        while let Some(item) = stream.next().await {
+            hits.push(item?);
         }
-    }
-    Ok(out)
+
+        let ids = reflection_memory_ids_from_hits(hits);
+        let reflection_client = ReflectionServiceClient::new(state.memories_channel().await?);
+        Ok(resolve_hybrid_hits(ids, &req.outcomes, |id| {
+            let mut client = reflection_client.clone();
+            async move {
+                client
+                    .find(mem_svc::FindReflectionRequest {
+                        id: Some(mem_data::ReflectionId { value: id }),
+                    })
+                    .await
+                    .map(|resp| resp.into_inner().reflection)
+            }
+        })
+        .await?)
+    })
+    .await
+}
+
+/// Hit lookups are independent, so they are resolved concurrently; entries
+/// keep hit order and any failed lookup fails the search as before.
+async fn resolve_hybrid_hits<F, Fut>(
+    ids: Vec<i64>,
+    outcomes: &[i32],
+    find: F,
+) -> Result<Vec<ReflectionEntry>, tonic::Status>
+where
+    F: Fn(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<mem_data::Reflection>, tonic::Status>>,
+{
+    let found = futures::future::try_join_all(ids.into_iter().map(find)).await?;
+    Ok(found
+        .into_iter()
+        .flatten()
+        .filter_map(entry_from_proto)
+        .filter(|entry| outcomes.is_empty() || outcomes.contains(&entry.outcome))
+        .collect())
 }
 
 /// Drain a `ReflectionSearchResult` stream into UI DTOs. Both `Search` and
@@ -830,6 +846,56 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    fn reflection(id: i64, outcome: i32) -> mem_data::Reflection {
+        let mut reflection = proto_with_summary("hit");
+        reflection.id = Some(mem_data::ReflectionId { value: id });
+        reflection.data.as_mut().unwrap().outcome = outcome;
+        reflection
+    }
+
+    #[tokio::test]
+    async fn hybrid_hits_resolve_concurrently_in_hit_order_and_filter_outcomes() {
+        let gate = crate::commands::concurrency_probe::ConcurrencyGate::new(4);
+        let entries = resolve_hybrid_hits(vec![1, 2, 3, 4], &[1], |id| {
+            let gate = &gate;
+            async move {
+                let found = match id {
+                    // Missing reflection rows are skipped.
+                    2 => None,
+                    // Outcome 2 is filtered out by the request.
+                    3 => Some(reflection(id, 2)),
+                    _ => Some(reflection(id, 1)),
+                };
+                Ok(gate.call(found).await)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1, 4]);
+    }
+
+    #[tokio::test]
+    async fn hybrid_hits_keep_every_outcome_without_a_filter_and_fail_on_any_error() {
+        let all = resolve_hybrid_hits(vec![1, 2], &[], |id| async move {
+            Ok(Some(reflection(id, id as i32)))
+        })
+        .await
+        .unwrap();
+        assert_eq!(all.len(), 2);
+
+        let err = resolve_hybrid_hits(vec![1, 2], &[], |id| async move {
+            if id == 2 {
+                Err(tonic::Status::unavailable("down"))
+            } else {
+                Ok(Some(reflection(id, 1)))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
     }
 
     fn proto_with_facts() -> mem_data::Reflection {

@@ -61,7 +61,7 @@ pub(crate) fn spawn_startup_orphan_sweep(jobworkerp_url: String) {
 fn completed_start_jobworkerp_url(
     report: Option<crate::sidecar::SidecarStartReport>,
 ) -> Option<String> {
-    report.map(|report| report.endpoints.jobworkerp_url())
+    report.and_then(|report| report.endpoints.jobworkerp_url())
 }
 
 fn finish_startup_orphan_sweep(result: AppResult<u64>) -> Option<u64> {
@@ -236,9 +236,10 @@ mod tests {
         assert_eq!(
             completed_start_jobworkerp_url(Some(crate::sidecar::SidecarStartReport {
                 endpoints: crate::sidecar::SidecarEndpoints {
-                    jobworkerp_port: 19_000,
+                    jobworkerp_port: Some(19_000),
+                    issue_tracker_port: None,
                     memories_port: Some(19_001),
-                    conductor_port: 19_002,
+                    conductor_port: Some(19_002),
                     mcp_server_port: None,
                 },
                 warnings: Vec::new(),

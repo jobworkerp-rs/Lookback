@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package jobworkerp.runner;
+
+message SandboxExecResult {
+  oneof result {
+    SandboxExecOutput output = 1;
+    SandboxExecExit exit = 2;
+  }
+}
+
+message SandboxExecOutput {
+  string stream = 1;
+  bytes data = 2;
+}
+
+message SandboxExecExit {
+  int32 exit_code = 1;
+  uint64 execution_time_ms = 2;
+  string sandbox_id = 3;
+}

@@ -34,6 +34,7 @@ const APP_SETTINGS_DEFAULT: AppSettingsResponse = {
   data_root_override: null,
   timezone: null,
   effective_timezone: "Asia/Tokyo",
+  migration_backup: { enabled: true, keep: 1 },
   resolved: {
     current_data_root: "/Users/u/Library/Application Support/lookback",
     default_data_root: "/Users/u/Library/Application Support/lookback",
@@ -48,6 +49,7 @@ const APP_SETTINGS_WITH_OVERRIDE: AppSettingsResponse = {
   data_root_override: "/Volumes/Ext/lookback",
   timezone: null,
   effective_timezone: "Asia/Tokyo",
+  migration_backup: { enabled: true, keep: 1 },
   resolved: {
     current_data_root: "/Users/u/Library/Application Support/lookback",
     default_data_root: "/Users/u/Library/Application Support/lookback",
@@ -173,12 +175,18 @@ describe("DataRootCard", () => {
     return renderUi(
       <DataRootCard
         sqlitePath="/Users/u/Library/Application Support/lookback/db/jobworkerp.sqlite3"
-        lancedbPath="/Users/u/Library/Application Support/lookback/lancedb"
         pluginsPath="/Users/u/Library/Application Support/lookback/plugins"
         logPath="/Users/u/Library/Application Support/lookback/log"
       />,
     );
   }
+
+  it("lists only Lookback-owned sub-paths, not memories' LanceDB store", async () => {
+    getAppSettings.mockResolvedValue(APP_SETTINGS_DEFAULT);
+    renderCard();
+    await screen.findByText("SQLite");
+    expect(screen.queryByText("LanceDB")).toBeNull();
+  });
 
   it("uses the persisted override as the default input value", async () => {
     getAppSettings.mockResolvedValue(APP_SETTINGS_WITH_OVERRIDE);

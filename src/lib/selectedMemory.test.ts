@@ -42,6 +42,21 @@ describe("selected memory validation", () => {
     );
   });
 
+  it("accepts group summaries and validates their owning group id", () => {
+    expect(
+      validateSelectedMemories(
+        [memory({ kind: "thread-group", group_id: "42" })],
+        DEFAULT_SELECTED_MEMORY_LIMITS,
+      ),
+    ).toHaveLength(1);
+    expect(() =>
+      validateSelectedMemories(
+        [memory({ kind: "thread-group", group_id: "01" })],
+        DEFAULT_SELECTED_MEMORY_LIMITS,
+      ),
+    ).toThrow();
+  });
+
   it("rejects unsafe wire ids and the eleventh item", () => {
     expect(() =>
       validateSelectedMemories([memory({ memory_id: "01" })], DEFAULT_SELECTED_MEMORY_LIMITS),

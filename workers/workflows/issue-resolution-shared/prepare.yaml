@@ -1,0 +1,333 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: issue-resolution-prepare
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [review_row, manager_contract, manager_store_identity, issue_tracker_grpc_host, issue_tracker_grpc_port, correlation_prefix]
+      properties:
+        review_row: { type: object }
+        manager_contract: { type: object }
+        manager_store_identity: { type: object }
+        issue_tracker_grpc_host: { type: string }
+        issue_tracker_grpc_port: { type: integer }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+        correlation_prefix: { type: string, minLength: 1 }
+
+timeout:
+  after:
+    hours: 1
+
+do:
+  - adoptInput:
+      set:
+        review_row: "${ $workflow.input.review_row }"
+        manager_contract: "${ $workflow.input.manager_contract }"
+        manager_store_identity: "${ $workflow.input.manager_store_identity }"
+
+  - initCandidateState:
+      set:
+        candidate: "${ $review_row.candidate // {} }"
+        associated_issue: "${ $review_row.associatedIssue // $review_row.associated_issue // {} }"
+        candidate_integrity: "${ $review_row.integrity // \"\" }"
+        resolution_state: "${ $review_row.resolutionState // $review_row.resolution_state // \"\" }"
+        source_evidence_refs: "${ [] }"
+        candidate_labels: "${ null }"
+        issue_labels: "${ null }"
+        associated_issue_record: "${ {} }"
+        associated_issue_id: "${ \"\" }"
+        candidate_status: "${ \"\" }"
+        candidate_id: "${ \"\" }"
+        candidate_revision: "${ 0 }"
+        candidate_history_entries: "${ [] }"
+        issue_history_entries: "${ [] }"
+        history_entries: "${ [] }"
+        human_history_present: "${ false }"
+        candidate_outcome_recorded: "${ false }"
+        skipped_candidate_ids: "${ [] }"
+        skipped_candidates: "${ [] }"
+        protected_candidates: "${ [] }"
+        failed_candidates: "${ [] }"
+
+  - selectCandidateFields:
+      set:
+        candidate_id: "${ $candidate.candidateId // $candidate.candidate_id // \"\" }"
+        candidate_revision: "${ ($candidate.revision // 0) }"
+        candidate_status: "${ $candidate.status // \"\" }"
+        candidate_integrity: "${ $review_row.integrity // \"\" }"
+        resolution_state: "${ $review_row.resolutionState // $review_row.resolution_state // \"\" }"
+        source_evidence_refs: "${ $candidate.sourceEvidence // $candidate.source_evidence // [] }"
+        associated_issue_id: "${ $associated_issue.issueId // $associated_issue.issue_id // \"\" }"
+        # Raw labels of the source thread at extraction time; null when the
+        # server-owned snapshot is missing or unreadable. Parsed with the
+        # same rules as src-tauri/src/commands/issues/source_labels.rs.
+        candidate_labels: >-
+          ${ ($candidate.metadata // [])
+             | map(select((.key // "") == "lookback.source_label_snapshots_json"))
+             | if length == 1
+               then (try (.[0].value | fromjson
+                          | if any(.[]; ((.thread_id // "") == "") or ((.extraction_run_id // "") == ""))
+                            then null
+                            else (map(.labels // []) | add // [] | unique) end)
+                     catch null)
+               else null end }
+
+  - fetchAssociatedIssue:
+      if: >-
+        ${ (($candidate_status == "CANDIDATE_STATUS_AUTO_REGISTERED")
+            or ($candidate_status == "AUTO_REGISTERED"))
+           and ($associated_issue_id != "") }
+      try:
+        - getAssociatedIssue:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.issue_tracker_grpc_host}"
+                  port: ${$workflow.input.issue_tracker_grpc_port}
+                  tls: ${$workflow.input.issue_tracker_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "issue_tracker.rpc.v1.ManagerConsumerService/GetIssueWithSync"
+                  json_body: >-
+                    ${ {
+                        context: {
+                          correlation_id: (($workflow.input.correlation_prefix + "-issue-") + $associated_issue_id),
+                          schema_fingerprint: ($manager_contract.schemaFingerprint // $manager_contract.schema_fingerprint // ""),
+                          data_root_id: ($manager_store_identity.dataRootId // $manager_store_identity.data_root_id // ""),
+                          contract_fingerprint: ($manager_contract.contractFingerprint // $manager_contract.contract_fingerprint // "")
+                        },
+                        issue_id: $associated_issue_id
+                      } | tojson }
+                  as_json: true
+            export:
+              as:
+                associated_issue_record: "${ .jsonBody | fromjson | .success.issue // {} }"
+      catch:
+        as: associated_issue_fetch_error
+        do:
+          - recordAssociatedIssueFailure:
+              set:
+                associated_issue_record: "${ {} }"
+                failed_candidates: >-
+                  ${ $failed_candidates + [{ candidate_id: $candidate_id,
+                      reason: ($associated_issue_fetch_error | tostring), source: "GetIssueWithSync" }] }
+                candidate_outcome_recorded: "${ true }"
+
+  - shapeIssueLabels:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        issue_labels: >-
+          ${ (($associated_issue_record.provenanceMetadata // $associated_issue_record.provenance_metadata) // [])
+             | map(select((.key // "") == "lookback.source_label_snapshots_json"))
+             | if length == 1
+               then (try (.[0].value | fromjson
+                          | if any(.[]; ((.thread_id // "") == "") or ((.extraction_run_id // "") == ""))
+                            then null
+                            else (map(.labels // []) | add // [] | unique) end)
+                     catch null)
+               else null end }
+
+  # Human review is discovered from the generic operation history before any write.
+  - listCandidateOperationHistory:
+      if: "${ $candidate_id != \"\" }"
+      try:
+        - fetchCandidateHistory:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.issue_tracker_grpc_host}"
+                  port: ${$workflow.input.issue_tracker_grpc_port}
+                  tls: ${$workflow.input.issue_tracker_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "issue_tracker.rpc.v1.ManagerConsumerService/ListOperationHistory"
+                  json_body: >-
+                    ${ {
+                        context: {
+                          correlation_id: (($workflow.input.correlation_prefix + "-history-") + $candidate_id),
+                          schema_fingerprint: ($manager_contract.schemaFingerprint // $manager_contract.schema_fingerprint // ""),
+                          data_root_id: ($manager_store_identity.dataRootId // $manager_store_identity.data_root_id // ""),
+                          contract_fingerprint: ($manager_contract.contractFingerprint // $manager_contract.contract_fingerprint // "")
+                        },
+                        page: { page_size: 100 },
+                        filter: { candidate_id: $candidate_id },
+                        include_total_size: false
+                      } | tojson }
+                  as_json: true
+            export:
+              as:
+                candidate_history_entries: "${ (.jsonBody | fromjson | .success.entries // []) }"
+                candidate_history_next_token: '${ (.jsonBody | fromjson | (.success.page.nextPageToken // .success.page.next_page_token // "")) | tostring }'
+        # A truncated history could hide a human operation, so the
+        # candidate is recorded as failed instead of silently protected. The
+        # history only grows, so the failure is marked permanent: a caller
+        # that waits for retryable failures must not wait on it.
+        - failOnIncompleteCandidateHistory:
+            if: '${ $candidate_history_next_token != "" }'
+            raise:
+              error:
+                type: "https://lookback.local/errors/issue-resolution/history-page"
+                status: 502
+                title: "Candidate operation history exceeded one page"
+      catch:
+        as: history_error_value
+        do:
+          - recordHistoryFailure:
+              set:
+                failed_candidates: >-
+                  ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($history_error_value | tostring), source: "ListOperationHistory",
+                                              permanent: ($history_error_value.type? // "" | tostring | endswith("/history-page")) }] }
+                candidate_outcome_recorded: "${ true }"
+
+  - listAssociatedIssueOperationHistory:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($candidate_status == "CANDIDATE_STATUS_AUTO_REGISTERED")
+                or ($candidate_status == "AUTO_REGISTERED"))
+           and ($associated_issue_id != "") }
+      try:
+        - fetchAssociatedIssueHistory:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.issue_tracker_grpc_host}"
+                  port: ${$workflow.input.issue_tracker_grpc_port}
+                  tls: ${$workflow.input.issue_tracker_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "issue_tracker.rpc.v1.ManagerConsumerService/ListOperationHistory"
+                  json_body: >-
+                    ${ {
+                        context: {
+                          correlation_id: (($workflow.input.correlation_prefix + "-history-issue-") + $associated_issue_id),
+                          schema_fingerprint: ($manager_contract.schemaFingerprint // $manager_contract.schema_fingerprint // ""),
+                          data_root_id: ($manager_store_identity.dataRootId // $manager_store_identity.data_root_id // ""),
+                          contract_fingerprint: ($manager_contract.contractFingerprint // $manager_contract.contract_fingerprint // "")
+                        },
+                        page: { page_size: 100 },
+                        filter: {
+                          issue_id: $associated_issue_id,
+                          direct_scope_only: true
+                        },
+                        include_total_size: false
+                      } | tojson }
+                  as_json: true
+            export:
+              as:
+                issue_history_entries: "${ (.jsonBody | fromjson | .success.entries // []) }"
+                issue_history_next_token: '${ (.jsonBody | fromjson | (.success.page.nextPageToken // .success.page.next_page_token // "")) | tostring }'
+        - failOnIncompleteIssueHistory:
+            if: '${ $issue_history_next_token != "" }'
+            raise:
+              error:
+                type: "https://lookback.local/errors/issue-resolution/history-page"
+                status: 502
+                title: "Associated issue operation history exceeded one page"
+      catch:
+        as: issue_history_error_value
+        do:
+          - recordAssociatedIssueHistoryFailure:
+              set:
+                failed_candidates: >-
+                  ${ $failed_candidates + [{ candidate_id: $candidate_id,
+                      reason: ($issue_history_error_value | tostring),
+                      source: "ListOperationHistory(issue_id)",
+                      permanent: ($issue_history_error_value.type? // "" | tostring | endswith("/history-page")) }] }
+                candidate_outcome_recorded: "${ true }"
+
+  - combineOperationHistory:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        history_entries: >-
+          ${ ($candidate_history_entries // []) + ($issue_history_entries // []) }
+
+  - detectProtectedHistory:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        human_history_present: >-
+          ${ any(($history_entries // [])[];
+             ((.actorAudit.actorKind // .actor_audit.actor_kind // "") == "ACTOR_KIND_HUMAN"
+              or (.actorAudit.actorKind // .actor_audit.actor_kind // "") == "HUMAN"
+              or (.actorAudit.actorKind // .actor_audit.actor_kind // 0) == 1)
+             or (((.method // "") | ascii_downcase) | contains("claim"))
+             or (((.method // "") | ascii_downcase) | contains("comment"))
+             or (((.method // "") | ascii_downcase) | contains("terminal"))
+             or (((.method // "") | ascii_downcase) | contains("transition"))
+             or (.state == "DURABLE_OPERATION_STATE_ARBITRATED")) }
+
+  - protectHumanTouchedCandidate:
+      if: "${ ($candidate_outcome_recorded | not) and ($human_history_present // false) }"
+      set:
+        protected_candidates: >-
+          ${ $protected_candidates + [{ candidate_id: $candidate_id, reason: "human_operation_history" }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - protectIntegrity:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ($candidate_integrity != "REVIEW_CANDIDATE_INTEGRITY_NORMAL")
+           and ($candidate_integrity != "NORMAL") }
+      set:
+        protected_candidates: >-
+          ${ $protected_candidates + [{ candidate_id: $candidate_id, reason: "integrity_not_normal" }] }
+        candidate_outcome_recorded: "${ true }"
+
+
+  # A pending resolution is someone else's unconfirmed write; an active claim
+  # is a person or agent working on the Issue. Neither is ours to resolve.
+  - protectPendingResolution:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($resolution_state == "REVIEW_CANDIDATE_RESOLUTION_STATE_RESOLUTION_PENDING")
+                or ($resolution_state == "RESOLUTION_PENDING")) }
+      set:
+        protected_candidates: >-
+          ${ $protected_candidates + [{ candidate_id: $candidate_id, reason: "existing_resolution_pending" }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - protectActiveClaim:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($associated_issue_record.claim // null) != null) }
+      set:
+        protected_candidates: >-
+          ${ $protected_candidates + [{ candidate_id: $candidate_id, reason: "active_claim" }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - skipNonActionableRow:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($resolution_state != "REVIEW_CANDIDATE_RESOLUTION_STATE_ACTIONABLE")
+                and ($resolution_state != "ACTIONABLE")) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "not_actionable" }] }
+        candidate_outcome_recorded: "${ true }"
+
+output:
+  as:
+    candidate_outcome_recorded: "${ $candidate_outcome_recorded }"
+    skipped_candidate_ids: "${ $skipped_candidate_ids }"
+    skipped_candidates: "${ $skipped_candidates }"
+    protected_candidates: "${ $protected_candidates }"
+    # An entry with `permanent: true` fails the same way on every run; a
+    # caller that waits for retryable failures may go on without it.
+    failed_candidates: "${ $failed_candidates }"
+    candidate_id: "${ $candidate_id }"
+    candidate_revision: "${ $candidate_revision }"
+    candidate_status: "${ $candidate_status }"
+    candidate_labels: "${ $candidate_labels }"
+    issue_labels: "${ $issue_labels }"
+    source_evidence_refs: "${ $source_evidence_refs }"
+    associated_issue_id: "${ $associated_issue_id }"

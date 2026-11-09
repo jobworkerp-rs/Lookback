@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -410,14 +410,28 @@ function SignalsDrawer({ onClose }: { onClose: () => void }) {
   // signal-count badge reflects it).
   const del = useDeleteAction(deletePersonalitySignal, [SIGNALS_QUERY_KEY, PERSONALITY_QUERY_KEY]);
 
-  const signals = useQuery({
+  const signals = useInfiniteQuery({
     queryKey: SIGNALS_QUERY_KEY,
-    queryFn: () => listPersonalitySignals({ user_id: 1 }),
+    queryFn: ({ pageParam }) => listPersonalitySignals({ user_id: 1, offset: pageParam }),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage) => lastPage.next_offset ?? undefined,
+  });
+  // Shares the page's personality query; its signal_count is the drawer total.
+  const personality = useQuery({
+    queryKey: PERSONALITY_QUERY_KEY,
+    queryFn: () => getPersonality({ user_id: 1 }),
   });
 
   useEscape(onClose);
 
-  const rows = signals.data ?? [];
+  const rows = useMemo(() => {
+    // Offset pages can overlap if signals change between page loads.
+    const seen = new Set<string>();
+    return (signals.data?.pages ?? [])
+      .flatMap((page) => page.signals)
+      .filter((signal) => !seen.has(signal.memory_id) && seen.add(signal.memory_id));
+  }, [signals.data?.pages]);
+  const total = personality.data?.signal_count ?? rows.length;
 
   // Follow a `memory_ids` link into the signal's source thread.
   async function openMemory(signal: PersonalitySignal, memoryId: string) {
@@ -438,8 +452,8 @@ function SignalsDrawer({ onClose }: { onClose: () => void }) {
             <div className="signal-drawer-title">{t("personality.signalsDrawerTitle")}</div>
             <div className="signal-drawer-subtitle">
               {t("personality.signalsUsedCount", {
-                count: rows.length,
-                formatted: formatNumber(rows.length, locale),
+                count: total,
+                formatted: formatNumber(total, locale),
               })}
             </div>
           </div>
@@ -469,6 +483,16 @@ function SignalsDrawer({ onClose }: { onClose: () => void }) {
               onDelete={() => del.request(signal.memory_id)}
             />
           ))}
+          {signals.hasNextPage && (
+            <button
+              type="button"
+              className="btn"
+              disabled={signals.isFetchingNextPage}
+              onClick={() => void signals.fetchNextPage()}
+            >
+              {t("personality.signalsLoadMore")}
+            </button>
+          )}
         </div>
       </aside>
 

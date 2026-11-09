@@ -3,6 +3,8 @@ import { type RenderResult, render } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { I18nextProvider } from "react-i18next";
 import i18n from "@/i18n";
+import { LOCAL_CONNECTION_CONFIG } from "@/lib/connectionConfig";
+import type { CodingAgentNativeSetupResponse, ConnectionConfig } from "@/types/api";
 
 /**
  * Render a component tree with a fresh `QueryClient` so each test gets an
@@ -34,4 +36,41 @@ export function renderWithProviders(node: ReactElement): RenderResult {
       <QueryClientProvider client={client}>{node}</QueryClientProvider>
     </I18nextProvider>,
   );
+}
+
+/**
+ * Build a native setup diagnostic response with the defaults the backend
+ * produces for the given state, so tests only spell out what they assert on.
+ */
+export function makeNativeSetupResponse(
+  overrides: Partial<CodingAgentNativeSetupResponse> &
+    Pick<CodingAgentNativeSetupResponse, "settingsRevision" | "state">,
+): CodingAgentNativeSetupResponse {
+  const packageFingerprint =
+    overrides.packageFingerprint === undefined
+      ? overrides.state === "unavailable"
+        ? null
+        : "pkg-fixture"
+      : overrides.packageFingerprint;
+  return {
+    packageFingerprint,
+    packageVersion: packageFingerprint ? "0.1.0" : null,
+    repositoryApprovals: [],
+    unavailableReason: overrides.state === "unavailable" ? "package_missing" : null,
+    packageProvenance: packageFingerprint ? "release" : null,
+    approvalSource: "legacy_policy",
+    ...overrides,
+  };
+}
+
+/** Remote jobworkerp and memories, everything else local. */
+export function remoteConnectionConfig(
+  jobworkerpUrl = "http://10.0.0.2:9000",
+  memoriesUrl = "http://10.0.0.2:9010",
+): ConnectionConfig {
+  return {
+    ...LOCAL_CONNECTION_CONFIG,
+    jobworkerp: { mode: "remote", remote_url: jobworkerpUrl },
+    memories: { mode: "remote", remote_url: memoriesUrl },
+  };
 }

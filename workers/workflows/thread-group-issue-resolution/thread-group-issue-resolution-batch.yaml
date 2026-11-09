@@ -1,0 +1,921 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-group-issue-resolution-batch
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [group_id, group_owner_user_id, memories_grpc_host, memories_grpc_port, issue_tracker_grpc_host, issue_tracker_grpc_port, policy_json]
+      properties:
+        group_id:
+          type: string
+          pattern: "^[1-9][0-9]*$"
+        group_owner_user_id:
+          type: integer
+          minimum: 1
+        expected_membership_snapshot_digest:
+          type: string
+          description: Canonical membership digest observed by the caller.
+        expected_membership_digest:
+          type: string
+          description: Alias accepted by callers that use the shorter digest name.
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        issue_tracker_grpc_host: { type: string, default: "" }
+        issue_tracker_grpc_port: { type: integer, default: 0 }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+        policy_json: { type: string, default: "" }
+        llm_worker_name:
+          type: string
+          default: "memories-llm"
+        output_language:
+          type: string
+          enum: ["ja", "en"]
+          default: "ja"
+        # Verification aid: judge every candidate but write nothing.
+        dry_run: { type: boolean, default: false }
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  - initState:
+      set:
+        policy: "${ (try (($workflow.input.policy_json // \"\") | fromjson)) // {} }"
+        resolution_enabled: "${ false }"
+        resolution_mode: "${ \"DISABLED\" }"
+        resolution_min_confidence: "${ 1.0 }"
+        active_member_thread_ids: "${ [] }"
+        thread_summaries: "${ [] }"
+        review_rows: "${ [] }"
+        manager_contract: "${ {} }"
+        manager_store_identity: "${ {} }"
+        completed_candidate_ids: "${ [] }"
+        canceled_candidate_ids: "${ [] }"
+        rejected_candidate_ids: "${ [] }"
+        skipped_candidate_ids: "${ [] }"
+        applied_candidates: "${ [] }"
+        dry_run_candidates: "${ [] }"
+        active_member_labels: "${ [] }"
+        protected_candidates: "${ [] }"
+        skipped_candidates: "${ [] }"
+        conflicted_candidates: "${ [] }"
+        group_changed_candidates: "${ [] }"
+        failed_candidates: "${ [] }"
+        last_error: "${ null }"
+
+  - normalizePolicy:
+      set:
+        resolution_enabled: "${ $policy.extraction_enabled // false }"
+        resolution_mode: "${ $policy.resolution_mode // \"DISABLED\" }"
+        resolution_min_confidence: "${ (($policy.resolution_min_confidence // 1.0) | tonumber) }"
+
+  - validateGroupOwner:
+      if: "${ $workflow.input.group_owner_user_id == null or $workflow.input.group_owner_user_id <= 0 }"
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-issue-resolution/group-owner-required"
+          status: 400
+          title: "group_owner_user_id must be a positive integer"
+
+  - resolveExpectedSnapshot:
+      set:
+        expected_membership_digest: >-
+          ${ if ($workflow.input | has("expected_membership_snapshot_digest"))
+             then $workflow.input.expected_membership_snapshot_digest
+             elif ($workflow.input | has("expected_membership_digest"))
+             then $workflow.input.expected_membership_digest
+             else null end }
+        expected_snapshot_inputs_valid: >-
+          ${ (((($workflow.input | has("expected_membership_snapshot_digest")) | not)
+               or (($workflow.input.expected_membership_snapshot_digest | type) == "string"))
+              and ((($workflow.input | has("expected_membership_digest")) | not)
+               or (($workflow.input.expected_membership_digest | type) == "string"))) }
+        expected_snapshot_aliases_match: >-
+          ${ ((((($workflow.input | has("expected_membership_snapshot_digest"))
+                 and ($workflow.input | has("expected_membership_digest"))) | not)
+               or ($workflow.input.expected_membership_snapshot_digest
+                   == $workflow.input.expected_membership_digest))) }
+
+  - validateExpectedSnapshot:
+      if: >-
+        ${ (($expected_snapshot_inputs_valid | not)
+           or ($expected_snapshot_aliases_match | not)
+           or (($expected_membership_digest | type) != "string")
+           or (if (($expected_membership_digest | type) == "string")
+               then (($expected_membership_digest | length) == 0)
+               else true end)) }
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-issue-resolution/snapshot-required"
+          status: 400
+          title: "a consistent nonempty membership snapshot digest is required"
+
+  # Fail closed before touching either the LLM or Issue Tracker. DISABLED is side-effect free.
+  - skipIfDisabled:
+      if: '${ (($resolution_enabled // false) | not) or (($resolution_mode // "DISABLED") == "DISABLED") }'
+      set:
+        skipped_candidate_ids: "${ [\"disabled\"] }"
+        skipped_candidates: "${ [{ candidate_id: \"disabled\", reason: \"disabled\" }] }"
+      export:
+        as:
+          result: "skipped: disabled"
+      then: exit
+
+  # Direct and scheduled workflow runs bypass the desktop dispatch probe.
+  - verifyGroupOwnerCapability:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadGroupService/GetThreadGroupCapabilities"
+            json_body: "{}"
+            as_json: true
+      export:
+        as:
+          group_owner_capability: "${ .jsonBody | fromjson }"
+
+  - requireGroupOwnerCapability:
+      if: "${ ($group_owner_capability.supportsIndependentGroupOwnerScope // $group_owner_capability.supports_independent_group_owner_scope // false) != true }"
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-issue-resolution/owner-scope-unsupported"
+          status: 412
+          title: "Memories server does not support independent ThreadGroup group ownership"
+
+  - fetchActiveLineage:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadGroupService/FindThreadGroupLineage"
+            json_body: "${ { value: $workflow.input.group_id, user_id: $workflow.input.group_owner_user_id } | tojson }"
+            as_json: true
+      export:
+        as:
+          lineage: "${ .jsonBody | fromjson }"
+
+  - validateInitialMembership:
+      if: >-
+        ${ (($lineage.group.membershipSnapshotDigest // $lineage.group.membership_snapshot_digest // "")
+                != $expected_membership_digest) }
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-issue-resolution/membership-changed"
+          status: 409
+          title: "Thread Group membership changed before resolution"
+
+  - collectActiveMembers:
+      set:
+        active_member_thread_ids: >-
+          ${ ($lineage.members // [])
+             | map(select(.state == "THREAD_GROUP_MEMBER_STATE_ACTIVE" and (.threadId // .thread_id) != null)
+                   | (.threadId // .thread_id) | tostring)
+             | unique }
+
+  # Shared with the cross-thread resolution; only rows citing an active member
+  # come back, so later jq evaluations do not copy every review candidate.
+  - listReviewCandidates:
+      run:
+        function:
+          workerName: lookback-issue-resolution-review-candidates
+          arguments:
+            input: >-
+              ${ {
+                  issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                  issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                  issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                  correlation_prefix: "thread-group-issue-resolution",
+                  correlation_key: ($workflow.input.group_id | tostring),
+                  source_thread_ids: $active_member_thread_ids
+                } | tojson }
+      export:
+        as:
+          review_listing: '${ .output | fromjson }'
+
+  - adoptReviewCandidates:
+      set:
+        manager_contract: "${ $review_listing.manager_contract // {} }"
+        manager_store_identity: "${ $review_listing.manager_store_identity // {} }"
+        review_rows: "${ $review_listing.review_rows // [] }"
+        review_listing: "${ null }"
+
+  - fetchMemberSummaries:
+      if: "${ ($active_member_thread_ids | length) > 0 }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/FindListByCondition"
+            json_body: >-
+              ${ {
+                  content_types: ["TEXT"],
+                  memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
+                  external_id_prefix: "summary:"
+                } | tojson }
+            as_json: true
+      export:
+        as:
+          thread_summaries: >-
+            ${ (.jsonBody // "[]") | fromjson
+               | if type == "array" then . else (.data // []) end }
+
+  # Members are the same for every candidate of this group, so their labels
+  # are read once here; a member whose read fails is left out, which the
+  # context check treats like a member without labels.
+  - fetchActiveMemberLabels:
+      if: "${ ($active_member_thread_ids | length) > 0 }"
+      for:
+        each: member_thread_id
+        in: "${ $active_member_thread_ids }"
+      onError: continue
+      do:
+        - findMemberThread:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.ThreadService/Find"
+                  json_body: "${ { value: $member_thread_id } | tojson }"
+                  as_json: true
+            export:
+              as:
+                # Find returns { data: Thread { id, data: ThreadData } }.
+                member_labels_for_thread: "${ .jsonBody | fromjson | .data.data.labels // [] }"
+        - collectActiveMemberLabels:
+            set:
+              active_member_labels: >-
+                ${ $active_member_labels + [{ thread_id: $member_thread_id, labels: $member_labels_for_thread }] }
+
+  - resolveEachCandidate:
+      for:
+        each: review_row
+        at: candidate_index
+        in: "${ $review_rows }"
+      onError: continue
+      do:
+        - reportProgress:
+            set:
+              progress_processed: "${ $candidate_index + 1 }"
+              progress_total: "${ $review_rows | length }"
+        - initCandidateState:
+            set:
+              candidate: "${ $review_row.candidate // {} }"
+              associated_issue: "${ $review_row.associatedIssue // $review_row.associated_issue // {} }"
+              candidate_id: "${ \"\" }"
+              candidate_revision: "${ 0 }"
+              candidate_status: "${ \"\" }"
+              associated_issue_id: "${ \"\" }"
+              source_evidence_refs: "${ [] }"
+              source_thread_ids: "${ [] }"
+              other_member_thread_ids: "${ [] }"
+              selected_member_thread_ids: "${ [] }"
+              other_member_summaries: "${ [] }"
+              candidate_labels: "${ null }"
+              issue_labels: "${ null }"
+              member_labels: "${ [] }"
+              project_context: >-
+                ${ { unknown: true, member_match: false, matching_member_thread_ids: [] } }
+              candidate_source_latest_at: "${ null }"
+              primary_llm_text: "${ \"\" }"
+              primary_llm_json: "${ null }"
+              primary_selection_valid: "${ false }"
+              resolution_decision: "${ \"NO_CHANGE\" }"
+              resolution_rationale: "${ \"\" }"
+              evidence_memory_ids: "${ [] }"
+              evidence_thread_ids: "${ [] }"
+              decision_audit: '${ { rationale: "", reason: "" } }'
+              decision_payload: "${ null }"
+              operation_id: "${ \"\" }"
+              operation_confirmed: "${ false }"
+              candidate_outcome_recorded: "${ false }"
+              fresh_membership_digest: '${ "" }'
+              prepared: "${ null }"
+              origin_result: "${ null }"
+              judged: "${ null }"
+              applied: "${ null }"
+
+        - prepareCandidate:
+            try:
+              - invokePrepare:
+                  run:
+                    function:
+                      workerName: lookback-issue-resolution-prepare
+                      arguments:
+                        input: >-
+                          ${ {
+                              review_row: $review_row,
+                              manager_contract: $manager_contract,
+                              manager_store_identity: $manager_store_identity,
+                              issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                              issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                              issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                              correlation_prefix: "thread-group-issue-resolution"
+                            } | tojson }
+                  export:
+                    as:
+                      prepared: '${ .output | fromjson }'
+            catch:
+              as: prepare_error
+              do:
+                - recordPrepareFailure:
+                    set:
+                      failed_candidates: >-
+                        ${ $failed_candidates + [{ candidate_id: ($candidate.candidateId // $candidate.candidate_id // ""),
+                            reason: ($prepare_error | tostring), source: "prepare" }] }
+                      candidate_outcome_recorded: "${ true }"
+
+        - adoptPreparedCandidate:
+            if: "${ $prepared != null }"
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + ($prepared.skipped_candidate_ids // []) }"
+              skipped_candidates: "${ $skipped_candidates + ($prepared.skipped_candidates // []) }"
+              protected_candidates: "${ $protected_candidates + ($prepared.protected_candidates // []) }"
+              failed_candidates: "${ $failed_candidates + ($prepared.failed_candidates // []) }"
+              candidate_outcome_recorded: "${ $prepared.candidate_outcome_recorded // false }"
+              candidate_id: "${ $prepared.candidate_id // \"\" }"
+              candidate_revision: "${ $prepared.candidate_revision // 0 }"
+              candidate_status: "${ $prepared.candidate_status // \"\" }"
+              candidate_labels: "${ $prepared.candidate_labels }"
+              issue_labels: "${ $prepared.issue_labels }"
+              source_evidence_refs: "${ $prepared.source_evidence_refs // [] }"
+              associated_issue_id: "${ $prepared.associated_issue_id // \"\" }"
+              prepared: "${ null }"
+
+        - selectSourceThreads:
+            if: "${ ($candidate_outcome_recorded | not) }"
+            set:
+              source_thread_ids: >-
+                ${ ($source_evidence_refs // [])
+                   | map(.threadId // .thread_id // "")
+                   | map(select(. != ""))
+                   | map(tostring)
+                   | map(. as $source
+                         | select(($active_member_thread_ids | index($source)) != null))
+                   | unique }
+
+        - selectOtherMemberThreads:
+            if: "${ ($candidate_outcome_recorded | not) and (($source_thread_ids | length) > 0) }"
+            set:
+              other_member_thread_ids: >-
+                ${ ($active_member_thread_ids // [])
+                   | map(. as $member
+                          | select(($source_thread_ids | index($member)) == null))
+                    | unique }
+
+        - selectMemberLabels:
+            if: "${ ($candidate_outcome_recorded | not) and (($other_member_thread_ids | length) > 0) }"
+            set:
+              member_labels: >-
+                ${ $active_member_labels
+                   | map(select(.thread_id as $member | $other_member_thread_ids | index($member) != null)) }
+
+        - skipWithoutSourceThread:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and (($source_thread_ids | length) == 0) }
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+              skipped_candidates: >-
+                ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "source_thread_missing" }] }
+              candidate_outcome_recorded: "${ true }"
+
+        # Only active members other than every source thread can supply evidence.
+        - skipSameThreadCandidate:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and (($source_thread_ids | length) > 0)
+                 and (($other_member_thread_ids | length) == 0) }
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+              skipped_candidates: >-
+                ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "no_cross_thread_member" }] }
+              candidate_outcome_recorded: "${ true }"
+
+        # Compare canonical repository identities when both sides carry `repo:`
+        # labels (snapshots taken before import canonicalized them still hold
+        # raw remote URLs), otherwise require an identical `path:` label. An
+        # identity without a host or a path names no repository and is dropped
+        # so it cannot match another such label.
+        # `dir:` is a basename and collides across repositories, so it is
+        # never used.
+        - validateProjectContext:
+            if: "${ ($candidate_outcome_recorded | not) }"
+            set:
+              project_context: >-
+                ${ def repo_identity:
+                     sub("^repo:"; "") as $raw
+                     | (if ($raw | test("^[A-Za-z][A-Za-z0-9+.-]*://"))
+                        then ($raw | index("://")) as $scheme_end
+                             | ($raw[0:$scheme_end] | ascii_downcase) as $scheme
+                             | $raw[($scheme_end + 3):] as $rest
+                             | (($rest | index("/")) // ($rest | length)) as $slash
+                             | ($rest[0:$slash] | split("@") | last // "" | split(":")) as $host_port
+                             | { host: (if (($host_port | length) == 2)
+                                            and (({ http: "80", https: "443", ssh: "22", git: "9418" }[$scheme]) != $host_port[1])
+                                        then $host_port[0] + ":" + $host_port[1]
+                                        else $host_port[0] end),
+                                 path: $rest[$slash:] }
+                        elif ($raw | test("^[^/]*:")) and (($raw | test("^[^/]*:[0-9]+(/|$)")) | not)
+                        then ($raw | index(":")) as $colon
+                             | { host: ($raw[0:$colon] | split("@") | last), path: $raw[($colon + 1):] }
+                        else (($raw | index("/")) // ($raw | length)) as $slash
+                             | { host: $raw[0:$slash], path: $raw[$slash:] }
+                        end)
+                     | ((.host // "") | ascii_downcase | rtrimstr(".")) + "/"
+                       + (.path | sub("^/+"; "") | sub("/+$"; "") | sub("\\.[Gg][Ii][Tt]$"; ""));
+                   def context_keys:
+                     if . == null then null
+                     else { repos: (map(select(startswith("repo:")) | repo_identity
+                                        | select(test("^[^/]+/.+"))) | unique),
+                            paths: (map(select(startswith("path:"))) | unique) } end;
+                   def has_keys: (. != null) and (((.repos | length) > 0) or ((.paths | length) > 0));
+                   def matches($a; $b):
+                     if (($a.repos | length) > 0) and (($b.repos | length) > 0)
+                     then any($a.repos[]; . as $repo | any($b.repos[]; . == $repo))
+                     else any($a.paths[]; . as $path | any($b.paths[]; . == $path)) end;
+                   ($candidate_labels | context_keys) as $candidate_keys
+                   | ($issue_labels | context_keys) as $issue_keys
+                   | (($candidate_status == "CANDIDATE_STATUS_AUTO_REGISTERED")
+                      or ($candidate_status == "AUTO_REGISTERED")) as $auto_registered
+                   | [ $member_labels[]
+                       | { thread_id: .thread_id, keys: (.labels | context_keys) }
+                       | select(.keys | has_keys) ] as $members
+                   | (($candidate_keys | has_keys | not)
+                      or ($auto_registered and ($issue_keys | has_keys | not))
+                      or (($members | length) == 0)) as $unknown
+                   | (if $unknown then false
+                      elif $auto_registered then matches($candidate_keys; $issue_keys)
+                      else true end) as $pair_match
+                   | (if $pair_match
+                      then [ $members[]
+                             | select(matches($candidate_keys; .keys)
+                                      and (($auto_registered | not) or matches($issue_keys; .keys)))
+                             | .thread_id ]
+                      else [] end) as $matching
+                   | { unknown: $unknown,
+                       member_match: (($matching | length) > 0),
+                       matching_member_thread_ids: $matching } }
+
+        - skipProjectContextMismatch:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and ($project_context.unknown | not)
+                 and ($project_context.member_match | not) }
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+              skipped_candidates: >-
+                ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "project_context_mismatch" }] }
+              candidate_outcome_recorded: "${ true }"
+
+        # An unknown context is accepted only with an `[[issue:<id>]]` reference
+        # in the evidence; without an associated Issue that can never hold, so
+        # skip before the LLM calls instead of after them.
+        - skipUnknownContextWithoutIssue:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and $project_context.unknown
+                 and ($associated_issue_id == "") }
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+              skipped_candidates: >-
+                ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "issue_reference_required" }] }
+              candidate_outcome_recorded: "${ true }"
+
+        - restrictMembersToMatchingContext:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and ($project_context.unknown | not)
+                 and $project_context.member_match }
+            set:
+              other_member_thread_ids: '${ $project_context.matching_member_thread_ids }'
+
+
+        - resolveCandidateOrigin:
+            if: "${ ($candidate_outcome_recorded | not) }"
+            try:
+              - invokeOrigin:
+                  run:
+                    function:
+                      workerName: lookback-issue-resolution-origin
+                      arguments:
+                        input: >-
+                          ${ {
+                              candidate_id: $candidate_id,
+                              source_evidence_refs: $source_evidence_refs,
+                              memories_grpc_host: $workflow.input.memories_grpc_host,
+                              memories_grpc_port: $workflow.input.memories_grpc_port,
+                              memories_grpc_tls: ($workflow.input.memories_grpc_tls // false)
+                            } | tojson }
+                  export:
+                    as:
+                      origin_result: '${ .output | fromjson }'
+            catch:
+              as: origin_error
+              do:
+                - recordOriginFailure:
+                    set:
+                      failed_candidates: >-
+                        ${ $failed_candidates + [{ candidate_id: ($candidate.candidateId // $candidate.candidate_id // ""),
+                            reason: ($origin_error | tostring), source: "origin" }] }
+                      candidate_outcome_recorded: "${ true }"
+
+        - adoptCandidateOrigin:
+            if: "${ $origin_result != null }"
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + ($origin_result.skipped_candidate_ids // []) }"
+              skipped_candidates: "${ $skipped_candidates + ($origin_result.skipped_candidates // []) }"
+              protected_candidates: "${ $protected_candidates + ($origin_result.protected_candidates // []) }"
+              failed_candidates: "${ $failed_candidates + ($origin_result.failed_candidates // []) }"
+              candidate_outcome_recorded: "${ $origin_result.candidate_outcome_recorded // false }"
+              candidate_source_latest_at: "${ $origin_result.candidate_source_latest_at }"
+              origin_result: "${ null }"
+
+        - fetchCrossThreadSummaries:
+            if: "${ ($candidate_outcome_recorded | not) and (($other_member_thread_ids | length) > 0) }"
+            set:
+              other_member_summaries: >-
+                ${ ($thread_summaries // [])
+                   | map(. as $entry
+                         | (($entry.memory.data.externalId // $entry.memory.data.external_id // "")
+                            | tostring | sub("^summary:"; "")) as $thread_id
+                         | select(($other_member_thread_ids | index($thread_id)) != null)
+                         | { thread_id: $thread_id,
+                             summary: ($entry.memory.data.content // $entry.memory.content // "") })
+                   | map(select(.summary != "")) }
+
+        - skipWithoutCrossThreadSummary:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and (($other_member_summaries | length) == 0) }
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+              skipped_candidates: >-
+                ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "cross_thread_summary_missing" }] }
+              candidate_outcome_recorded: "${ true }"
+
+        # The summary is only a first-pass selector. It is never the final resolution evidence.
+        - primaryEvidenceSelection:
+            if: "${ ($candidate_outcome_recorded | not) and (($other_member_summaries | length) > 0) }"
+            try:
+              - runPrimarySelection:
+                  run:
+                    function:
+                      workerName: "${ $workflow.input.llm_worker_name }"
+                      using: completion
+                      arguments:
+                        system_prompt: >-
+                          Select which different active member threads should be inspected next.
+                          Summaries are triage hints only, not proof of completion or cancellation.
+                          Return only JSON and never make the final resolution decision from summaries.
+                        # The selector answers with thread IDs, so every summary is
+                        # labelled with its thread ID, and it needs the candidate's
+                        # content to judge which member could have resolved it.
+                        prompt: >-
+                          $${## Candidate
+                          - id: {{ candidate_id }}
+                          - title: {{ candidate.title }}
+                          - description: {{ candidate.description }}
+                          - source thread ids: {{ source_thread_ids | json_encode }}
+                          ## Cross-thread summary hints
+                          {% for summary in other_member_summaries %}
+                          ### thread_id={{ summary.thread_id }}
+                          {{ summary.summary }}
+                          {% endfor %}}
+                        options:
+                          max_tokens: 10000
+                          temperature: 0.1
+                        json_schema: |
+                          {
+                            "type": "object",
+                            "required": ["selected_thread_ids"],
+                            "properties": {
+                              "selected_thread_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}
+                            }
+                          }
+                  export:
+                    as:
+                      primary_llm_text: "${ .content.text // \"\" }"
+            catch:
+              as: primary_llm_error
+              do:
+                - recordPrimaryLlmFailure:
+                    set:
+                      failed_candidates: "${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($primary_llm_error | tostring), source: \"primary_llm\" }] }"
+                      candidate_outcome_recorded: "${ true }"
+
+        # Parse once into an object or null so later checks never see a
+        # blank or non-object answer as valid (see jobworkerp-rs #357).
+        - parsePrimarySelection:
+            if: "${ ($candidate_outcome_recorded | not) }"
+            set:
+              primary_llm_json: >-
+                ${ if ($primary_llm_text | type) == "string" and ($primary_llm_text | test("\\S"))
+                   then (try ($primary_llm_text | fromjson | if type == "object" then . else null end) catch null)
+                   else null end }
+
+        - shapePrimarySelection:
+            if: "${ ($candidate_outcome_recorded | not) }"
+            set:
+              primary_selection_valid: >-
+                ${ ($primary_llm_json != null) and (($primary_llm_json.selected_thread_ids | type) == "array") }
+              primary_llm_text: '${ "" }'
+              primary_llm_json: "${ null }"
+              selected_member_thread_ids: >-
+                ${ try (($primary_llm_json.selected_thread_ids // [])
+                        | map(tostring)
+                        | map(. as $selected_thread
+                             | select(($other_member_thread_ids | index($selected_thread)) != null))
+                        | unique)
+                   catch [] }
+
+        - failOnInvalidPrimaryResponse:
+            if: "${ ($candidate_outcome_recorded | not) and (($primary_selection_valid // false) | not) }"
+            set:
+              failed_candidates: "${ $failed_candidates + [{ candidate_id: $candidate_id, reason: \"invalid primary selection LLM response\", source: \"primary_llm\" }] }"
+              candidate_outcome_recorded: "${ true }"
+
+        - skipWithoutSelectedMember:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and (($selected_member_thread_ids | length) == 0) }
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+              skipped_candidates: >-
+                ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "no_selected_cross_thread_member" }] }
+              candidate_outcome_recorded: "${ true }"
+
+        # Fetch raw user/assistant text only after the first-pass selection.
+        - judgeCandidate:
+            if: "${ ($candidate_outcome_recorded | not) and (($selected_member_thread_ids | length) > 0) }"
+            try:
+              - invokeJudge:
+                  run:
+                    function:
+                      workerName: lookback-issue-resolution-judge
+                      arguments:
+                        input: >-
+                          ${ {
+                              candidate: $candidate,
+                              candidate_id: $candidate_id,
+                              candidate_status: $candidate_status,
+                              source_thread_ids: $source_thread_ids,
+                              selected_member_thread_ids: $selected_member_thread_ids,
+                              candidate_source_latest_at: $candidate_source_latest_at,
+                              associated_issue: $associated_issue,
+                              associated_issue_id: $associated_issue_id,
+                              project_context: $project_context,
+                              resolution_min_confidence: $resolution_min_confidence,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              evidence_scope: "active Thread Group members other than the candidate source thread",
+                              memories_grpc_host: $workflow.input.memories_grpc_host,
+                              memories_grpc_port: $workflow.input.memories_grpc_port,
+                              memories_grpc_tls: ($workflow.input.memories_grpc_tls // false)
+                            } | tojson }
+                  export:
+                    as:
+                      judged: '${ .output | fromjson }'
+            catch:
+              as: judge_error
+              do:
+                - recordJudgeFailure:
+                    set:
+                      failed_candidates: >-
+                        ${ $failed_candidates + [{ candidate_id: ($candidate.candidateId // $candidate.candidate_id // ""),
+                            reason: ($judge_error | tostring), source: "judge" }] }
+                      candidate_outcome_recorded: "${ true }"
+
+        - adoptJudgement:
+            if: "${ $judged != null }"
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + ($judged.skipped_candidate_ids // []) }"
+              skipped_candidates: "${ $skipped_candidates + ($judged.skipped_candidates // []) }"
+              protected_candidates: "${ $protected_candidates + ($judged.protected_candidates // []) }"
+              failed_candidates: "${ $failed_candidates + ($judged.failed_candidates // []) }"
+              candidate_outcome_recorded: "${ $judged.candidate_outcome_recorded // false }"
+              resolution_decision: "${ $judged.resolution_decision // \"NO_CHANGE\" }"
+              resolution_rationale: "${ $judged.resolution_rationale // \"\" }"
+              evidence_memory_ids: "${ $judged.evidence_memory_ids // [] }"
+              evidence_thread_ids: "${ $judged.evidence_thread_ids // [] }"
+              decision_audit: '${ $judged.decision_audit // { rationale: "", reason: "" } }'
+              decision_payload: "${ $judged.decision_payload }"
+              judged: "${ null }"
+
+        # A dry run reports what would be written and stops before any mutation.
+        - recordDryRunDecision:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and ($decision_payload != null)
+                 and ($workflow.input.dry_run // false) }
+            set:
+              dry_run_candidates: >-
+                ${ $dry_run_candidates + [{ candidate_id: $candidate_id,
+                                            decision: $resolution_decision,
+                                            rationale: $resolution_rationale,
+                                            evidence_thread_ids: $evidence_thread_ids,
+                                            evidence_memory_ids: $evidence_memory_ids }] }
+              candidate_outcome_recorded: "${ true }"
+
+        # Re-read membership immediately before the mutation; a changed group is not a tracker failure.
+        - fetchLineageBeforeApply:
+            if: "${ ($candidate_outcome_recorded | not) and ($decision_payload != null) }"
+            try:
+              - fetchFreshLineage:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: unary
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.ThreadGroupService/FindThreadGroupLineage"
+                        json_body: "${ { value: $workflow.input.group_id, user_id: $workflow.input.group_owner_user_id } | tojson }"
+                        as_json: true
+                  export:
+                    as:
+                      fresh_membership_digest: >-
+                        ${ .jsonBody | fromjson | (.group.membershipSnapshotDigest // .group.membership_snapshot_digest // "") }
+            catch:
+              as: fresh_lineage_error
+              do:
+                - recordFreshLineageFailure:
+                    set:
+                      failed_candidates: "${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($fresh_lineage_error | tostring), source: \"membership_read\" }] }"
+                      candidate_outcome_recorded: "${ true }"
+                      decision_payload: "${ null }"
+
+        - markGroupChanged:
+            if: >-
+              ${ ($candidate_outcome_recorded | not)
+                 and ($decision_payload != null)
+                 and (($fresh_membership_digest // "") != $expected_membership_digest) }
+            set:
+              group_changed_candidates: >-
+                ${ $group_changed_candidates + [{ candidate_id: $candidate_id, reason: "membership_changed_before_apply" }] }
+              candidate_outcome_recorded: "${ true }"
+              decision_payload: "${ null }"
+
+        - applyResolution:
+            if: "${ ($candidate_outcome_recorded | not) and ($decision_payload != null) }"
+            try:
+              - invokeApply:
+                  run:
+                    function:
+                      workerName: lookback-issue-resolution-apply
+                      arguments:
+                        input: >-
+                          ${ {
+                              candidate_id: $candidate_id,
+                              candidate_revision: $candidate_revision,
+                              decision_payload: $decision_payload,
+                              audit_reason: $decision_audit.reason,
+                              actor_id: "lookback-thread-group-issue-resolution",
+                              idempotency_key: ("thread-group-issue-resolution:" + ($workflow.input.group_id | tostring) + ":" + $candidate_id + ":" + ($fresh_membership_digest // "")),
+                              correlation_prefix: "thread-group-issue-resolution",
+                              manager_contract: $manager_contract,
+                              manager_store_identity: $manager_store_identity,
+                              issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                              issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                              issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false)
+                            } | tojson }
+                  export:
+                    as:
+                      applied: '${ .output | fromjson }'
+            catch:
+              as: apply_error
+              do:
+                - recordApplyWorkerFailure:
+                    set:
+                      failed_candidates: >-
+                        ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($apply_error | tostring), source: "tracker" }] }
+                      candidate_outcome_recorded: "${ true }"
+                      last_error: "${ $apply_error }"
+                      decision_payload: "${ null }"
+
+        - adoptApplyOutcome:
+            if: "${ $applied != null }"
+            set:
+              conflicted_candidates: "${ $conflicted_candidates + ($applied.conflicted_candidates // []) }"
+              failed_candidates: "${ $failed_candidates + ($applied.failed_candidates // []) }"
+              last_error: "${ $applied.last_error // $last_error }"
+              operation_confirmed: "${ $applied.operation_confirmed // false }"
+              operation_id: "${ $applied.operation_id // \"\" }"
+              candidate_outcome_recorded: >-
+                ${ ((($applied.conflicted_candidates // []) | length) > 0)
+                   or ((($applied.failed_candidates // []) | length) > 0) }
+              decision_payload: >-
+                ${ if ($applied.operation_confirmed // false) then $decision_payload else null end }
+              applied: "${ null }"
+
+        - recordApplied:
+            if: "${ ($candidate_outcome_recorded | not) and ($operation_confirmed == true) }"
+            set:
+              applied_candidates: >-
+                ${ $applied_candidates + [{ candidate_id: $candidate_id, operation_id: $operation_id,
+                                            decision: $resolution_decision, rationale: $resolution_rationale }] }
+              candidate_outcome_recorded: "${ true }"
+
+        - recordCompleted:
+            if: >-
+              ${ ($operation_confirmed == true)
+                 and ($resolution_decision == "COMPLETE")
+                 and (($candidate_status == "CANDIDATE_STATUS_AUTO_REGISTERED") or ($candidate_status == "AUTO_REGISTERED")) }
+            set:
+              completed_candidate_ids: "${ $completed_candidate_ids + [$candidate_id] }"
+
+        - recordCanceled:
+            if: >-
+              ${ ($operation_confirmed == true)
+                 and ($resolution_decision == "CANCEL")
+                 and (($candidate_status == "CANDIDATE_STATUS_AUTO_REGISTERED") or ($candidate_status == "AUTO_REGISTERED")) }
+            set:
+              canceled_candidate_ids: "${ $canceled_candidate_ids + [$candidate_id] }"
+
+        - recordRejected:
+            if: >-
+              ${ ($operation_confirmed == true)
+                 and (($candidate_status == "CANDIDATE_STATUS_PROPOSED") or ($candidate_status == "PROPOSED")) }
+            set:
+              rejected_candidate_ids: "${ $rejected_candidate_ids + [$candidate_id] }"
+
+        - recordUnclassifiedSkip:
+            if: "${ ($candidate_outcome_recorded | not) }"
+            set:
+              skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+              skipped_candidates: >-
+                ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "not_resolvable" }] }
+              candidate_outcome_recorded: "${ true }"
+
+output:
+  as:
+    completed: "${ ($failed_candidates | length) == 0 }"
+    resolution_mode: "${ $resolution_mode }"
+    resolution_min_confidence: "${ $resolution_min_confidence }"
+    candidate_count: "${ $review_rows | length }"
+    processed_count: >-
+      ${ ($applied_candidates | length)
+         + ($dry_run_candidates | length)
+         + ($protected_candidates | length)
+         + ($skipped_candidates | length)
+         + ($conflicted_candidates | length)
+         + ($group_changed_candidates | length)
+         + ($failed_candidates | length) }
+    applied_count: "${ $applied_candidates | length }"
+    protected_count: "${ $protected_candidates | length }"
+    skipped_count: "${ $skipped_candidates | length }"
+    conflicted_count: "${ $conflicted_candidates | length }"
+    group_changed_count: "${ $group_changed_candidates | length }"
+    failed_count: "${ $failed_candidates | length }"
+    applied_candidates: "${ $applied_candidates }"
+    dry_run_candidates: "${ $dry_run_candidates }"
+    protected_candidates: "${ $protected_candidates }"
+    skipped_candidates: "${ $skipped_candidates }"
+    conflicted_candidates: "${ $conflicted_candidates }"
+    group_changed_candidates: "${ $group_changed_candidates }"
+    failed_candidates: "${ $failed_candidates }"
+    applied: "${ $applied_candidates }"
+    protected: "${ $protected_candidates }"
+    skipped: "${ $skipped_candidates }"
+    conflicted: "${ $conflicted_candidates }"
+    group_changed: "${ $group_changed_candidates }"
+    failed: "${ $failed_candidates }"
+    completed_count: "${ $completed_candidate_ids | length }"
+    canceled_count: "${ $canceled_candidate_ids | length }"
+    rejected_count: "${ $rejected_candidate_ids | length }"
+    completed_candidate_ids: "${ $completed_candidate_ids }"
+    canceled_candidate_ids: "${ $canceled_candidate_ids }"
+    rejected_candidate_ids: "${ $rejected_candidate_ids }"
+    skipped_candidate_ids: "${ $skipped_candidate_ids }"
+    last_error: "${ $last_error }"

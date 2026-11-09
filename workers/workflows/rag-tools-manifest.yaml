@@ -1,0 +1,68 @@
+# Jobworkerp manifest for Lookback's RAG tools.
+#
+# This mirrors the app's `lookback-rag` function set while keeping the
+# workflow paths and names specific to the bundled Lookback workflows.
+
+workers:
+  defaults:
+    response_type: DIRECT
+    store_failure: true
+    broadcast_results: false
+    retry_policy:
+      type: EXPONENTIAL
+      interval: 800
+      max_interval: 60000
+      max_retry: 0
+      basis: 2.0
+
+  entries:
+    - name: lookback_recall
+      runner: WORKFLOW
+      description: >-
+        Search the user's past Lookback memories across summary and raw-message
+        layers. Use this when answering questions about prior conversations,
+        decisions, or work history.
+      channel: rag
+      settings:
+        workflow_data:
+          $file: rag/lookback-recall.yaml
+
+    - name: lookback_get_context
+      runner: WORKFLOW
+      description: >-
+        Retrieve selected Lookback memories or messages by exact memory and
+        thread identifiers without running embedding search.
+      channel: rag
+      settings:
+        workflow_data:
+          $file: rag/lookback-get-context.yaml
+
+    - name: lookback_get_reflections
+      runner: WORKFLOW
+      description: >-
+        Retrieve the latest non-empty reflections for exact thread identifiers.
+      channel: rag
+      settings:
+        workflow_data:
+          $file: rag/lookback-get-reflections.yaml
+
+function_sets:
+  defaults:
+    category: 0
+
+  entries:
+    - name: lookback-rag
+      description: >-
+        Tools for recalling the user's past Lookback memories. The recall
+        workflow searches both summary and raw-message layers; the context and
+        reflection workflows retrieve specific follow-up context.
+      targets:
+        - type: WORKER
+          name: lookback_recall
+          using: run
+        - type: WORKER
+          name: lookback_get_context
+          using: run
+        - type: WORKER
+          name: lookback_get_reflections
+          using: run

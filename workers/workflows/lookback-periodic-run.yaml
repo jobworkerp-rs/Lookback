@@ -33,9 +33,11 @@ input:
             monthly_day: { type: [integer, "null"], minimum: 1, maximum: 28 }
             lookback_days: { type: integer, minimum: 0 }
             force_thread_summary: { type: boolean, default: true }
+            run_summary_thread_group: { type: boolean, default: false }
             run_summary_daily: { type: boolean, default: true }
             run_personality: { type: boolean, default: false }
             run_reflection: { type: boolean, default: false }
+            stop_on_error: { type: boolean, default: false }
         runtime:
           type: object
           required:
@@ -48,6 +50,19 @@ input:
             memories_grpc_port: { type: integer }
             memories_grpc_tls: { type: boolean }
             llm_worker_name: { type: string }
+            # Period-summary batches require the same model contract as their
+            # manual-dispatch counterparts. Defaults retain compatibility for
+            # old persisted scheduler inputs until startup refresh rewrites
+            # them with values calculated from the active model settings.
+            llm_context_window_tokens: { type: integer, minimum: 1024, default: 131072 }
+            llm_expected_model: { type: string, default: "" }
+            summary_max_completion_tokens: { type: integer, minimum: 1, default: 32768 }
+            summary_input_byte_budget: { type: integer, minimum: 0, default: 200000 }
+            # Prompt-only writing targets. Rust resolves these from the saved
+            # guide settings and effective model context before scheduling.
+            summary_output_guidance:
+              type: object
+              default: {daily: {item_chars: 300, total_chars: 12000}, weekly: {item_chars: 500, total_chars: 30000}, monthly: {item_chars: 800, total_chars: 80000}, max_purpose_groups: {daily: 10, weekly: 20, monthly: 50}, max_source_memory_ids: 10}
             # Output language forwarded into each batch as `output_language`,
             # so the batches resolve the matching language-specific single
             # worker (`memories-<feature>-single-<lang>`). Injected by the Rust
@@ -67,15 +82,29 @@ input:
               type: string
               default: "memories-import"
               description: memories-import binary path used by regular tasks before generation.
-
-timeout:
-  after:
-    days: 72
+            policy_json:
+              type: string
+              default: ""
+              description: Auto-issue policy snapshot JSON forwarded into thread-summary-batch.
+            import_working_dir:
+              type: string
+              default: ""
+              description: Absolute working directory used by memories-import for periodic imports.
+            opencode_db_path:
+              type: string
+              default: ""
+              description: Resolved OpenCode database path used by the periodic importer.
+            # The Issue tracker as jobworkerp reaches it, rewritten at every
+            # startup refresh; empty while Issue tracking is off.
+            issue_tracker_grpc_host: { type: string, default: "" }
+            issue_tracker_grpc_port: { type: integer, default: 0 }
+            issue_tracker_grpc_tls: { type: boolean, default: false }
 
 do:
   - initResults:
       set:
         thread_result: "${ null }"
+        thread_group_result: "${ null }"
         daily_result: "${ null }"
         weekly_result: "${ null }"
         monthly_result: "${ null }"
@@ -83,8 +112,10 @@ do:
         reflection_result: "${ null }"
         import_codex_result: "${ null }"
         import_claude_code_result: "${ null }"
+        import_opencode_result: "${ null }"
         codex_import_root_status: "not-selected"
         claude_code_import_root_status: "not-selected"
+        opencode_import_root_status: "not-selected"
         skipped_import_sources: "${ [] }"
 
   - resolveSourceFilterSources:
@@ -103,9 +134,10 @@ do:
           ${ $source_filter_sources
              | map(if . == "agent:codex" then .
                    elif . == "agent:claude_code" then .
-                   elif . == "codex" then "agent:codex"
-                   elif . == "claude-code" then "agent:claude_code"
-                   else .
+                    elif . == "codex" then "agent:codex"
+                    elif . == "claude-code" then "agent:claude_code"
+                    elif . == "opencode" then "agent:opencode"
+                    else .
                    end) }
         source_filter_match_mode: >-
           ${ if $workflow.input.task.source == "codex+claude-code"
@@ -113,6 +145,45 @@ do:
              then "LABEL_ANY"
              else "LABEL_ALL"
              end }
+
+  - serializeSourceScope:
+      set:
+        source_scope_json: >-
+          ${ {labels: ($source_filter_labels | sort | unique),
+              match_mode: $source_filter_match_mode, version: 1} | tojson }
+
+  # A periodic invocation has no frontend dispatch UUID. Mint an execution
+  # identity here rather than using a seconds-only timestamp, which can make
+  # two independently scheduled tasks look like one generation in the UI.
+  - mintGenerationId:
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args:
+              - "-c"
+              - "stamp=$(date -u +%Y%m%d%H%M%S); iso=$(date -u +%Y-%m-%dT%H:%M:%SZ); nonce=$(od -An -N8 -tx8 /dev/urandom | tr -d ' '); printf '%s-%s|%s' \"$stamp\" \"$nonce\" \"$iso\""
+            treat_nonzero_as_error: true
+      export:
+        as:
+          generation_id: "${ .stdout | split(\"|\")[0] }"
+          generation_started_at: "${ .stdout | split(\"|\")[1] }"
+
+  - digestSourceScope:
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            stdin: "${ $source_scope_json }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          source_scope_digest: "${ .stdout | split(\" \")[0] }"
 
   # The import window start is `today - lookback_days` on the local
   # calendar. When the worker's TZ env var is set, jq's `strflocaltime`
@@ -207,16 +278,37 @@ do:
         as:
           claude_code_import_root_status: "${ .stdout }"
 
+  - probeOpenCodeImportRoot:
+      if: "${ $workflow.input.task.task_kind == \"regular\" and (($source_filter_sources | index(\"opencode\")) != null) }"
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args:
+              - "-c"
+              - 'if [ -f "$1" ]; then printf present; else printf missing; fi; exit 0'
+              - "opencode-import-probe"
+              - "${ $workflow.input.runtime.opencode_db_path // \"\" }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          opencode_import_root_status: "${ .stdout }"
+
   - collectSkippedImportSources:
       if: "${ $workflow.input.task.task_kind == \"regular\" }"
       set:
         skipped_import_sources: >-
           ${ (if (($source_filter_sources | index("codex")) != null
-                  and (($codex_import_root_status // "") == "missing"))
-              then ["codex"] else [] end)
-             + (if (($source_filter_sources | index("claude-code")) != null
-                    and (($claude_code_import_root_status // "") == "missing"))
-                then ["claude-code"] else [] end) }
+                 and (($codex_import_root_status // "") == "missing"))
+             then ["codex"] else [] end)
+            + (if (($source_filter_sources | index("claude-code")) != null
+                   and (($claude_code_import_root_status // "") == "missing"))
+              then ["claude-code"] else [] end)
+            + (if (($source_filter_sources | index("opencode")) != null
+                   and (($opencode_import_root_status // "") == "missing"))
+              then ["opencode"] else [] end) }
 
   - runImportCodex:
       if: '${ $workflow.input.task.task_kind == "regular" and (($source_filter_sources | index("codex")) != null) and (($codex_import_root_status // "") == "present") }'
@@ -230,6 +322,7 @@ do:
           arguments:
             command: "${ $workflow.input.runtime.memories_import_bin }"
             args: "${ $regular_import_common_args + [\"codex\", \"--all-sessions\"] }"
+            working_dir: "${ $workflow.input.runtime.import_working_dir // \"\" }"
             treat_nonzero_as_error: true
       export:
         as:
@@ -247,21 +340,52 @@ do:
           arguments:
             command: "${ $workflow.input.runtime.memories_import_bin }"
             args: "${ $regular_import_common_args + [\"claude-code\", \"--all-projects\"] }"
+            working_dir: "${ $workflow.input.runtime.import_working_dir // \"\" }"
             treat_nonzero_as_error: true
       export:
         as:
           import_claude_code_result: "${ .output }"
 
-  - threadSummaryForRegular:
+  - runImportOpenCode:
+      if: '${ $workflow.input.task.task_kind == "regular" and (($source_filter_sources | index("opencode")) != null) and (($opencode_import_root_status // "") == "present") }'
       timeout:
         after:
-          hours: 24
-      if: "${ $workflow.input.task.task_kind == \"regular\" and ($workflow.input.task.force_thread_summary // true) }"
+          hours: 2
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "${ $workflow.input.runtime.memories_import_bin }"
+            args: "${ $regular_import_common_args + [\"opencode\", \"--all-sessions\", \"--opencode-db\", $workflow.input.runtime.opencode_db_path] }"
+            working_dir: "${ $workflow.input.runtime.import_working_dir // \"\" }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          import_opencode_result: "${ .output }"
+
+  # Thread summaries and ThreadGroups only cover threads active within the
+  # task's lookback window, so a run's cost follows recent activity rather
+  # than the whole history; older unsummarized threads are backfilled from
+  # the Summaries tab. The window starts one day earlier than
+  # `now - lookback_days` so it always covers the import's local-midnight
+  # start date in any timezone.
+  - buildPeriodicActivityWindow:
+      set:
+        periodic_activity_after_ms: >-
+          ${ (now - (([($workflow.input.task.lookback_days // 1), 0] | max) + 1) * 86400)
+             * 1000 | floor }
+
+  - threadSummaryForTask:
+      if: >-
+        ${ (($workflow.input.task.task_kind == "regular")
+             or ($workflow.input.task.run_summary_thread_group // false))
+           and ($workflow.input.task.force_thread_summary // true) }
       do:
         - runThreadBatch:
             timeout:
               after:
-                hours: 24
+                hours: 115
             run:
               function:
                 workerName: memories-summarize-batch
@@ -275,22 +399,70 @@ do:
                       llm_worker_name: $workflow.input.runtime.llm_worker_name,
                       output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
                       labels_filter: $source_filter_labels,
-                      labels_filter_match_mode: $source_filter_match_mode
+                      labels_filter_match_mode: $source_filter_match_mode,
+                      last_message_after_ms: $periodic_activity_after_ms,
+                      issue_tracker_grpc_host: ($workflow.input.runtime.issue_tracker_grpc_host // ""),
+                      issue_tracker_grpc_port: ($workflow.input.runtime.issue_tracker_grpc_port // 0),
+                      issue_tracker_grpc_tls: ($workflow.input.runtime.issue_tracker_grpc_tls // false),
+                      policy_json: ($workflow.input.runtime.policy_json // "")
                     } | tojson }
             export:
               as:
                 thread_result: "${ .output | fromjson }"
 
-  - dailyForRegular:
+  # Only groups with a member active within the task's lookback window are
+  # summarized; each group still aggregates all of its current members. Run
+  # this before any current period output.
+  - threadGroupForPeriodic:
       timeout:
         after:
-          days: 31
+          hours: 121
+      if: >-
+        ${ ($workflow.input.task.run_summary_thread_group // false)
+           and ($workflow.input.task.force_thread_summary // true) }
+      run:
+        function:
+          workerName: memories-thread-group-summary-batch
+          arguments:
+            input: >-
+              ${ {
+                group_owner_user_id: 1,
+                memories_grpc_host: $workflow.input.runtime.memories_grpc_host,
+                memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
+                memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
+                output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
+                llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                issue_tracker_grpc_host: ($workflow.input.runtime.issue_tracker_grpc_host // ""),
+                issue_tracker_grpc_port: ($workflow.input.runtime.issue_tracker_grpc_port // 0),
+                issue_tracker_grpc_tls: ($workflow.input.runtime.issue_tracker_grpc_tls // false),
+                policy_json: ($workflow.input.runtime.policy_json // ""),
+                stop_on_error: ($workflow.input.task.stop_on_error // false),
+                trigger_kind: "periodic",
+                activity_after_ms: $periodic_activity_after_ms,
+                activity_before_ms: ((now * 1000 | floor) + 1)
+              } | tojson }
+      export:
+        as:
+          thread_group_result: "${ .output | fromjson }"
+
+  - threadGroupPeriodicFatalCheck:
+      if: >-
+        ${ ($workflow.input.task.stop_on_error // false)
+           and (($thread_group_result.failed_count // 0) > 0) }
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+          status: 500
+          title: "ThreadGroup summary stage failed"
+          detail: "a ThreadGroup group failure was detected; aborting before period summaries"
+
+  - dailyForRegular:
       if: "${ $workflow.input.task.task_kind == \"regular\" and ($workflow.input.task.run_summary_daily // true) }"
       do:
         - runDailyBatch:
             timeout:
               after:
-                hours: 24
+                hours: 11
             run:
               function:
                 workerName: memories-daily-summary-batch
@@ -308,10 +480,19 @@ do:
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
                       llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      summary_output_guidance: $workflow.input.runtime.summary_output_guidance,
+                      llm_context_window_tokens: $workflow.input.runtime.llm_context_window_tokens,
+                      llm_expected_model: $workflow.input.runtime.llm_expected_model,
+                      summary_max_completion_tokens: $workflow.input.runtime.summary_max_completion_tokens,
+                      summary_input_byte_budget: $workflow.input.runtime.summary_input_byte_budget,
                       output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
                       extra_labels_filter: $source_filter_labels,
                       extra_labels_match_mode: $source_filter_match_mode,
-                      force_resummarize: true
+                      force_resummarize: true,
+                      stop_on_error: ($workflow.input.task.stop_on_error // false),
+                      source_scope_digest: $source_scope_digest,
+                      generation_id: $generation_id,
+                      generation_started_at: $generation_started_at
                     } | tojson }
             export:
               as:
@@ -323,7 +504,7 @@ do:
         - runPersonalityBatch:
             timeout:
               after:
-                hours: 24
+                hours: 19
             run:
               function:
                 workerName: memories-personality-batch
@@ -354,7 +535,7 @@ do:
         - runReflectionBatch:
             timeout:
               after:
-                hours: 24
+                hours: 27
             run:
               function:
                 workerName: memories-reflection-batch
@@ -456,15 +637,12 @@ do:
               | strptime("%G-W%V-%u") | mktime | strftime("%Y-%m-%d")) }
 
   - weeklyStage:
-      timeout:
-        after:
-          days: 15
       if: "${ $workflow.input.task.task_kind == \"weekly\" }"
       do:
         - runDailyBatch:
             timeout:
               after:
-                days: 7
+                hours: 11
             run:
               function:
                 workerName: memories-daily-summary-batch
@@ -478,10 +656,19 @@ do:
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
                       llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      summary_output_guidance: $workflow.input.runtime.summary_output_guidance,
+                      llm_context_window_tokens: $workflow.input.runtime.llm_context_window_tokens,
+                      llm_expected_model: $workflow.input.runtime.llm_expected_model,
+                      summary_max_completion_tokens: $workflow.input.runtime.summary_max_completion_tokens,
+                      summary_input_byte_budget: $workflow.input.runtime.summary_input_byte_budget,
                       output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
                       extra_labels_filter: $source_filter_labels,
                       extra_labels_match_mode: $source_filter_match_mode,
-                      force_resummarize: true
+                      force_resummarize: true,
+                      stop_on_error: ($workflow.input.task.stop_on_error // false),
+                      source_scope_digest: $source_scope_digest,
+                      generation_id: $generation_id,
+                      generation_started_at: $generation_started_at
                     } | tojson }
             export:
               as:
@@ -489,7 +676,7 @@ do:
         - runWeeklyBatch:
             timeout:
               after:
-                days: 7
+                hours: 11
             run:
               function:
                 workerName: memories-weekly-summary-batch
@@ -503,25 +690,31 @@ do:
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
                       llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      summary_output_guidance: $workflow.input.runtime.summary_output_guidance,
+                      llm_context_window_tokens: $workflow.input.runtime.llm_context_window_tokens,
+                      llm_expected_model: $workflow.input.runtime.llm_expected_model,
+                      summary_max_completion_tokens: $workflow.input.runtime.summary_max_completion_tokens,
+                      summary_input_byte_budget: $workflow.input.runtime.summary_input_byte_budget,
                       output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
                       extra_labels_filter: $source_filter_labels,
                       extra_labels_match_mode: $source_filter_match_mode,
-                      force_resummarize: true
+                      force_resummarize: true,
+                      stop_on_error: ($workflow.input.task.stop_on_error // false),
+                      source_scope_digest: $source_scope_digest,
+                      generation_id: $generation_id,
+                      generation_started_at: $generation_started_at
                     } | tojson }
             export:
               as:
                 weekly_result: "${ .output | fromjson }"
 
   - monthlyStage:
-      timeout:
-        after:
-          days: 72
       if: "${ $workflow.input.task.task_kind == \"monthly\" }"
       do:
         - runDailyBatch:
             timeout:
               after:
-                days: 31
+                hours: 11
             run:
               function:
                 workerName: memories-daily-summary-batch
@@ -535,10 +728,19 @@ do:
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
                       llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      summary_output_guidance: $workflow.input.runtime.summary_output_guidance,
+                      llm_context_window_tokens: $workflow.input.runtime.llm_context_window_tokens,
+                      llm_expected_model: $workflow.input.runtime.llm_expected_model,
+                      summary_max_completion_tokens: $workflow.input.runtime.summary_max_completion_tokens,
+                      summary_input_byte_budget: $workflow.input.runtime.summary_input_byte_budget,
                       output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
                       extra_labels_filter: $source_filter_labels,
                       extra_labels_match_mode: $source_filter_match_mode,
-                      force_resummarize: true
+                      force_resummarize: true,
+                      stop_on_error: ($workflow.input.task.stop_on_error // false),
+                      source_scope_digest: $source_scope_digest,
+                      generation_id: $generation_id,
+                      generation_started_at: $generation_started_at
                     } | tojson }
             export:
               as:
@@ -546,7 +748,7 @@ do:
         - runWeeklyBatch:
             timeout:
               after:
-                days: 7
+                hours: 11
             run:
               function:
                 workerName: memories-weekly-summary-batch
@@ -560,10 +762,19 @@ do:
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
                       llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      summary_output_guidance: $workflow.input.runtime.summary_output_guidance,
+                      llm_context_window_tokens: $workflow.input.runtime.llm_context_window_tokens,
+                      llm_expected_model: $workflow.input.runtime.llm_expected_model,
+                      summary_max_completion_tokens: $workflow.input.runtime.summary_max_completion_tokens,
+                      summary_input_byte_budget: $workflow.input.runtime.summary_input_byte_budget,
                       output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
                       extra_labels_filter: $source_filter_labels,
                       extra_labels_match_mode: $source_filter_match_mode,
-                      force_resummarize: true
+                      force_resummarize: true,
+                      stop_on_error: ($workflow.input.task.stop_on_error // false),
+                      source_scope_digest: $source_scope_digest,
+                      generation_id: $generation_id,
+                      generation_started_at: $generation_started_at
                     } | tojson }
             export:
               as:
@@ -571,7 +782,7 @@ do:
         - runMonthlyBatch:
             timeout:
               after:
-                days: 31
+                hours: 7
             run:
               function:
                 workerName: memories-monthly-summary-batch
@@ -585,20 +796,60 @@ do:
                       memories_grpc_port: $workflow.input.runtime.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.runtime.memories_grpc_tls,
                       llm_worker_name: $workflow.input.runtime.llm_worker_name,
+                      summary_output_guidance: $workflow.input.runtime.summary_output_guidance,
+                      llm_context_window_tokens: $workflow.input.runtime.llm_context_window_tokens,
+                      llm_expected_model: $workflow.input.runtime.llm_expected_model,
+                      summary_max_completion_tokens: $workflow.input.runtime.summary_max_completion_tokens,
+                      summary_input_byte_budget: $workflow.input.runtime.summary_input_byte_budget,
                       output_language: (if (($workflow.input.runtime.output_language // "") == "") then "ja" else $workflow.input.runtime.output_language end),
                       extra_labels_filter: $source_filter_labels,
                       extra_labels_match_mode: $source_filter_match_mode,
-                      force_resummarize: true
+                      force_resummarize: true,
+                      stop_on_error: ($workflow.input.task.stop_on_error // false),
+                      source_scope_digest: $source_scope_digest,
+                      generation_id: $generation_id,
+                      generation_started_at: $generation_started_at
                     } | tojson }
             export:
               as:
                 monthly_result: "${ .output | fromjson }"
+
+  # Stages run best-effort so later stages still execute after a failure, but
+  # the scheduler only sees the job status: fail the run when any stage
+  # reported failures or ended incomplete. Workers do not retry (max_retry 0).
+  # `tonumber` accepts counts re-serialized as ProtoJSON strings.
+  - collectIncompletePeriodicStages:
+      set:
+        incomplete_periodic_stages: >-
+          ${ {thread: $thread_result, thread_group: $thread_group_result,
+              daily: $daily_result, weekly: $weekly_result,
+              monthly: $monthly_result, personality: $personality_result,
+              reflection: $reflection_result}
+             | to_entries
+             | map(select(.value != null
+                          and ((.value.completed == false)
+                               or (((.value.failed_count // 0) | tonumber) > 0))))
+             | map({stage: .key, last_error: (.value.last_error // null)}) }
+  # Raising drops `output`, so the error detail carries each stage's last
+  # error for diagnosis.
+  - failIfAnyStageIncomplete:
+      if: "${ ($incomplete_periodic_stages | length) > 0 }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+          status: 500
+          title: "periodic run finished with incomplete stages"
+          detail: >-
+            ${ $incomplete_periodic_stages
+               | map(.stage + ": " + ((.last_error // "incomplete") | tostring))
+               | join("; ") }
 
 output:
   as:
     task_name: "${ $workflow.input.task.name }"
     task_kind: "${ $workflow.input.task.task_kind }"
     thread: "${ $thread_result }"
+    thread_group: "${ $thread_group_result }"
     daily: "${ $daily_result }"
     weekly: "${ $weekly_result }"
     monthly: "${ $monthly_result }"

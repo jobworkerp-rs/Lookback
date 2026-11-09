@@ -1,11 +1,36 @@
-import { createContext, useContext } from "react";
+import { createContext, useContext, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { MarkdownBody } from "@/components/MarkdownMessage";
 import { MemoryRefs } from "@/components/MemoryRefs";
+import type { PeriodSummaryExpansionMode } from "@/lib/summaryDisplayPreference";
 import type { SummaryContent, SummaryValue } from "@/types/api";
 
 /** Keys that, when present, are promoted to the card title rather than shown
  *  as a labelled section. Covers the English schema key and its JA aliases. */
 const TITLE_KEYS = ["title", "タイトル", "件名"];
+
+const STRUCTURED_COLLECTION_KEYS = new Set([
+  "purpose_groups",
+  "by_topic",
+  "trends",
+  "highlights",
+  "milestones",
+]);
+
+const STRUCTURED_FIELD_LABEL_KEYS: Record<string, string> = {
+  purpose_groups: "purposeGroups",
+  by_topic: "byTopic",
+  trends: "trends",
+  highlights: "highlights",
+  milestones: "milestones",
+};
+
+const STRUCTURED_ITEM_HEADER_KEYS = new Set(["purpose", "topic", "title", "status", "kind"]);
+
+export interface PeriodSummaryDisplay {
+  initialMode: PeriodSummaryExpansionMode;
+  onBulkModeChange?: (mode: PeriodSummaryExpansionMode) => void;
+}
 
 function isTitleKey(key: string): boolean {
   return TITLE_KEYS.includes(key);
@@ -66,10 +91,18 @@ const TITLE_SCRAPE_PATTERNS: ReadonlyArray<RegExp> = TITLE_KEYS.map(
 export function SummaryBody({
   parsed,
   raw,
+  periodDisplay,
 }: {
   parsed: Record<string, SummaryValue> | null;
   raw: string;
+  /** Enables compact item cards for known period-summary collections only. */
+  periodDisplay?: PeriodSummaryDisplay;
 }) {
+  const { t } = useTranslation();
+  const [bulkMode, setBulkMode] = useState<PeriodSummaryExpansionMode>(
+    periodDisplay?.initialMode ?? "expanded",
+  );
+  const [itemOpen, setItemOpen] = useState<Record<string, boolean>>({});
   if (parsed == null) {
     return (
       <div className="sum-section-body message-body">
@@ -88,19 +121,142 @@ export function SummaryBody({
   }
 
   const titleEntry = entries.find(([k]) => isTitleKey(k));
+  const structuredCollections = periodDisplay
+    ? entries.filter(([key, value]) => isStructuredCollection(key, value))
+    : [];
+  const setAllItems = (mode: PeriodSummaryExpansionMode) => {
+    setBulkMode(mode);
+    setItemOpen({});
+    periodDisplay?.onBulkModeChange?.(mode);
+  };
   return (
     <>
       {titleEntry && <div className="sum-title">{stringifyScalar(titleEntry[1])}</div>}
+      {structuredCollections.length > 0 && (
+        <fieldset className="summary-item-controls">
+          <legend className="visually-hidden">{t("summaries.structured.controlsLabel")}</legend>
+          <button type="button" className="btn secondary" onClick={() => setAllItems("expanded")}>
+            {t("summaries.structured.expandAll")}
+          </button>
+          <button type="button" className="btn secondary" onClick={() => setAllItems("collapsed")}>
+            {t("summaries.structured.collapseAll")}
+          </button>
+        </fieldset>
+      )}
       {entries
         .filter(([k]) => !isTitleKey(k))
-        .map(([key, value]) => (
-          <div key={key} className="sum-section">
-            <div className="sum-section-label">{key}</div>
-            <SummaryValueView value={value} parentKey={key} />
-          </div>
-        ))}
+        .map(([key, value]) => {
+          if (periodDisplay && isStructuredCollection(key, value)) {
+            return (
+              <StructuredCollection
+                key={key}
+                collectionKey={key}
+                value={value}
+                bulkMode={bulkMode}
+                itemOpen={itemOpen}
+                onItemOpenChange={(itemKey, open) =>
+                  setItemOpen((current) => ({ ...current, [itemKey]: open }))
+                }
+              />
+            );
+          }
+          return (
+            <div key={key} className="sum-section">
+              <div className="sum-section-label">{key}</div>
+              <SummaryValueView value={value} parentKey={key} />
+            </div>
+          );
+        })}
     </>
   );
+}
+
+function isStructuredCollection(key: string, value: SummaryValue): value is SummaryValue[] {
+  const nonEmptyItems = Array.isArray(value) ? value.filter((item) => !isEmptyValue(item)) : [];
+  return (
+    STRUCTURED_COLLECTION_KEYS.has(key) &&
+    nonEmptyItems.length > 0 &&
+    nonEmptyItems.every((item) => item != null && typeof item === "object" && !Array.isArray(item))
+  );
+}
+
+function StructuredCollection({
+  collectionKey,
+  value,
+  bulkMode,
+  itemOpen,
+  onItemOpenChange,
+}: {
+  collectionKey: string;
+  value: SummaryValue[];
+  bulkMode: PeriodSummaryExpansionMode;
+  itemOpen: Record<string, boolean>;
+  onItemOpenChange: (itemKey: string, open: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  const items = value.filter(
+    (item): item is Record<string, SummaryValue> =>
+      item != null && typeof item === "object" && !Array.isArray(item) && !isEmptyValue(item),
+  );
+  if (items.length === 0) return <SummaryValueView value={value} parentKey={collectionKey} />;
+  return (
+    <section className="sum-section summary-structured-section">
+      <div className="sum-section-label">
+        {t(`summaries.structured.fields.${STRUCTURED_FIELD_LABEL_KEYS[collectionKey]}`)}
+      </div>
+      <div className="summary-structured-cards">
+        {items.map((item, index) => {
+          const itemKey = `${collectionKey}:${index}`;
+          const isOpen = itemOpen[itemKey] ?? bulkMode === "expanded";
+          const heading =
+            summaryText(item.purpose) ??
+            summaryText(item.topic) ??
+            summaryText(item.title) ??
+            t("summaries.structured.unnamedItem", { count: index + 1 });
+          const bulletCount = Array.isArray(item.bullets)
+            ? item.bullets.filter((bullet) => !isEmptyValue(bullet)).length
+            : 0;
+          return (
+            <details
+              className="summary-structured-card"
+              key={itemKey}
+              open={isOpen}
+              onToggle={(event) => onItemOpenChange(itemKey, event.currentTarget.open)}
+            >
+              <summary>
+                <span className="summary-structured-heading">{heading}</span>
+                <span className="summary-structured-meta">
+                  {summaryText(item.status) && (
+                    <span className="label-pill">{summaryText(item.status)}</span>
+                  )}
+                  {summaryText(item.kind) && (
+                    <span className="label-pill">{summaryText(item.kind)}</span>
+                  )}
+                  {bulletCount > 0 && (
+                    <span>{t("summaries.structured.itemCount", { count: bulletCount })}</span>
+                  )}
+                </span>
+              </summary>
+              <div className="summary-structured-content">
+                {Object.entries(item)
+                  .filter(([key]) => !STRUCTURED_ITEM_HEADER_KEYS.has(key))
+                  .map(([key, child]) => (
+                    <div key={key} className="sum-section">
+                      <div className="sum-section-label">{key}</div>
+                      <SummaryValueView value={child} parentKey={key} />
+                    </div>
+                  ))}
+              </div>
+            </details>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function summaryText(value: SummaryValue | undefined): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
 }
 
 /** Render a single summary field value by its runtime shape: list → bullets,

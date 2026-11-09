@@ -35,7 +35,9 @@ message JobResultData {
   jobworkerp.data.ResultStatus status = 6;
 
   // # Result Output
-  // Job execution output data (non-streaming)
+  // Job execution output data (non-streaming). On success, items contains the
+  // runner method's result protobuf. On failure, items contains a UTF-8
+  // diagnostic message instead.
   jobworkerp.data.ResultOutput output = 7;
 
   // # Retry Count

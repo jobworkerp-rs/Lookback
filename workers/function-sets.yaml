@@ -1,8 +1,6 @@
-# Function set definitions for the Lookback RAG chat (spec §4.3,
-# rag-chat-design.md DECIDE-CHAT-9). The `chat-rag` workflow narrows
-# the LLM's callable tool surface to this set by passing
-# `function_options.function_set_name: lookback-rag`, so the chat LLM
-# does NOT see batch / import / summary workers as callable tools.
+# Function set definitions for the Lookback chat. `lookback-rag` preserves
+# the retrieval-only RAG set; `lookback-chat` adds the chat-only Issue facade
+# workers. Coding-agent proposal/status tools are shared with the external MCP set.
 #
 # Loaded by the sidecar startup path via
 # `jobworkerp_client::client::function_set_yaml::register_function_sets_from_yaml`,
@@ -40,14 +38,55 @@ function_sets:
         name: lookback_get_reflections
         using: run
 
+  - name: lookback-chat
+    description: >-
+      Tools for recalling saved Lookback memories and managing Issues from
+      chat. Issue calls use the local trusted Issue Tracker and require a
+      one-shot app-issued request permission. Mutations report success only
+      after a durable COMMITTED operation is confirmed.
+    targets:
+      - type: WORKER
+        name: lookback_recall
+        using: run
+      - type: WORKER
+        name: lookback_get_context
+        using: run
+      - type: WORKER
+        name: lookback_get_reflections
+        using: run
+      - type: WORKER
+        name: lookback_issue_list
+        using: unary
+      - type: WORKER
+        name: lookback_issue_get
+        using: unary
+      - type: WORKER
+        name: lookback_issue_create
+        using: unary
+      - type: WORKER
+        name: lookback_issue_update
+        using: unary
+      - type: WORKER
+        name: lookback_issue_cancel
+        using: unary
+      - type: WORKER
+        name: lookback_issue_agent_plan
+        using: unary
+      - type: WORKER
+        name: lookback_issue_agent_get
+        using: unary
+
   # MCP-exposed retrieval tools. Surfaced to EXTERNAL MCP clients
   # (e.g. Claude Desktop) when the user enables the MCP server in Settings —
-  # the sidecar is then spawned with `MCP_SET_NAME=lookback-mcp-rag`, which
+  # the sidecar is then spawned with `MCP_SET_NAME=lookback-mcp`, which
   # narrows jobworkerp's MCP tool surface to exactly this set. Kept SEPARATE
   # from `lookback-rag` (the in-app chat tool set) so the MCP-visible surface
-  # can grow independently of what the chat LLM may call. The split is the
-  # extension point.
-  - name: lookback-mcp-rag
+  # can grow independently of what the chat LLM may call. This is the
+  # composite MCP boundary for RAG tools and curated Lookback Issue Gateway
+  # workers. When the tracker is enabled but temporarily unavailable the
+  # set stays stable and calls report the failure from the GRPC worker.
+  # Disabling the tracker removes the Issue targets at registration time.
+  - name: lookback-mcp
     description: >-
       Tools for searching the user's saved memories of their past work and
       conversations. Use these whenever the question depends on what the
@@ -64,3 +103,24 @@ function_sets:
       - type: WORKER
         name: lookback_get_reflections
         using: run
+      - type: WORKER
+        name: lookback_issue_list_ready
+        using: unary
+      - type: WORKER
+        name: lookback_issue_transition
+        using: unary
+      - type: WORKER
+        name: lookback_issue_claim
+        using: unary
+      - type: WORKER
+        name: lookback_issue_heartbeat
+        using: unary
+      - type: WORKER
+        name: lookback_issue_release
+        using: unary
+      - type: WORKER
+        name: lookback_issue_agent_plan
+        using: unary
+      - type: WORKER
+        name: lookback_issue_agent_get
+        using: unary

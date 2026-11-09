@@ -72,11 +72,7 @@ describe("SettingsSaveBar", () => {
     expect(screen.getByText(/vectordb はリセット/)).toBeInTheDocument();
   });
 
-  it("always promises a sidecar restart", () => {
-    // Every save scope (LLM / embedding / HF_HOME) restarts the sidecar. The
-    // backend may hot-reload some External-only swaps in place, but the bar
-    // can't tell which, so it always shows the restart copy (harmless
-    // over-warning, never a false "no restart").
+  it("warns that only required sidecars restart and jobworkerp jobs stop", () => {
     renderWithProviders(
       <SettingsSaveBar
         dirtyCount={1}
@@ -86,7 +82,11 @@ describe("SettingsSaveBar", () => {
         onSave={noop}
       />,
     );
-    expect(screen.getByText("保存すると sidecar が再起動されます。")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /必要な sidecar を再起動する場合、jobworkerp で実行中の生成・インポート・要約などは停止します/,
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByText("保存して適用 (再起動)")).toBeInTheDocument();
   });
 
@@ -102,5 +102,40 @@ describe("SettingsSaveBar", () => {
     );
     expect(screen.getByText("保存中…")).toBeDisabled();
     expect(screen.getByText("破棄")).toBeDisabled();
+  });
+
+  it("does not imply a restart for coding-agent-only changes", () => {
+    renderWithProviders(
+      <SettingsSaveBar
+        dirtyCount={1}
+        resetsVectordb={false}
+        saving={false}
+        showRestartHint={false}
+        onDiscard={noop}
+        onSave={noop}
+      />,
+    );
+    expect(screen.queryByText(/必要な sidecar を再起動/)).not.toBeInTheDocument();
+    expect(screen.getByText("保存して適用")).toBeInTheDocument();
+  });
+
+  it("disables save and explains an edited invalid form", () => {
+    const onSave = vi.fn();
+    renderWithProviders(
+      <SettingsSaveBar
+        dirtyCount={1}
+        resetsVectordb={false}
+        saving={false}
+        saveDisabled
+        saveDisabledReason="入力内容を確認してから保存してください。"
+        onDiscard={noop}
+        onSave={onSave}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("入力内容を確認してから保存してください。");
+    const save = screen.getByRole("button", { name: "保存して適用 (再起動)" });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(onSave).not.toHaveBeenCalled();
   });
 });

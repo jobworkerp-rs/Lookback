@@ -13,13 +13,17 @@ import { EmbeddingProviderCard } from "./Settings";
 
 const getEmbeddingSettings = vi.fn();
 const listEmbeddingPresets = vi.fn();
+const getEmbeddingSpace = vi.fn();
+const inspectEmbeddingMigration = vi.fn();
 
 vi.mock("@/api", () => ({
   getEmbeddingSettings: () => getEmbeddingSettings(),
+  getEmbeddingSpace: () => getEmbeddingSpace(),
+  inspectEmbeddingMigration: () => inspectEmbeddingMigration(),
   listEmbeddingPresets: () => listEmbeddingPresets(),
   // EmbeddingProviderCard does not call these, but Settings.tsx re-exports
   // them in the same module — stub so the mock module is complete.
-  applySettings: () => Promise.resolve({ restarted: true, backup_path: null }),
+  applySettings: () => Promise.resolve({ restarted: true }),
   createDataRoot: () => Promise.resolve(),
   getAppSettings: () => Promise.resolve(null),
   getConnectionConfig: () => Promise.resolve(null),
@@ -97,6 +101,8 @@ const DEFAULT_LOCAL_SETTINGS: EmbeddingSettingsResponse = {
     dtype: "F16",
     max_sequence_length: 32_768,
     is_multimodal: false,
+    model_revision: "",
+    distance_type: "cosine",
   },
   connection_remote: false,
 };
@@ -146,6 +152,34 @@ describe("EmbeddingProviderCard", () => {
     getEmbeddingSettings.mockReset();
     listEmbeddingPresets.mockReset();
     listEmbeddingPresets.mockResolvedValue(PRESETS);
+    getEmbeddingSpace.mockResolvedValue({
+      registration_state: "registered",
+      current_space: null,
+      tables: [],
+      rpc_migration_supported: true,
+      write_rejections: {},
+      mm_embedding_worker_name: "worker",
+    });
+    inspectEmbeddingMigration.mockResolvedValue({
+      kind: "inspect",
+      data: {
+        state: "consistent",
+        space: { kind: "none" },
+        required: 0,
+        complete: 0,
+        missing: 0,
+        stale: 0,
+        unverified: 0,
+        failed_transient: 0,
+        failed_permanent: 0,
+        orphan: 0,
+        backup_supported: true,
+        attempt: null,
+        backup: null,
+        unavailable_reason: null,
+        next_action: "none",
+      },
+    });
   });
 
   it("keeps embedding editable without reset warning when connection is remote", async () => {
@@ -249,12 +283,12 @@ describe("EmbeddingProviderCard", () => {
     expect(screen.queryByText(/text-only モデルです。画像検索は無効化されます/)).toBeNull();
   });
 
-  it("uses the Japanese recommendation only when first-run requests it", async () => {
+  it("retains the current local space during Japanese first-run setup", async () => {
     getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
     renderCard(vi.fn(), vi.fn(), { preferredDefaultLanguage: "ja" });
     await waitFor(() => {
       const select = screen.getByRole("combobox") as HTMLSelectElement;
-      expect(select.value).toBe("ruri-v3-310m-onnx-int8");
+      expect(select.value).toBe("qwen3-embedding-0-6b");
     });
   });
 
@@ -290,25 +324,25 @@ describe("EmbeddingProviderCard", () => {
       expect(lastPayload(onDirty)).toMatchObject({
         preset_id: "qwen3-vl-embedding-2b",
         custom_model_id: null,
-        evacuate_vectordb: true,
       }),
     );
   });
 
-  it("shows the destructive vectordb-reset warning + reports resets=true on a model/dim change", async () => {
+  it("defers model/dimension impact to the authoritative migration plan", async () => {
     getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
     const { onResetsVectordbChange } = renderCard();
     await waitFor(() => expect(screen.queryByText(/現在の設定/)).not.toBeNull());
-    // Clean state → no banner, resets reported false.
+    // A clean state has no plan-impact notice.
     expect(screen.queryByText(/既存の全 embedding が/)).toBeNull();
     await waitFor(() => expect(lastResets(onResetsVectordbChange)).toBe(false));
-    // Switch to a different model (and dim) → reset banner + resets=true.
+    // A different model/dimension is not enough for the UI to predict the
+    // service-owned migration decision.
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "qwen3-vl-embedding-2b" } });
-    await waitFor(() => expect(screen.getByText(/既存の全 embedding が/)).toBeInTheDocument());
-    await waitFor(() => expect(lastResets(onResetsVectordbChange)).toBe(true));
+    await waitFor(() => expect(screen.getByText(/memoriesの計画で判定/)).toBeInTheDocument());
+    await waitFor(() => expect(lastResets(onResetsVectordbChange)).toBe(false));
   });
 
-  it("suppresses the destructive vectordb warning during first-run setup", async () => {
+  it("shows the migration limitation even during first-run setup", async () => {
     getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
     const { onResetsVectordbChange } = renderCard(undefined, undefined, {
       suppressResetWarning: true,
@@ -317,17 +351,14 @@ describe("EmbeddingProviderCard", () => {
 
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "qwen3-vl-embedding-2b" } });
 
-    await waitFor(() => expect(lastResets(onResetsVectordbChange)).toBe(true));
-    expect(screen.queryByText(/既存の全 embedding が/)).toBeNull();
+    await waitFor(() => expect(lastResets(onResetsVectordbChange)).toBe(false));
+    expect(screen.getByText(/memoriesの計画で判定/)).toBeInTheDocument();
     expect(screen.queryByText(/退避する \(チェックを外すと削除\)/)).toBeNull();
   });
 
   it("does NOT warn (resets=false) for a dtype-only custom change at the same model/dim", async () => {
-    // Regression: a dtype / max-seq / tokenizer / multimodal-only edit is
-    // saveable but leaves the index intact (backend `needs_vectordb_reset`
-    // is false). The destructive banner + evacuate checkbox must NOT appear,
-    // and the card must report resets=false so the parent's save-bar warning
-    // and blocker-modal copy stay non-destructive.
+    // A dtype-only change must not be represented as safe/no-rebuild by a
+    // frontend model/dimension comparison; the Memories plan is authoritative.
     getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
     const { onDirtyChange: onDirty, onResetsVectordbChange } = renderCard();
     await waitFor(() => expect(screen.queryByText(/現在の設定/)).not.toBeNull());
@@ -345,13 +376,24 @@ describe("EmbeddingProviderCard", () => {
     fireEvent.change(dtypeSelect as HTMLSelectElement, { target: { value: "BF16" } });
     // A payload IS reported (the change is saveable)…
     await waitFor(() => expect(lastPayload(onDirty)).not.toBeNull());
-    // …but it does not reset the vectordb.
+    // The frontend does not guess whether the index is affected.
     await waitFor(() => expect(lastResets(onResetsVectordbChange)).toBe(false));
-    // The destructive banner is absent; the milder "index preserved" note is
-    // shown instead, and the evacuate checkbox is hidden.
+    // The service-owned plan note is shown for all embedding changes.
     expect(screen.queryByText(/既存の全 embedding が/)).toBeNull();
-    expect(screen.getByText(/既存の vectordb は保持されます/)).toBeInTheDocument();
+    expect(screen.getByText(/memoriesの計画で判定/)).toBeInTheDocument();
     expect(screen.queryByText(/退避する \(チェックを外すと削除\)/)).toBeNull();
+  });
+
+  it("does not claim that tokenizer or revision changes need no rebuild", async () => {
+    getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
+    renderCard();
+    await waitFor(() => expect(screen.queryByText(/現在の設定/)).not.toBeNull());
+    fireEvent.change(await screen.findByRole("textbox", { name: "Model revision" }), {
+      target: { value: "revision-next" },
+    });
+
+    expect(screen.getByText(/memoriesの計画で判定/)).toBeInTheDocument();
+    expect(screen.queryByText(/再生成は不要/)).not.toBeInTheDocument();
   });
 
   it("does not show a separate text-only warning chip", async () => {
@@ -362,13 +404,210 @@ describe("EmbeddingProviderCard", () => {
     expect(screen.queryByText(/text-only モデルです。画像検索は無効化されます/)).toBeNull();
   });
 
-  it("reports evacuate_vectordb=false when the user opts out", async () => {
+  it("explains service migration instead of offering filesystem policies", async () => {
     getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
     const { onDirtyChange: onDirty } = renderCard();
     await waitFor(() => expect(screen.queryByText(/現在の設定/)).not.toBeNull());
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "qwen3-vl-embedding-2b" } });
-    const cb = screen.getAllByRole("checkbox").at(-1) as HTMLInputElement;
-    fireEvent.click(cb);
-    await waitFor(() => expect(lastPayload(onDirty)).toMatchObject({ evacuate_vectordb: false }));
+    expect(screen.getByText(/memoriesの計画で判定/)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/退避|削除/)).not.toBeInTheDocument();
+    await waitFor(() => expect(lastPayload(onDirty)).not.toBeNull());
+  });
+  it("preserves all effective custom settings during initial setup", async () => {
+    getEmbeddingSettings.mockResolvedValue({
+      ...DEFAULT_LOCAL_SETTINGS,
+      effective: {
+        ...DEFAULT_LOCAL_SETTINGS.effective,
+        model_id: "private/custom-model",
+        tokenizer_id: "private/custom-tokenizer",
+        vector_size: 512,
+        dtype: "BF16",
+        max_sequence_length: 4096,
+        is_multimodal: true,
+      },
+    });
+    const { onDirtyChange: onDirty } = renderCard();
+    await waitFor(() =>
+      expect(lastPayload(onDirty)).toMatchObject({
+        preset_id: "custom",
+        custom_model_id: "private/custom-model",
+        custom_tokenizer_id: "private/custom-tokenizer",
+        custom_vector_size: 512,
+        custom_dtype: "BF16",
+        custom_max_sequence_length: 4096,
+        custom_is_multimodal: true,
+      }),
+    );
+  });
+
+  it("preserves the model revision and leaves an empty revision editable", async () => {
+    getEmbeddingSettings.mockResolvedValue({
+      ...DEFAULT_LOCAL_SETTINGS,
+      model_revision: "revision-7",
+      effective: { ...DEFAULT_LOCAL_SETTINGS.effective, model_revision: "revision-7" },
+    });
+    const { onDirtyChange } = renderCard();
+    const revision = await screen.findByRole("textbox", { name: "Model revision" });
+    await waitFor(() => expect(revision).toHaveValue("revision-7"));
+    fireEvent.change(revision, { target: { value: "" } });
+    await waitFor(() => expect(lastPayload(onDirtyChange)).toMatchObject({ model_revision: "" }));
+  });
+
+  it("keeps max sequence length editable when registration is pending", async () => {
+    getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
+    getEmbeddingSpace.mockResolvedValue({
+      registration_state: "pending",
+      current_space: null,
+      tables: [],
+      rpc_migration_supported: true,
+      write_rejections: {},
+      mm_embedding_worker_name: "worker",
+    });
+    renderCard();
+    await waitFor(() => expect(screen.queryByText(/現在の設定/)).not.toBeNull());
+    const preset = await screen.findByRole("combobox");
+    fireEvent.change(preset, { target: { value: "custom" } });
+    await screen.findByPlaceholderText("org/name");
+    await waitFor(() => expect(screen.getByLabelText("最大シーケンス長")).toBeEnabled());
+    expect(screen.getByLabelText("Dtype")).toBeEnabled();
+    expect(screen.getByText(/Embedding worker が登録待ち/)).toBeInTheDocument();
+  });
+
+  it("locks max sequence length for a pending local table marker but leaves dtype editable", async () => {
+    getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
+    getEmbeddingSpace.mockResolvedValue({
+      registration_state: "registered",
+      current_space: null,
+      tables: [
+        {
+          table: "memory",
+          record: {
+            space: null,
+            legacy_accept: false,
+            migration_marker: { state: "pending", attempt_id: "attempt-marker" },
+          },
+        },
+      ],
+      rpc_migration_supported: true,
+      write_rejections: {},
+      mm_embedding_worker_name: "worker",
+    });
+    renderCard();
+    await waitFor(() => expect(screen.queryByText(/現在の設定/)).not.toBeNull());
+    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "custom" } });
+    await screen.findByPlaceholderText("org/name");
+
+    expect(screen.getByLabelText("最大シーケンス長")).toBeDisabled();
+    expect(screen.getByLabelText("Dtype")).toBeEnabled();
+  });
+
+  it("locks max sequence length while the fresh CLI inspection reports rebuild_pending", async () => {
+    getEmbeddingSettings.mockResolvedValue(DEFAULT_LOCAL_SETTINGS);
+    inspectEmbeddingMigration.mockResolvedValue({
+      kind: "inspect",
+      data: {
+        state: "migrating",
+        space: { kind: "id", value: "space-a" },
+        required: 1,
+        complete: 0,
+        missing: 1,
+        stale: 0,
+        unverified: 0,
+        failed_transient: 0,
+        failed_permanent: 0,
+        orphan: 0,
+        backup_supported: true,
+        attempt: { attempt: "attempt-cli", stage: "rebuild_pending", backup_mode: "backup" },
+        backup: "/backup/attempt-cli",
+        unavailable_reason: null,
+        next_action: "start_rebuild",
+      },
+    });
+    renderCard();
+    await waitFor(() => expect(screen.queryByText(/現在の設定/)).not.toBeNull());
+    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "custom" } });
+    await screen.findByPlaceholderText("org/name");
+
+    expect(screen.getByLabelText("最大シーケンス長")).toBeDisabled();
+    expect(screen.getByLabelText("Dtype")).toBeEnabled();
+  });
+
+  it("re-enables max sequence length after switching from local pending migration to remote", async () => {
+    getEmbeddingSettings.mockResolvedValue({
+      ...DEFAULT_LOCAL_SETTINGS,
+      preset_id: "custom",
+      custom_model_id: "private/model",
+      custom_vector_size: 512,
+      custom_max_sequence_length: 4096,
+      effective: {
+        ...DEFAULT_LOCAL_SETTINGS.effective,
+        model_id: "private/model",
+        vector_size: 512,
+        max_sequence_length: 4096,
+      },
+    });
+    getEmbeddingSpace.mockResolvedValue({
+      registration_state: "registered",
+      current_space: null,
+      tables: [
+        {
+          table: "memory",
+          record: {
+            space: null,
+            legacy_accept: false,
+            migration_marker: { state: "pending", attempt_id: "attempt-local" },
+          },
+        },
+      ],
+      rpc_migration_supported: true,
+      write_rejections: {},
+      mm_embedding_worker_name: "worker",
+    });
+    inspectEmbeddingMigration.mockResolvedValue({
+      kind: "inspect",
+      data: {
+        state: "migrating",
+        space: { kind: "id", value: "space-a" },
+        required: 1,
+        complete: 0,
+        missing: 1,
+        stale: 0,
+        unverified: 0,
+        failed_transient: 0,
+        failed_permanent: 0,
+        orphan: 0,
+        backup_supported: true,
+        attempt: { attempt: "attempt-local", stage: "rebuild_pending", backup_mode: "none" },
+        backup: null,
+        unavailable_reason: null,
+        next_action: "start_rebuild",
+      },
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const card = (memoriesMode: "local" | "remote") => (
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={client}>
+          <EmbeddingProviderCard
+            retrying={false}
+            status={undefined}
+            onRetry={() => {}}
+            onDirtyChange={vi.fn()}
+            memoriesMode={memoriesMode}
+            resetSignal={0}
+          />
+        </QueryClientProvider>
+      </I18nextProvider>
+    );
+    const view = render(card("local"));
+
+    const maxSequenceLength = await screen.findByLabelText("最大シーケンス長");
+    await waitFor(() => expect(maxSequenceLength).toBeDisabled());
+    const localSpaceCalls = getEmbeddingSpace.mock.calls.length;
+    const localInspectionCalls = inspectEmbeddingMigration.mock.calls.length;
+    view.rerender(card("remote"));
+
+    await waitFor(() => expect(maxSequenceLength).toBeEnabled());
+    expect(getEmbeddingSpace).toHaveBeenCalledTimes(localSpaceCalls);
+    expect(inspectEmbeddingMigration).toHaveBeenCalledTimes(localInspectionCalls);
   });
 });

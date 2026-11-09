@@ -35,6 +35,16 @@ input:
         # centrally without editing every workflow YAML.
         memory_thread_label_prefix: { type: string, default: "summary" }
         force_resummarize: { type: boolean, default: false }
+        issue_tracker_grpc_host: { type: string, default: "" }
+        issue_tracker_grpc_port: { type: integer, default: 0 }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+        policy_json: { type: string, default: "" }
+        # Accepted only for an explicitly targeted, one-shot re-extraction.
+        # Batch and periodic callers omit it so suppressions cannot fan out.
+        rejected_candidate_ids_to_unsuppress:
+          type: array
+          items: { type: string }
+          default: []
 
 do:
   # Step 0: Initialize variables that may be referenced from `output.as`
@@ -51,6 +61,23 @@ do:
         summary_json: "${ null }"
         skipped: "${ false }"
         result: "${ null }"
+        extract_skipped: "${ false }"
+        extract_run_state: "${ null }"
+        extract_error: "${ null }"
+        add_summary_memory_response: "${ null }"
+        saved_summary_memory_id: "${ null }"
+        resolution_content_digest: "${ null }"
+        resolution_complete: "${ null }"
+        resolution_error: "${ null }"
+        resolution_outcome: "${ null }"
+        cross_thread_resolution_dispatched: "${ false }"
+        cross_thread_resolution_error: "${ null }"
+        resolution_status: "${ null }"
+        resolution_retry_allowed: "${ false }"
+        resolution_summary_memory: "${ null }"
+        resolution_summary_metadata: "${ {} }"
+        resolution_summary_matches_run: "${ false }"
+        resolution_status_metadata: "${ null }"
 
   # Step 1: Fetch the target thread
   - fetchThread:
@@ -84,6 +111,99 @@ do:
       export:
         as:
           result: "skipped: thread not found"
+      then: exit
+
+  # Step 1.6: Search for existing memory thread by labels
+  - findMemoryThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: ( ($thread.data.labels
+                           // ["thread_" + ($workflow.input.thread_id | tostring)])
+                          + [$workflow.input.memory_thread_label_prefix] ),
+                match_mode: "LABEL_ALL",
+                user_id: $workflow.input.user_id,
+                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
+                limit: 1
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_memory_thread_id: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].id.value else null end) }
+
+  # Step 1.7: Initialize default for existing_summary_memory
+  # (findExistingSummary may be skipped when no memory thread exists)
+  - initExistingSummary:
+      set:
+        existing_summary_memory: "${ null }"
+
+  # Step 1.8: Search for existing summary memory (for dedup + re-summarize check)
+  - findExistingSummary:
+      if: "${ $existing_memory_thread_id != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $existing_memory_thread_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_summary_memory: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(select(
+                   (((.data.metadata // "{}") | fromjson).source_thread_id | tostring)
+                   == ($workflow.input.thread_id | tostring)
+                 ))
+               | (if length > 0 then .[0] else null end) }
+
+  # Step 1.9: Decide freshness before reading messages, so an up-to-date
+  # thread skips without loading its history. This is the only freshness
+  # check; batches dispatch every candidate here. ProtoJSON may carry the
+  # int64 timestamps as strings, so compare them by digit count first.
+  - checkEligibility:
+      set:
+        eligible: >-
+          ${ (($thread.data.lastMessageAt // "0") | tostring) as $last_message_at
+             | (($existing_summary_memory.data.updatedAt // "0") | tostring) as $summary_updated_at
+             | $workflow.input.force_resummarize
+               or ($thread.data.description // "") == ""
+               or ($existing_summary_memory == null)
+               or (($last_message_at | length) > ($summary_updated_at | length))
+               or ((($last_message_at | length) == ($summary_updated_at | length))
+                   and $last_message_at > $summary_updated_at) }
+
+  # Same setTask shape as the other skip gates above.
+  - skipIfNotEligible:
+      if: "${ $eligible | not }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: already up to date"
       then: exit
 
   # Step 2: Fetch chat history (USER + ASSISTANT, TEXT only)
@@ -123,6 +243,46 @@ do:
             ${ (.jsonBody | fromjson | length)
                >= $workflow.input.min_message_count }
 
+  # Resolve the message that this summary represents from the same raw
+  # USER/ASSISTANT TEXT list used by the prompt, never from thread audit time.
+  - deriveCurrentMessageCheckpoint:
+      set:
+        current_message_id: >-
+          ${ if ($messages | length) > 0
+             then (($messages[-1].id.value // $messages[-1].data.id.value // "") | tostring)
+             else ""
+             end }
+        current_message_at: >-
+          ${ if ($messages | length) > 0
+             then (try (($messages[-1].data.createdAt // $messages[-1].data.created_at) | tonumber) catch null)
+             else null
+             end }
+
+  - validateCurrentMessageCheckpoint:
+      set:
+        current_message_position: >-
+          ${ if ($messages | length) > 0 then (($messages | length) - 1) else null end }
+        current_message_checkpoint_valid: >-
+          ${ (($messages | length) > 0)
+             and (($current_message_id | length) > 0)
+             and ($current_message_at != null)
+             and (($messages
+                    | map((.id.value // .data.id.value // "") | tostring)
+                    | unique | length) == ($messages | length))
+             and all($messages[];
+                   ((.data.role // .role // "") == "ROLE_USER"
+                    or (.data.role // .role // "") == "ROLE_ASSISTANT")
+                   and ((.data.contentType // .data.content_type // "TEXT") == "TEXT"
+                        or (.data.contentType // .data.content_type // "") == "CONTENT_TYPE_TEXT"
+                        or (.data.contentType // .data.content_type // null) == 0)
+                   and ((try ((.data.createdAt // .data.created_at) | tonumber) catch null) != null))
+             and all(range(1; ($messages | length));
+                   . as $message_index
+                   | (try (($messages[$message_index].data.createdAt
+                            // $messages[$message_index].data.created_at) | tonumber) catch null)
+                     >= (try (($messages[$message_index - 1].data.createdAt
+                               // $messages[$message_index - 1].data.created_at) | tonumber) catch null)) }
+
   # Step 3: Skip if not enough messages. Same setTask shape as
   # `checkThreadExists` for the same validator-bug reason.
   - checkMessageCount:
@@ -132,93 +292,6 @@ do:
       export:
         as:
           result: "skipped: not enough messages"
-      then: exit
-
-  # Step 4: Search for existing memory thread by labels
-  - findMemoryThread:
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
-            json_body: >-
-              ${ {
-                labels: ( ($thread.data.labels
-                           // ["thread_" + ($workflow.input.thread_id | tostring)])
-                          + [$workflow.input.memory_thread_label_prefix] ),
-                match_mode: "LABEL_ALL",
-                user_id: $workflow.input.user_id,
-                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
-                limit: 1
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          existing_memory_thread_id: >-
-            ${ ((.jsonBody // "[]") | fromjson)
-               | (if length > 0 then .[0].id.value else null end) }
-
-  # Step 4.5: Initialize default for existing_summary_memory
-  # (findExistingSummary may be skipped when no memory thread exists)
-  - initExistingSummary:
-      set:
-        existing_summary_memory: "${ null }"
-
-  # Step 5: Search for existing summary memory (for dedup + re-summarize check)
-  - findExistingSummary:
-      if: "${ $existing_memory_thread_id != null }"
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
-            json_body: >-
-              ${ {
-                thread_id: { value: $existing_memory_thread_id },
-                roles: ["ROLE_ASSISTANT"],
-                content_types: ["TEXT"]
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          existing_summary_memory: >-
-            ${ ((.jsonBody // "[]") | fromjson)
-               | map(select(
-                   (((.data.metadata // "{}") | fromjson).source_thread_id | tostring)
-                   == ($workflow.input.thread_id | tostring)
-                 ))
-               | (if length > 0 then .[0] else null end) }
-
-  # Step 6: Determine eligibility for (re-)summarization
-  - checkEligibility:
-      set:
-        eligible: >-
-          ${ $workflow.input.force_resummarize
-             or ($thread.data.description // "") == ""
-             or ($existing_summary_memory == null)
-             or ($thread.data.lastMessageAt
-                 > $existing_summary_memory.data.updatedAt) }
-
-  # Same setTask shape as the other skip gates above.
-  - skipIfNotEligible:
-      if: "${ $eligible | not }"
-      set:
-        skipped: true
-      export:
-        as:
-          result: "skipped: already up to date"
       then: exit
 
   # Step 7: Truncate messages if total content exceeds max_context_chars
@@ -257,6 +330,15 @@ do:
                else "summary_user_tail is missing"
                end }
 
+  # The thread's createdAt is a server audit time (an import time for
+  # imported conversations); the LLM needs when the conversation started.
+  - resolveConversationStart:
+      set:
+        conversation_started_at: >-
+          ${ if (($thread.data.firstMessageAt // "") | tostring) == "" then "unknown"
+             else ($thread.data.firstMessageAt | tonumber / 1000 | floor
+                   | strftime("%Y-%m-%dT%H:%M:%SZ")) end }
+
   # Step 8: Generate summary via the named LLM worker referenced by
   # `llm_worker_name` (default `memories-llm`, see workers/llm-workers.yaml).
   # Settings (model / hf_repo / ctx_size / channel=llm / use_static=true)
@@ -264,42 +346,79 @@ do:
   # not require editing this file. The language-specific system_prompt and
   # user_tail come from the worker's baked `workflow_context` so the same
   # YAML serves both ja and en (the lang-worker name pins the language).
-  - generateSummary:
-      run:
-        function:
-          workerName: "${$workflow.input.llm_worker_name}"
-          using: completion
-          arguments:
-            system_prompt: "${ $summary_system_prompt }"
-            prompt: >-
-              $${## Thread info
-              - labels: {{ thread.data.labels | join: ", " }}
-              - createdAt: {{ thread.data.createdAt }}
+  - generateSummaryWithRetry:
+      try:
+        - generateSummary:
+            run:
+              function:
+                workerName: "${$workflow.input.llm_worker_name}"
+                using: completion
+                arguments:
+                  system_prompt: "${ $summary_system_prompt }"
+                  prompt: >-
+                    $${## Thread info
+                    - labels: {{ thread.data.labels | join: ", " }}
+                    - startedAt: {{ conversation_started_at }}
 
-              ## Conversation history
-              {% for msg in truncated_messages %}
-              [{{ msg.data.role }}] {{ msg.data.content }}
-              {% endfor %}
+                    ## Conversation history
+                    {% for msg in truncated_messages %}
+                    [{{ msg.data.role }}] {{ msg.data.content }}
+                    {% endfor %}
 
-              {{ summary_user_tail }}}
-            options:
-              max_tokens: 20000
-              temperature: 0.3
-            json_schema: |
-              {
-                "type": "object",
-                "required": ["category", "title", "summary", "key_decisions", "status"],
-                "properties": {
-                  "category": {"type": "string", "enum": ["coding","consultation","research","creative","general"]},
-                  "title": {"type": "string"},
-                  "summary": {"type": "string"},
-                  "key_decisions": {"type": "array", "items": {"type": "string"}},
-                  "status": {"type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"]}
-                }
-              }
-      export:
-        as:
-          summary_json: ${ .content.text | fromjson }
+                    {{ summary_user_tail }}}
+                  options:
+                    max_tokens: 20000
+                    temperature: 0.3
+                    # Thinking inside schema-constrained output can collapse to blank JSON.
+                    extract_reasoning_content: false
+                  json_schema: |
+                    {
+                      "type": "object",
+                      "required": ["category", "title", "summary", "key_decisions", "status", "has_unfinished_issue_candidates"],
+                      "properties": {
+                        "category": {"type": "string", "enum": ["coding","consultation","research","creative","general"]},
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "key_decisions": {"type": "array", "items": {"type": "string"}},
+                        "status": {"type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"]},
+                        "has_unfinished_issue_candidates": {"type": "boolean"}
+                      }
+                    }
+            export:
+              as:
+                summary_json: >-
+                  ${ (try (.content.text | fromjson)) // null }
+        - validateThreadSummaryOutput:
+            if: >-
+              ${ (($summary_json | type) != "object")
+                 or (($summary_json.title | type) != "string")
+                 or (($summary_json.summary | type) != "string")
+                 or (($summary_json.title | gsub("\\s"; "")) == "")
+                 or (($summary_json.summary | gsub("\\s"; "")) == "") }
+            raise:
+              error:
+                type: "https://memories.local/errors/thread-summary/invalid-output"
+                status: 422
+                title: "Thread summary output does not match its contract"
+                detail: "The LLM returned malformed, incomplete, or blank JSON."
+      # Blank or malformed LLM output is usually transient; retry only that.
+      catch:
+        errors:
+          with:
+            type: "https://memories.local/errors/thread-summary/invalid-output"
+        retry:
+          limit:
+            attempt:
+              count: 2
+        do:
+          # Retries are exhausted: fail instead of persisting the output.
+          - rejectThreadSummaryOutput:
+              raise:
+                error:
+                  type: "https://memories.local/errors/thread-summary/invalid-output"
+                  status: 422
+                  title: "Thread summary output does not match its contract"
+                  detail: "The LLM returned malformed, incomplete, or blank JSON."
 
   # Step 9: Update ThreadData.description with summary title + text
   - updateThreadDescription:
@@ -362,9 +481,155 @@ do:
           created_memory_thread_id: ${ .jsonBody | fromjson | .id.value }
 
   # Step 11: Resolve which memory thread ID to use
+  # The stale-summary lookup and both writes share one external_id so the
+  # lookup always finds what would collide with the write.
   - resolveMemoryThreadId:
       set:
         memory_thread_id: "${ $existing_memory_thread_id // $created_memory_thread_id }"
+        summary_external_id: '${ "summary:" + ($workflow.input.thread_id | tostring) }'
+
+  # The summary Memory metadata is the durable wire contract for checkpoint
+  # discovery: last_processed_message_id / last_processed_message_at identify
+  # the raw source message represented by the saved summary, while
+  # resolution_high_water_message_id / resolution_high_water_message_at mark
+  # the newest message eligible for same-thread resolution. The *_at values
+  # use the source Memory.createdAt numeric unit. A high-water mark is only
+  # introduced from a valid predecessor and never replaced by an older time.
+  - prepareResolutionCheckpoint:
+      set:
+        existing_summary_metadata: >-
+          ${ if $existing_summary_memory != null
+             then ((try (($existing_summary_memory.data.metadata // "{}") | fromjson)) // {}) as $metadata
+                  | if ($metadata | type) == "object" then $metadata else {} end
+             else {}
+             end }
+
+  - derivePreviousMessageCheckpoint:
+      set:
+        previous_message_id: >-
+          ${ (($existing_summary_metadata.last_processed_message_id // "") | tostring) }
+        previous_message_at: >-
+          ${ try ($existing_summary_metadata.last_processed_message_at | tonumber) catch null }
+        previous_resolution_high_water_id: >-
+          ${ (($existing_summary_metadata.resolution_high_water_message_id // "") | tostring) }
+        previous_resolution_high_water_at: >-
+          ${ try ($existing_summary_metadata.resolution_high_water_message_at | tonumber) catch null }
+        is_legacy_message_checkpoint: >-
+          ${ $existing_summary_memory != null
+             and ($existing_summary_metadata | type) == "object"
+             and (($existing_summary_metadata | has("last_processed_message_id")) | not)
+             and (($existing_summary_metadata | has("last_processed_message_at")) | not) }
+        # The first summary writes an explicit null/null high-water pair.
+        # Accept that pair (or two absent keys) as uninitialized, but reject
+        # mismatched key presence so partial metadata corruption fails closed.
+        previous_resolution_high_water_absent: >-
+          ${ $existing_summary_memory == null
+             or (($existing_summary_metadata | type) == "object"
+                 and (($existing_summary_metadata
+                       | has("resolution_high_water_message_id"))
+                     == ($existing_summary_metadata
+                         | has("resolution_high_water_message_at")))
+                 and ($existing_summary_metadata.resolution_high_water_message_id == null)
+                 and ($existing_summary_metadata.resolution_high_water_message_at == null)) }
+        resolution_mode: >-
+          ${ (((try (($workflow.input.policy_json // "") | fromjson)) // {})
+               | .resolution_mode // "DISABLED") }
+
+  - validatePreviousMessageCheckpoint:
+      set:
+        previous_message_position: >-
+          ${ if ($previous_message_id | length) > 0 and $previous_message_at != null
+             then ($messages
+                   | map((.id.value // .data.id.value // "") | tostring)
+                   | index($previous_message_id))
+             else null
+             end }
+        previous_message_checkpoint_matches: >-
+          ${ if ($previous_message_id | length) > 0 and $previous_message_at != null
+             then ($messages
+                   | map(select(((.id.value // .data.id.value // "") | tostring) == $previous_message_id
+                                and (try ((.data.createdAt // .data.created_at) | tonumber) catch null)
+                                    == $previous_message_at))
+                   | length) == 1
+             else false
+             end }
+
+  - assessPreviousMessageCheckpoint:
+      set:
+        previous_message_checkpoint_valid: >-
+          ${ $existing_summary_memory != null
+             and (($is_legacy_message_checkpoint) | not)
+             and ($previous_message_id | length) > 0
+             and ($previous_message_at != null)
+             and ($previous_message_position != null)
+             and ($previous_message_checkpoint_matches)
+             and ($current_message_checkpoint_valid)
+             and ($previous_message_position <= $current_message_position) }
+
+  - determineResolutionCheckpointAdvancement:
+      set:
+        processed_message_checkpoint_should_advance: >-
+          ${ $current_message_checkpoint_valid
+             and (($existing_summary_memory == null)
+                  or $is_legacy_message_checkpoint
+                  or ($previous_message_checkpoint_valid
+                      and $current_message_position > $previous_message_position
+                      and $current_message_at >= $previous_message_at)) }
+        resolution_high_water_should_advance: >-
+          ${ $existing_summary_memory != null
+             and $previous_message_checkpoint_valid
+             and $current_message_checkpoint_valid
+             and $current_message_position > $previous_message_position
+             and $current_message_at > $previous_message_at
+              and ($resolution_mode == "APPLY")
+              and (env.LOOKBACK_EXPERIMENTAL_ISSUES_ENABLED == "true")
+             and ($workflow.input.force_resummarize | not)
+             and (($previous_resolution_high_water_absent)
+                  or (($previous_resolution_high_water_id | length) > 0
+                      and $previous_resolution_high_water_at != null))
+             and (($previous_resolution_high_water_at == null)
+                  or $current_message_at > $previous_resolution_high_water_at) }
+
+  - prepareSummaryMetadata:
+      set:
+        summary_metadata: >-
+          ${ ($existing_summary_metadata
+               + {
+                   source_thread_id: ($workflow.input.thread_id | tostring),
+                   category: $summary_json.category,
+                   summary_version: "1.0"
+                 }
+               + (if $processed_message_checkpoint_should_advance
+                  then {
+                    last_processed_message_id: $current_message_id,
+                    last_processed_message_at: $current_message_at
+                  }
+                  else {}
+                  end)
+                + {
+                    resolution_high_water_message_id:
+                      (if $resolution_high_water_should_advance
+                      then $current_message_id
+                      else ($existing_summary_metadata.resolution_high_water_message_id // null)
+                      end),
+                   resolution_high_water_message_at:
+                     (if $resolution_high_water_should_advance
+                       then $current_message_at
+                       else ($existing_summary_metadata.resolution_high_water_message_at // null)
+                       end)
+                  }
+                + (if $resolution_high_water_should_advance
+                   then { issue_resolution_status: "PENDING" }
+                   elif ($existing_summary_metadata | has("issue_resolution_status"))
+                   then { issue_resolution_status: $existing_summary_metadata.issue_resolution_status }
+                   else {}
+                   end))
+              | tojson }
+        resolution_status: >-
+          ${ if $resolution_high_water_should_advance
+             then "PENDING"
+             else ($existing_summary_metadata.issue_resolution_status // null)
+             end }
 
   # Step 11.5: Clean up stale summaries from old memory threads
   # (label-change scenario). Must run BEFORE Step 12-b because the
@@ -374,12 +639,14 @@ do:
   # Skip when the existing summary lives in the same memory thread we
   # are about to write to — Step 12-a's Update path will refresh it
   # in-place with no UNIQUE conflict.
+  # Looking the conflict up by that UNIQUE key keeps this one call however
+  # many summary threads exist.
   - cleanupStaleSummaries:
       if: >-
         ${ ($existing_summary_memory != null
                 and $existing_memory_thread_id == $memory_thread_id) | not }
       do:
-        - findAllSummaryThreads:
+        - findStaleSummaries:
             run:
               function:
                 runnerName: GRPC
@@ -390,76 +657,44 @@ do:
                   tls: ${$workflow.input.memories_grpc_tls}
                   useReflection: true
                 arguments:
-                  method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+                  method: "/llm_memory.service.MemoryService/FindListByCondition"
                   json_body: >-
                     ${ {
-                      labels: [$workflow.input.memory_thread_label_prefix],
-                      match_mode: "LABEL_ANY",
-                      user_id: $workflow.input.user_id,
+                      user_id: { value: $workflow.input.user_id },
+                      external_id: $summary_external_id,
                       memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"]
                     } | tojson }
                   as_json: true
             export:
               as:
-                all_summary_threads: ${ .jsonBody | fromjson }
+                stale_summaries: >-
+                  ${ ((try ((.jsonBody // "[]") | fromjson)) // [])
+                     | map(.memory) }
 
-        - iterateSummaryThreads:
+        - deleteStale:
             for:
-              each: st
-              in: >-
-                ${ $all_summary_threads
-                   | map(select(.id.value != $memory_thread_id)) }
+              each: stale
+              in: "${ $stale_summaries }"
             do:
-              - searchStale:
+              - deleteOne:
                   run:
                     function:
                       runnerName: GRPC
-                      using: streaming
+                      using: unary
                       settings:
                         host: "${$workflow.input.memories_grpc_host}"
                         port: ${$workflow.input.memories_grpc_port}
                         tls: ${$workflow.input.memories_grpc_tls}
                         useReflection: true
                       arguments:
-                        method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+                        method: "/llm_memory.service.MemoryService/Delete"
                         json_body: >-
-                          ${ {
-                            thread_id: { value: $st.id.value },
-                            roles: ["ROLE_ASSISTANT"],
-                            content_types: ["TEXT"]
-                          } | tojson }
+                          ${ $stale.id | tojson }
                         as_json: true
-                  export:
-                    as:
-                      stale_memories: >-
-                        ${ ((.jsonBody // "[]") | fromjson)
-                           | map(select(
-                               (((.data.metadata // "{}") | fromjson).source_thread_id | tostring)
-                               == ($workflow.input.thread_id | tostring)
-                             )) }
 
-              - deleteStale:
-                  for:
-                    each: stale
-                    in: "${ $stale_memories }"
-                  do:
-                    - deleteOne:
-                        run:
-                          function:
-                            runnerName: GRPC
-                            using: unary
-                            settings:
-                              host: "${$workflow.input.memories_grpc_host}"
-                              port: ${$workflow.input.memories_grpc_port}
-                              tls: ${$workflow.input.memories_grpc_tls}
-                              useReflection: true
-                            arguments:
-                              method: "/llm_memory.service.MemoryService/Delete"
-                              json_body: >-
-                                ${ $stale.id | tojson }
-                              as_json: true
-
-  # Step 12-a: Update existing summary memory
+  # Step 12-a: Update existing summary memory. updated_at stays on the
+  # conversation's last message (as in Step 12-b): daily summaries bucket
+  # by it and re-summarization compares against it.
   - updateSummary:
       if: "${ $existing_summary_memory != null }"
       run:
@@ -475,16 +710,12 @@ do:
             method: "/llm_memory.service.MemoryService/Update"
             json_body: >-
               ${ {
-                id: $existing_summary_memory.id,
-                data: ($existing_summary_memory.data
-                  | .content = ($summary_json | tojson)
-                  | .metadata = ({
-                      source_thread_id: ($workflow.input.thread_id | tostring),
-                      category: $summary_json.category,
-                      summary_version: "1.0"
-                    } | tojson)
-                  | .externalId = ("summary:" + ($workflow.input.thread_id | tostring))
-                  | .updatedAt = $thread.data.updatedAt)
+                 id: $existing_summary_memory.id,
+                 data: ($existing_summary_memory.data
+                   | .content = ($summary_json | tojson)
+                   | .metadata = $summary_metadata
+                   | .externalId = $summary_external_id
+                   | .updatedAt = $thread.data.lastMessageAt)
               } | tojson }
             as_json: true
 
@@ -510,18 +741,369 @@ do:
                   content: ($summary_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",
-                  metadata: ({
-                    source_thread_id: ($workflow.input.thread_id | tostring),
-                    category: $summary_json.category,
-                    summary_version: "1.0"
-                  } | tojson),
-                  external_id: ("summary:" + ($workflow.input.thread_id | tostring)),
+                  metadata: $summary_metadata,
+                  external_id: $summary_external_id,
                   created_at: $thread.data.firstMessageAt,
                   updated_at: $thread.data.lastMessageAt,
                   memory_kind: "MEMORY_KIND_THREAD_SUMMARY"
                 }
               } | tojson }
             as_json: true
+      export:
+        as:
+          add_summary_memory_response: ${ .jsonBody | fromjson }
+
+  # Resolve the ID only after the selected summary write succeeds. AddMemory
+  # returns the durable ID needed to verify the saved snapshot downstream.
+  - resolveSavedSummaryMemoryId:
+      set:
+        saved_summary_memory_id: >-
+          ${ if $existing_summary_memory != null
+             then (($existing_summary_memory.id.value // $existing_summary_memory.id // "") | tostring)
+             else (($add_summary_memory_response.id.value // $add_summary_memory_response.id // "") | tostring)
+             end }
+
+  # Assess the just-saved summary only for a strictly newer resolution
+  # checkpoint. This stays independent of new-issue extraction eligibility.
+  - resolveThreadIssueCandidates:
+      if: "${ $resolution_high_water_should_advance }"
+      try:
+        - digestSavedSummaryForResolution:
+            run:
+              function:
+                runnerName: COMMAND
+                settings: {}
+                arguments:
+                  command: "/bin/sh"
+                  args: ["-c", "if command -v sha256sum >/dev/null 2>&1; then sha256sum; elif command -v shasum >/dev/null 2>&1; then shasum -a 256; else exit 127; fi"]
+                  stdin: "${ $summary_json | tojson }"
+                  treat_nonzero_as_error: true
+            export:
+              as:
+                resolution_content_digest: '${ "sha256:" + (.stdout | split(" ")[0]) }'
+
+        - prepareResolutionRetry:
+            set:
+              resolution_retry_allowed: "${ true }"
+              resolution_complete: "${ false }"
+              resolution_error: "${ null }"
+              resolution_outcome: "${ null }"
+
+        - retrySafeResolutionFailures:
+            for:
+              each: resolution_attempt_index
+              in: '${ [range(0; 3)] }'
+            do:
+              - runResolutionAttempt:
+                  if: "${ $resolution_retry_allowed }"
+                  try:
+                    - runThreadIssueResolution:
+                        run:
+                          function:
+                            workerName: lookback-thread-issue-resolution
+                            arguments:
+                              input: >-
+                                ${ {
+                                  thread_id: ($workflow.input.thread_id | tostring),
+                                  summary_memory_id: $saved_summary_memory_id,
+                                  summary_content_digest: $resolution_content_digest,
+                                  summary_checkpoint_memory_id: ($current_message_id | tostring),
+                                  summary_checkpoint_at: ($current_message_at | tostring),
+                                  memories_grpc_host: $workflow.input.memories_grpc_host,
+                                  memories_grpc_port: $workflow.input.memories_grpc_port,
+                                  memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                                  issue_tracker_grpc_host: ($workflow.input.issue_tracker_grpc_host // ""),
+                                  issue_tracker_grpc_port: ($workflow.input.issue_tracker_grpc_port // 0),
+                                  issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                                  llm_worker_name: $workflow.input.llm_worker_name,
+                                  output_language: $workflow.input.output_language,
+                                  policy_json: ($workflow.input.policy_json // "")
+                                } | tojson }
+                        export:
+                          as:
+                            resolution_outcome: '${ .output | fromjson }'
+                  catch:
+                    as: resolutionAttemptError
+                    do:
+                      - stopResolutionOnUnknownAttempt:
+                          set:
+                            resolution_retry_allowed: "${ false }"
+                            resolution_complete: "${ false }"
+                            resolution_status: "UNKNOWN"
+                            resolution_outcome: "${ null }"
+                            resolution_error: "${ $resolutionAttemptError | tostring | .[0:400] }"
+
+              - classifyResolutionAttempt:
+                  if: "${ $resolution_retry_allowed and $resolution_outcome != null }"
+                  set:
+                    resolution_complete: >-
+                      ${ (($resolution_outcome.complete // false) == true)
+                         and (($resolution_outcome.failed_count // 0) == 0)
+                         and (($resolution_outcome.unconfirmed_count // 0) == 0)
+                         and ((($resolution_outcome.unconfirmed_candidates // []) | length) == 0) }
+                    resolution_retry_allowed: >-
+                      ${ (($resolution_outcome.complete // false) == false)
+                          and (($resolution_outcome.unconfirmed_count // 0) == 0)
+                          and ((($resolution_outcome.unconfirmed_candidates // []) | length) == 0)
+                          and (($resolution_outcome.applied_count // 0) == 0)
+                          and (($resolution_outcome.conflicted_count // 0) == 0)
+                          and ( ((($resolution_outcome.result // "") == "failed: tracker not ready")
+                                 and (($resolution_outcome.failed_count // 0) == 0)
+                                 )
+                                or ((($resolution_outcome.failed_count // 0) > 0)
+                                  and (($resolution_outcome.failed_count // 0)
+                                       == (($resolution_outcome.failed_candidates // []) | length))
+                                  and (($resolution_outcome.failed_candidates // []) | length) > 0
+                                  and all($resolution_outcome.failed_candidates[];
+                                    .source as $failure_source
+                                    | ($failure_source == "current_issue_read"
+                                       or $failure_source == "operation_history"
+                                       or $failure_source == "origin_memory_read"
+                                       or $failure_source == "resolution_llm"
+                                       or $failure_source == "preapply_recheck"
+                                       or $failure_source == "policy_recheck")
+                                      and ((.reason // "") | tostring | ascii_downcase
+                                           | test("unavailable|resource_exhausted|server_busy|temporarily|temporary|connection reset|connection refused|timeout|deadline_exceeded|too many requests|429|503"))
+                                  )))
+                         and ($resolution_attempt_index < 2) }
+
+              - recordCompleteResolution:
+                  if: "${ $resolution_complete == true }"
+                  set:
+                    resolution_status: "COMPLETE"
+                    resolution_error: "${ null }"
+
+              - keepPendingDuringSafeRetry:
+                  if: "${ $resolution_retry_allowed }"
+                  set:
+                    resolution_status: "PENDING"
+                    resolution_error: "${ null }"
+
+              - recordIncompleteResolution:
+                  if: >-
+                    ${ (($resolution_retry_allowed | not)
+                        and ($resolution_complete != true)
+                        and ($resolution_outcome != null)) }
+                  set:
+                    resolution_status: "UNKNOWN"
+                    resolution_error: >-
+                      ${ ("resolution incomplete: " + ($resolution_outcome | tojson))[0:400] }
+
+              - waitBeforeFirstResolutionRetry:
+                  if: "${ $resolution_retry_allowed and $resolution_attempt_index == 0 }"
+                  wait: { seconds: 1 }
+
+              - waitBeforeSecondResolutionRetry:
+                  if: "${ $resolution_retry_allowed and $resolution_attempt_index == 1 }"
+                  wait: { seconds: 2 }
+      catch:
+        as: resolutionError
+        do:
+          - keepSummarySuccess:
+              set:
+                resolution_retry_allowed: "${ false }"
+                resolution_complete: "${ false }"
+                resolution_status: "UNKNOWN"
+                resolution_outcome: "${ null }"
+                resolution_error: "${ $resolutionError | tostring | .[0:400] }"
+
+  # The status update is deliberately separate from the summary write. A
+  # crash before this step leaves the durable PENDING marker for manual review.
+  - finalizeThreadIssueResolution:
+      if: "${ $resolution_high_water_should_advance }"
+      try:
+        - fetchSummaryBeforeResolutionStatusUpdate:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.MemoryService/Find"
+                  json_body: >-
+                    ${ { value: $saved_summary_memory_id } | tojson }
+                  as_json: true
+            export:
+              as:
+                resolution_summary_memory: '${ .jsonBody | fromjson | .data // null }'
+
+        - parseResolutionSummaryMetadata:
+            set:
+              resolution_summary_metadata: >-
+                ${ if $resolution_summary_memory != null
+                   then ((try (($resolution_summary_memory.data.metadata // "{}") | fromjson)) // {})
+                   else {} end }
+
+        - verifySummaryStillMatchesResolutionRun:
+            set:
+              resolution_summary_matches_run: >-
+                ${ ($resolution_summary_memory != null)
+                   and ((($resolution_summary_memory.id.value // $resolution_summary_memory.id // "") | tostring)
+                        == $saved_summary_memory_id)
+                   and (($resolution_summary_memory.data.content // "") == ($summary_json | tojson))
+                   and (($resolution_summary_metadata.source_thread_id // "")
+                        == ($workflow.input.thread_id | tostring))
+                   and (($resolution_summary_metadata.resolution_high_water_message_id // "")
+                        == ($current_message_id | tostring))
+                   and (($resolution_summary_metadata.resolution_high_water_message_at // null | tostring)
+                        == ($current_message_at | tostring))
+                   and (($resolution_summary_metadata.issue_resolution_status // "") == "PENDING") }
+
+        - reportChangedResolutionSummary:
+            if: "${ $resolution_summary_matches_run | not }"
+            set:
+              resolution_status: "UNKNOWN"
+              resolution_error: >-
+                ${ $resolution_error // "saved summary changed before its resolution status could be persisted" }
+
+        - prepareResolutionStatusMetadata:
+            if: "${ $resolution_summary_matches_run }"
+            set:
+              resolution_status_metadata: >-
+                ${ ($resolution_summary_metadata
+                    + { issue_resolution_status: $resolution_status }) | tojson }
+
+        - persistResolutionStatus:
+            if: "${ $resolution_summary_matches_run }"
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.MemoryService/Update"
+                  json_body: >-
+                    ${ {
+                      id: $resolution_summary_memory.id,
+                      data: ($resolution_summary_memory.data
+                             | .metadata = $resolution_status_metadata)
+                    } | tojson }
+                  as_json: true
+      catch:
+        as: resolutionStatusError
+        do:
+          - preserveSummarySuccessOnResolutionStatusError:
+              set:
+                resolution_status: "UNKNOWN"
+                resolution_error: >-
+                  ${ $resolution_error // ($resolutionStatusError | tostring | .[0:400]) }
+
+  - extractIssues:
+      if: >-
+        ${ $summary_json != null
+           and ((((try ($workflow.input.policy_json | fromjson)) // {})
+                 | .extraction_enabled // false)) }
+      try:
+        - runExtract:
+            run:
+              function:
+                workerName: lookback-issue-extract
+                arguments:
+                  input: >-
+                    ${ {
+                      thread_id: ($workflow.input.thread_id | tostring),
+                      memories_grpc_host: $workflow.input.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.llm_worker_name,
+                      output_language: $workflow.input.output_language,
+                      issue_tracker_grpc_host: ($workflow.input.issue_tracker_grpc_host // ""),
+                      issue_tracker_grpc_port: ($workflow.input.issue_tracker_grpc_port // 0),
+                      issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                      idempotency_key: (
+                        "lookback-extract:"
+                        + ($workflow.input.thread_id | tostring)
+                        + ":"
+                        + (($thread.data.lastMessageAt // 0) | tostring)
+                        + ":"
+                        + ((now * 1000000) | floor | tostring)
+                      ),
+                      policy_json: ($workflow.input.policy_json // ""),
+                      rejected_candidate_ids_to_unsuppress:
+                        ($workflow.input.rejected_candidate_ids_to_unsuppress // []),
+                      summary_json: $summary_json
+                    } | tojson }
+            export:
+              as:
+                extract_child_result: "${ (try (.output | fromjson)) // null }"
+        - rejectFaultedExtractResult:
+            if: >-
+              ${ ($extract_child_result == null)
+                 or (($extract_child_result.error // null) != null)
+                 or ((($extract_child_result.result // "") | startswith("failed:"))) }
+            raise:
+              error:
+                type: "https://lookback.local/errors/issue-extract/child-faulted"
+                status: 502
+                title: "Issue extraction workflow faulted"
+                detail: >-
+                  ${ ($extract_child_result.error // $extract_child_result.result // "Issue extraction returned no valid output") | tostring | .[0:400] }
+        - captureExtractOutcome:
+            set:
+              extract_skipped: "${ $extract_child_result.skipped // false }"
+              extract_run_state: >-
+                ${ $extract_child_result.extract.applied.runState // null }
+      catch:
+        as: extractError
+        do:
+          - keepSummarySuccess:
+              set:
+                extract_error: "${ $extractError | tostring | .[0:400] }"
+
+  # Later threads may resolve candidates of other threads. The run is reserved
+  # after extraction so it sees the candidates this summary produced; it
+  # finds its own range, so a lost reservation is covered by the next one.
+  # The run checks the policy again; checking here avoids queueing jobs that
+  # would only exit.
+  - dispatchCrossThreadResolution:
+      if: >-
+        ${ ($summary_json != null)
+           and (($workflow.input.issue_tracker_grpc_host // "") != "")
+           and (((try (($workflow.input.policy_json // "") | fromjson)) // {}) as $policy
+                | (($policy.resolution_mode // "DISABLED") == "APPLY")
+                  and (($policy.cross_thread_resolution_mode // "DISABLED") == "APPLY")) }
+      try:
+        # With await: false this timeout is the enqueued job's deadline.
+        - invokeCrossThreadResolution:
+            timeout:
+              after:
+                hours: 24
+            run:
+              await: false
+              function:
+                workerName: lookback-cross-thread-issue-resolution
+                arguments:
+                  input: >-
+                    ${ {
+                        mode: "auto",
+                        user_id: $workflow.input.user_id,
+                        memories_grpc_host: $workflow.input.memories_grpc_host,
+                        memories_grpc_port: $workflow.input.memories_grpc_port,
+                        memories_grpc_tls: ($workflow.input.memories_grpc_tls // false),
+                        issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                        issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                        issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                        policy_json: $workflow.input.policy_json,
+                        llm_worker_name: $workflow.input.llm_worker_name
+                      } | tojson }
+        - recordCrossThreadResolutionDispatched:
+            set:
+              cross_thread_resolution_dispatched: "${ true }"
+      catch:
+        as: crossThreadDispatchError
+        do:
+          - recordCrossThreadDispatchFailure:
+              set:
+                cross_thread_resolution_dispatched: "${ false }"
+                cross_thread_resolution_error: "${ $crossThreadDispatchError | tostring | .[0:400] }"
 
 output:
   as:
@@ -530,3 +1112,12 @@ output:
     summary_title: ${ if $summary_json != null then $summary_json.title else null end }
     skipped: ${ $skipped // false }
     skip_reason: ${ if ($skipped // false) then $result else null end }
+    extract_error: ${ $extract_error // null }
+    extract_skipped: ${ $extract_skipped // false }
+    extract_run_state: ${ $extract_run_state // null }
+    resolution_complete: ${ $resolution_complete // null }
+    resolution_status: ${ $resolution_status // null }
+    resolution_error: ${ $resolution_error // null }
+    resolution_outcome: ${ $resolution_outcome // null }
+    cross_thread_resolution_dispatched: ${ $cross_thread_resolution_dispatched // false }
+    cross_thread_resolution_error: ${ $cross_thread_resolution_error // null }

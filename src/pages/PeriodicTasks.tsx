@@ -23,7 +23,7 @@ import {
   draftFromTask,
   formatExecutionTime,
   PERIODIC_INTERVAL_HOUR_OPTIONS,
-  PERIODIC_SOURCE_OPTIONS,
+  PERIODIC_SOURCE_CHOICES,
   type PeriodicTaskDraft,
   periodicKindLabel,
   periodicSourceLabel,
@@ -481,6 +481,7 @@ function PeriodicTaskDialog({
   const [draft, setDraft] = useState<PeriodicTaskDraft>(
     entry?.task ? draftFromTask(entry.task) : DEFAULT_PERIODIC_DRAFT,
   );
+  const [saveError, setSaveError] = useState<string | null>(null);
   const task = useMemo(() => toTaskArgs(draft), [draft]);
   const errors = validatePeriodicDraft(draft);
   const mutation = useMutation({
@@ -491,10 +492,13 @@ function PeriodicTaskDialog({
         await createPeriodicTask({ task, enabled: true, description: null });
       }
     },
+    onMutate: () => setSaveError(null),
     onSuccess: () => {
+      setSaveError(null);
       onSaved();
       onClose();
     },
+    onError: (e) => setSaveError(errorMessage(e)),
   });
 
   const set = <K extends keyof PeriodicTaskDraft>(key: K, value: PeriodicTaskDraft[K]) =>
@@ -521,7 +525,28 @@ function PeriodicTaskDialog({
   const setRunSummaryThread = (checked: boolean) =>
     setDraft((prev) => ({
       ...prev,
-      run_summary_thread: prev.run_summary_daily ? true : checked,
+      run_summary_thread: prev.run_summary_daily || prev.run_summary_thread_group ? true : checked,
+    }));
+
+  const setRunSummaryThreadGroup = (checked: boolean) =>
+    setDraft((prev) => ({
+      ...prev,
+      run_summary_thread_group: checked,
+      run_summary_thread: checked ? true : prev.run_summary_thread,
+    }));
+
+  const setTaskKind = (taskKind: PeriodicTaskDraft["task_kind"]) =>
+    setDraft((prev) => ({
+      ...prev,
+      task_kind: taskKind,
+      // A regular draft starts with the compatibility default; switching to
+      // weekly/monthly must not silently opt those schedules in.
+      run_summary_thread_group:
+        prev.task_kind === "regular" && taskKind !== "regular"
+          ? false
+          : prev.task_kind !== "regular" && taskKind === "regular"
+            ? true
+            : prev.run_summary_thread_group,
     }));
 
   return (
@@ -540,23 +565,33 @@ function PeriodicTaskDialog({
             <span className="field-label">{t("periodic.dialog.name")}</span>
             <input value={draft.name} onChange={(e) => set("name", e.currentTarget.value)} />
           </label>
-          <label className="field">
+          <div className="field">
             <span className="field-label">{t("periodic.dialog.source")}</span>
-            <select value={draft.source} onChange={(e) => set("source", e.currentTarget.value)}>
-              {PERIODIC_SOURCE_OPTIONS.map((source) => (
-                <option key={source.value} value={source.value}>
-                  {source.label}
-                </option>
+            <div className="periodic-checkbox-grid">
+              {PERIODIC_SOURCE_CHOICES.map((source) => (
+                <label key={source} className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={draft.sources.includes(source)}
+                    onChange={(e) =>
+                      set(
+                        "sources",
+                        e.currentTarget.checked
+                          ? [...draft.sources, source]
+                          : draft.sources.filter((selected) => selected !== source),
+                      )
+                    }
+                  />
+                  {source}
+                </label>
               ))}
-            </select>
-          </label>
+            </div>
+          </div>
           <label className="field">
             <span className="field-label">{t("periodic.dialog.kind")}</span>
             <select
               value={draft.task_kind}
-              onChange={(e) =>
-                set("task_kind", e.currentTarget.value as PeriodicTaskDraft["task_kind"])
-              }
+              onChange={(e) => setTaskKind(e.currentTarget.value as PeriodicTaskDraft["task_kind"])}
             >
               <option value="regular">{t("periodic.dialog.kindRegular")}</option>
               <option value="weekly">{t("periodic.dialog.kindWeekly")}</option>
@@ -632,10 +667,18 @@ function PeriodicTaskDialog({
                   <input
                     type="checkbox"
                     checked={draft.run_summary_thread || draft.run_summary_daily}
-                    disabled={draft.run_summary_daily}
+                    disabled={draft.run_summary_daily || draft.run_summary_thread_group}
                     onChange={(e) => setRunSummaryThread(e.currentTarget.checked)}
                   />
                   {t("periodic.dialog.summaryThread")}
+                </label>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={draft.run_summary_thread_group}
+                    onChange={(e) => setRunSummaryThreadGroup(e.currentTarget.checked)}
+                  />
+                  {t("periodic.dialog.summaryThreadGroup")}
                 </label>
                 <label className="checkbox-row">
                   <input
@@ -669,6 +712,14 @@ function PeriodicTaskDialog({
               <div className="field periodic-field-span">
                 <span className="field-label">{t("periodic.dialog.outputs")}</span>
                 <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={draft.run_summary_thread_group}
+                    onChange={(e) => setRunSummaryThreadGroup(e.currentTarget.checked)}
+                  />
+                  {t("periodic.dialog.summaryThreadGroup")}
+                </label>
+                <label className="checkbox-row">
                   <input type="checkbox" checked readOnly />
                   {t("periodic.dialog.summaryWeekly")}
                 </label>
@@ -692,6 +743,14 @@ function PeriodicTaskDialog({
             <>
               <div className="field periodic-field-span">
                 <span className="field-label">{t("periodic.dialog.outputs")}</span>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={draft.run_summary_thread_group}
+                    onChange={(e) => setRunSummaryThreadGroup(e.currentTarget.checked)}
+                  />
+                  {t("periodic.dialog.summaryThreadGroup")}
+                </label>
                 <label className="checkbox-row">
                   <input type="checkbox" checked readOnly />
                   {t("periodic.dialog.summaryMonthly")}
@@ -718,6 +777,14 @@ function PeriodicTaskDialog({
               onChange={(e) => set("lookback_days", Number(e.currentTarget.value))}
             />
           </label>
+          <label className="checkbox-row periodic-field-span">
+            <input
+              type="checkbox"
+              checked={draft.stop_on_error}
+              onChange={(e) => set("stop_on_error", e.currentTarget.checked)}
+            />
+            {t("periodic.dialog.stopOnError")}
+          </label>
         </div>
 
         <div className="periodic-cron-preview">
@@ -725,6 +792,7 @@ function PeriodicTaskDialog({
           <code>{cronPreview(t, task)}</code>
         </div>
         {errors.length > 0 && errors[0] && <div className="form-error">{t(errors[0])}</div>}
+        {saveError && <div className="form-error">{saveError}</div>}
       </div>
 
       <div className="modal-foot">

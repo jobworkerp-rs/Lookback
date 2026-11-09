@@ -18,6 +18,8 @@ DRY_RUN=1 LOOKBACK_TAURI_VERBOSE=1 \
 
 grep -Fq 'pnpm tauri build -v --bundles appimage' "${verbose_log}" \
   || { echo "expected verbose tauri build command" >&2; exit 1; }
+grep -Fq 'Issue Tracker gRPC E2E:' "${verbose_log}" \
+  || { echo "expected Issue Tracker gRPC E2E gate" >&2; exit 1; }
 
 DRY_RUN=1 \
   bash "${ROOT_DIR}/scripts/build-release.sh" \

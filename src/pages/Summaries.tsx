@@ -4,16 +4,18 @@ import { useTranslation } from "react-i18next";
 import {
   deleteSummary,
   findMemoriesByThreadId,
-  findSummaryCoOccurringLabels,
-  findSummaryDistinctLabels,
+  getSummaryContent,
+  getSummaryRecoveryStatus,
   listSummaries,
+  listSummaryPathChildren,
   listSummaryPeriodKeys,
   parseSummaryContent,
+  resetSummaryRecoveryState,
 } from "@/api";
-import { AnalysisProgress } from "@/components/AnalysisProgress";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DateInput } from "@/components/DateInput";
-import { LabelFilter } from "@/components/LabelFilter";
+import { Modal } from "@/components/Modal";
+import { StagedProgressPanel } from "@/components/StagedProgressPanel";
 import {
   extractSummaryTitle,
   SummaryBody,
@@ -26,14 +28,18 @@ import { type OpenThreadState, ThreadDetail } from "@/components/ThreadDetail";
 import { Toolbar } from "@/components/Toolbar";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useDeleteAction } from "@/hooks/useDeleteAction";
-import { useLabelSelection } from "@/hooks/useLabelSelection";
 import { useLocaleTag } from "@/hooks/useLocaleTag";
 import { isVectorDegraded, type SidecarStatus } from "@/hooks/useSidecarStatus";
-import type { StepStreamProgressHandle } from "@/hooks/useStepStreamProgress";
+import { type StagedProgressHandle, SUMMARY_GENERATION_STEPS } from "@/hooks/useStagedProgress";
 import { useTimezone } from "@/hooks/useTimezone";
 import { localDateToEpochMs } from "@/lib/dateInput";
 import { formatDateTime } from "@/lib/localeFormat";
 import { isEmbeddingSearchMode, resolveSearchErrorHint, SEARCH_MODES } from "@/lib/searchModes";
+import {
+  loadPeriodSummaryDisplayPreference,
+  type PeriodSummaryDisplayPreference,
+  savePeriodSummaryDisplayPreference,
+} from "@/lib/summaryDisplayPreference";
 import { KIND_LABEL_KEYS } from "@/lib/summaryKind";
 import {
   buildMonthGrid,
@@ -43,12 +49,14 @@ import {
 } from "@/lib/summaryPeriod";
 import { resolveSummaryRefNavigation } from "@/lib/summaryRefNav";
 import { synthesizeThreadSummary } from "@/lib/threadSummary";
+import { incrementUiMemoryCounter } from "@/lib/uiMemoryDiagnostics";
 import type {
   ConnectionMode,
-  LabelMatch,
   SearchMode,
   SummaryEntry,
   SummaryKind,
+  SummaryPathChildEntry,
+  SummaryRecoveryRecord,
   ThreadHit,
 } from "@/types/api";
 
@@ -57,16 +65,15 @@ import type {
 const LOOKBACK_USER_ID = 1;
 
 type View = "list" | "search" | "calendar";
-type CalendarKind = Exclude<SummaryKind, "per-thread">;
+type PublicSummaryKind = Exclude<SummaryKind, "per-thread">;
+type CalendarKind = Exclude<SummaryKind, "per-thread" | "thread-group">;
 type CalendarState = { month: string; selectedKey: string | null };
 type CalendarStateByKind = Record<CalendarKind, CalendarState>;
 
-/** Summary-thread label that scopes full-text search to a single kind.
- *  All four kinds share the Lookback user, so without a label filter a search
- *  would mix per-thread and period summaries; each kind's thread carries a
- *  distinct label (`summary` / `daily_summary` / ...) that keeps them apart. */
+/** Summary label that scopes full-text search to one public summary kind. */
 const KIND_SEARCH_LABEL: Record<SummaryKind, string> = {
   "per-thread": "summary",
+  "thread-group": "thread_group_summary",
   daily: "daily_summary",
   weekly: "weekly_summary",
   monthly: "monthly_summary",
@@ -75,14 +82,22 @@ const KIND_SEARCH_LABEL: Record<SummaryKind, string> = {
 /** Numeric values of llm_memory.data.MemoryKind, kept in sync with the proto. */
 const KIND_SEARCH_MEMORY_KIND: Record<SummaryKind, number> = {
   "per-thread": 2,
+  "thread-group": 8,
   daily: 3,
   weekly: 4,
   monthly: 5,
 };
 
+const PUBLIC_SUMMARY_KINDS: readonly PublicSummaryKind[] = [
+  "thread-group",
+  "daily",
+  "weekly",
+  "monthly",
+];
+
 /** Deep-link hint a caller (currently: the RAG chat tab's
  *  `period_summary` source pill) can pass so Summaries opens straight to
- *  the cited period card instead of the default per-thread / current-month
+ *  the cited period card instead of the default group-summary / current-month
  *  view. `view` is fixed to `calendar` because that's the only view that
  *  honours `selectedKey`. */
 export interface SummariesFocus {
@@ -92,38 +107,46 @@ export interface SummariesFocus {
 }
 
 export function Summaries({
-  summaryProgress,
+  summaryGenerationProgress,
   sidecar,
-  connectionMode = "local",
+  memoriesMode = "local",
   focus,
   onFocusConsumed,
+  onNavigateThreadGroup,
 }: {
-  summaryProgress: StepStreamProgressHandle;
+  summaryGenerationProgress: StagedProgressHandle<"summary-generation">;
   sidecar: SidecarStatus;
-  connectionMode?: ConnectionMode | null;
+  memoriesMode?: ConnectionMode | null;
   /** One-shot focus seed: applied once on mount or whenever a new value
    *  arrives, then `onFocusConsumed` clears it so navigating around the
    *  tab freely doesn't keep snapping back. */
   focus?: SummariesFocus | null;
   onFocusConsumed?: () => void;
+  onNavigateThreadGroup?: (groupId: string) => void;
 }) {
   const { t } = useTranslation();
+  const summaryRecovery = useQuery({
+    queryKey: ["summary-recovery-status"],
+    queryFn: getSummaryRecoveryStatus,
+    staleTime: 30_000,
+  });
   // Date filters anchored to midnight in the display timezone so the range
   // boundary matches the rendered timestamps (see Threads for the rationale).
   const timezone = useTimezone();
-  const [kind, setKind] = useState<SummaryKind>(focus?.kind ?? "per-thread");
+  const [kind, setKind] = useState<PublicSummaryKind>(focus?.kind ?? "thread-group");
+  const [confirmRecoveryReset, setConfirmRecoveryReset] = useState(false);
+  const [recoveryDetailsOpen, setRecoveryDetailsOpen] = useState(false);
   const [view, setView] = useState<View>(focus ? "calendar" : "list");
   const [updatedAfter, setUpdatedAfter] = useState("");
   const [updatedBefore, setUpdatedBefore] = useState("");
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 300);
   const [mode, setMode] = useState<SearchMode>("keyword");
-  const { selectedLabels, setSelectedLabels, sortedLabels, toggleLabel, toggleManyLabels } =
-    useLabelSelection();
-  const labelMatch: LabelMatch = "all";
+  const [periodDisplayPreference, setPeriodDisplayPreference] =
+    useState<PeriodSummaryDisplayPreference>(loadPeriodSummaryDisplayPreference);
   // Semantic / hybrid embed the query, so they're gated while the local vector
   // store is degraded; keyword (FTS) stays available.
-  const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
+  const vectorDisabled = isVectorDegraded(sidecar, memoriesMode) != null;
   // biome-ignore lint/correctness/useExhaustiveDependencies: only the degrade transition should reset the mode; depending on `mode` would loop
   useEffect(() => {
     if (vectorDisabled && isEmbeddingSearchMode(mode)) setMode("keyword");
@@ -147,9 +170,8 @@ export function Summaries({
   });
   const [lastCalendarKind, setLastCalendarKind] = useState<CalendarKind>(focus?.kind ?? "daily");
   const [generateOpen, setGenerateOpen] = useState(false);
-  // Source-ID chips and the per-thread `Thread #{id}` link both pop the
-  // ThreadDetail modal — reuses the same `OpenThreadState` shape that the
-  // search-hit, personality, and chat paths share.
+  // Legacy source-ID chips and per-thread links both pop the ThreadDetail
+  // modal — reuses the same OpenThreadState shape as other navigation paths.
   const [openThread, setOpenThread] = useState<OpenThreadState | null>(null);
   // Token bumped on every memory-ref click so stale async resolutions can
   // detect they were superseded by a later click and skip their setState,
@@ -161,16 +183,33 @@ export function Summaries({
   // Mirrors the App-level "summary generation done" invalidation set.
   const del = useDeleteAction(deleteSummary, [
     ["summaries"],
-    ["count-summaries"],
+    ["count-thread-group-summaries"],
     ["summary-period-keys"],
     ["summary-search"],
     ["summary-distinct-labels"],
     ["summary-co-occurring-labels"],
   ]);
 
-  // per-thread has no period_key, so the calendar view is meaningless there.
-  const calendarKind: CalendarKind | null = kind === "per-thread" ? null : kind;
-  const isPerThread = kind === "per-thread";
+  // Thread-group summaries have no period_key, so the calendar view is
+  // meaningless for that public kind.
+  const calendarKind: CalendarKind | null = kind === "thread-group" ? null : kind;
+  const periodDisplay = useMemo(
+    () =>
+      calendarKind == null
+        ? undefined
+        : {
+            initialMode: periodDisplayPreference.remember
+              ? periodDisplayPreference.mode
+              : ("collapsed" as const),
+            onBulkModeChange: (mode: PeriodSummaryDisplayPreference["mode"]) => {
+              if (!periodDisplayPreference.remember) return;
+              const next = { ...periodDisplayPreference, mode };
+              setPeriodDisplayPreference(next);
+              savePeriodSummaryDisplayPreference(next);
+            },
+          },
+    [calendarKind, periodDisplayPreference],
+  );
   const effectiveView: View = view === "calendar" && calendarKind == null ? "list" : view;
   const calendarState = calendarKind == null ? null : calendarStateByKind[calendarKind];
   const month = calendarState?.month ?? "";
@@ -206,36 +245,14 @@ export function Summaries({
     openCalendar(focus.kind, { month: focus.month, selectedKey: focus.periodKey });
     onFocusConsumed?.();
   }, [focus, onFocusConsumed, openCalendar]);
-  const summaryLabelArgs = useMemo(
-    () =>
-      isPerThread && sortedLabels.length > 0 ? { labels_any: ["summary", ...sortedLabels] } : {},
-    [isPerThread, sortedLabels],
-  );
-  const searchLabels = useMemo(
-    () => (isPerThread ? ["summary", ...sortedLabels] : [KIND_SEARCH_LABEL[kind]]),
-    [isPerThread, kind, sortedLabels],
-  );
-
-  const labelAggregate = useQuery({
-    queryKey: ["summary-distinct-labels"],
-    queryFn: findSummaryDistinctLabels,
-    enabled: isPerThread,
-    staleTime: Number.POSITIVE_INFINITY,
-  });
-  const coOccurringLabels = useQuery({
-    queryKey: ["summary-co-occurring-labels", sortedLabels],
-    queryFn: () => findSummaryCoOccurringLabels(sortedLabels),
-    enabled: isPerThread && sortedLabels.length > 0,
-    staleTime: Number.POSITIVE_INFINITY,
-  });
+  const searchLabels = useMemo(() => [KIND_SEARCH_LABEL[kind]], [kind]);
 
   const listQuery = useQuery({
-    queryKey: ["summaries", kind, updatedAfter, updatedBefore, sortedLabels, timezone],
+    queryKey: ["summaries", kind, updatedAfter, updatedBefore, timezone],
     queryFn: () =>
       fetchSummaries(kind, {
         after: localDateToEpochMs(updatedAfter, timezone),
         before: localDateToEpochMs(updatedBefore, timezone),
-        ...summaryLabelArgs,
       }),
     enabled: effectiveView === "list",
   });
@@ -266,16 +283,7 @@ export function Summaries({
 
   const searchEnabled = effectiveView === "search" && debouncedQuery.trim().length > 0;
   const search = useQuery({
-    queryKey: [
-      "summary-search",
-      kind,
-      mode,
-      debouncedQuery,
-      updatedAfter,
-      updatedBefore,
-      sortedLabels,
-      timezone,
-    ],
+    queryKey: ["summary-search", kind, mode, debouncedQuery, updatedAfter, updatedBefore, timezone],
     enabled: searchEnabled,
     queryFn: () =>
       SEARCH_MODES[mode].fn({
@@ -284,7 +292,7 @@ export function Summaries({
         user_id: LOOKBACK_USER_ID,
         memory_kinds: [KIND_SEARCH_MEMORY_KIND[kind]],
         labels_any: searchLabels,
-        label_match: isPerThread && searchLabels.length > 1 ? labelMatch : undefined,
+        label_match: undefined,
         created_after_ms: localDateToEpochMs(updatedAfter, timezone),
         created_before_ms: localDateToEpochMs(updatedBefore, timezone),
         limit: 50,
@@ -296,6 +304,23 @@ export function Summaries({
   const selectedEntries = useMemo(
     () => detailQuery.data?.filter((e) => e.period_key === selectedKey) ?? [],
     [detailQuery.data, selectedKey],
+  );
+  // A recovery record is intentionally not a synthetic summary.  It may be
+  // the only evidence for a period whose overall Memory was never persisted,
+  // so expose it separately in the calendar without inflating summary counts.
+  const selectedRecoveryRecords = useMemo(
+    () =>
+      summaryRecovery.data?.records.filter(
+        (record) => record.period_kind === calendarKind && record.period_key === selectedKey,
+      ) ?? [],
+    [calendarKind, selectedKey, summaryRecovery.data?.records],
+  );
+  const warningPeriodKeys = useMemo(
+    () =>
+      summaryRecovery.data?.records
+        .filter((record) => record.period_kind === calendarKind)
+        .map((record) => record.period_key) ?? [],
+    [calendarKind, summaryRecovery.data?.records],
   );
 
   // `Thread #{id}` link on per-thread cards, or a `source_thread_ids` chip
@@ -319,6 +344,8 @@ export function Summaries({
       if (!target) return;
       if (target.kind === "open-thread") {
         setOpenThread(target.open);
+      } else if (target.kind === "open-thread-group") {
+        onNavigateThreadGroup?.(target.groupId);
       } else {
         openCalendar(target.focus.kind, {
           month: target.focus.month,
@@ -326,7 +353,7 @@ export function Summaries({
         });
       }
     },
-    [openCalendar],
+    [onNavigateThreadGroup, openCalendar],
   );
 
   const refHandlers = useMemo(
@@ -335,12 +362,13 @@ export function Summaries({
   );
 
   const count = subtitleCount(effectiveView, {
-    list: listQuery.data?.length,
+    list: listQuery.data?.filter((entry) => entry.kind !== "per-thread").length,
     search: searchEnabled ? (search.data?.length ?? 0) : undefined,
     calendar: periodKeysQuery.data?.length,
   });
 
-  const generating = summaryProgress.busy;
+  const generating = summaryGenerationProgress.busy;
+  const startGeneration = () => setGenerateOpen(true);
 
   return (
     <SummaryRefHandlersProvider value={refHandlers}>
@@ -354,7 +382,7 @@ export function Summaries({
               className="btn"
               onClick={() => {
                 // Only refetch the query backing the active view. `refetch()`
-                // ignores `enabled: false`, so reloading the per-thread list
+                // ignores `enabled: false`, so reloading the inactive period list
                 // would otherwise fire periodKeysQuery with a null kind and
                 // trip the Rust enum deserialization.
                 if (effectiveView === "list") listQuery.refetch();
@@ -368,6 +396,25 @@ export function Summaries({
             >
               {t("common.reload")}
             </button>
+            {summaryRecovery.data?.health === "healthy" &&
+              summaryRecovery.data.record_count > 0 && (
+                <button
+                  type="button"
+                  className="btn summary-recovery-indicator"
+                  onClick={() => setRecoveryDetailsOpen(true)}
+                  title={t("summaries.recoveryDetailsButton", {
+                    count: summaryRecovery.data.record_count,
+                  })}
+                  aria-label={t("summaries.recoveryDetailsButton", {
+                    count: summaryRecovery.data.record_count,
+                  })}
+                >
+                  <span className="summary-recovery-indicator-icon" aria-hidden="true">
+                    ⓘ
+                  </span>
+                  <span>{summaryRecovery.data.record_count}</span>
+                </button>
+              )}
             {generating ? (
               // Mirror the chat composer pattern (`src/pages/Chat.tsx`):
               // while busy, the primary action's slot is replaced by a
@@ -377,7 +424,7 @@ export function Summaries({
               <button
                 type="button"
                 className="btn secondary"
-                onClick={() => void summaryProgress.cancel()}
+                onClick={() => void summaryGenerationProgress.cancel()}
                 title={t("summaries.cancelTitle")}
               >
                 {t("summaries.cancel")}
@@ -386,7 +433,7 @@ export function Summaries({
               <button
                 type="button"
                 className="btn primary"
-                onClick={() => setGenerateOpen(true)}
+                onClick={() => void startGeneration()}
                 title={t("summaries.generateTitle")}
               >
                 {t("summaries.generate")}
@@ -396,34 +443,121 @@ export function Summaries({
         }
       />
       <div className="content">
-        <AnalysisProgress
-          progress={summaryProgress.progress}
-          error={null}
-          onClose={summaryProgress.clear}
-        />
+        {summaryRecovery.data?.health !== undefined &&
+          summaryRecovery.data.health !== "healthy" && (
+            <div className="form-error" role="alert">
+              {t("summaries.recoveryStateError")}
+              {summaryRecovery.data.detail ? `: ${summaryRecovery.data.detail}` : ""}
+              {summaryRecovery.data.health === "corrupt" && (
+                <button
+                  type="button"
+                  className="btn secondary"
+                  onClick={() => setConfirmRecoveryReset(true)}
+                >
+                  {t("summaries.recoveryReset")}
+                </button>
+              )}
+            </div>
+          )}
+        {summaryGenerationProgress.snapshot && (
+          <StagedProgressPanel
+            snapshot={summaryGenerationProgress.snapshot}
+            title={t("summaryGen.progressTitle")}
+            labels={summaryStageLabels(t)}
+            steps={SUMMARY_GENERATION_STEPS}
+            statusNamespace="analysis"
+            showOverall
+            onClose={() => summaryGenerationProgress.clear()}
+          />
+        )}
+
+        {confirmRecoveryReset && (
+          <ConfirmDialog
+            title={t("summaries.recoveryResetTitle")}
+            message={t("summaries.recoveryResetMessage")}
+            confirmLabel={t("summaries.recoveryReset")}
+            onCancel={() => setConfirmRecoveryReset(false)}
+            onConfirm={() => {
+              setConfirmRecoveryReset(false);
+              void resetSummaryRecoveryState().then(() => summaryRecovery.refetch());
+            }}
+          />
+        )}
+
+        {recoveryDetailsOpen &&
+          summaryRecovery.data?.health === "healthy" &&
+          summaryRecovery.data.record_count > 0 && (
+            <Modal
+              onClose={() => setRecoveryDetailsOpen(false)}
+              ariaLabel={t("summaries.recoveryDetailsTitle")}
+            >
+              <div className="modal-head">
+                <div className="modal-title">{t("summaries.recoveryDetailsTitle")}</div>
+              </div>
+              <div className="modal-body">
+                <p className="summary-recovery-details-description">
+                  {t("summaries.recoveryPending", { count: summaryRecovery.data.record_count })}
+                </p>
+                <ul className="summary-recovery-details-list">
+                  {summaryRecovery.data.records.map((record) => (
+                    <li key={summaryRecoveryRecordKey(record)}>
+                      <div className="summary-recovery-record">
+                        {formatSummaryRecoveryRecord(record, t)}
+                      </div>
+                      {record.detail && (
+                        <div className="summary-recovery-record-detail">{record.detail}</div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="modal-foot">
+                <button type="button" className="btn" onClick={() => setRecoveryDetailsOpen(false)}>
+                  {t("summaries.recoveryDetailsClose")}
+                </button>
+              </div>
+            </Modal>
+          )}
 
         <div className="search-bar">
           <div className="segment">
-            {(Object.keys(KIND_LABEL_KEYS) as SummaryKind[]).map((k) => (
+            {PUBLIC_SUMMARY_KINDS.map((k) => (
               <button
                 type="button"
                 key={k}
                 className={`segment-btn ${kind === k ? "active" : ""}`}
                 onClick={() => {
                   setKind(k);
-                  if (k !== "per-thread") {
+                  if (k !== "thread-group") {
                     setLastCalendarKind(k);
-                    if (kind !== "per-thread" && kind !== k) {
+                    if (kind !== k) {
                       updateCalendarState(k, { selectedKey: null });
                     }
                   }
-                  setSelectedLabels([]);
                 }}
               >
                 {t(KIND_LABEL_KEYS[k])}
               </button>
             ))}
           </div>
+
+          {calendarKind != null && (
+            <label className="summary-display-preference">
+              <input
+                type="checkbox"
+                checked={periodDisplayPreference.remember}
+                onChange={(event) => {
+                  const next = { ...periodDisplayPreference, remember: event.target.checked };
+                  setPeriodDisplayPreference(next);
+                  savePeriodSummaryDisplayPreference(next);
+                }}
+              />
+              <span>
+                <strong>{t("summaries.structured.remember")}</strong>
+                <small>{t("summaries.structured.rememberDescription")}</small>
+              </span>
+            </label>
+          )}
 
           <div className="segment">
             <button
@@ -506,21 +640,14 @@ export function Summaries({
           )}
         </div>
 
-        {isPerThread && (
-          <LabelFilter
-            labels={labelAggregate.data ?? []}
-            coOccurringLabels={selectedLabels.length > 0 ? coOccurringLabels.data : undefined}
-            selected={selectedLabels}
-            match={labelMatch}
-            onToggle={toggleLabel}
-            onToggleMany={toggleManyLabels}
-            onSetMatch={() => {}}
-            showMatchToggle={false}
-            isLoading={labelAggregate.isLoading}
+        {effectiveView === "list" && (
+          <ListView
+            query={listQuery}
+            onDelete={del.request}
+            periodDisplay={periodDisplay}
+            onNavigateThreadGroup={onNavigateThreadGroup}
           />
         )}
-
-        {effectiveView === "list" && <ListView query={listQuery} onDelete={del.request} />}
 
         {effectiveView === "search" && (
           <SearchResults
@@ -529,6 +656,8 @@ export function Summaries({
             error={search.error as Error | null}
             mode={mode}
             enabled={searchEnabled}
+            periodDisplay={periodDisplay}
+            onNavigateThreadGroup={onNavigateThreadGroup}
           />
         )}
 
@@ -538,6 +667,7 @@ export function Summaries({
               kind={calendarKind}
               month={month}
               periodKeys={periodKeysQuery.data ?? []}
+              warningPeriodKeys={warningPeriodKeys}
               selectedKey={selectedKey}
               onSelectKey={(key) => updateCalendarState(calendarKind, { selectedKey: key })}
               onMonthChange={(m) => {
@@ -552,18 +682,32 @@ export function Summaries({
                 <div className="empty-desc">{t("common.loading")}</div>
               )}
               {selectedKey != null && !detailQuery.isLoading && selectedEntries.length === 0 && (
-                <div className="empty-desc">
-                  {t("summaries.calendar.noEntries", { key: selectedKey })}
-                </div>
+                <>
+                  <div className="empty-desc">
+                    {selectedRecoveryRecords.length > 0
+                      ? t("summaries.calendar.incomplete")
+                      : t("summaries.calendar.noEntries", { key: selectedKey })}
+                  </div>
+                  {selectedRecoveryRecords.length > 0 && (
+                    <ul className="empty-desc">
+                      {selectedRecoveryRecords.map((record) => (
+                        <li
+                          key={summaryRecoveryRecordKey(record)}
+                          title={record.path_label ?? undefined}
+                        >
+                          {formatSummaryRecoveryRecord(record, t)}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
               )}
               <div className="sum-list">
-                {selectedEntries.map((entry) => (
-                  <SummaryCard
-                    key={entry.memory_id}
-                    entry={entry}
-                    onDelete={() => del.request(entry.memory_id)}
-                  />
-                ))}
+                <SummaryCardList
+                  entries={selectedEntries}
+                  onDelete={del.request}
+                  periodDisplay={periodDisplay}
+                />
               </div>
             </div>
           </div>
@@ -581,7 +725,8 @@ export function Summaries({
       {generateOpen && (
         <SummaryGenerateDialog
           onClose={() => setGenerateOpen(false)}
-          onStarted={(jobId) => summaryProgress.start(jobId)}
+          onStart={summaryGenerationProgress.reset}
+          onDispatchError={(dispatchId) => summaryGenerationProgress.clear(dispatchId)}
           initialKind={kind}
           sidecar={sidecar}
         />
@@ -599,6 +744,54 @@ export function Summaries({
       )}
     </SummaryRefHandlersProvider>
   );
+}
+
+function summaryStageLabels(t: (key: string) => string): Record<string, string> {
+  return {
+    "thread-summary": t("summaryGen.stageThreadSummary"),
+    "thread-group-summary": t("summaryGen.stageThreadGroupSummary"),
+    daily: t(KIND_LABEL_KEYS.daily),
+    weekly: t(KIND_LABEL_KEYS.weekly),
+    monthly: t(KIND_LABEL_KEYS.monthly),
+  };
+}
+
+function summaryRecoveryRecordKey(record: SummaryRecoveryRecord): string {
+  return [
+    record.memories_endpoint_id,
+    record.owner_id,
+    record.source_scope_digest,
+    record.period_kind,
+    record.period_key,
+    record.rollup_scope,
+    record.path_bucket_digest ?? "overall",
+  ].join(":");
+}
+
+function formatSummaryRecoveryRecord(
+  record: SummaryRecoveryRecord,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  const path =
+    record.rollup_scope === "path"
+      ? formatSummaryPath(
+          record.path_bucket_digest
+            ? {
+                path_bucket_digest: record.path_bucket_digest,
+                path_bucket_kind: record.path_bucket_kind ?? "unassigned",
+                path_label: record.path_label,
+              }
+            : null,
+          t,
+        )
+      : t("summaries.card.rollup.overall");
+  return t("summaries.recoveryRecord", {
+    kind: record.period_kind,
+    period: record.period_key,
+    path,
+    stage: record.stage,
+    reason: record.reason_code,
+  });
 }
 
 function fetchSummaries(
@@ -635,12 +828,17 @@ function subtitleCount(
 function ListView({
   query,
   onDelete,
+  periodDisplay,
+  onNavigateThreadGroup,
 }: {
   query: ReturnType<typeof useQuery<SummaryEntry[]>>;
   onDelete: (memoryId: string) => void;
+  periodDisplay?: React.ComponentProps<typeof SummaryBody>["periodDisplay"];
+  onNavigateThreadGroup?: (groupId: string) => void;
 }) {
   const { t } = useTranslation();
   const { data, isLoading, error } = query;
+  const publicEntries = (data ?? []).filter((entry) => entry.kind !== "per-thread");
   return (
     <>
       {isLoading && <div className="empty-desc">{t("common.loading")}</div>}
@@ -648,15 +846,14 @@ function ListView({
         <div style={{ color: "var(--danger)", fontSize: 12 }}>{(error as Error).message}</div>
       )}
       <div className="sum-list">
-        {data?.map((entry) => (
-          <SummaryCard
-            key={entry.memory_id}
-            entry={entry}
-            onDelete={() => onDelete(entry.memory_id)}
-          />
-        ))}
+        <SummaryCardList
+          entries={publicEntries}
+          onDelete={onDelete}
+          periodDisplay={periodDisplay}
+          onNavigateThreadGroup={onNavigateThreadGroup}
+        />
       </div>
-      {!isLoading && !error && (data?.length ?? 0) === 0 && (
+      {!isLoading && !error && publicEntries.length === 0 && (
         <div className="empty-state">
           <div className="empty-title">{t("summaries.list.emptyTitle")}</div>
           <div className="empty-desc">{t("summaries.list.emptyDesc")}</div>
@@ -666,7 +863,69 @@ function ListView({
   );
 }
 
-function SummaryCard({ entry, onDelete }: { entry: SummaryEntry; onDelete: () => void }) {
+/**
+ * A legacy `_all` row remains directly visible when it is the only known
+ * representation of a period.  When a v2 row for that period also exists but
+ * is incomplete, keep the legacy body available as a collapsed previous
+ * representation instead of presenting two competing primary cards.
+ */
+function SummaryCardList({
+  entries,
+  onDelete,
+  periodDisplay,
+  onNavigateThreadGroup,
+}: {
+  entries: SummaryEntry[];
+  onDelete: (memoryId: string) => void;
+  periodDisplay?: React.ComponentProps<typeof SummaryBody>["periodDisplay"];
+  onNavigateThreadGroup?: (groupId: string) => void;
+}) {
+  incrementUiMemoryCounter("summary_list_render_attempts_total");
+  const { t } = useTranslation();
+  const publicEntries = entries.filter((entry) => entry.kind !== "per-thread");
+  // Keyed lookups keep this linear; a period page can hold hundreds of rows.
+  const periodKey = (entry: SummaryEntry) => JSON.stringify([entry.kind, entry.period_key]);
+  const currentPeriods = new Set(entries.filter((candidate) => !candidate.legacy).map(periodKey));
+  const legacyPrevious = publicEntries.filter(
+    (entry) => entry.legacy && entry.scope_key === "_all" && currentPeriods.has(periodKey(entry)),
+  );
+  const legacyPreviousSet = new Set(legacyPrevious);
+  const primary = publicEntries.filter((entry) => !legacyPreviousSet.has(entry));
+  const cards = (rows: SummaryEntry[]) =>
+    rows.map((entry) => (
+      <SummaryCard
+        key={entry.memory_id}
+        entry={entry}
+        onDelete={() => onDelete(entry.memory_id)}
+        periodDisplay={periodDisplay}
+        onNavigateThreadGroup={onNavigateThreadGroup}
+      />
+    ));
+  return (
+    <>
+      {cards(primary)}
+      {legacyPrevious.length > 0 && (
+        <details className="summary-path-disclosure">
+          <summary>{t("summaries.card.previousLegacy", { count: legacyPrevious.length })}</summary>
+          {cards(legacyPrevious)}
+        </details>
+      )}
+    </>
+  );
+}
+
+function SummaryCard({
+  entry,
+  onDelete,
+  periodDisplay,
+  onNavigateThreadGroup,
+}: {
+  entry: SummaryEntry;
+  onDelete: () => void;
+  periodDisplay?: React.ComponentProps<typeof SummaryBody>["periodDisplay"];
+  onNavigateThreadGroup?: (groupId: string) => void;
+}) {
+  incrementUiMemoryCounter("summary_card_render_attempts_total");
   const { t } = useTranslation();
   const locale = useLocaleTag();
   const timezone = useTimezone();
@@ -674,12 +933,51 @@ function SummaryCard({ entry, onDelete }: { entry: SummaryEntry; onDelete: () =>
   const content = parseSummaryContent(entry);
   // `_all` is the default scope and adds no signal; only surface a named scope.
   const scopeBadge = entry.scope_key && entry.scope_key !== "_all" ? entry.scope_key : null;
+  const rollupBadge =
+    entry.rollup_scope == null ? null : t(`summaries.card.rollup.${entry.rollup_scope}`);
+  const completionBadge =
+    entry.completion_status === "incomplete"
+      ? t("summaries.card.incomplete", { count: entry.missing_path_bucket_count ?? 0 })
+      : null;
+  const consistencyBadge =
+    entry.generation_consistency && entry.generation_consistency !== "aligned"
+      ? t(`summaries.card.generation.${entry.generation_consistency}`)
+      : null;
+  const fallbackBadge =
+    (entry.fallback_path_bucket_digests?.length ?? 0) > 0
+      ? t("summaries.card.fallback", { count: entry.fallback_path_bucket_digests?.length ?? 0 })
+      : null;
+  const missingBadge =
+    (entry.missing_path_bucket_digests?.length ?? 0) > 0
+      ? t("summaries.card.missing", { count: entry.missing_path_bucket_digests?.length ?? 0 })
+      : null;
+  const failedAttemptBadge =
+    entry.last_material_attempt_status === "failed" &&
+    entry.last_material_attempt_generation_id != null &&
+    entry.last_material_attempt_generation_id !== entry.generation_id
+      ? t("summaries.card.latestAttemptFailed")
+      : null;
+  const contextTruncatedBadge =
+    entry.context_truncated && (entry.omitted_source_count ?? 0) > 0
+      ? t("summaries.card.contextTruncated", { count: entry.omitted_source_count })
+      : null;
   const threadId = entry.thread_id;
   const isPerThreadLink = entry.kind === "per-thread" && threadId != null && onOpenThread != null;
+  const isGroupLink =
+    entry.kind === "thread-group" && entry.group_id != null && onNavigateThreadGroup != null;
   return (
     <div className="sum-card">
       <div className="sum-head">
-        {isPerThreadLink ? (
+        {isGroupLink ? (
+          <button
+            type="button"
+            className="signal-thread-link"
+            title={t("summaries.card.openGroupTitle")}
+            onClick={() => onNavigateThreadGroup(entry.group_id as string)}
+          >
+            {t("summaries.groupFallbackTitle", { id: entry.group_id })}
+          </button>
+        ) : isPerThreadLink ? (
           <button
             type="button"
             className="signal-thread-link"
@@ -696,7 +994,14 @@ function SummaryCard({ entry, onDelete }: { entry: SummaryEntry; onDelete: () =>
                 : (entry.external_id ?? t("summaries.card.noId")))}
           </span>
         )}
+        {rollupBadge && <span className="label-pill">{rollupBadge}</span>}
         {scopeBadge && <span className="label-pill">{scopeBadge}</span>}
+        {completionBadge && <span className="label-pill">{completionBadge}</span>}
+        {consistencyBadge && <span className="label-pill">{consistencyBadge}</span>}
+        {fallbackBadge && <span className="label-pill">{fallbackBadge}</span>}
+        {missingBadge && <span className="label-pill">{missingBadge}</span>}
+        {failedAttemptBadge && <span className="label-pill">{failedAttemptBadge}</span>}
+        {contextTruncatedBadge && <span className="label-pill">{contextTruncatedBadge}</span>}
         <span style={{ marginLeft: "auto" }}>
           {formatDateTime(entry.updated_at_ms, locale, timezone)}
         </span>
@@ -704,9 +1009,147 @@ function SummaryCard({ entry, onDelete }: { entry: SummaryEntry; onDelete: () =>
           {t("common.delete")}
         </button>
       </div>
-      <SummaryBody parsed={content.parsed} raw={content.raw} />
+      <SummaryBody parsed={content.parsed} raw={content.raw} periodDisplay={periodDisplay} />
+      {(entry.path_bucket_diagnostics?.length ?? 0) > 0 && (
+        <details className="summary-path-disclosure">
+          <summary>{t("summaries.pathSummaries.diagnostics")}</summary>
+          <ul className="empty-desc">
+            {entry.path_bucket_diagnostics?.map((diagnostic) => {
+              const path = formatSummaryPath(
+                {
+                  path_bucket_digest: diagnostic.path_bucket_digest,
+                  path_bucket_kind: diagnostic.path_bucket_kind,
+                  path_label: diagnostic.path_label,
+                },
+                t,
+              );
+              return (
+                <li key={diagnostic.path_bucket_digest} title={diagnostic.path_label ?? undefined}>
+                  {path}: {diagnostic.statuses.join(", ")}
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      )}
+      {entry.rollup_scope === "overall" &&
+        entry.source_scope_digest != null &&
+        entry.period_key != null &&
+        entry.kind !== "per-thread" &&
+        (entry.path_summary_count ?? 0) >= 2 && (
+          <PathSummaryDisclosure entry={entry} periodDisplay={periodDisplay} />
+        )}
     </div>
   );
+}
+
+function PathSummaryDisclosure({
+  entry,
+  periodDisplay,
+}: {
+  entry: SummaryEntry;
+  periodDisplay?: React.ComponentProps<typeof SummaryBody>["periodDisplay"];
+}) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const children = useQuery({
+    queryKey: ["summary-path-children", entry.kind, entry.period_key, entry.source_scope_digest],
+    queryFn: () =>
+      listSummaryPathChildren({
+        kind: entry.kind as CalendarKind,
+        period_key: entry.period_key as string,
+        source_scope_digest: entry.source_scope_digest as string,
+      }),
+    enabled: open,
+  });
+  return (
+    <details
+      className="summary-path-disclosure summary-path-section"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span className="summary-path-section-heading">
+          <span className="summary-path-section-icon" aria-hidden="true">
+            ⌘
+          </span>
+          <span>
+            <strong>
+              {t("summaries.pathSummaries.title", { count: entry.path_summary_count })}
+            </strong>
+            <small>{t("summaries.pathSummaries.description")}</small>
+          </span>
+        </span>
+      </summary>
+      <div className="summary-path-section-content">
+        {children.isLoading && <p className="empty-desc">{t("common.loading")}</p>}
+        {children.error && <p className="chat-error">{(children.error as Error).message}</p>}
+        {children.data?.map((child) => (
+          <PathSummaryRow key={child.memory_id} entry={child} periodDisplay={periodDisplay} />
+        ))}
+        {!children.isLoading && !children.error && children.data?.length === 0 && (
+          <p className="empty-desc">{t("summaries.pathSummaries.empty")}</p>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function PathSummaryRow({
+  entry,
+  periodDisplay,
+}: {
+  entry: SummaryPathChildEntry;
+  periodDisplay?: React.ComponentProps<typeof SummaryBody>["periodDisplay"];
+}) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const content = useQuery({
+    queryKey: ["summary-content", entry.memory_id],
+    queryFn: () => getSummaryContent(entry.memory_id),
+    enabled: open,
+  });
+  const path = formatSummaryPath(entry.path_bucket, t);
+  const parsed =
+    content.data == null ? null : parseSummaryContent({ ...entry, content_json: content.data });
+  return (
+    <details
+      className="summary-path-row"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary title={entry.path_bucket?.path_label ?? path}>
+        <span className="summary-path-row-heading">
+          <span className="summary-path-row-icon" aria-hidden="true">
+            ⌁
+          </span>
+          <span className="summary-path-row-path">{path}</span>
+        </span>
+        {entry.aggregation_mode === "passthrough" && (
+          <span className="label-pill">{t("summaries.pathSummaries.passthrough")}</span>
+        )}
+      </summary>
+      <div className="summary-path-row-content">
+        {content.isLoading && <p className="empty-desc">{t("common.loading")}</p>}
+        {content.error && <p className="chat-error">{(content.error as Error).message}</p>}
+        {parsed && (
+          <SummaryBody parsed={parsed.parsed} raw={parsed.raw} periodDisplay={periodDisplay} />
+        )}
+      </div>
+    </details>
+  );
+}
+
+function formatSummaryPath(
+  bucket: SummaryEntry["path_bucket"],
+  t: (key: string) => string,
+): string {
+  if (bucket?.path_bucket_kind === "unassigned") return t("summaries.pathSummaries.unassigned");
+  if (bucket?.path_bucket_kind === "ambiguous") return t("summaries.pathSummaries.ambiguous");
+  const raw = bucket?.path_label?.replace(/^path:/, "") ?? "";
+  if (raw.length <= 48) return raw;
+  const parts = raw.split("/").filter(Boolean);
+  return parts.length > 1 ? `…/${parts.slice(-2).join("/")}` : `…${raw.slice(-47)}`;
 }
 
 function SearchResults({
@@ -715,12 +1158,16 @@ function SearchResults({
   error,
   mode,
   enabled,
+  periodDisplay,
+  onNavigateThreadGroup,
 }: {
   hits: ThreadHit[] | undefined;
   isLoading: boolean;
   error: Error | null;
   mode: SearchMode;
   enabled: boolean;
+  periodDisplay?: React.ComponentProps<typeof SummaryBody>["periodDisplay"];
+  onNavigateThreadGroup?: (groupId: string) => void;
 }) {
   const { t } = useTranslation();
   if (!enabled) {
@@ -752,7 +1199,12 @@ function SearchResults({
   return (
     <div className="sum-list">
       {hits.map((hit) => (
-        <SearchHitCard key={hit.thread_id} hit={hit} />
+        <SearchHitCard
+          key={hit.thread_id}
+          hit={hit}
+          periodDisplay={periodDisplay}
+          onNavigateThreadGroup={onNavigateThreadGroup}
+        />
       ))}
     </div>
   );
@@ -762,7 +1214,15 @@ function SearchResults({
  *  memory, so the collapsed header shows the scraped title (falling back to
  *  the thread name); expanding fetches the full summary memory and renders it
  *  structured via `SummaryBody`. */
-function SearchHitCard({ hit }: { hit: ThreadHit }) {
+function SearchHitCard({
+  hit,
+  periodDisplay,
+  onNavigateThreadGroup,
+}: {
+  hit: ThreadHit;
+  periodDisplay?: React.ComponentProps<typeof SummaryBody>["periodDisplay"];
+  onNavigateThreadGroup?: (groupId: string) => void;
+}) {
   const { t } = useTranslation();
   const locale = useLocaleTag();
   const timezone = useTimezone();
@@ -781,13 +1241,26 @@ function SearchHitCard({ hit }: { hit: ThreadHit }) {
   const previewContent = content ?? parseSummaryContent({ content_json: hit.top_snippet });
   const title =
     extractSummaryTitle(previewContent) ??
+    (hit.group_id != null ? t("summaries.groupFallbackTitle", { id: hit.group_id }) : null) ??
     hit.thread_description ??
     t("summaries.fallbackTitle", { id: hit.thread_id });
+  const groupLink = hit.group_id != null && onNavigateThreadGroup != null;
 
   return (
     <div className="sum-card">
       <div className="sum-head">
-        <span>{title}</span>
+        {groupLink ? (
+          <button
+            type="button"
+            className="signal-thread-link"
+            title={t("summaries.card.openGroupTitle")}
+            onClick={() => onNavigateThreadGroup(hit.group_id as string)}
+          >
+            {title}
+          </button>
+        ) : (
+          <span>{title}</span>
+        )}
         <span style={{ marginLeft: "auto" }}>
           {t("summaries.hit.score", {
             count: hit.hit_count,
@@ -806,7 +1279,9 @@ function SearchHitCard({ hit }: { hit: ThreadHit }) {
             {(detail.error as Error).message}
           </div>
         )}
-        {content && <SummaryBody parsed={content.parsed} raw={content.raw} />}
+        {content && (
+          <SummaryBody parsed={content.parsed} raw={content.raw} periodDisplay={periodDisplay} />
+        )}
       </details>
     </div>
   );

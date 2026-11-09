@@ -20,7 +20,9 @@ message CronSchedulerData {
   optional string args = 10;                    // Additional arguments string (optional)
 
   // Execution target (mutually exclusive with deprecated fields 3/4)
-  // Field numbers 11-12 intentionally skipped for future extension
+  // Field 12 is intentionally skipped for future extension.
+  // Timeout in seconds; unset uses the default and 0 disables the timeout.
+  optional uint32 job_timeout_sec = 11;
   oneof execution_target {
     WorkflowExecution workflow = 13;   // URL execution mode (WORKFLOW runner only)
     WorkerExecution worker = 14;       // Worker execution mode (any runner type)

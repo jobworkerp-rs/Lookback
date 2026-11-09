@@ -15,12 +15,6 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::jobworkerp::JobworkerpHandle;
 
-/// jobworkerp worker that runs the multimodal embedding runner. Overridable
-/// so a memories-side rename is an env change, not a code change.
-pub fn embed_worker_name() -> String {
-    std::env::var("LOOKBACK_EMBED_WORKER").unwrap_or_else(|_| "memories-mm-embedding".to_string())
-}
-
 /// Method selector passed as the `using` argument. The multimodal runner
 /// has no single default method, so `embed_text` MUST be specified — calling
 /// the bare worker resolves to a non-embed path and fails opaquely.
@@ -74,28 +68,34 @@ fn embed_text_arguments(text: &str, prefix: Option<&str>) -> serde_json::Value {
     }
 }
 
-/// Embed a search query into a single vector via the jobworkerp embedding
-/// worker. Empty/whitespace input is rejected before dispatch so the
-/// failure is observable rather than a 5xx from the runner.
-pub async fn embed_query(handle: &JobworkerpHandle, text: &str) -> AppResult<Vec<f32>> {
+pub fn validate_query_text(text: &str) -> AppResult<&str> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(AppError::Config("embedding text must be non-empty".into()));
+        Err(AppError::Config("embedding text must be non-empty".into()))
+    } else {
+        Ok(trimmed)
     }
-    let worker = embed_worker_name();
+}
+
+/// Embed a search query into a single vector via the jobworkerp embedding
+/// worker selected from the Memories embedding-space contract. The effective
+/// query prefix is supplied by application settings rather than a process-env
+/// override so client-side and server-side retrieval use the same config.
+pub async fn embed_query(
+    handle: &JobworkerpHandle,
+    worker: &str,
+    text: &str,
+    query_prefix: Option<&str>,
+) -> AppResult<Vec<f32>> {
+    let trimmed = validate_query_text(text)?;
     let method = embed_method();
     // MultimodalEmbeddingRunner is registered with response_type=DIRECT and
     // rejects the streaming enqueue path ("runner does not support
     // streaming"), so query embedding must use the unary dispatch.
     let result = handle
         .dispatch_unary(
-            &worker,
-            embed_text_arguments(
-                trimmed,
-                std::env::var("MEMORY_EMBEDDING_QUERY_PREFIX")
-                    .ok()
-                    .as_deref(),
-            ),
+            worker,
+            embed_text_arguments(trimmed, query_prefix),
             Some(&method),
         )
         .await?;
@@ -164,21 +164,20 @@ mod tests {
     }
 
     #[test]
-    fn embed_worker_name_defaults_and_overrides() {
-        // SAFETY: single-threaded test, no concurrent env access.
-        unsafe { std::env::remove_var("LOOKBACK_EMBED_WORKER") };
-        assert_eq!(embed_worker_name(), "memories-mm-embedding");
-        unsafe { std::env::set_var("LOOKBACK_EMBED_WORKER", "custom-embed") };
-        assert_eq!(embed_worker_name(), "custom-embed");
-        unsafe { std::env::remove_var("LOOKBACK_EMBED_WORKER") };
-    }
-
-    #[test]
     fn embed_method_defaults_and_overrides() {
         unsafe { std::env::remove_var("LOOKBACK_EMBED_METHOD") };
         assert_eq!(embed_method(), "embed_text");
         unsafe { std::env::set_var("LOOKBACK_EMBED_METHOD", "embed_v2") };
         assert_eq!(embed_method(), "embed_v2");
         unsafe { std::env::remove_var("LOOKBACK_EMBED_METHOD") };
+    }
+
+    #[test]
+    fn query_text_validation_trims_but_rejects_empty_input() {
+        assert_eq!(validate_query_text("  query  ").unwrap(), "query");
+        assert!(matches!(
+            validate_query_text(" \n\t"),
+            Err(AppError::Config(_))
+        ));
     }
 }

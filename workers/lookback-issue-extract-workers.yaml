@@ -1,0 +1,113 @@
+# Issue extract workflow. Always registered so skipIfDisabled can run when
+# the tracker host is empty. Gateway workers stay READY-gated because they
+# expand ISSUE_TRACKER_GRPC_* at apply time.
+defaults:
+  response_type: DIRECT
+  store_failure: true
+  broadcast_results: false
+
+workers:
+  - name: lookback-issue-extract
+    description: "Extract issue candidates after a thread summary persist."
+    runner: WORKFLOW
+    channel: issue_extract
+    settings:
+      workflow_data:
+        $file: workflows/issue-extract/issue-extract.yaml
+  # Enqueued without waiting by the group summary single; its own channel
+  # keeps a long group run from queueing the extract / same-thread jobs that
+  # thread summaries wait on in issue_extract.
+  - name: lookback-thread-group-issue-resolution
+    description: "Resolve issue candidates from evidence in other active Thread Group members."
+    runner: WORKFLOW
+    channel: issue_resolution_group
+    settings:
+      workflow_data:
+        $file: workflows/thread-group-issue-resolution/thread-group-issue-resolution-batch.yaml
+  - name: lookback-thread-issue-resolution
+    description: "Resolve candidates from later messages in their source thread."
+    runner: WORKFLOW
+    channel: issue_extract
+    settings:
+      workflow_data:
+        $file: workflows/thread-issue-resolution/thread-issue-resolution.yaml
+  - name: lookback-thread-issue-resolution-manual
+    description: "Manually re-evaluate a source thread using its saved summary."
+    runner: WORKFLOW
+    channel: issue_resolution_manual
+    settings:
+      workflow_data:
+        $file: workflows/thread-issue-resolution/thread-issue-resolution-manual.yaml
+  # Steps shared by the Thread Group and cross-thread resolutions. Callers
+  # wait on these, so they run on their own channel: a caller on the same
+  # single-slot channel would wait on a child that can never start.
+  - name: lookback-issue-resolution-review-candidates
+    description: "List every review candidate, optionally only those citing given threads."
+    runner: WORKFLOW
+    channel: issue_resolution_shared
+    settings:
+      workflow_data:
+        $file: workflows/issue-resolution-shared/review-candidates.yaml
+  - name: lookback-issue-resolution-prepare
+    description: "Read one review candidate's facts and stop at human, claimed or pending ones."
+    runner: WORKFLOW
+    channel: issue_resolution_shared
+    settings:
+      workflow_data:
+        $file: workflows/issue-resolution-shared/prepare.yaml
+  - name: lookback-issue-resolution-origin
+    description: "Read the creation time of a candidate's source messages."
+    runner: WORKFLOW
+    channel: issue_resolution_shared
+    settings:
+      workflow_data:
+        $file: workflows/issue-resolution-shared/origin.yaml
+  - name: lookback-issue-resolution-judge
+    description: "Judge a candidate against raw messages of given evidence threads."
+    runner: WORKFLOW
+    channel: issue_resolution_shared
+    settings:
+      workflow_data:
+        $file: workflows/issue-resolution-shared/judge.yaml
+  - name: lookback-issue-resolution-apply
+    description: "Write one ResolveCandidate decision and confirm it committed."
+    runner: WORKFLOW
+    channel: issue_resolution_shared
+    settings:
+      workflow_data:
+        $file: workflows/issue-resolution-shared/apply.yaml
+  # Cross-thread resolution, enqueued without waiting by each thread summary
+  # single. Kept in the database so a reservation survives a restart; one
+  # slot so runs never overlap. Registered once Memories names the embedding
+  # worker (see sidecar lifecycle).
+  - name: lookback-cross-thread-issue-resolution
+    description: "Resolve review candidates from later threads of the same project."
+    runner: WORKFLOW
+    channel: issue_resolution_cross
+    queue_type: WITH_BACKUP
+    settings:
+      workflow_data:
+        $file: workflows/cross-thread-issue-resolution/cross-thread-issue-resolution.yaml
+  # Operator backfill and dry runs; its runs never move the automatic position.
+  - name: lookback-cross-thread-issue-resolution-manual
+    description: "Run the cross-thread resolution over a chosen range, optionally as a dry run."
+    runner: WORKFLOW
+    channel: issue_resolution_manual
+    settings:
+      workflow_data:
+        $file: workflows/cross-thread-issue-resolution/cross-thread-issue-resolution.yaml
+  - name: lookback-cross-thread-issue-resolution-candidate
+    description: "Resolve one review candidate from later threads of its project."
+    runner: WORKFLOW
+    channel: issue_resolution_cross_candidate
+    settings:
+      workflow_data:
+        $file: workflows/cross-thread-issue-resolution/cross-thread-candidate.yaml
+  # Marker of a cross-thread run that finished without a transient failure;
+  # its stored result's uniq_key holds the run's start time.
+  - name: lookback-cross-thread-issue-resolution-watermark
+    description: "Record where the next cross-thread resolution run starts."
+    runner: COMMAND
+    response_type: NO_RESULT
+    store_success: true
+    settings: ~

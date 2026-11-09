@@ -161,6 +161,7 @@ mod tests {
             fts_tokenizer: 0,
             fts_ngram_min: None,
             fts_ngram_max: None,
+            ..Default::default()
         };
         let stats = stats_from_proto(resp);
         assert_eq!(stats.total_records, 100);

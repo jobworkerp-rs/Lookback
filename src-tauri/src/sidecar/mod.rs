@@ -1,15 +1,20 @@
+pub(crate) mod embedding_migration;
 pub mod generation_workers;
 pub mod lifecycle;
-pub mod memory_kind_gate;
-pub mod migration_gate;
+pub mod memories_migration;
 pub mod ports;
+pub(crate) mod query_embedding_worker;
 pub mod readiness;
 pub mod reaper;
 pub mod startup_error;
 
 pub use lifecycle::{
-    SidecarConfig, SidecarEndpoints, SidecarStartReport, SidecarWarning, SidecarWarningKind,
-    Sidecars,
+    ManagedChildHomeSource, ManagedJobworkerpAdmissionGuard, ManagedJobworkerpRuntimeObservation,
+    ManagedJobworkerpSdkSourceCheck, ManagedJobworkerpSdkSourceFileStamp,
+    ManagedJobworkerpSdkSourceSnapshot, ManagedJobworkerpSdkSourceStamp,
+    ManagedJobworkerpSdkSourceUnavailableReason, ManagedJobworkerpSpawnSnapshot,
+    ManagedSdkConfigSourceStamp, McpRuntimeStatus, RestartPlan, SidecarConfig, SidecarEndpoints,
+    SidecarKind, SidecarStartReport, SidecarWarning, SidecarWarningKind, Sidecars,
 };
 // `STARTUP_ERROR_TARGET` and `StartupFailureSlot` stay module-private:
 // the target literal is half of a frozen contract with memories (not a

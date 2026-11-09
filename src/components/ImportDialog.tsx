@@ -46,6 +46,7 @@ export function ImportDialog({
   const timezone = useTimezone();
   const [claude, setClaude] = useState(true);
   const [codex, setCodex] = useState(true);
+  const [opencode, setOpencode] = useState(true);
   // Plain source is off by default (it needs an explicit directory). The
   // grouping strategy seeds from the last choice (persisted in localStorage).
   const [plain, setPlain] = useState(false);
@@ -97,6 +98,7 @@ export function ImportDialog({
     const sources: ImportSource[] = [];
     if (claude) sources.push("claude-code");
     if (codex) sources.push("codex");
+    if (opencode) sources.push("opencode");
     if (plain) sources.push("plain");
 
     if (sources.length === 0) {
@@ -140,7 +142,7 @@ export function ImportDialog({
 
     setBusy(true);
     try {
-      // Dispatch id doubles as the cancel key: the toast's Stop button
+      // Dispatch id doubles as the cancel key: the Threads toolbar button
       // sends it to start_import_cancel which targets the same in-flight
       // map entry the Rust side registers from this request. The
       // backend echoes the same id back as `res.job_id` so the
@@ -200,6 +202,14 @@ export function ImportDialog({
           <label className="checkbox-row">
             <input type="checkbox" checked={codex} onChange={(e) => setCodex(e.target.checked)} />
             codex (~/.codex/sessions)
+          </label>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={opencode}
+              onChange={(e) => setOpencode(e.target.checked)}
+            />
+            opencode (~/.local/share/opencode/opencode.db)
           </label>
           <label className="checkbox-row">
             <input type="checkbox" checked={plain} onChange={(e) => setPlain(e.target.checked)} />

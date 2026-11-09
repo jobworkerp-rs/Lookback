@@ -20,8 +20,10 @@ tauri-build = { workspace = true }
 tonic-prost-build = { workspace = true }
 
 [dependencies]
+coding-agent-executor = { path = "../coding-agent-executor" }
 tauri = { workspace = true }
 tauri-plugin-dialog = { workspace = true }
+tauri-plugin-single-instance = { workspace = true }
 tauri-plugin-shell = { workspace = true }
 
 tokio = { workspace = true }
@@ -55,10 +57,12 @@ dirs = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = "0.10"
 url = { workspace = true }
+percent-encoding = { workspace = true }
 which = { workspace = true }
 dotenvy = { workspace = true }
 rusqlite = { workspace = true }
 fs2 = { workspace = true }
+libc = { workspace = true }
 open = { workspace = true }
 sha2 = "0.10"
 unicode-normalization = "0.1"
@@ -79,17 +83,25 @@ tokenizers = { version = "0.22", default-features = false, features = ["fancy-re
 # (Option<&opentelemetry::Context>); we only ever pass None. `prost-reflect`
 # decodes streamed proto bytes for human-readable progress.
 jobworkerp-client = { git = "https://github.com/jobworkerp-rs/jobworkerp-client-rs", branch = "main" }
+oci-client = { version = "=0.18.0", default-features = false, features = ["rustls-tls"] }
+microsandbox = { version = "=0.7.6", default-features = false, features = ["local", "net"] }
 opentelemetry = "0.32"
 prost-reflect = { version = "0.16", features = ["serde"] }
+tempfile = "3"
+getrandom = "0.3"
 
 [dev-dependencies]
-tempfile = "3"
+liquid = "0.26"
 command-utils = { git = "https://github.com/sutr-app/command-utils.git", branch = "main" }
+jsonschema = "0.46"
+# Tests parse generated config with the consumer sidecar's parser major version; production escapes manually.
+toml = "0.8"
 
 # Default to "custom-protocol" feature for production
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+experimental-issues = []
 
 # Platform-specific keyring backend. The `apple-native` backend only builds on
 # macOS; Linux needs the Secret Service backend (D-Bus, requires libdbus-1-dev
@@ -100,3 +112,4 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+webkit2gtk = { version = "2.0.2", features = ["v2_40"] }

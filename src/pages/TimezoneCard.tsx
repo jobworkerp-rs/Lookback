@@ -35,7 +35,7 @@ function SettingRow({ label, value }: { label: string; value: string }) {
  * app-settings.json (or `null` for "Auto"), which the sidecar injects as the
  * jobworkerp worker's `TZ` for the summary/import day/week/month boundary jq.
  * `TZ` is spawn-time env, so saving restarts the sidecar (unified save bar).
- * Disabled in remote connection mode because those workflows run on the remote
+ * Disabled while jobworkerp is remote because those workflows run on the remote
  * jobworkerp, where this local app-settings file cannot change the worker TZ.
  */
 export function TimezoneCard({ onDirtyChange, resetSignal, disabled = false }: TimezoneCardProps) {
@@ -132,11 +132,9 @@ export function TimezoneCard({ onDirtyChange, resetSignal, disabled = false }: T
         label={t("settings.timezone.effectiveCurrent")}
         value={data?.effective_timezone ?? "\u2014"}
       />
-      {dirty && (
-        <div style={{ color: "var(--label-tertiary)", fontSize: 11 }}>
-          {t("settings.timezone.restartHint")}
-        </div>
-      )}
+      <div style={{ color: "var(--label-tertiary)", fontSize: 11 }}>
+        {t("settings.timezone.restartHint")}
+      </div>
     </div>
   );
 }

@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package jobworkerp.runner;
+
+import "jobworkerp/runner/sandbox_common.proto";
+
+message SandboxRunnerSettings {
+  SandboxVmConfig vm = 1;
+  SandboxNetworkConfig network = 2;
+  repeated string allowed_images = 3;
+  repeated SandboxAllowedHostMount allowed_host_mounts = 4;
+  optional uint64 default_exec_timeout_ms = 5;
+}

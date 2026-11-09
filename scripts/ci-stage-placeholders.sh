@@ -39,10 +39,13 @@ LIBEXT=$([[ "${TRIPLE}" == *darwin ]] && echo dylib || echo so)
 BIN_DIR="${AGENT_APP}/src-tauri/bin"
 PLUGINS_DIR="${AGENT_APP}/src-tauri/plugins"
 DICT_DIR="${AGENT_APP}/dict"
-mkdir -p "${BIN_DIR}" "${PLUGINS_DIR}" "${DICT_DIR}"
+# The memories-db-migrate bundle is staged by stage-dev-external-bins.sh and is not
+# tracked, but its mapped resource directory must exist for tauri-build.
+MIGRATION_BUNDLE_DIR="${AGENT_APP}/src-tauri/migration-bundle"
+mkdir -p "${BIN_DIR}" "${PLUGINS_DIR}" "${DICT_DIR}" "${MIGRATION_BUNDLE_DIR}"
 
 # externalBin entries (tauri.conf.json) with the platform-triple suffix.
-for name in all-in-one front conductor-main memories-import protoc; do
+for name in all-in-one front conductor-main issue-tracker-server memories-import protoc; do
   dest="${BIN_DIR}/${name}-${TRIPLE}"
   [[ -e "${dest}" ]] || : > "${dest}"
 done
@@ -52,4 +55,4 @@ done
 placeholder="${PLUGINS_DIR}/libplaceholder_ci.${LIBEXT}"
 [[ -e "${placeholder}" ]] || : > "${placeholder}"
 
-echo "staged CI placeholders for ${TRIPLE} (bin/*, plugins/*.${LIBEXT}*, dict/)" >&2
+echo "staged CI placeholders for ${TRIPLE} (bin/*, plugins/*.${LIBEXT}*, dict/, migration-bundle/)" >&2

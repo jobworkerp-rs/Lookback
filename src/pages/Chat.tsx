@@ -1,8 +1,13 @@
 import { save } from "@tauri-apps/plugin-dialog";
 import type { TFunction } from "i18next";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { saveChatMarkdown } from "@/api";
+import {
+  listPendingChatIssueOperations,
+  type PendingChatIssueOperation,
+  retryPendingChatIssueOperation,
+  saveChatMarkdown,
+} from "@/api";
 import { MarkdownBody } from "@/components/MarkdownMessage";
 import type { Route } from "@/components/Sidebar";
 import { SummarySelectionModal } from "@/components/SummarySelectionModal";
@@ -25,15 +30,74 @@ export interface ChatPageProps {
    *  the calendar kind / month / selected period so the user lands on
    *  the cited period card. App.tsx clears the seed once consumed. */
   onNavigateSummariesFocus: (focus: SummariesFocus) => void;
+  onNavigateThreadGroup?: (groupId: string) => void;
   /** Conversation state lifted to `App.tsx` so tab switches don't
    *  unmount the `useTauriEvent` listener or wipe turns. */
   rag: UseRagChat;
 }
 
-export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProps) {
+export function Chat({
+  onNavigate,
+  onNavigateSummariesFocus,
+  onNavigateThreadGroup,
+  rag,
+}: ChatPageProps) {
   const { t } = useTranslation();
-  const { turns, ask, reset, cancel, busy } = rag;
+  const {
+    turns,
+    ask,
+    reset,
+    cancel,
+    busy,
+    requireApproval,
+    setRequireApproval,
+    respondToToolApproval,
+    setApprovalUiActive,
+    rejectPendingApprovals,
+  } = rag;
   const [draft, setDraft] = useState("");
+  const [savingApprovalSetting, setSavingApprovalSetting] = useState(false);
+  const [approvalSettingError, setApprovalSettingError] = useState(false);
+  const [pendingIssueOperations, setPendingIssueOperations] = useState<PendingChatIssueOperation[]>(
+    [],
+  );
+  const [recoveryMessage, setRecoveryMessage] = useState("");
+  const [recoveringKey, setRecoveringKey] = useState<string | null>(null);
+  const refreshPendingIssueOperations = useCallback(async () => {
+    try {
+      setPendingIssueOperations(await listPendingChatIssueOperations());
+    } catch {
+      setRecoveryMessage(t("chat.issueRecovery.unavailable"));
+    }
+  }, [t]);
+  useEffect(() => {
+    void refreshPendingIssueOperations();
+  }, [refreshPendingIssueOperations]);
+  const wasBusy = useRef(busy);
+  useEffect(() => {
+    if (wasBusy.current && !busy) {
+      void refreshPendingIssueOperations();
+    }
+    wasBusy.current = busy;
+  }, [busy, refreshPendingIssueOperations]);
+  const retryPendingIssueOperation = useCallback(
+    async (operationKey: string) => {
+      setRecoveringKey(operationKey);
+      setRecoveryMessage("");
+      try {
+        const result = await retryPendingChatIssueOperation(operationKey);
+        setRecoveryMessage(
+          `${result.issue_id}: ${result.operation_state} (${result.operation_id})`,
+        );
+        await refreshPendingIssueOperations();
+      } catch {
+        setRecoveryMessage(t("chat.issueRecovery.stillPending"));
+      } finally {
+        setRecoveringKey(null);
+      }
+    },
+    [refreshPendingIssueOperations, t],
+  );
   const [selectedMemories, setSelectedMemories] = useState<SelectedMemorySnapshot[]>([]);
   const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>("source_details");
   const [selectionOpen, setSelectionOpen] = useState(false);
@@ -47,6 +111,30 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
   // skip their `setOpenThread` — protects against rapid alternating
   // clicks where the slower IPC reply would otherwise win.
   const sourceClickToken = useRef(0);
+
+  useLayoutEffect(() => {
+    setApprovalUiActive(true);
+    return () => {
+      // The page unmounts on tab navigation while the hook remains alive; do not leave the backend waiting on an invisible prompt.
+      setApprovalUiActive(false);
+      void rejectPendingApprovals();
+    };
+  }, [rejectPendingApprovals, setApprovalUiActive]);
+
+  const changeApprovalSetting = useCallback(
+    async (next: boolean) => {
+      setSavingApprovalSetting(true);
+      setApprovalSettingError(false);
+      try {
+        await setRequireApproval(next);
+      } catch {
+        setApprovalSettingError(true);
+      } finally {
+        setSavingApprovalSetting(false);
+      }
+    },
+    [setRequireApproval],
+  );
 
   const { containerRef, isPinnedAway, scrollToBottom, notifyContentChanged } = useStickToBottom();
   // Tail-length is the streaming trigger; the hook is a no-op when the
@@ -126,6 +214,10 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
         }
         return;
       }
+      if (source.source_kind === "thread_group_summary") {
+        onNavigateThreadGroup?.(source.group_id);
+        return;
+      }
       const threadId = source.source_thread_id;
       const memoryId = source.source_kind === "reflection" ? null : source.memory_id;
       const thread = synthesizeThreadSummary({ id: threadId });
@@ -137,7 +229,7 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
       }
       setOpenThread({ thread, highlight });
     },
-    [onNavigate, onNavigateSummariesFocus],
+    [onNavigate, onNavigateSummariesFocus, onNavigateThreadGroup],
   );
 
   return (
@@ -146,17 +238,57 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
         title={t("chat.title")}
         subtitle={t("chat.subtitle")}
         actions={
-          <button
-            type="button"
-            className="btn"
-            onClick={clearChat}
-            disabled={turns.length === 0 || busy}
-            title={t("chat.clearTitle")}
-          >
-            {t("chat.clear")}
-          </button>
+          <>
+            <label className="chat-tool-approval-setting">
+              <input
+                type="checkbox"
+                checked={requireApproval}
+                disabled={savingApprovalSetting}
+                onChange={(event) => void changeApprovalSetting(event.target.checked)}
+              />
+              {t("chat.toolApproval.settingLabel")}
+            </label>
+            <button
+              type="button"
+              className="btn"
+              onClick={clearChat}
+              disabled={turns.length === 0 || busy}
+              title={t("chat.clearTitle")}
+            >
+              {t("chat.clear")}
+            </button>
+          </>
         }
       />
+
+      <div className="chat-tool-approval-hint">
+        {approvalSettingError && <p role="alert">{t("chat.toolApproval.settingSaveFailed")}</p>}
+        <p>
+          {requireApproval
+            ? t("chat.toolApproval.settingRequiredHint")
+            : t("chat.toolApproval.settingAutomaticRisk")}
+        </p>
+      </div>
+      {(pendingIssueOperations.length > 0 || recoveryMessage) && (
+        <section className="chat-issue-recovery" aria-label={t("chat.issueRecovery.title")}>
+          <h3>{t("chat.issueRecovery.title")}</h3>
+          {pendingIssueOperations.map((operation) => (
+            <div key={operation.operation_key}>
+              <span>
+                {operation.issue_id} ({operation.method}){" "}
+              </span>
+              <button
+                type="button"
+                disabled={recoveringKey !== null}
+                onClick={() => void retryPendingIssueOperation(operation.operation_key)}
+              >
+                {t("chat.issueRecovery.retry")}
+              </button>
+            </div>
+          ))}
+          {recoveryMessage && <p role="status">{recoveryMessage}</p>}
+        </section>
+      )}
 
       <div className="chat-scroll" ref={containerRef}>
         {turns.length === 0 && <ChatEmptyState />}
@@ -167,6 +299,7 @@ export function Chat({ onNavigate, onNavigateSummariesFocus, rag }: ChatPageProp
             onSourceClick={onSourceClick}
             onCopy={copyAnswer}
             onSave={saveAnswer}
+            onToolApproval={respondToToolApproval}
           />
         ))}
         {isPinnedAway && (
@@ -274,6 +407,7 @@ interface ChatTurnCardProps {
   onSourceClick: (source: ChatSource) => void;
   onCopy: (answer: string) => Promise<void>;
   onSave: (answer: string) => Promise<boolean>;
+  onToolApproval: (jobId: string, callId: string, approved: boolean) => Promise<void>;
 }
 
 const ChatTurnCard = memo(function ChatTurnCard({
@@ -281,6 +415,7 @@ const ChatTurnCard = memo(function ChatTurnCard({
   onSourceClick,
   onCopy,
   onSave,
+  onToolApproval,
 }: ChatTurnCardProps) {
   const { t } = useTranslation();
   const markdownLabels = useMemo<ChatMarkdownLabels>(
@@ -345,6 +480,27 @@ const ChatTurnCard = memo(function ChatTurnCard({
       <div className="chat-answer">
         <strong>Lookback</strong>
         <ChatAnswerBody turn={turn} />
+        {(turn.issueMutations ?? []).map((receipt) => (
+          <div className="chat-issue-mutation" role="status" key={receipt.operation_id}>
+            <strong>{t("chat.issueMutation.title")}</strong>
+            <p>
+              {t("chat.issueMutation.issueId")}: {receipt.issue_id}
+            </p>
+            <p>
+              {t("chat.issueMutation.operationState")}: {receipt.operation_state}
+            </p>
+            <p>
+              {t("chat.issueMutation.auditReason")}: {receipt.audit_reason}
+            </p>
+          </div>
+        ))}
+        {turn.pendingApproval && (
+          <ChatToolApprovalCard
+            jobId={turn.jobId}
+            approval={turn.pendingApproval}
+            onRespond={onToolApproval}
+          />
+        )}
         {turn.phase === "done" && !turn.cancelled && turn.answer && (
           <div className="chat-answer-actions">
             {(turn.sources.length > 0 || (turn.selectedMemories?.length ?? 0) > 0) && (
@@ -394,6 +550,9 @@ function ChatAnswerBody({ turn }: { turn: ChatTurn }) {
   if (turn.phase === "start") {
     return <ChatStatus text={t("chat.status.preparing")} />;
   }
+  if (turn.phase === "approval-required" && !turn.pendingApproval) {
+    return <ChatStatus text={t("chat.toolApproval.detailsUnavailable")} />;
+  }
   if (turn.phase === "searching" && !turn.answer) {
     // Empty answer + searching = the LLM hasn't started generating
     // yet, it's still waiting on the tool result. Surface the message
@@ -412,6 +571,65 @@ function ChatAnswerBody({ turn }: { turn: ChatTurn }) {
     <div className="message-body">
       <MarkdownBody>{turn.answer}</MarkdownBody>
     </div>
+  );
+}
+
+function ChatToolApprovalCard({
+  jobId,
+  approval,
+  onRespond,
+}: {
+  jobId: string;
+  approval: NonNullable<ChatTurn["pendingApproval"]>;
+  onRespond: (jobId: string, callId: string, approved: boolean) => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  const respond = useCallback(
+    async (approved: boolean) => {
+      setBusy(true);
+      setFailed(false);
+      try {
+        await onRespond(jobId, approval.call_id, approved);
+      } catch {
+        setFailed(true);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [approval.call_id, jobId, onRespond],
+  );
+
+  return (
+    <section className="chat-tool-approval" aria-label={t("chat.toolApproval.title")}>
+      <h3>{t("chat.toolApproval.title")}</h3>
+      <dl>
+        <dt>{t("chat.toolApproval.toolName")}</dt>
+        <dd>
+          <code>{approval.tool_name}</code>
+        </dd>
+        <dt>{t("chat.toolApproval.arguments")}</dt>
+        <dd>
+          <pre>{approval.arguments_json}</pre>
+        </dd>
+      </dl>
+      <div className="chat-tool-approval-actions">
+        <button
+          type="button"
+          className="btn primary"
+          disabled={busy}
+          onClick={() => void respond(true)}
+        >
+          {t("chat.toolApproval.approve")}
+        </button>
+        <button type="button" className="btn" disabled={busy} onClick={() => void respond(false)}>
+          {t("chat.toolApproval.reject")}
+        </button>
+      </div>
+      {failed && <p role="alert">{t("chat.toolApproval.responseFailed")}</p>}
+    </section>
   );
 }
 
@@ -453,16 +671,16 @@ function ChatSourceList({ sources, onSourceClick }: ChatSourceListProps) {
 }
 
 function sourceKey(source: ChatSource): string {
-  return source.source_kind === "reflection"
-    ? `reflection-${source.reflection_id}`
-    : `memory-${source.memory_id}`;
+  if (source.source_kind === "reflection") return `reflection-${source.reflection_id}`;
+  if (source.source_kind === "thread_group_summary") return `group-summary-${source.group_id}`;
+  return `memory-${source.memory_id}`;
 }
 
 /** Render the kind-count breakdown (e.g. "Raw 7 / Thread summary 2 / Period summary 1")
  *  for the collapsed source summary. Returns null when only one kind is
  *  present — repeating the same label as `Sources (N)` would be noise.
  *  Iteration order follows SOURCE_KIND_ORDER so the canonical kind sequence
- *  (raw → thread summary → period summary) is the single source of truth. */
+ *  (raw → period → thread-group summary) is the single source of truth. */
 function summarizeKinds(t: TFunction, sources: ChatSource[]): string | null {
   const counts = new Map<ChatSource["source_kind"], number>();
   for (const src of sources) {
@@ -489,7 +707,9 @@ function ChatSourceItem({ source, onSourceClick }: ChatSourceItemProps) {
   const detail =
     source.source_kind === "period_summary"
       ? `${source.period_key} (${source.scope_key})`
-      : t("chat.sources.threadDetail", { id: source.source_thread_id });
+      : source.source_kind === "thread_group_summary"
+        ? t("chat.sources.groupDetail", { id: source.group_id })
+        : t("chat.sources.threadDetail", { id: source.source_thread_id });
   return (
     <li className="chat-source">
       <button
@@ -511,8 +731,8 @@ function ChatSourceItem({ source, onSourceClick }: ChatSourceItemProps) {
 // resolved via `t("chat.sourceKind.<kind>")`.
 const SOURCE_KIND_ORDER: ChatSource["source_kind"][] = [
   "raw_memory",
-  "thread_summary",
   "period_summary",
+  "thread_group_summary",
   "reflection",
 ];
 

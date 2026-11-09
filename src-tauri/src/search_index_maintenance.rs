@@ -70,6 +70,17 @@ pub struct PersistentState {
     pub last_window_id: Option<String>,
     #[serde(default)]
     pub observed_periodic_execution_ids: Vec<String>,
+    /// The worker timezone observed while a conductor-owned execution was
+    /// active. Retained until terminal recovery completes so a later settings
+    /// change cannot reinterpret the execution's calendar periods.
+    #[serde(default)]
+    pub periodic_execution_timezones: Vec<PeriodicExecutionTimezone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeriodicExecutionTimezone {
+    pub execution_id: String,
+    pub timezone_name: String,
 }
 
 /// Returns the local-start-date identity of an active `[start,end)` window.
@@ -737,12 +748,58 @@ impl SearchIndexMaintenanceCoordinator {
         Ok(true)
     }
 
-    pub async fn begin_periodic_execution(&self, execution_id: &str) -> AppResult<bool> {
+    /// Returns whether terminal side effects for this periodic execution still
+    /// need to run. Callers must only record the terminal ID after every
+    /// durable side effect has succeeded, so a transient result-read or
+    /// recovery-state failure remains retryable on the next poll.
+    pub async fn needs_periodic_terminal_processing(&self, execution_id: &str) -> bool {
+        !self
+            .state
+            .lock()
+            .await
+            .observed_periodic_execution_ids
+            .iter()
+            .any(|known| known == execution_id)
+    }
+
+    pub async fn begin_periodic_execution(
+        &self,
+        execution_id: &str,
+        timezone_name: &str,
+    ) -> AppResult<bool> {
         let mut active = self.active_periodic_execution_ids.lock().await;
         if !active.insert(execution_id.to_string()) {
             return Ok(false);
         }
         drop(active);
+        let snapshot_result = {
+            let mut state = self.state.lock().await;
+            if !state
+                .periodic_execution_timezones
+                .iter()
+                .any(|snapshot| snapshot.execution_id == execution_id)
+            {
+                state
+                    .periodic_execution_timezones
+                    .push(PeriodicExecutionTimezone {
+                        execution_id: execution_id.to_string(),
+                        timezone_name: timezone_name.to_string(),
+                    });
+                if state.periodic_execution_timezones.len() > 256 {
+                    state.periodic_execution_timezones.remove(0);
+                }
+                self.save_locked(&state)
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(error) = snapshot_result {
+            self.active_periodic_execution_ids
+                .lock()
+                .await
+                .remove(execution_id);
+            return Err(error);
+        }
         if let Err(error) = self
             .begin_write(&[MaintenanceTable::Memory, MaintenanceTable::Thread])
             .await
@@ -756,6 +813,16 @@ impl SearchIndexMaintenanceCoordinator {
         Ok(true)
     }
 
+    pub async fn periodic_execution_timezone(&self, execution_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .periodic_execution_timezones
+            .iter()
+            .find(|snapshot| snapshot.execution_id == execution_id)
+            .map(|snapshot| snapshot.timezone_name.clone())
+    }
+
     pub async fn finish_periodic_execution(&self, execution_id: &str) -> AppResult<bool> {
         if self
             .active_periodic_execution_ids
@@ -764,9 +831,14 @@ impl SearchIndexMaintenanceCoordinator {
             .remove(execution_id)
         {
             self.finish_write().await?;
-            return Ok(true);
         }
-        self.record_periodic_terminal(execution_id).await
+        let recorded = self.record_periodic_terminal(execution_id).await?;
+        let mut state = self.state.lock().await;
+        state
+            .periodic_execution_timezones
+            .retain(|snapshot| snapshot.execution_id != execution_id);
+        self.save_locked(&state)?;
+        Ok(recorded)
     }
 }
 
@@ -901,7 +973,12 @@ mod tests {
     async fn periodic_active_scope_blocks_manual_writes_until_terminal() {
         let dir = tempfile::tempdir().unwrap();
         let coordinator = SearchIndexMaintenanceCoordinator::new(DataPaths::with_root(dir.path()));
-        assert!(coordinator.begin_periodic_execution("run-1").await.unwrap());
+        assert!(
+            coordinator
+                .begin_periodic_execution("run-1", "Asia/Tokyo")
+                .await
+                .unwrap()
+        );
         assert!(coordinator.status().await.writing);
         assert!(
             coordinator
@@ -910,6 +987,56 @@ mod tests {
                 .unwrap()
         );
         assert!(!coordinator.status().await.writing);
+        assert!(
+            !coordinator
+                .needs_periodic_terminal_processing("run-1")
+                .await
+        );
+        assert_eq!(coordinator.periodic_execution_timezone("run-1").await, None);
+    }
+
+    #[tokio::test]
+    async fn periodic_execution_timezone_snapshot_survives_a_settings_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let coordinator = SearchIndexMaintenanceCoordinator::new(DataPaths::with_root(dir.path()));
+        coordinator
+            .begin_periodic_execution("run-1", "America/New_York")
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .periodic_execution_timezone("run-1")
+                .await
+                .as_deref(),
+            Some("America/New_York")
+        );
+
+        let reloaded = SearchIndexMaintenanceCoordinator::new(DataPaths::with_root(dir.path()));
+        assert_eq!(
+            reloaded
+                .periodic_execution_timezone("run-1")
+                .await
+                .as_deref(),
+            Some("America/New_York")
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_terminal_remains_retryable_until_recorded() {
+        let coordinator = SearchIndexMaintenanceCoordinator::new(DataPaths::with_root(
+            tempfile::tempdir().unwrap().path(),
+        ));
+        assert!(
+            coordinator
+                .needs_periodic_terminal_processing("run-1")
+                .await
+        );
+        assert!(coordinator.record_periodic_terminal("run-1").await.unwrap());
+        assert!(
+            !coordinator
+                .needs_periodic_terminal_processing("run-1")
+                .await
+        );
     }
 
     #[tokio::test]

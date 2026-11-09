@@ -11,19 +11,70 @@ import { buildChatMarkdown, Chat, type ChatMarkdownLabels } from "./Chat";
 // `findMemoriesByThreadId` is what ThreadDetail calls once mounted;
 // keep it minimal so the modal renders without errors.
 vi.mock("@/api", () => ({
+  getAppCapabilities: vi.fn().mockResolvedValue({ experimental_issues_enabled: false }),
   findMemoryPosition: vi.fn(),
   findMemoriesByThreadId: vi.fn().mockResolvedValue([]),
   saveChatMarkdown: vi.fn(),
+  listPendingChatIssueOperations: vi.fn().mockResolvedValue([]),
+  retryPendingChatIssueOperation: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
 
 import { save } from "@tauri-apps/plugin-dialog";
-import { findMemoryPosition, saveChatMarkdown } from "@/api";
+import {
+  findMemoryPosition,
+  listPendingChatIssueOperations,
+  retryPendingChatIssueOperation,
+  saveChatMarkdown,
+} from "@/api";
 
 const mockFindMemoryPosition = vi.mocked(findMemoryPosition);
 const mockSaveChatMarkdown = vi.mocked(saveChatMarkdown);
 const mockSaveDialog = vi.mocked(save);
+
+describe("pending Issue operation recovery", () => {
+  it("shows only redacted pending identifiers and retries the selected operation", async () => {
+    vi.mocked(listPendingChatIssueOperations).mockResolvedValueOnce([
+      {
+        operation_key: "issue-chat-update-1",
+        issue_id: "issue-42",
+        method: "manager_update_issue",
+        created_at_ms: 1,
+      },
+    ]);
+    vi.mocked(retryPendingChatIssueOperation).mockResolvedValueOnce({
+      issue_id: "issue-42",
+      operation_id: "op-1",
+      operation_state: "COMMITTED",
+      revision: "4",
+      resulting_state: "OPEN",
+    });
+    renderChat([]);
+    const retry = await screen.findByRole("button", { name: /再送|retry/i });
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(retryPendingChatIssueOperation).toHaveBeenCalledWith("issue-chat-update-1"),
+    );
+    expect(await screen.findByText(/COMMITTED/)).toBeInTheDocument();
+  });
+
+  it("keeps an uncertain operation visible when status recovery fails", async () => {
+    vi.mocked(listPendingChatIssueOperations).mockResolvedValueOnce([
+      {
+        operation_key: "issue-chat-cancel-2",
+        issue_id: "issue-43",
+        method: "manager_apply_issue_admin_action",
+        created_at_ms: 2,
+      },
+    ]);
+    vi.mocked(retryPendingChatIssueOperation).mockRejectedValueOnce(new Error("unconfirmed"));
+    renderChat([]);
+    fireEvent.click(await screen.findByRole("button", { name: /再送|retry/i }));
+    expect(await screen.findByText(/保留中|not confirmed/)).toBeInTheDocument();
+    expect(screen.getByText(/issue-43/)).toBeInTheDocument();
+  });
+});
 
 beforeAll(() => {
   // ThreadDetail relies on these jsdom-absent APIs.
@@ -60,6 +111,11 @@ function makeRag(turns: ChatTurn[], overrides: Partial<UseRagChat> = {}): UseRag
     reset: vi.fn(),
     cancel: vi.fn().mockResolvedValue(undefined),
     busy: false,
+    requireApproval: true,
+    setRequireApproval: vi.fn().mockResolvedValue(undefined),
+    respondToToolApproval: vi.fn().mockResolvedValue(undefined),
+    setApprovalUiActive: vi.fn(),
+    rejectPendingApprovals: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -80,19 +136,22 @@ function markdownLabels(language: "ja" | "en"): ChatMarkdownLabels {
 interface RenderOpts {
   onNavigate?: ReturnType<typeof vi.fn>;
   onNavigateSummariesFocus?: ReturnType<typeof vi.fn>;
+  onNavigateThreadGroup?: ReturnType<typeof vi.fn>;
 }
 
 function renderChat(sources: ChatSource[], opts: RenderOpts = {}) {
   const onNavigate = opts.onNavigate ?? vi.fn();
   const onNavigateSummariesFocus = opts.onNavigateSummariesFocus ?? vi.fn();
+  const onNavigateThreadGroup = opts.onNavigateThreadGroup ?? vi.fn();
   renderWithProviders(
     <Chat
       onNavigate={onNavigate}
       onNavigateSummariesFocus={onNavigateSummariesFocus}
+      onNavigateThreadGroup={onNavigateThreadGroup}
       rag={makeRag([turn({ sources })])}
     />,
   );
-  return { onNavigate, onNavigateSummariesFocus };
+  return { onNavigate, onNavigateSummariesFocus, onNavigateThreadGroup };
 }
 
 beforeEach(() => {
@@ -117,23 +176,6 @@ describe("Chat source click", () => {
     };
     const { onNavigate, onNavigateSummariesFocus } = renderChat([rawSource]);
     fireEvent.click(screen.getByTitle(/^原文:/));
-    await waitFor(() => {
-      expect(screen.getByRole("dialog")).toBeTruthy();
-    });
-    expect(onNavigate).not.toHaveBeenCalled();
-    expect(onNavigateSummariesFocus).not.toHaveBeenCalled();
-  });
-
-  it("opens ThreadDetail in-place for thread_summary sources", async () => {
-    const summarySource: ChatSource = {
-      source_kind: "thread_summary",
-      memory_id: "101",
-      source_thread_id: "201",
-      snippet: "summary snippet",
-      score: 0.8,
-    };
-    const { onNavigate, onNavigateSummariesFocus } = renderChat([summarySource]);
-    fireEvent.click(screen.getByTitle(/^スレッド要約:/));
     await waitFor(() => {
       expect(screen.getByRole("dialog")).toBeTruthy();
     });
@@ -217,6 +259,19 @@ describe("Chat source click", () => {
     });
   });
 
+  it("navigates thread-group summary sources to the owning group", () => {
+    const groupSource: ChatSource = {
+      source_kind: "thread_group_summary",
+      memory_id: "105",
+      group_id: "9007199254740993",
+      snippet: "group summary",
+      score: 0.8,
+    };
+    const { onNavigateThreadGroup } = renderChat([groupSource]);
+    fireEvent.click(screen.getByTitle(/^スレッドグループ要約:/));
+    expect(onNavigateThreadGroup).toHaveBeenCalledWith("9007199254740993");
+  });
+
   it("falls back to a plain Summaries tab switch when period_key is malformed", () => {
     const periodSource: ChatSource = {
       source_kind: "period_summary",
@@ -285,7 +340,147 @@ describe("Chat composer stop button — OPEN-CHAT-2", () => {
   });
 });
 
+describe("Chat tool approval", () => {
+  const approval = {
+    call_id: "call-9",
+    tool_name: "lookback_issue_update",
+    arguments_json: '{"issue_id":"issue-3","patch":{"title":"Updated title"}}',
+  };
+
+  function renderPendingApproval(overrides: Partial<UseRagChat> = {}) {
+    const rag = makeRag(
+      [
+        turn({
+          answer: "",
+          phase: "approval-required",
+          pendingApproval: approval,
+          sources: [],
+        }),
+      ],
+      { busy: true, ...overrides },
+    );
+    const view = renderWithProviders(
+      <Chat onNavigate={vi.fn()} onNavigateSummariesFocus={vi.fn()} rag={rag} />,
+    );
+    return { ...view, rag };
+  }
+
+  it("shows the requested tool and exact arguments before offering approval", () => {
+    renderPendingApproval();
+
+    expect(screen.getByText("lookback_issue_update")).toBeInTheDocument();
+    expect(screen.getByText(approval.arguments_json)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "承認して実行" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "拒否" })).toBeInTheDocument();
+  });
+
+  it("sends an explicit approval or rejection for the displayed call", async () => {
+    const { rag } = renderPendingApproval();
+
+    fireEvent.click(screen.getByRole("button", { name: "承認して実行" }));
+    await waitFor(() => {
+      expect(rag.respondToToolApproval).toHaveBeenCalledWith("job-1", "call-9", true);
+    });
+  });
+
+  it("returns a rejection without executing the displayed call", async () => {
+    const { rag } = renderPendingApproval();
+
+    fireEvent.click(screen.getByRole("button", { name: "拒否" }));
+    await waitFor(() => {
+      expect(rag.respondToToolApproval).toHaveBeenCalledWith("job-1", "call-9", false);
+    });
+  });
+
+  it("persists switching approval off from the default-on setting", () => {
+    const setRequireApproval = vi.fn().mockResolvedValue(undefined);
+    renderPendingApproval({ requireApproval: true, setRequireApproval });
+
+    const toggle = screen.getByRole("checkbox", { name: "ツール実行前に承認を求める" });
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+
+    expect(setRequireApproval).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps the pending request visible and reports a failed approval response", async () => {
+    const respondToToolApproval = vi.fn().mockRejectedValue(new Error("ipc failed"));
+    renderPendingApproval({ respondToToolApproval });
+
+    fireEvent.click(screen.getByRole("button", { name: "承認して実行" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "ツールへの応答を送信できませんでした。もう一度お試しください。",
+    );
+    expect(screen.getByText("lookback_issue_update")).toBeInTheDocument();
+  });
+
+  it("does not offer approval when backend call details are missing", () => {
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([
+          turn({ answer: "", phase: "approval-required", pendingApproval: null, sources: [] }),
+        ])}
+      />,
+    );
+
+    expect(
+      screen.getByText("ツール呼び出しの内容を確認できません。安全のため実行は保留中です。"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "承認して実行" })).toBeNull();
+  });
+
+  it("shows the read/write risk when automatic tool execution is enabled", () => {
+    const setRequireApproval = vi.fn().mockResolvedValue(undefined);
+    renderPendingApproval({ requireApproval: false, setRequireApproval });
+
+    const toggle = screen.getByRole("checkbox", { name: "ツール実行前に承認を求める" });
+    expect(toggle).not.toBeChecked();
+    expect(screen.getByText(/読み取り・書き込み操作を含む/)).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(setRequireApproval).toHaveBeenCalledWith(true);
+  });
+
+  it("rejects outstanding approvals when leaving the Chat tab", async () => {
+    const { unmount, rag } = renderPendingApproval();
+
+    unmount();
+
+    await waitFor(() => expect(rag.rejectPendingApprovals).toHaveBeenCalledTimes(1));
+  });
+});
+
 describe("Chat terminal status", () => {
+  it("renders a committed Issue mutation even when the assistant returns no answer", () => {
+    renderWithProviders(
+      <Chat
+        onNavigate={vi.fn()}
+        onNavigateSummariesFocus={vi.fn()}
+        rag={makeRag([
+          turn({
+            answer: "",
+            phase: "done",
+            sources: [],
+            issueMutations: [
+              {
+                tool_name: "lookback_issue_update",
+                issue_id: "issue-42",
+                operation_id: "op-42",
+                operation_state: "COMMITTED",
+                audit_reason: "requested edit",
+              },
+            ],
+          }),
+        ])}
+      />,
+    );
+    expect(screen.getByText(/issue-42/)).toBeTruthy();
+    expect(screen.getByText(/COMMITTED/)).toBeTruthy();
+    expect(screen.getByText(/requested edit/)).toBeTruthy();
+  });
   it("localizes the empty terminal state instead of showing a perpetual generating state", () => {
     renderWithProviders(
       <Chat
@@ -534,9 +729,9 @@ describe("Chat selected memory display", () => {
       turn({
         sources: [
           {
-            source_kind: "thread_summary",
+            source_kind: "thread_group_summary",
             memory_id: "2",
-            source_thread_id: "3",
+            group_id: "3",
             snippet: "取得した詳細",
             score: 1,
           },
@@ -557,7 +752,7 @@ describe("Chat selected memory display", () => {
     );
     expect(markdown).toContain("## 選択した要約");
     expect(markdown).toContain("- 種別: 週次");
-    expect(markdown).toContain("- スレッド要約: 取得した詳細");
+    expect(markdown).toContain("- スレッドグループ要約: 取得した詳細");
     expect(markdown).not.toContain("thread_summary");
   });
 });
@@ -594,8 +789,17 @@ describe("Chat source list collapse", () => {
           score,
         };
       }
+      if (kind === "thread_group_summary") {
+        return {
+          source_kind: "thread_group_summary",
+          memory_id,
+          group_id: `g-${kind}-${i}`,
+          snippet,
+          score,
+        };
+      }
       return {
-        source_kind: kind,
+        source_kind: "raw_memory",
         memory_id,
         source_thread_id: `t-${kind}-${i}`,
         snippet,
@@ -616,12 +820,12 @@ describe("Chat source list collapse", () => {
   it("breaks down the count by kind when the list mixes sources", () => {
     renderChat([
       ...makeSources(3, "raw_memory"),
-      ...makeSources(2, "thread_summary"),
+      ...makeSources(2, "thread_group_summary"),
       ...makeSources(1, "period_summary"),
     ]);
     // The single-line summary must let the user know what's inside
     // before they commit to expanding the list.
-    expect(screen.getByText("原文 3 / スレッド要約 2 / 期間要約 1")).toBeTruthy();
+    expect(screen.getByText("原文 3 / 期間要約 1 / スレッドグループ要約 2")).toBeTruthy();
   });
 
   it("omits the breakdown when every source is the same kind", () => {

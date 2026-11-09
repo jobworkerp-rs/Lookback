@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::sidecar::memories_migration::EmbeddingMigrationFailure;
 use crate::sidecar::startup_error::StartupFailure;
 
 #[derive(Debug, thiserror::Error)]
@@ -13,7 +14,7 @@ pub enum AppError {
     /// branches on; the inner payload carries the recovery hints
     /// (`expected_dim` / `actual_dim` etc.).
     #[error("sidecar startup failed: {}", .0.code())]
-    SidecarStartupFailed(StartupFailure),
+    SidecarStartupFailed(Box<StartupFailure>),
 
     /// Another Lookback instance is already running against the same data
     /// directory (it holds the `sidecar.lock`). We refuse to spawn a second set
@@ -27,26 +28,37 @@ pub enum AppError {
     )]
     AnotherInstanceRunning,
 
-    #[error("database migration failed during {phase}: {reason} (backup: {backup_path})")]
+    /// Failure reported by the memories migration tool. `error_code` is the
+    /// tool's fixed vocabulary and is what the UI acts on; `detail` is an
+    /// English diagnostic for logs and bug reports only.
+    #[error(
+        "database migration failed at {stage}: {error_code} (resolution: {resolution}, backup: {backup_path}): {detail}"
+    )]
     DatabaseMigrationFailed {
-        phase: String,
-        reason: String,
+        stage: String,
+        error_code: String,
+        resolution: String,
         backup_path: String,
+        detail: String,
     },
 
-    #[error(
-        "memory_kind migration is required for {db_path}; migrate with Lookback v0.0.7 before restarting"
-    )]
-    MemoryKindMigrationRequired { db_path: String },
-
-    #[error("memory_kind database schema is invalid at {db_path}: {reason}")]
-    MemoryKindDatabaseSchemaInvalid { db_path: String, reason: String },
-
-    #[error("memory_kind database check failed at {db_path}: {reason}")]
-    MemoryKindDatabaseCheckFailed { db_path: String, reason: String },
+    /// A failure in the embedding-space CLI contract. `failure` is present
+    /// only when the final line passed strict contract validation.
+    #[error("embedding migration failed: {detail}")]
+    EmbeddingMigrationFailed {
+        failure: Option<Box<EmbeddingMigrationFailure>>,
+        detail: String,
+        inspect_required: bool,
+    },
 
     #[error("gRPC error: {0}")]
     Grpc(#[from] tonic::Status),
+
+    /// The connected memories sidecar predates the additive ThreadGroup read
+    /// service. Keep this distinct so the UI can explain compatibility rather
+    /// than silently showing the legacy thread list.
+    #[error("この memories バージョンはスレッドグループ表示に未対応です")]
+    ThreadGroupUnsupported,
 
     #[error("transport error: {0}")]
     Transport(#[from] tonic::transport::Error),
@@ -67,6 +79,9 @@ pub enum AppError {
     #[error("jobworkerp: {0}")]
     Jobworkerp(String),
 
+    #[error("issue tracker server: {0}")]
+    IssueTrackerServer(String),
+
     /// The local vector store (LanceDB) could not be opened at the
     /// configured embedding dimension, so the sidecar was restarted in a
     /// degraded mode with vector features disabled. Embedding-dependent
@@ -81,7 +96,14 @@ pub enum AppError {
     )]
     VectorStoreDegraded { expected_dim: u32, actual_dim: u32 },
 
-    #[error("{0}")]
+    /// Escape hatch for `anyhow` boundaries (the jobworkerp client's
+    /// unique-enqueue errors, etc.). Rendered with `{0:#}` so the whole
+    /// cause chain survives: `Display` on `anyhow::Error` without `#` prints
+    /// only the outermost context, which turned a rejected uniq enqueue into
+    /// the contentless toast "enqueue stream memories-summarize-batch"
+    /// instead of naming the reason ("job with the unique key already
+    /// exists: …").
+    #[error("{0:#}")]
     Other(#[from] anyhow::Error),
 }
 
@@ -95,3 +117,34 @@ impl Serialize for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn other_renders_the_anyhow_cause_chain() {
+        // The uniq-enqueue path wraps `UniqueEnqueueError` in an
+        // `.context(action)` layer; the toast must still name the reason.
+        let error = AppError::Other(
+            anyhow::anyhow!("job with the unique key already exists: op-key")
+                .context("enqueue stream memories-summarize-batch"),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "enqueue stream memories-summarize-batch: job with the unique key already exists: op-key"
+        );
+        assert_eq!(
+            serde_json::to_string(&error).unwrap(),
+            r#""enqueue stream memories-summarize-batch: job with the unique key already exists: op-key""#
+        );
+    }
+
+    #[test]
+    fn other_without_a_chain_stays_unchanged() {
+        let error = AppError::Other(anyhow::anyhow!("bare failure"));
+
+        assert_eq!(error.to_string(), "bare failure");
+    }
+}

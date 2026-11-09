@@ -184,3 +184,43 @@ describe("Personality merge-only button", () => {
     expect(progress.start).toHaveBeenCalledWith("personality-merge-1");
   });
 });
+
+describe("SignalsDrawer paging", () => {
+  function signal(id: string) {
+    return {
+      memory_id: `m-${id}`,
+      source_thread_id: id,
+      content_json: JSON.stringify({ no_signal: false, reason: `reason ${id}` }),
+      updated_at_ms: 0,
+    };
+  }
+
+  it("loads signals one page at a time and appends the next page on demand", async () => {
+    getPersonality.mockResolvedValue({ thread_count: 3, signal_count: 3, profile: null });
+    listPersonalitySignals.mockReset();
+    listPersonalitySignals
+      .mockResolvedValueOnce({ signals: [signal("101"), signal("102")], next_offset: 2 })
+      .mockResolvedValueOnce({ signals: [signal("103")], next_offset: null });
+    renderPage();
+    // The stat only becomes clickable once the signal count has loaded.
+    await waitFor(() =>
+      expect(screen.getByText("Signals").closest(".persona-stat")).toHaveTextContent("3"),
+    );
+    fireEvent.click(screen.getByText("Signals"));
+
+    expect(await screen.findByText("スレッド #101")).toBeInTheDocument();
+    expect(screen.queryByText("スレッド #103")).not.toBeInTheDocument();
+    // The subtitle reports the total, not just the loaded page.
+    expect(screen.getByText(/3 件のシグナル/)).toBeInTheDocument();
+    expect(listPersonalitySignals).toHaveBeenLastCalledWith(
+      expect.objectContaining({ user_id: 1, offset: 0 }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "さらに読み込む" }));
+    expect(await screen.findByText("スレッド #103")).toBeInTheDocument();
+    expect(listPersonalitySignals).toHaveBeenLastCalledWith(
+      expect.objectContaining({ user_id: 1, offset: 2 }),
+    );
+    expect(screen.queryByRole("button", { name: "さらに読み込む" })).not.toBeInTheDocument();
+  });
+});

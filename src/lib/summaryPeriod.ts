@@ -179,6 +179,28 @@ export function expandToDayRange(topKind: SummaryKind, from: string, to: string)
   }
 }
 
+/** Expand calendar dates to complete ISO weeks containing the boundary dates.
+ *
+ * The weekly generate dialog intentionally uses native date inputs: browser
+ * support for `input[type=week]` is inconsistent, and dates are easier to
+ * choose. Both boundary weeks are included in full, so each weekly aggregate
+ * receives every one of its daily source summaries.
+ */
+export function expandDateRangeToContainingWeeks(from: string, to: string): DayRange | null {
+  const start = localDateFromDayKey(from);
+  const end = localDateFromDayKey(to);
+  if (!start || !end) return null;
+  return expandToDayRange("weekly", isoWeekOfDate(start), isoWeekOfDate(end));
+}
+
+/** Compare two strictly valid calendar-day keys, or return null when either is invalid. */
+export function compareDayKeys(from: string, to: string): number | null {
+  const start = localDateFromDayKey(from);
+  const end = localDateFromDayKey(to);
+  if (!start || !end) return null;
+  return start.getTime() - end.getTime();
+}
+
 /**
  * The fallback span when no range is given but a period layer is selected:
  * mirror each period batch's own fallback so the dependency chain still has
@@ -287,6 +309,14 @@ export function dayRangeToPeriodTokens(periodSpan: DayRange, dailySpan: DayRange
 function localDate(yyyymmdd: string): Date {
   const [y, m, d] = yyyymmdd.split("-").map(Number);
   return new Date(y ?? 1970, (m ?? 1) - 1, d ?? 1);
+}
+
+/** Parse a native date input value without letting Date normalize invalid days. */
+function localDateFromDayKey(key: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
+  if (!match) return null;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return dayKey(date) === key ? date : null;
 }
 
 /** New Date pulled back to its ISO week's Monday (Monday-based weekday). */

@@ -1,20 +1,23 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { generateSummaries } from "@/api";
-import { DateInput } from "@/components/DateInput";
+import { MondayDatePicker } from "@/components/MondayDatePicker";
+import { MonthPicker } from "@/components/MonthPicker";
 import { hasLlmInitFailure, type SidecarStatus } from "@/hooks/useSidecarStatus";
 import { useTimezone } from "@/hooks/useTimezone";
 import { dayRangeToEpochMs, resolveTimezoneOffsetHours } from "@/lib/dateInput";
 import {
   applyDependency,
   KIND_LABEL_KEYS,
-  KIND_ORDER,
   type KindSelection,
+  PUBLIC_PERIOD_KIND_ORDER,
   topKind,
 } from "@/lib/summaryKind";
 import {
+  compareDayKeys,
   type DayRange,
   dayRangeToPeriodTokens,
+  expandDateRangeToContainingWeeks,
   expandToDayRange,
   extendStartToWeekStart,
   fallbackDayRange,
@@ -25,24 +28,27 @@ import { Modal } from "./Modal";
 
 export interface SummaryGenerateDialogProps {
   onClose: () => void;
-  /** Receives the dispatched job_id so the caller can open a progress slot. */
-  onStarted: (jobId: string) => void;
+  /** Resets the progress slot before dispatch so the first event cannot race it. */
+  onStart: (dispatchId: string) => void;
+  /** Releases the pre-dispatch slot if invoke rejects before a run is created. */
+  onDispatchError: (dispatchId: string) => void;
   /** Granularity to preselect — the page mounts this dialog fresh each open,
    *  so it always reflects the page's current tab. */
-  initialKind: SummaryKind;
+  initialKind: Exclude<SummaryKind, "per-thread">;
   sidecar: SidecarStatus;
 }
 
-/** Native `<input>` type and value format per top-most granularity. */
-const PICKER_TYPE: Record<SummaryKind, "date" | "month" | "week"> = {
+/** Native picker type per top-most granularity. Weekly ranges use dates so
+ *  selecting a period does not depend on OS support for `input[type=week]`. */
+const PICKER_TYPE: Record<Exclude<SummaryKind, "thread-group">, "date" | "month"> = {
   "per-thread": "date",
   daily: "date",
-  weekly: "week",
+  weekly: "date",
   monthly: "month",
 };
 
 /** i18n key per granularity for the range hint, resolved with `t` at render. */
-const RANGE_HINT_KEY: Record<SummaryKind, string> = {
+const RANGE_HINT_KEY: Record<Exclude<SummaryKind, "thread-group">, string> = {
   "per-thread": "summaryGen.rangeHintPerThread",
   daily: "summaryGen.rangeHintDaily",
   weekly: "summaryGen.rangeHintWeekly",
@@ -58,17 +64,25 @@ const EMPTY_TOKENS: PeriodTokens = {
   monthly_end: "",
 };
 
+/** User-facing manual stages. Per-thread is an implicit dependency and is
+ * intentionally omitted. */
+const MANUAL_STAGE_KIND_ORDER: readonly Exclude<SummaryKind, "per-thread">[] = [
+  "thread-group",
+  ...PUBLIC_PERIOD_KIND_ORDER,
+];
+
 /** i18n key per build error, resolved with `t` at render. */
 const BUILD_ERROR_KEY: Record<BuildError, string> = {
   "one-sided": "summaryGen.errorOneSided",
   reversed: "summaryGen.errorReversed",
   invalid: "summaryGen.errorInvalid",
+  required: "summaryGen.errorRequired",
 };
 
 /** Why a build failed — lets the dialog show a specific message instead of
  *  re-deriving the reason from a null result. `null` request + `null` reason =
  *  nothing selected (no message needed). */
-export type BuildError = "one-sided" | "reversed" | "invalid";
+export type BuildError = "one-sided" | "reversed" | "invalid" | "required";
 
 export interface BuildResult {
   request: GenerateSummariesRequest | null;
@@ -91,10 +105,11 @@ export function buildGenerateRequest(
   timeZone?: string,
 ): BuildResult {
   const top = topKind(selection);
-  if (!top) return { request: null, error: null };
+  if (!Object.values(selection).some(Boolean)) return { request: null, error: null };
 
   const base: GenerateSummariesRequest = {
     run_per_thread: selection["per-thread"],
+    run_thread_group: selection["thread-group"],
     run_daily: selection.daily,
     run_weekly: selection.weekly,
     run_monthly: selection.monthly,
@@ -103,12 +118,20 @@ export function buildGenerateRequest(
     timezone_offset_hours: tzOffsetHours,
   };
 
+  if (!top) return { request: base, error: null };
+
   const hasFrom = from.length > 0;
   const hasTo = to.length > 0;
   if (hasFrom !== hasTo) return { request: null, error: "one-sided" };
 
   if (!hasFrom) {
-    if (top === "per-thread") return { request: base, error: null };
+    // ThreadGroups are selected by member activity in the period, so a
+    // ThreadGroup run without one would visit every group.
+    if (top === "per-thread") {
+      return selection["thread-group"]
+        ? { request: null, error: "required" }
+        : { request: base, error: null };
+    }
     // Resolve the fallback in the workflow's tz so it matches each batch's own
     // `now_utc + offset` fallback (see fallbackDayRange).
     const fb = fallbackDayRange(top, tzOffsetHours, new Date(), timeZone);
@@ -116,11 +139,40 @@ export function buildGenerateRequest(
     return { request: applyDayRange(base, selection, top, fb, timeZone), error: null };
   }
 
-  const span = expandToDayRange(top, from, to);
+  // Weekly date selection is expanded to complete weeks below. Check the
+  // user's dates first, otherwise a reverse order inside one week collapses
+  // into the same Monday..Sunday range and incorrectly becomes valid.
+  if (top === "weekly" && (compareDayKeys(from, to) ?? 0) > 0) {
+    return { request: null, error: "reversed" };
+  }
+
+  const span =
+    top === "weekly" ? expandDateRangeToContainingWeeks(from, to) : expandToDayRange(top, from, to);
   if (!span) return { request: null, error: "invalid" };
   // String compare works for all three token formats once expanded to YYYY-MM-DD.
   if (span.fromDate > span.toDate) return { request: null, error: "reversed" };
   return { request: applyDayRange(base, selection, top, span, timeZone), error: null };
+}
+
+/** The period a request covers at its top granularity (`a〜b`, or one key
+ *  when both ends match), or null when it is unbounded. Exported for tests. */
+export function targetRange(
+  top: Exclude<SummaryKind, "thread-group">,
+  request: GenerateSummariesRequest | null,
+  from: string,
+  to: string,
+): string | null {
+  if (!request) return null;
+  const [start, end] =
+    top === "monthly"
+      ? [request.monthly_start, request.monthly_end]
+      : top === "weekly"
+        ? [request.weekly_start, request.weekly_end]
+        : top === "daily"
+          ? [request.daily_start, request.daily_end]
+          : [from, to];
+  if (!start || !end) return null;
+  return start === end ? start : `${start}〜${end}`;
 }
 
 /** Derive every layer's input from the selected `periodSpan`.
@@ -144,17 +196,24 @@ function applyDayRange(
     ...base,
     ...dayRangeToPeriodTokens(periodSpan, dailySpan),
   };
+  const { after, before } = dayRangeToEpochMs(dailySpan.fromDate, dailySpan.toDate, timeZone);
   if (selection["per-thread"]) {
-    const { after, before } = dayRangeToEpochMs(dailySpan.fromDate, dailySpan.toDate, timeZone);
     if (after !== undefined) req.last_message_after_ms = after;
     if (before !== undefined) req.last_message_before_ms = before;
+  }
+  // SearchThreadGroups treats both bounds as exclusive, while `before` is the
+  // inclusive last millisecond of the span.
+  if (selection["thread-group"] && after !== undefined && before !== undefined) {
+    req.thread_group_activity_after_ms = after;
+    req.thread_group_activity_before_ms = before + 1;
   }
   return req;
 }
 
-function initialSelection(initialKind: SummaryKind): KindSelection {
+function initialSelection(initialKind: Exclude<SummaryKind, "per-thread">): KindSelection {
   const sel: KindSelection = {
     "per-thread": false,
+    "thread-group": false,
     daily: false,
     weekly: false,
     monthly: false,
@@ -164,7 +223,8 @@ function initialSelection(initialKind: SummaryKind): KindSelection {
 
 export function SummaryGenerateDialog({
   onClose,
-  onStarted,
+  onStart,
+  onDispatchError,
   initialKind,
   sidecar,
 }: SummaryGenerateDialogProps) {
@@ -177,7 +237,9 @@ export function SummaryGenerateDialog({
   const [error, setError] = useState<string | null>(null);
   const llmDown = hasLlmInitFailure(sidecar);
 
-  const top = topKind(selection);
+  const hasSelectedStage = MANUAL_STAGE_KIND_ORDER.some((kind) => selection[kind]);
+  // Per-thread alone is an implicit leftover, not a user-selected stage.
+  const top = hasSelectedStage ? topKind(selection) : null;
   // Fallback "yesterday / last week / last month" and the per-thread window are
   // resolved in the display timezone so a manual run with no explicit range
   // targets the same day the workflow's own `env.TZ` boundary would.
@@ -192,28 +254,33 @@ export function SummaryGenerateDialog({
     [selection, from, to, tzOffsetHours, timezone],
   );
 
-  const toggle = (k: SummaryKind, next: boolean) => {
+  // The period actually sent, so an unset range shows its fallback too.
+  const range = top == null ? null : targetRange(top, build.request, from, to);
+
+  const toggle = (k: Exclude<SummaryKind, "per-thread">, next: boolean) => {
     setSelection((cur) => applyDependency(cur, k, next));
   };
 
   const handleSubmit = async () => {
-    if (!build.request) return;
+    if (!hasSelectedStage || !build.request) return;
     setError(null);
     setBusy(true);
+    let dispatchId: string | undefined;
     try {
       // Frontend-generated dispatch id doubles as the cancel key:
       // analysis_cancel(dispatch_id) targets the same in-flight map
       // entry the backend registers from this request, so the Stop
       // button in the toolbar (Summaries.tsx) hits the right job.
-      const dispatch_id = crypto.randomUUID();
-      const res = await generateSummaries({
+      dispatchId = crypto.randomUUID();
+      onStart(dispatchId);
+      await generateSummaries({
         ...build.request,
         stop_on_error: stopOnError,
-        dispatch_id,
+        dispatch_id: dispatchId,
       });
-      onStarted(res.job_id_hint);
       onClose();
     } catch (e) {
+      if (dispatchId) onDispatchError(dispatchId);
       setError((e as Error).message);
     } finally {
       setBusy(false);
@@ -235,7 +302,7 @@ export function SummaryGenerateDialog({
 
         <div className="field">
           <span className="field-label">{t("summaryGen.stages")}</span>
-          {KIND_ORDER.map((k) => (
+          {MANUAL_STAGE_KIND_ORDER.map((k) => (
             <label key={k} className="checkbox-row">
               <input
                 type="checkbox"
@@ -263,21 +330,24 @@ export function SummaryGenerateDialog({
           <div className="field">
             <span className="field-label">{t("summaryGen.targetPeriod")}</span>
             <div className="radio-row">
-              <DateInput
-                type={PICKER_TYPE[top]}
-                value={from}
-                onChange={setFrom}
-                title={t("summaryGen.rangeStart")}
-              />
+              {PICKER_TYPE[top] === "date" ? (
+                <MondayDatePicker
+                  value={from}
+                  onChange={setFrom}
+                  title={t("summaryGen.rangeStart")}
+                />
+              ) : (
+                <MonthPicker value={from} onChange={setFrom} title={t("summaryGen.rangeStart")} />
+              )}
               <span style={{ fontSize: 12 }}>〜</span>
-              <DateInput
-                type={PICKER_TYPE[top]}
-                value={to}
-                onChange={setTo}
-                title={t("summaryGen.rangeEnd")}
-              />
+              {PICKER_TYPE[top] === "date" ? (
+                <MondayDatePicker value={to} onChange={setTo} title={t("summaryGen.rangeEnd")} />
+              ) : (
+                <MonthPicker value={to} onChange={setTo} title={t("summaryGen.rangeEnd")} />
+              )}
             </div>
             <div className="field-hint">{t(RANGE_HINT_KEY[top])}</div>
+            {range && <div className="field-hint">{t("summaryGen.targetRange", { range })}</div>}
             {build.error && <div className="form-error">{t(BUILD_ERROR_KEY[build.error])}</div>}
           </div>
         )}
@@ -292,7 +362,7 @@ export function SummaryGenerateDialog({
           type="button"
           className="btn primary"
           onClick={() => void handleSubmit()}
-          disabled={busy || llmDown || build.request == null}
+          disabled={busy || llmDown || !hasSelectedStage || build.request == null}
         >
           {busy ? t("summaryGen.submitting") : t("summaryGen.submit")}
         </button>

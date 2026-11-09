@@ -1,15 +1,19 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { I18nextProvider } from "react-i18next";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
+import { LOCAL_CONNECTION_CONFIG } from "@/lib/connectionConfig";
+import { makeNativeSetupResponse, remoteConnectionConfig } from "@/test-utils";
+import type { ConnectionConfig } from "@/types/api";
 import { type EmbeddingFocus, Settings } from "./Settings";
 
 // Settings renders every card, so the whole @/api surface is mocked. The
 // view-switch tests only care about which cards are visible and the
 // in-component leave-guard, so most mocks return innocuous defaults.
 const applySettings = vi.fn();
+const setConnectionConfig = vi.fn();
 const getLlmSettings = vi.fn();
 const listLlmPresets = vi.fn();
 const getEmbeddingSettings = vi.fn();
@@ -18,30 +22,75 @@ const getAppSettings = vi.fn();
 const getConnectionConfig = vi.fn();
 const getMemoryEmbeddingStats = vi.fn();
 const getBackgroundJobQueueStatus = vi.fn();
+const getEmbeddingSpace = vi.fn();
+const inspectEmbeddingMigration = vi.fn();
+const recoverEmbeddingMigration = vi.fn();
+const startEmbeddingRebuild = vi.fn();
+const startEmbeddingReconcile = vi.fn();
+const planEmbeddingChange = vi.fn();
+const switchEmbeddingSpace = vi.fn();
 const getModelStatus = vi.fn();
 const getSettings = vi.fn();
+const codingAgentGetSettings = vi.fn();
+const codingAgentUpdateSettings = vi.fn();
+const codingAgentGetBackendStatus = vi.fn();
+const codingAgentGetNativeSetup = vi.fn();
+const codingAgentApproveNativeBackend = vi.fn();
 const getMcpSettings = vi.fn();
+const getIssueTrackerSettings = vi.fn();
 const getSearchIndexMaintenanceStatus = vi.fn();
 const startSearchIndexMaintenance = vi.fn();
 const setSearchIndexMaintenanceSchedule = vi.fn();
 
 vi.mock("@/api", () => ({
   applySettings: (req: unknown) => applySettings(req),
+  inspectRemoteJobworkerp: () => new Promise(() => {}),
   getLlmSettings: () => getLlmSettings(),
   listLlmPresets: () => listLlmPresets(),
   getEmbeddingSettings: () => getEmbeddingSettings(),
   listEmbeddingPresets: () => listEmbeddingPresets(),
   getMcpSettings: () => getMcpSettings(),
+  getIssueTrackerSettings: () => getIssueTrackerSettings(),
   getAppSettings: () => getAppSettings(),
   getConnectionConfig: () => getConnectionConfig(),
+  getEmbeddingSpace: () => getEmbeddingSpace(),
+  inspectEmbeddingMigration: (...args: unknown[]) => inspectEmbeddingMigration(...args),
+  recoverEmbeddingMigration: (...args: unknown[]) => recoverEmbeddingMigration(...args),
+  startEmbeddingRebuild: (...args: unknown[]) => startEmbeddingRebuild(...args),
+  startEmbeddingReconcile: (...args: unknown[]) => startEmbeddingReconcile(...args),
+  planEmbeddingChange: (req: unknown) => planEmbeddingChange(req),
+  switchEmbeddingSpace: (req: unknown) => switchEmbeddingSpace(req),
   getMemoryEmbeddingStats: () => getMemoryEmbeddingStats(),
   getBackgroundJobQueueStatus: () => getBackgroundJobQueueStatus(),
   getModelStatus: () => getModelStatus(),
   getSettings: () => getSettings(),
+  codingAgentGetSettings: () => codingAgentGetSettings(),
+  codingAgentUpdateSettings: (request: unknown) => codingAgentUpdateSettings(request),
+  codingAgentGetBackendStatus: () => codingAgentGetBackendStatus(),
+  codingAgentGetNativeSetup: () => codingAgentGetNativeSetup(),
+  codingAgentApproveNativeBackend: (request: unknown) => codingAgentApproveNativeBackend(request),
   getSearchIndexMaintenanceStatus: () => getSearchIndexMaintenanceStatus(),
+  getWorkEligibility: () => Promise.resolve({ work_eligibility: "REVIEWED_ONLY" }),
+  setWorkEligibility: () => Promise.resolve({ work_eligibility: "REVIEWED_ONLY" }),
+  getIssueReviewPolicy: () => Promise.resolve({ require_high_priority_reason: false }),
+  setIssueReviewPolicy: () => Promise.resolve({ require_high_priority_reason: false }),
+  getAutoIssuePolicy: () =>
+    Promise.resolve({
+      version: 1,
+      changed_at_ms: 0,
+      policy: {
+        extraction_enabled: true,
+        auto_register_min_confidence: 0.9,
+        auto_register_priority_range: { lower: "P0", upper: "P2" },
+        explicit_only: true,
+        allowed_kinds: [],
+        extract_cap: 5,
+      },
+    }),
+  setAutoIssuePolicy: () => Promise.resolve(),
   startSearchIndexMaintenance: () => startSearchIndexMaintenance(),
   setSearchIndexMaintenanceSchedule: (req: unknown) => setSearchIndexMaintenanceSchedule(req),
-  setConnectionConfig: () => Promise.resolve(),
+  setConnectionConfig: (cfg: unknown) => setConnectionConfig(cfg),
   setDataRoot: () => Promise.resolve(),
   createDataRoot: () => Promise.resolve(),
   validateDataRoot: () => Promise.resolve(null),
@@ -67,6 +116,25 @@ const LLM_SETTINGS = {
   local_hf_repo: null,
   local_ctx_size: null,
   local_kv_cache_type: null,
+  model_max_output_tokens: null,
+  summary_output_guidance: {
+    small: {
+      daily: { item_chars: 200, total_chars: 8000 },
+      weekly: { item_chars: 350, total_chars: 18000 },
+      monthly: { item_chars: 500, total_chars: 40000 },
+    },
+    standard: {
+      daily: { item_chars: 300, total_chars: 12000 },
+      weekly: { item_chars: 500, total_chars: 30000 },
+      monthly: { item_chars: 800, total_chars: 80000 },
+    },
+    large: {
+      daily: { item_chars: 500, total_chars: 20000 },
+      weekly: { item_chars: 800, total_chars: 50000 },
+      monthly: { item_chars: 1200, total_chars: 120000 },
+    },
+    limits: { daily: 10, weekly: 20, monthly: 50, max_source_memory_ids: 10 },
+  },
 };
 
 const LLM_PRESETS = [
@@ -146,6 +214,7 @@ const APP_SETTINGS = {
   data_root_override: null,
   timezone: null,
   effective_timezone: "Asia/Tokyo",
+  migration_backup: { enabled: true, keep: 1 },
   resolved: {
     current_data_root: "/root",
     default_data_root: "/root",
@@ -154,10 +223,57 @@ const APP_SETTINGS = {
   },
 };
 
+const CODING_AGENT_PROFILE = {
+  profileId: "profile-one",
+  version: 1,
+  displayName: "Primary agent",
+  imageRef: "registry.example/agent:latest",
+  allowedImageRefs: ["registry.example/agent:latest"],
+  command: ["agent"],
+  containerHome: "/workspace",
+  runtimeEnvironment: {},
+  networkAccess: "public" as const,
+  resources: {
+    cpuMillis: 1000,
+    memoryMib: 1024,
+    rootDiskMib: 4096,
+    maxParallelRuns: 1,
+    useStatic: true,
+  },
+  mountAllowedRoots: [],
+  persistentMounts: [],
+  allowedRepositories: [{ host: "forge.example", organization: "team", repository: "repo" }],
+  credentialReference: null,
+};
+
+const CODING_AGENT_HOST = {
+  labelHost: "forge.example",
+  forge: "github" as const,
+  apiBaseUrl: "https://forge.example/api/v3",
+  cloneTransport: { kind: "https" as const, baseUrl: "https://forge.example" },
+  readCredentialRef: null,
+  publicationCredentialRef: null,
+};
+
+function codingAgentResponse(displayName = CODING_AGENT_PROFILE.displayName, revision = 1) {
+  return {
+    settings: {
+      formatVersion: 1,
+      revision,
+      activeProfileId: CODING_AGENT_PROFILE.profileId,
+      semanticJudgeEnabled: true,
+      autoDoneEnabled: false,
+      profiles: [{ ...CODING_AGENT_PROFILE, displayName }],
+      repositoryHosts: [CODING_AGENT_HOST],
+    },
+    profileMountAvailability: [],
+    availableAgentPresets: [],
+  };
+}
+
 const SETTINGS_SNAPSHOT = {
   data_root: "/root",
   sqlite_path: "/root/db.sqlite",
-  lancedb_path: "/root/lancedb",
   plugins_path: "/root/plugins",
   models_path: "/root/models",
   log_path: "/root/log",
@@ -167,38 +283,126 @@ const SETTINGS_SNAPSHOT = {
 
 function renderSettings(props?: Parameters<typeof Settings>[0]) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+  const result = render(
     <I18nextProvider i18n={i18n}>
       <QueryClientProvider client={client}>
         <Settings {...props} />
       </QueryClientProvider>
     </I18nextProvider>,
   );
+  return { ...result, invalidateSpy };
+}
+
+async function findReadyIssueTrackerToggle() {
+  const toggle = await screen.findByRole("checkbox", {
+    name: /Issue Tracker を有効にする/,
+  });
+  await waitFor(() => expect(toggle).toBeEnabled());
+  return toggle;
 }
 
 describe("Settings view switching", () => {
   beforeEach(() => {
     i18n.changeLanguage("ja");
+    setConnectionConfig.mockReset().mockResolvedValue(undefined);
     applySettings.mockReset();
-    applySettings.mockResolvedValue({ restarted: true, backup_path: null });
+    applySettings.mockResolvedValue({
+      restarted: true,
+      embedding_runtime: null,
+      warnings: [],
+      mcp_auth_token: null,
+    });
     getLlmSettings.mockResolvedValue(LLM_SETTINGS);
     listLlmPresets.mockResolvedValue(LLM_PRESETS);
     getEmbeddingSettings.mockResolvedValue(EMB_SETTINGS);
     listEmbeddingPresets.mockResolvedValue(EMB_PRESETS);
     getMcpSettings.mockResolvedValue({
       enabled: false,
+      allow_unauthenticated_requests: false,
       exclude_runner_as_tool: null,
       exclude_worker_as_tool: null,
       streaming: null,
       request_timeout_sec: null,
-      set_name: "lookback-mcp-rag",
+      rag_default_period_scope: "overall_only",
+      set_name: "lookback-mcp",
       active_port: null,
+      auth_token_configured: false,
+      runtime_status: "disabled",
+      unavailable_reason: null,
+    });
+    getIssueTrackerSettings.mockResolvedValue({
+      enabled: false,
+      effective_enabled: false,
     });
     getAppSettings.mockResolvedValue(APP_SETTINGS);
-    getConnectionConfig.mockResolvedValue({
-      mode: "local",
-      remote_jobworkerp_url: null,
-      remote_memories_url: null,
+    getConnectionConfig.mockResolvedValue(LOCAL_CONNECTION_CONFIG);
+    getEmbeddingSpace.mockResolvedValue({
+      registration_state: "registered",
+      current_space: null,
+      mm_embedding_worker_name: "worker",
+      tables: [],
+      rpc_migration_supported: true,
+      write_rejections: {},
+    });
+    inspectEmbeddingMigration.mockReset().mockResolvedValue({
+      kind: "inspect",
+      data: {
+        state: "consistent",
+        space: { kind: "none" },
+        required: 0,
+        complete: 0,
+        missing: 0,
+        stale: 0,
+        unverified: 0,
+        failed_transient: 0,
+        failed_permanent: 0,
+        orphan: 0,
+        backup_supported: true,
+        attempt: null,
+        backup: null,
+        unavailable_reason: null,
+        next_action: "none",
+      },
+    });
+    recoverEmbeddingMigration.mockReset().mockResolvedValue({
+      result: {
+        kind: "restored",
+        data: {
+          outcome: "restored",
+          attempt: "attempt-1",
+          space: { kind: "none" },
+          next_action: "reconcile",
+        },
+      },
+      restarted: true,
+    });
+    startEmbeddingRebuild
+      .mockReset()
+      .mockResolvedValue({ attempt_id: "attempt-1", task_id: "rebuild-task" });
+    startEmbeddingReconcile.mockReset().mockResolvedValue({ task_id: "reconcile-task" });
+    planEmbeddingChange.mockReset().mockResolvedValue({
+      kind: "plan",
+      data: {
+        decision: "no_change",
+        executable: true,
+        reason: null,
+        current_space: { kind: "id", value: "source-space" },
+        target_space: "target-space",
+        memory_text: 10,
+        memory_media: 2,
+        thread: 3,
+        reflection_intent: 1,
+        failed_transient: 0,
+        failed_permanent: 0,
+      },
+    });
+    switchEmbeddingSpace.mockReset().mockResolvedValue({
+      result: {
+        kind: "switched",
+        data: { outcome: "switched", attempt: "attempt-1", next_action: "start_rebuild" },
+      },
+      restarted: false,
     });
     getMemoryEmbeddingStats.mockResolvedValue({
       total_records: 0,
@@ -214,6 +418,36 @@ describe("Settings view switching", () => {
       embedding: { name: "emb", repo: "org/emb", state: "ready", error: null },
     });
     getSettings.mockResolvedValue(SETTINGS_SNAPSHOT);
+    codingAgentGetSettings.mockResolvedValue({
+      settings: {
+        formatVersion: 1,
+        revision: 1,
+        activeProfileId: null,
+        semanticJudgeEnabled: true,
+        autoDoneEnabled: false,
+        profiles: [],
+        repositoryHosts: [],
+      },
+      profileMountAvailability: [],
+      availableAgentPresets: [],
+    });
+    codingAgentUpdateSettings.mockReset();
+    codingAgentGetBackendStatus.mockResolvedValue({
+      enabled: false,
+      executorVersion: null,
+      executorProtocolVersion: null,
+      executorFeatures: [],
+      appManagedJobworkerpReady: false,
+      blockers: ["coding_agent_executor_not_bundled"],
+    });
+    codingAgentGetNativeSetup.mockResolvedValue(
+      makeNativeSetupResponse({
+        settingsRevision: 1,
+        state: "unavailable",
+        packageFingerprint: null,
+      }),
+    );
+    codingAgentApproveNativeBackend.mockReset();
     startSearchIndexMaintenance.mockReset();
     startSearchIndexMaintenance.mockResolvedValue(undefined);
     setSearchIndexMaintenanceSchedule.mockReset();
@@ -232,13 +466,147 @@ describe("Settings view switching", () => {
     });
   });
 
+  it("hides the Issue Tracker toggle and experimental policy cards when tracking is not configurable", async () => {
+    renderSettings({ experimentalIssuesEnabled: false, issueTrackingConfigurable: false });
+
+    expect(
+      screen.queryByRole("checkbox", { name: /Issue Tracker を有効にする/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Issues 設定 (experimental)")).not.toBeInTheDocument();
+    expect(
+      await screen.findByText("Issue機能が無効なため、現在のIssue処理では使用されません。"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the Issue Tracker toggle when configurable even if the effective capability is disabled", async () => {
+    renderSettings({ experimentalIssuesEnabled: false, issueTrackingConfigurable: true });
+
+    expect(
+      await screen.findByRole("checkbox", { name: /Issue Tracker を有効にする/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Issues 設定 (experimental)")).not.toBeInTheDocument();
+  });
+
+  it("sends the Issue Tracker toggle in the basic apply payload", async () => {
+    renderSettings({ experimentalIssuesEnabled: false, issueTrackingConfigurable: true });
+    const toggle = await findReadyIssueTrackerToggle();
+
+    fireEvent.click(toggle);
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+    await waitFor(() => expect(applySettings).toHaveBeenCalled());
+    expect(applySettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issue_tracker: { enabled: true },
+        embedding: null,
+        mcp: null,
+      }),
+    );
+  });
+
+  it("sends an ON-to-OFF Issue Tracker toggle in the basic apply payload", async () => {
+    getIssueTrackerSettings.mockResolvedValue({ enabled: true, effective_enabled: true });
+    renderSettings({ experimentalIssuesEnabled: false, issueTrackingConfigurable: true });
+    const toggle = await findReadyIssueTrackerToggle();
+
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+    await waitFor(() => expect(applySettings).toHaveBeenCalled());
+    expect(applySettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issue_tracker: { enabled: false },
+        embedding: null,
+        mcp: null,
+      }),
+    );
+  });
+
+  it("invalidates capabilities and Issue Tracker settings after applying the toggle", async () => {
+    const { invalidateSpy } = renderSettings({
+      experimentalIssuesEnabled: false,
+      issueTrackingConfigurable: true,
+    });
+    const toggle = await findReadyIssueTrackerToggle();
+    fireEvent.click(toggle);
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+    await waitFor(() => expect(applySettings).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["app-capabilities"] });
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["issue-tracker-settings"] });
+    });
+  });
+
+  it("reflects the refreshed effective Issue Tracker state after applying", async () => {
+    getIssueTrackerSettings
+      .mockResolvedValueOnce({ enabled: false, effective_enabled: false })
+      .mockResolvedValueOnce({ enabled: true, effective_enabled: true });
+    renderSettings({ experimentalIssuesEnabled: false, issueTrackingConfigurable: true });
+    const toggle = await findReadyIssueTrackerToggle();
+
+    fireEvent.click(toggle);
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+    await waitFor(() => expect(applySettings).toHaveBeenCalled());
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(screen.queryByText(/未保存の変更があります/)).not.toBeInTheDocument();
+  });
+
+  it("discards a pending Issue Tracker toggle", async () => {
+    renderSettings({ experimentalIssuesEnabled: false, issueTrackingConfigurable: true });
+    const toggle = await findReadyIssueTrackerToggle();
+
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    fireEvent.click(await screen.findByText("破棄"));
+
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    expect(applySettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps the Issue Tracker edit dirty when applying fails", async () => {
+    applySettings.mockRejectedValue(new Error("Issue Tracker apply failed"));
+    renderSettings({ experimentalIssuesEnabled: false, issueTrackingConfigurable: true });
+    const toggle = await findReadyIssueTrackerToggle();
+
+    fireEvent.click(toggle);
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+    expect(await screen.findByText("Issue Tracker apply failed")).toBeInTheDocument();
+    expect(toggle).toBeChecked();
+    expect(screen.getByText(/未保存の変更があります/)).toBeInTheDocument();
+  });
+
+  it("shows the experimental Issues settings only when the capability is enabled", async () => {
+    renderSettings({ experimentalIssuesEnabled: true, issueTrackingConfigurable: true });
+
+    expect(
+      await screen.findByRole("checkbox", { name: /Issue Tracker を有効にする/ }),
+    ).toBeInTheDocument();
+    expect(await screen.findByLabelText("Issues 設定 (experimental)")).toBeInTheDocument();
+  });
+
+  it("localizes the Issues section heading and description", async () => {
+    i18n.changeLanguage("en");
+    renderSettings({ experimentalIssuesEnabled: true, issueTrackingConfigurable: true });
+
+    expect(await screen.findByLabelText("Issues settings (experimental)")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Configure Issue requirement assessment, completion decisions, and related automation.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("shows only the basic cards by default", async () => {
     renderSettings();
     // Basic-view cards.
     await screen.findByText("LLM Provider");
     expect(screen.getByText("Embedding index")).toBeInTheDocument();
     expect(screen.getByText("Hugging Face cache (HF_HOME)")).toBeInTheDocument();
-    expect(screen.getByText("Logs")).toBeInTheDocument();
+    expect(screen.queryByText("Logs")).toBeNull();
     // Advanced-view cards hidden.
     expect(screen.queryByText("Connection")).toBeNull();
     expect(screen.queryByText("Embedding model")).toBeNull();
@@ -246,6 +614,190 @@ describe("Settings view switching", () => {
     expect(screen.queryByText("Destructive")).toBeNull();
     // Entry button present.
     expect(screen.getByText("高度な設定を開く…")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("高度な設定を開く…"));
+    expect((await screen.findAllByText("Logs")).length).toBeGreaterThan(0);
+  });
+
+  it("connects the coding-agent Settings card and keeps an unconfirmed backend state neutral", async () => {
+    renderSettings();
+
+    const card = await screen.findByRole("region", { name: i18n.t("codingAgent.settings.title") });
+    const help = await within(card).findByRole("button", {
+      name: i18n.t("codingAgent.settings.settingsHelpTitle"),
+    });
+    expect(
+      within(card).queryByText(i18n.t("codingAgent.settings.backendStatusNeutral")),
+    ).toBeNull();
+
+    fireEvent.click(help);
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      i18n.t("codingAgent.settings.settingsHelpDescription"),
+    );
+
+    const blockers = within(card).getByRole("button", {
+      name: i18n.t("codingAgent.settings.backendBlockers"),
+    });
+    fireEvent.click(blockers);
+    expect(within(card).queryByText("coding_agent_executor_not_bundled")).toBeNull();
+    const diagnostic = await screen.findByRole("dialog", {
+      name: i18n.t("codingAgent.settings.backendBlockers"),
+    });
+    expect(within(diagnostic).getByText("coding_agent_executor_not_bundled")).toBeVisible();
+    expect(codingAgentGetSettings).toHaveBeenCalled();
+    expect(codingAgentGetBackendStatus).toHaveBeenCalled();
+  });
+
+  it("saves coding-agent-only edits through the common footer", async () => {
+    const response = codingAgentResponse();
+    codingAgentGetSettings.mockResolvedValue(response);
+    codingAgentUpdateSettings.mockResolvedValue({
+      ...response,
+      settings: {
+        ...response.settings,
+        revision: 2,
+        profiles: [{ ...CODING_AGENT_PROFILE, displayName: "Edited agent" }],
+      },
+    });
+
+    renderSettings();
+    fireEvent.click(await screen.findByRole("button", { name: "プロフィールを編集" }));
+    const dialog = await screen.findByRole("dialog", { name: /プロフィールを編集/ });
+    fireEvent.change(within(dialog).getByLabelText("表示名"), {
+      target: { value: "Edited agent" },
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: i18n.t("codingAgent.settings.applyChanges") }),
+    );
+
+    const save = await screen.findByRole("button", { name: "保存して適用" });
+    fireEvent.click(save);
+    await waitFor(() => expect(codingAgentUpdateSettings).toHaveBeenCalledTimes(1));
+    expect(codingAgentUpdateSettings).toHaveBeenCalledWith({
+      expectedRevision: 1,
+      settings: expect.objectContaining({
+        profiles: [expect.objectContaining({ displayName: "Edited agent" })],
+      }),
+    });
+    expect(applySettings).not.toHaveBeenCalled();
+    expect(screen.queryByText(/未保存の変更があります/)).not.toBeInTheDocument();
+  });
+
+  it("retries a Coding Agent CAS after an initial conflict", async () => {
+    const response = codingAgentResponse();
+    codingAgentGetSettings.mockResolvedValue(response);
+    codingAgentUpdateSettings
+      .mockRejectedValueOnce(new Error("CAS failed"))
+      .mockResolvedValueOnce(codingAgentResponse("Retried agent", 2));
+
+    renderSettings();
+    fireEvent.click(await screen.findByRole("button", { name: "プロフィールを編集" }));
+    const dialog = await screen.findByRole("dialog", { name: /プロフィールを編集/ });
+    fireEvent.change(within(dialog).getByLabelText("表示名"), {
+      target: { value: "Retried agent" },
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: i18n.t("codingAgent.settings.applyChanges") }),
+    );
+
+    const save = await screen.findByRole("button", { name: "保存して適用" });
+    fireEvent.click(save);
+    expect(await screen.findByText("CAS failed")).toBeInTheDocument();
+    expect(codingAgentUpdateSettings).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.getByRole("button", { name: "保存して適用" })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole("button", { name: "保存して適用" }));
+    await waitFor(() => expect(codingAgentUpdateSettings).toHaveBeenCalledTimes(2));
+    expect(applySettings).not.toHaveBeenCalled();
+    expect(screen.queryByText(/未保存の変更があります/)).not.toBeInTheDocument();
+  });
+
+  it("clears Coding Agent dialog state when discarding a view move", async () => {
+    codingAgentGetSettings.mockResolvedValue(codingAgentResponse());
+    renderSettings();
+
+    fireEvent.click(await screen.findByRole("button", { name: "プロフィールを編集" }));
+    await screen.findByRole("dialog", { name: /プロフィールを編集/ });
+    fireEvent.click(screen.getByText("高度な設定を開く…"));
+    expect(await screen.findByText("保存していない変更があります")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("破棄して移動"));
+    await screen.findByText("Connection");
+    fireEvent.click(screen.getByText("← 設定に戻る"));
+    await screen.findByText("LLM Provider");
+
+    fireEvent.click(screen.getByText("高度な設定を開く…"));
+    await screen.findByText("Connection");
+    expect(screen.queryByText("保存していない変更があります")).not.toBeInTheDocument();
+  });
+
+  it("does not resend a successful CAS when a later sidecar save fails", async () => {
+    const response = codingAgentResponse();
+    codingAgentGetSettings.mockResolvedValue(response);
+    codingAgentUpdateSettings.mockResolvedValue(codingAgentResponse("Edited agent", 2));
+    applySettings.mockRejectedValueOnce(new Error("sidecar save failed"));
+
+    renderSettings();
+    fireEvent.click(await screen.findByRole("button", { name: "プロフィールを編集" }));
+    const dialog = await screen.findByRole("dialog", { name: /プロフィールを編集/ });
+    fireEvent.change(within(dialog).getByLabelText("表示名"), {
+      target: { value: "Edited agent" },
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: i18n.t("codingAgent.settings.applyChanges") }),
+    );
+
+    const presetLabel = await screen.findByText("プリセット");
+    const preset = presetLabel.closest(".settings-row")?.querySelector("select");
+    if (!(preset instanceof HTMLSelectElement)) throw new Error("LLM preset selector is missing");
+    await waitFor(() => expect(preset.options.length).toBeGreaterThan(1));
+    fireEvent.change(preset, { target: { value: "qwen3-5-9b-ud-q4-k-xl" } });
+    await screen.findByText(/未保存の変更があります/);
+
+    fireEvent.click(screen.getByRole("button", { name: "保存して適用 (再起動)" }));
+    expect(await screen.findByText("sidecar save failed")).toBeInTheDocument();
+    expect(codingAgentUpdateSettings).toHaveBeenCalledTimes(1);
+    expect(applySettings).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "保存して適用 (再起動)" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存して適用 (再起動)" }));
+    await waitFor(() => expect(applySettings).toHaveBeenCalledTimes(2));
+    expect(codingAgentUpdateSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("states each card's restart targets and job interruption risk", async () => {
+    renderSettings();
+    await screen.findByText("LLM Provider");
+    expect(
+      screen.getByText(/安全に hot reload できない変更では jobworkerp を再起動/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/保存時に jobworkerp を再起動します。実行中の生成/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/保存時に jobworkerp・conductor を再起動/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("高度な設定を開く…"));
+    await screen.findByText("MCP Server");
+    expect(screen.getByText(/jobworkerp・memories を再起動/)).toBeInTheDocument();
+    expect(screen.getByText(/変わったサービスに応じて sidecar を再構成/)).toBeInTheDocument();
+    expect(screen.getAllByText(/保存時に jobworkerp を再起動します。実行中の生成/)).toHaveLength(2);
+  });
+
+  it("states each card's restart targets and job interruption risk", async () => {
+    renderSettings();
+    await screen.findByText("LLM Provider");
+    expect(
+      screen.getByText(/安全に hot reload できない変更では jobworkerp を再起動/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/保存時に jobworkerp を再起動します。実行中の生成/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/保存時に jobworkerp・conductor を再起動/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("高度な設定を開く…"));
+    await screen.findByText("MCP Server");
+    expect(screen.getByText(/jobworkerp・memories を再起動/)).toBeInTheDocument();
+    expect(screen.getByText(/変わったサービスに応じて sidecar を再構成/)).toBeInTheDocument();
+    expect(screen.getAllByText(/保存時に jobworkerp を再起動します。実行中の生成/)).toHaveLength(2);
   });
 
   it("shows active index optimization and prevents another manual start", async () => {
@@ -301,11 +853,7 @@ describe("Settings view switching", () => {
   });
 
   it("disables timezone edits when the saved connection mode is remote", async () => {
-    getConnectionConfig.mockResolvedValue({
-      mode: "remote",
-      remote_jobworkerp_url: "http://10.0.0.2:9000",
-      remote_memories_url: "http://10.0.0.2:9010",
-    });
+    getConnectionConfig.mockResolvedValue(remoteConnectionConfig());
 
     renderSettings();
 
@@ -313,6 +861,19 @@ describe("Settings view switching", () => {
     const card = help.closest(".settings-card");
     const select = card?.querySelector("select");
     expect(select).toBeDisabled();
+  });
+
+  it("keeps timezone edits available while only memories is remote", async () => {
+    getConnectionConfig.mockResolvedValue({
+      ...LOCAL_CONNECTION_CONFIG,
+      memories: remoteConnectionConfig().memories,
+    });
+
+    renderSettings();
+
+    await screen.findByText("LLM Provider");
+    await waitFor(() => expect(getConnectionConfig).toHaveBeenCalled());
+    expect(screen.queryByText(i18n.t("settings.timezone.remoteDisabled"))).toBeNull();
   });
 
   it("switches to the advanced view and back", async () => {
@@ -438,32 +999,325 @@ describe("Settings view switching", () => {
     // Only the embedding scope is sent; llm / hf_home are null.
     expect(req.llm).toBeNull();
     expect(req.hf_home).toBeNull();
+    expect(req.issue_tracker).toBeNull();
     expect(req.embedding).toMatchObject({ preset_id: "custom", custom_model_id: "org/model" });
   });
 
+  it("reviews a local migration plan before applying an embedding change", async () => {
+    planEmbeddingChange.mockResolvedValue({
+      kind: "plan",
+      data: {
+        decision: "reembed_required",
+        executable: true,
+        reason: null,
+        current_space: { kind: "id", value: "source-space" },
+        target_space: "target-space",
+        memory_text: 10,
+        memory_media: 2,
+        thread: 3,
+        reflection_intent: 1,
+        failed_transient: 0,
+        failed_permanent: 0,
+      },
+    });
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    await screen.findByText("Embedding model");
+    await screen.findByText(/現在の設定/);
+
+    const select = screen
+      .getByText("Embedding model")
+      .closest(".settings-card")
+      ?.querySelector("select") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "custom" } });
+    fireEvent.change(screen.getByPlaceholderText("org/name"), {
+      target: { value: "org/model" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("e.g. 1024"), { target: { value: "1024" } });
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+    await waitFor(() =>
+      expect(planEmbeddingChange).toHaveBeenCalledWith(
+        expect.objectContaining({ custom_model_id: "org/model", custom_vector_size: 1024 }),
+      ),
+    );
+    expect(await screen.findByText(/再生成対象: Memory text 10/)).toBeInTheDocument();
+    expect(applySettings).not.toHaveBeenCalled();
+    expect(switchEmbeddingSpace).not.toHaveBeenCalled();
+  });
+
+  it("does not apply local embedding settings when migration planning fails", async () => {
+    planEmbeddingChange.mockResolvedValue({
+      kind: "failed",
+      data: {
+        command: "plan_embedding_change",
+        stage: "plan",
+        error_code: "resource_unavailable",
+        resolution: "check_environment",
+        attempt: null,
+        backup: null,
+        cancel_operation: null,
+        verification_counts: null,
+      },
+    });
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    await screen.findByText("Embedding model");
+    await screen.findByText(/現在の設定/);
+
+    const select = screen
+      .getByText("Embedding model")
+      .closest(".settings-card")
+      ?.querySelector("select") as HTMLSelectElement;
+    await waitFor(() => expect(select).toBeEnabled());
+    fireEvent.change(select, { target: { value: "custom" } });
+    fireEvent.change(screen.getByPlaceholderText("org/name"), {
+      target: { value: "org/model" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("e.g. 1024"), { target: { value: "1024" } });
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+    expect(
+      await screen.findByText(/plan_embedding_change.*resource_unavailable/),
+    ).toBeInTheDocument();
+    expect(applySettings).not.toHaveBeenCalled();
+    expect(screen.getByText(/未保存の変更があります/)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["jobworkerp and memories", remoteConnectionConfig()],
+    ["memories only", { ...LOCAL_CONNECTION_CONFIG, memories: remoteConnectionConfig().memories }],
+  ])(
+    "keeps remote embedding settings saveable without local migration operations (%s remote)",
+    async (_, config) => {
+      getConnectionConfig.mockResolvedValue(config);
+      getEmbeddingSettings.mockResolvedValue({ ...EMB_SETTINGS, connection_remote: true });
+      renderSettings();
+      fireEvent.click(await screen.findByText("高度な設定を開く…"));
+      await screen.findByText("Embedding model");
+
+      fireEvent.change(screen.getByLabelText("Model revision"), {
+        target: { value: "remote-revision" },
+      });
+      fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+      await waitFor(() =>
+        expect(applySettings).toHaveBeenCalledWith(
+          expect.objectContaining({
+            embedding: expect.objectContaining({ model_revision: "remote-revision" }),
+          }),
+        ),
+      );
+      expect(planEmbeddingChange).not.toHaveBeenCalled();
+      expect(switchEmbeddingSpace).not.toHaveBeenCalled();
+      expect(inspectEmbeddingMigration).not.toHaveBeenCalled();
+    },
+  );
+
+  it("waits for the connection mode before planning or saving local embedding edits", async () => {
+    let resolveConnection: ((value: ConnectionConfig) => void) | null = null;
+    getConnectionConfig.mockReturnValueOnce(
+      new Promise<ConnectionConfig>((resolve) => {
+        resolveConnection = resolve;
+      }),
+    );
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    await screen.findByText("Embedding model");
+    fireEvent.change(await screen.findByLabelText("Model revision"), {
+      target: { value: "revision-waiting" },
+    });
+
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+
+    expect(await screen.findByText(/接続モードの確認後にEmbedding設定を保存/)).toBeInTheDocument();
+    expect(planEmbeddingChange).not.toHaveBeenCalled();
+    expect(applySettings).not.toHaveBeenCalled();
+    expect(switchEmbeddingSpace).not.toHaveBeenCalled();
+    expect(inspectEmbeddingMigration).not.toHaveBeenCalled();
+    expect(await screen.findByLabelText("Model revision")).toHaveValue("revision-waiting");
+    expect(screen.getByText(/未保存の変更があります/)).toBeInTheDocument();
+
+    await act(async () => {
+      resolveConnection?.(LOCAL_CONNECTION_CONFIG);
+    });
+    fireEvent.click(await screen.findByText("保存して適用 (再起動)"));
+    await waitFor(() => expect(planEmbeddingChange).toHaveBeenCalled());
+  });
+
+  it("sends the migration backup choice in the advanced apply payload", async () => {
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    const toggle = await screen.findByRole("checkbox", { name: /移行前にバックアップを作成/ });
+    await waitFor(() => expect(toggle).toBeChecked());
+
+    fireEvent.click(toggle);
+    await screen.findByText(/未保存の変更があります/);
+    fireEvent.click(screen.getByText("保存して適用 (再起動)"));
+
+    await waitFor(() => expect(applySettings).toHaveBeenCalled());
+    const req = applySettings.mock.lastCall?.[0];
+    expect(req.migration_backup).toEqual({ enabled: false, keep: 1 });
+    expect(req.embedding).toBeNull();
+    expect(req.llm).toBeNull();
+  });
+
+  it("applies a pending MCP token rotation once and displays the returned token after save", async () => {
+    getMcpSettings.mockResolvedValue({
+      enabled: true,
+      allow_unauthenticated_requests: false,
+      exclude_runner_as_tool: null,
+      exclude_worker_as_tool: null,
+      streaming: null,
+      request_timeout_sec: null,
+      rag_default_period_scope: "overall_only",
+      set_name: "lookback-mcp",
+      active_port: 39010,
+      auth_token_configured: true,
+      runtime_status: "ready",
+      unavailable_reason: null,
+    });
+    applySettings.mockResolvedValue({
+      restarted: true,
+      embedding_runtime: null,
+      warnings: [],
+      mcp_auth_token: "saved-rotated-token",
+    });
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    await screen.findByText("MCP Server");
+    fireEvent.click(screen.getByRole("button", { name: "Regenerate auth token" }));
+    await screen.findByText(/保存時に jobworkerp を再起動して新しい token を反映します/);
+
+    fireEvent.click(screen.getByText("保存して適用 (再起動)"));
+    await waitFor(() =>
+      expect(applySettings).toHaveBeenCalledWith(
+        expect.objectContaining({ mcp: expect.objectContaining({ rotate_auth_token: true }) }),
+      ),
+    );
+    await screen.findByText("saved-rotated-token");
+    expect(screen.queryByText(/未保存の変更があります/)).toBeNull();
+  });
+
+  it("discards a pending MCP token rotation without saving it", async () => {
+    getMcpSettings.mockResolvedValue({
+      enabled: true,
+      allow_unauthenticated_requests: false,
+      exclude_runner_as_tool: null,
+      exclude_worker_as_tool: null,
+      streaming: null,
+      request_timeout_sec: null,
+      rag_default_period_scope: "overall_only",
+      set_name: "lookback-mcp",
+      active_port: 39010,
+      auth_token_configured: true,
+      runtime_status: "ready",
+      unavailable_reason: null,
+    });
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    await screen.findByText("MCP Server");
+    fireEvent.click(screen.getByRole("button", { name: "Regenerate auth token" }));
+    await screen.findByText(/保存時に jobworkerp を再起動して新しい token を反映します/);
+
+    fireEvent.click(screen.getByText("破棄"));
+    await waitFor(() => expect(screen.queryByText(/未保存の変更があります/)).toBeNull());
+    expect(applySettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps a pending MCP token rotation and shows the save failure without revealing a token", async () => {
+    getMcpSettings.mockResolvedValue({
+      enabled: true,
+      allow_unauthenticated_requests: false,
+      exclude_runner_as_tool: null,
+      exclude_worker_as_tool: null,
+      streaming: null,
+      request_timeout_sec: null,
+      rag_default_period_scope: "overall_only",
+      set_name: "lookback-mcp",
+      active_port: 39010,
+      auth_token_configured: true,
+      runtime_status: "ready",
+      unavailable_reason: null,
+    });
+    applySettings.mockRejectedValue(new Error("MCP restart failed"));
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    await screen.findByText("MCP Server");
+    fireEvent.click(screen.getByRole("button", { name: "Regenerate auth token" }));
+    fireEvent.click(screen.getByText("保存して適用 (再起動)"));
+
+    await screen.findAllByText("MCP restart failed");
+    expect(
+      screen.getByText(/保存時に jobworkerp を再起動して新しい token を反映します/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("saved-rotated-token")).toBeNull();
+    expect(screen.getByText(/未保存の変更があります/)).toBeInTheDocument();
+  });
+
   it("guards the view switch when the Connection card (advanced) is edited", async () => {
-    // Regression: Connection / Data location are self-contained cards (own
-    // Save button, not in the unified save bar). Their in-progress edits must
-    // still arm the leave-guard, or switching back to basic drops the input
-    // silently. Here: switch Connection to Remote, then try to leave.
+    // An in-progress Connection edit must arm the leave-guard, or switching
+    // back to basic drops the input silently. Here: switch memories to
+    // Remote without its URL, then try to leave.
     renderSettings();
     fireEvent.click(await screen.findByText("高度な設定を開く…"));
     await screen.findByText("Connection");
-    // Switch the connection mode → the form now differs from the persisted
-    // (local) config, so the card is edited. The seed effect re-runs when the
-    // config resolves and reverts the mode, so click inside waitFor until the
-    // Remote URL inputs appear (mode stuck on remote past the last seed).
-    await waitFor(() => {
-      fireEvent.click(screen.getByText("Remote server"));
-      expect(screen.getByPlaceholderText("http://host:9000")).toBeInTheDocument();
-    });
-    // No save bar (self-contained card), but the leave-guard must fire.
-    expect(screen.queryByText(/未保存の変更があります/)).toBeNull();
+    // Switch memories to remote → the form now differs from the persisted
+    // (local) config, so the card is edited.
+    fireEvent.click(
+      within(await screen.findByRole("group", { name: "memories" })).getByText("Remote server"),
+    );
+    expect(screen.getByPlaceholderText("http://host:9010")).toBeInTheDocument();
+    // The save bar shows the edit but cannot apply it without the URL.
+    expect(screen.getByText("保存して適用 (再起動)")).toBeDisabled();
+    expect(setConnectionConfig).not.toHaveBeenCalled();
     fireEvent.click(screen.getByText("← 設定に戻る"));
     expect(screen.getByText("保存していない変更があります")).toBeInTheDocument();
     // Cancel keeps us on advanced with the edit intact.
     fireEvent.click(screen.getByText("キャンセル"));
     expect(screen.getByText("Connection")).toBeInTheDocument();
+  });
+
+  it("applies a Connection change only from the advanced save bar", async () => {
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    const memories = within(await screen.findByRole("group", { name: "memories" }));
+    fireEvent.click(memories.getByText("Remote server"));
+    fireEvent.change(memories.getByRole("textbox", { name: "memories URL" }), {
+      target: { value: "http://10.0.0.2:9010" },
+    });
+    expect(setConnectionConfig).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText("保存して適用 (再起動)"));
+
+    await waitFor(() =>
+      expect(setConnectionConfig).toHaveBeenCalledWith({
+        ...LOCAL_CONNECTION_CONFIG,
+        memories: remoteConnectionConfig().memories,
+      }),
+    );
+    // Nothing else was edited, so no other settings are applied.
+    await waitFor(() => expect(screen.queryByText("保存して適用 (再起動)")).toBeNull());
+    expect(applySettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps a Connection edit whose apply failed", async () => {
+    setConnectionConfig.mockRejectedValue("a remote jobworkerp needs a remote memories");
+    renderSettings();
+    fireEvent.click(await screen.findByText("高度な設定を開く…"));
+    const memories = within(await screen.findByRole("group", { name: "memories" }));
+    fireEvent.click(memories.getByText("Remote server"));
+    fireEvent.change(memories.getByRole("textbox", { name: "memories URL" }), {
+      target: { value: "http://10.0.0.2:9010" },
+    });
+
+    fireEvent.click(screen.getByText("保存して適用 (再起動)"));
+
+    expect(
+      await screen.findByText("a remote jobworkerp needs a remote memories"),
+    ).toBeInTheDocument();
+    expect(screen.getByDisplayValue("http://10.0.0.2:9010")).toBeInTheDocument();
+    expect(screen.getByText("保存して適用 (再起動)")).toBeEnabled();
   });
 
   it("guards the view switch when the Data location card (advanced) is edited", async () => {
@@ -490,10 +1344,10 @@ describe("Settings view switching", () => {
     renderSettings();
     fireEvent.click(await screen.findByText("高度な設定を開く…"));
     await screen.findByText("Connection");
-    await waitFor(() => {
-      fireEvent.click(screen.getByText("Remote server"));
-      expect(screen.getByPlaceholderText("http://host:9000")).toBeInTheDocument();
-    });
+    fireEvent.click(
+      within(await screen.findByRole("group", { name: "memories" })).getByText("Remote server"),
+    );
+    expect(screen.getByPlaceholderText("http://host:9010")).toBeInTheDocument();
     fireEvent.click(screen.getByText("← 設定に戻る"));
     fireEvent.click(screen.getByText("破棄して移動"));
     // Back on basic. The discarded Connection edit must not keep the guard

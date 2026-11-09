@@ -47,9 +47,8 @@ workers:
   - name: memories-mark-reflection-embedding-status
     runner: GRPC
     settings:
-      host: "%{MEMORY_GRPC_HOST}"
-      port: "%{MEMORY_GRPC_PORT}"
-      tls: %{MEMORY_GRPC_TLS:-false}
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
       use_reflection: true
       method: llm_memory.service.ReflectionService/MarkReflectionEmbeddingStatus
       as_json: true
@@ -61,9 +60,8 @@ workers:
   - name: memories-upsert-reflection-intent-embedding
     runner: GRPC
     settings:
-      host: "%{MEMORY_GRPC_HOST}"
-      port: "%{MEMORY_GRPC_PORT}"
-      tls: %{MEMORY_GRPC_TLS:-false}
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
       use_reflection: true
       method: llm_memory.service.ReflectionVectorService/BatchUpsertIntentEmbeddings
       as_json: true
@@ -73,7 +71,7 @@ workers:
   # Same `embedding_workflow` channel as the summary path — both fan
   # out to the GPU-bound `embedding` channel so serializing them on
   # the workflow side keeps the GPU queue depth predictable.
-  - name: memories-auto-reflection-intent-embedding
+  - name: "memories-auto-reflection-intent-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: WORKFLOW
     response_type: NO_RESULT
     channel: embedding_workflow

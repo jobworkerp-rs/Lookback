@@ -3,6 +3,8 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { I18nextProvider } from "react-i18next";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
+import { LOCAL_CONNECTION_CONFIG } from "@/lib/connectionConfig";
+import { remoteConnectionConfig } from "@/test-utils";
 import { SetupWizard } from "./SetupWizard";
 
 const applySetupMock = vi.fn();
@@ -10,12 +12,18 @@ const resumeSetupMock = vi.fn();
 const restartForSetupMock = vi.fn();
 const validateDataRootMock = vi.fn();
 const openDialogMock = vi.fn();
+const getConnectionConfigMock = vi.fn();
+const planEmbeddingChangeMock = vi.fn();
+const switchEmbeddingSpaceMock = vi.fn();
 
 vi.mock("@/api", () => ({
   applySetup: (...args: unknown[]) => applySetupMock(...args),
   resumeSetup: (...args: unknown[]) => resumeSetupMock(...args),
   restartForSetup: (...args: unknown[]) => restartForSetupMock(...args),
   validateDataRoot: (...args: unknown[]) => validateDataRootMock(...args),
+  getConnectionConfig: (...args: unknown[]) => getConnectionConfigMock(...args),
+  planEmbeddingChange: (...args: unknown[]) => planEmbeddingChangeMock(...args),
+  switchEmbeddingSpace: (...args: unknown[]) => switchEmbeddingSpaceMock(...args),
   createDataRoot: vi.fn(),
 }));
 
@@ -39,7 +47,7 @@ vi.mock("@/pages/Settings", () => ({
             custom_dtype: null,
             custom_max_sequence_length: null,
             custom_is_multimodal: null,
-            evacuate_vectordb: true,
+            model_revision: "",
           })
         }
       >
@@ -106,6 +114,30 @@ describe("SetupWizard", () => {
     resumeSetupMock.mockReset().mockResolvedValue(undefined);
     restartForSetupMock.mockReset().mockResolvedValue(undefined);
     openDialogMock.mockReset().mockResolvedValue(null);
+    getConnectionConfigMock.mockReset().mockResolvedValue(LOCAL_CONNECTION_CONFIG);
+    planEmbeddingChangeMock.mockReset().mockResolvedValue({
+      kind: "plan",
+      data: {
+        decision: "reembed_required",
+        executable: true,
+        reason: null,
+        current_space: { kind: "id", value: "source-space" },
+        target_space: "target-space",
+        memory_text: 10,
+        memory_media: 2,
+        thread: 3,
+        reflection_intent: 1,
+        failed_transient: 0,
+        failed_permanent: 0,
+      },
+    });
+    switchEmbeddingSpaceMock.mockReset().mockResolvedValue({
+      result: {
+        kind: "switched",
+        data: { outcome: "switched", attempt: "attempt-1", next_action: "start_rebuild" },
+      },
+      restarted: false,
+    });
     validateDataRootMock.mockReset().mockResolvedValue({
       ok: true,
       writable: true,
@@ -122,7 +154,15 @@ describe("SetupWizard", () => {
     expect(applySetupMock).toHaveBeenCalledWith({
       data_root: null,
       preferred_language: "ja",
-      settings: { llm: null, embedding: null, hf_home: null, mcp: null, timezone: null },
+      settings: {
+        llm: null,
+        embedding: null,
+        hf_home: null,
+        mcp: null,
+        timezone: null,
+        issue_tracker: null,
+        migration_backup: null,
+      },
     });
     await waitFor(() => expect(onComplete).toHaveBeenCalled());
   });
@@ -216,6 +256,8 @@ describe("SetupWizard", () => {
         }),
         mcp: null,
         timezone: null,
+        issue_tracker: null,
+        migration_backup: null,
       },
     });
   });
@@ -226,6 +268,139 @@ describe("SetupWizard", () => {
     fireEvent.click(screen.getByRole("button", { name: "次へ" }));
 
     expect(screen.getByText("Embedding card")).toBeInTheDocument();
+  });
+
+  it("plans local embedding changes before applying setup and requires explicit backup choice", async () => {
+    openDialogMock.mockResolvedValue("/backups/embeddings");
+    const { onComplete } = renderWizard();
+    fireEvent.click(screen.getByRole("button", { name: "設定をはじめる" }));
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pick light embedding" }));
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    fireEvent.click(screen.getByRole("button", { name: "スキップ" }));
+
+    await waitFor(() =>
+      expect(planEmbeddingChangeMock).toHaveBeenCalledWith(
+        expect.objectContaining({ model_revision: "" }),
+      ),
+    );
+    expect(await screen.findByText(/再生成対象: Memory text 10/)).toBeInTheDocument();
+    expect(applySetupMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "計画を承認して切り替える" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "ディレクトリを選択…" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("バックアップ先ディレクトリ")).toHaveValue(
+        "/backups/embeddings",
+      ),
+    );
+    fireEvent.click(screen.getByLabelText(/Embedding 切替中は保守時間/));
+    fireEvent.click(screen.getByRole("button", { name: "計画を承認して切り替える" }));
+
+    await waitFor(() =>
+      expect(switchEmbeddingSpaceMock).toHaveBeenCalledWith({
+        settings: expect.objectContaining({ model_revision: "" }),
+        expected_space: { kind: "id", value: "source-space" },
+        backup: { mode: "directory", path: "/backups/embeddings" },
+      }),
+    );
+    await waitFor(() =>
+      expect(applySetupMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          settings: expect.objectContaining({ embedding: null }),
+        }),
+      ),
+    );
+    expect(onComplete).toHaveBeenCalled();
+  });
+
+  it("does not call local migration operations for remote embedding settings", async () => {
+    getConnectionConfigMock.mockResolvedValue(remoteConnectionConfig());
+    renderWizard();
+
+    fireEvent.click(screen.getByRole("button", { name: "設定をはじめる" }));
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pick light embedding" }));
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    fireEvent.click(screen.getByRole("button", { name: "スキップ" }));
+
+    await waitFor(() => expect(applySetupMock).toHaveBeenCalledTimes(1));
+    expect(getConnectionConfigMock).toHaveBeenCalledTimes(1);
+    expect(planEmbeddingChangeMock).not.toHaveBeenCalled();
+    expect(switchEmbeddingSpaceMock).not.toHaveBeenCalled();
+    expect(applySetupMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          embedding: expect.objectContaining({ preset_id: "qwen3-embedding-0-6b" }),
+        }),
+      }),
+    );
+  });
+
+  it("retains the embedding draft and retries planning after a local plan error", async () => {
+    planEmbeddingChangeMock
+      .mockRejectedValueOnce(new Error("plan unavailable"))
+      .mockResolvedValueOnce({
+        kind: "plan",
+        data: {
+          decision: "no_change",
+          executable: true,
+          reason: null,
+          current_space: { kind: "id", value: "source-space" },
+          target_space: "target-space",
+          memory_text: 10,
+          memory_media: 2,
+          thread: 3,
+          reflection_intent: 1,
+          failed_transient: 0,
+          failed_permanent: 0,
+        },
+      });
+    renderWizard();
+
+    fireEvent.click(screen.getByRole("button", { name: "設定をはじめる" }));
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pick light embedding" }));
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    fireEvent.click(screen.getByRole("button", { name: "スキップ" }));
+
+    expect(await screen.findByText("plan unavailable")).toBeInTheDocument();
+    expect(applySetupMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "リトライ" }));
+
+    await waitFor(() => expect(planEmbeddingChangeMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(applySetupMock).toHaveBeenCalledTimes(1));
+    expect(planEmbeddingChangeMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ preset_id: "qwen3-embedding-0-6b" }),
+    );
+    expect(applySetupMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          embedding: expect.objectContaining({ preset_id: "qwen3-embedding-0-6b" }),
+        }),
+      }),
+    );
+  });
+
+  it("allows no-backup switching only after explicit acknowledgement", async () => {
+    renderWizard();
+    fireEvent.click(screen.getByRole("button", { name: "設定をはじめる" }));
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pick light embedding" }));
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    fireEvent.click(screen.getByRole("button", { name: "スキップ" }));
+
+    await screen.findByText(/再生成対象: Memory text 10/);
+    fireEvent.click(screen.getByLabelText(/バックアップなしで続行することを理解/));
+    expect(screen.getByRole("button", { name: "計画を承認して切り替える" })).toBeDisabled();
+    fireEvent.click(screen.getByLabelText(/Embedding 切替中は保守時間/));
+    expect(screen.getByRole("button", { name: "計画を承認して切り替える" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "計画を承認して切り替える" }));
+
+    await waitFor(() =>
+      expect(switchEmbeddingSpaceMock).toHaveBeenCalledWith(
+        expect.objectContaining({ backup: { mode: "no_backup_unsafe" } }),
+      ),
+    );
   });
 
   it("passes the pending embedding selection to the LLM step", () => {

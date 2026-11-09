@@ -18,12 +18,19 @@ function Harness() {
       summaryCount={2}
       sidecar={{
         phase: "ready",
-        warnings: [],
+        warnings: [
+          {
+            kind: "mcp_unavailable",
+            message: "listener did not become ready",
+            detail: null,
+          },
+        ],
         endpoints: {
           jobworkerp_port: 9000,
           memories_port: 9010,
           conductor_port: 9020,
           mcp_server_port: null,
+          issue_tracker_port: null,
         },
       }}
       theme={{ pref: "system", setPref: vi.fn() }}
@@ -59,5 +66,16 @@ describe("Sidebar language switch", () => {
     expect(screen.getByText("Periodic Tasks")).toBeTruthy();
     expect(screen.queryByText("スレッド")).toBeNull();
     expect(document.documentElement.lang).toBe("en");
+  });
+
+  it("localizes the MCP listener unavailable warning", () => {
+    renderWithProviders(<Harness />);
+
+    expect(screen.getByText("MCP listener 利用不能")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "English" }));
+
+    expect(screen.getByText("MCP listener unavailable")).toBeTruthy();
+    expect(screen.queryByText("mcp_unavailable")).toBeNull();
   });
 });

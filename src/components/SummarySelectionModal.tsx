@@ -20,7 +20,7 @@ import type {
 } from "@/types/api";
 
 const KINDS: readonly SelectableMemoryKind[] = [
-  "per-thread",
+  "thread-group",
   "daily",
   "weekly",
   "monthly",
@@ -56,6 +56,9 @@ function toSummarySnapshot(
   entry: SummaryEntry,
   content = entry.content_json,
 ): SelectedMemorySnapshot {
+  if (entry.kind === "per-thread") {
+    throw new Error("per-thread summaries are internal and cannot be selected");
+  }
   const { allowedMemoryIds, allowedThreadIds } = projectSelectedMemoryContent(content);
   return {
     memory_id: entry.memory_id,
@@ -63,6 +66,7 @@ function toSummarySnapshot(
     content,
     period_key: entry.period_key ?? undefined,
     scope_key: entry.scope_key ?? undefined,
+    group_id: entry.group_id ?? undefined,
     source_memory_ids: allowedMemoryIds,
     source_thread_ids: entry.thread_id ? [entry.thread_id, ...allowedThreadIds] : allowedThreadIds,
     captured_at_ms: Date.now(),
@@ -95,6 +99,7 @@ function toReflectionSnapshot(
 
 function title(entry: SelectionEntry): string {
   if (isReflectionEntry(entry)) return entry.summary || `reflection #${entry.memory_id}`;
+  if (entry.group_id) return `group #${entry.group_id}`;
   if (entry.period_key) return `${entry.kind}: ${entry.period_key}`;
   return entry.thread_id ? `thread #${entry.thread_id}` : `memory #${entry.memory_id}`;
 }
@@ -122,6 +127,15 @@ export function SummarySelectionModal({
     loadingMore,
     retry,
     selectKind,
+    periodScope,
+    setPeriodScope,
+    includeOverall,
+    setIncludeOverall,
+    pathBucketDigests,
+    setPathBucketDigests,
+    pathCandidates,
+    includeLegacy,
+    setIncludeLegacy,
     setError,
   } = useSummarySelectionPages();
   const [selectionLimitReached, setSelectionLimitReached] = useState(false);
@@ -159,7 +173,10 @@ export function SummarySelectionModal({
   }, []);
 
   const rows = useMemo(
-    () => entries.map((entry) => ({ entry, selected: draft.has(entry.memory_id) })),
+    () =>
+      entries
+        .filter((entry) => isReflectionEntry(entry) || entry.kind !== "per-thread")
+        .map((entry) => ({ entry, selected: draft.has(entry.memory_id) })),
     [draft, entries],
   );
   const toggle = (entry: SelectionEntry) => {
@@ -305,6 +322,75 @@ export function SummarySelectionModal({
             ))}
           </div>
           <p>{t("chat.selectSummary.count", { count: draft.size })}</p>
+          {kind !== "thread-group" && kind !== "reflection" && (
+            <div className="chat-summary-scope-filter">
+              <label>
+                {t("chat.selectSummary.scope.label")}
+                <select
+                  value={periodScope}
+                  onChange={(event) => {
+                    const next = event.target.value as "overall" | "path";
+                    setPeriodScope(next);
+                    if (next === "overall") {
+                      setPathBucketDigests([]);
+                      setIncludeOverall(true);
+                    } else {
+                      setIncludeOverall(false);
+                    }
+                  }}
+                >
+                  <option value="overall">{t("chat.selectSummary.scope.overall")}</option>
+                  <option value="path">{t("chat.selectSummary.scope.path")}</option>
+                </select>
+              </label>
+              {periodScope === "path" && pathCandidates.length > 0 && (
+                <fieldset className="chat-summary-path-candidates">
+                  <legend>{t("chat.selectSummary.scope.paths")}</legend>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={includeOverall}
+                      onChange={(event) => setIncludeOverall(event.currentTarget.checked)}
+                    />
+                    {t("chat.selectSummary.scope.includeOverall")}
+                  </label>
+                  {pathCandidates.map((candidate) => {
+                    const digest = candidate.path_bucket.path_bucket_digest;
+                    const selected = pathBucketDigests.includes(digest);
+                    const label = candidate.path_bucket.path_label
+                      ? candidate.path_bucket.path_label.replace(/^path:/, "")
+                      : candidate.path_bucket.path_bucket_kind === "unassigned"
+                        ? t("summaries.path.unassigned")
+                        : t("summaries.path.ambiguous");
+                    return (
+                      <label key={digest}>
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() =>
+                            setPathBucketDigests((current) =>
+                              selected
+                                ? current.filter((value) => value !== digest)
+                                : [...current, digest],
+                            )
+                          }
+                        />
+                        {label} ({candidate.count})
+                      </label>
+                    );
+                  })}
+                </fieldset>
+              )}
+              <label>
+                <input
+                  type="checkbox"
+                  checked={includeLegacy}
+                  onChange={(event) => setIncludeLegacy(event.target.checked)}
+                />
+                {t("chat.selectSummary.scope.includeLegacy")}
+              </label>
+            </div>
+          )}
           {selectionLimitReached && (
             <p className="chat-error">{t("chat.selectSummary.limitReached")}</p>
           )}

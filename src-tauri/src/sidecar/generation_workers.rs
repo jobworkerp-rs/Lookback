@@ -28,6 +28,28 @@ use super::lifecycle::{SidecarWarning, SidecarWarningKind};
 /// `workflow_lang`, which is not part of agent-app's `WORKER_CHANNELS`.
 pub(crate) const LANG_WORKER_CHANNEL: &str = "llm_workflow";
 
+/// Workers `upsert-generation-workers --feature all` registers, one per
+/// output language each.
+pub(crate) fn generation_worker_names() -> Vec<String> {
+    use crate::commands::analysis_dispatch::PERSONALITY_MERGE_WORKER_BASE;
+    use crate::commands::background_jobs::{
+        PERSONALITY_SINGLE_WORKER_BASE, REFLECTION_SINGLE_WORKER_BASE, SUMMARY_SINGLE_WORKER_BASES,
+    };
+    SUMMARY_SINGLE_WORKER_BASES
+        .iter()
+        .chain([
+            &PERSONALITY_SINGLE_WORKER_BASE,
+            &REFLECTION_SINGLE_WORKER_BASE,
+            &PERSONALITY_MERGE_WORKER_BASE,
+        ])
+        .flat_map(|base| {
+            crate::commands::SUPPORTED_LANGUAGES
+                .iter()
+                .map(move |language| format!("{base}-{language}"))
+        })
+        .collect()
+}
+
 fn generation_workers_native_log_dir(log_dir: &Path) -> std::io::Result<std::path::PathBuf> {
     crate::log_rotation::native_log_dir(log_dir, "generation-workers")
 }
@@ -54,7 +76,7 @@ pub(crate) fn build_upsert_command(
     bin: &Path,
     repo_root: &Path,
     channel: &str,
-    jw_port: u16,
+    jobworkerp_url: &str,
     log_dir: &Path,
 ) -> Command {
     let mut cmd = Command::new(bin);
@@ -71,7 +93,7 @@ pub(crate) fn build_upsert_command(
         .arg(repo_root)
         // `new_by_env` reads JOBWORKERP_ADDR with `.expect()` — without it the
         // subcommand panics instead of connecting to the live jobworkerp.
-        .env("JOBWORKERP_ADDR", format!("http://127.0.0.1:{jw_port}"))
+        .env("JOBWORKERP_ADDR", jobworkerp_url)
         .env("RUST_LOG", "info")
         // Same tracing-init guard as `import.rs::build_command`: a
         // Finder-launched .app runs with cwd=`/`, and command-utils' tracing
@@ -111,10 +133,66 @@ fn forward_generation_worker_output(stdout: &[u8], stderr: &[u8]) {
     }
 }
 
+/// Line prefixes `memories-import upsert-generation-workers` prints per
+/// registered worker (stdout) and per skipped feature (stderr). They mirror
+/// the stable output constants in memories
+/// `agent-chat-import/src/generation_workers.rs` (`UPSERTED_PREFIX`,
+/// `DRY_RUN_PREFIX`, `SKIPPED_FEATURE_PREFIX`); the fixture-based contract
+/// tests below catch upstream rewording.
+const REGISTERED_PREFIXES: &[&str] = &[
+    "upserted generation worker: ",
+    "[dry-run] would upsert generation worker: ",
+];
+const SKIPPED_FEATURE_PREFIX: &str = "warning: skipped generation feature ";
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UpsertOutputSummary {
+    registered: Vec<String>,
+    failed_features: Vec<String>,
+}
+
+/// memories-import skips a feature whose files fail to load and still
+/// registers the rest, so a non-zero exit can mean a partial registration.
+fn summarize_upsert_output(stdout: &str, stderr: &str) -> UpsertOutputSummary {
+    let registered = stdout
+        .lines()
+        .filter_map(|line| {
+            REGISTERED_PREFIXES
+                .iter()
+                .find_map(|prefix| line.trim().strip_prefix(prefix))
+        })
+        .map(|name| name.trim().to_string())
+        .collect();
+    let failed_features = stderr
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(SKIPPED_FEATURE_PREFIX))
+        .filter_map(|rest| {
+            rest.split_once(':')
+                .map(|(feature, _)| feature.trim().to_string())
+        })
+        .collect();
+    UpsertOutputSummary {
+        registered,
+        failed_features,
+    }
+}
+
+fn failure_message(code: Option<i32>, summary: &UpsertOutputSummary, stderr_tail: &str) -> String {
+    if summary.registered.is_empty() {
+        format!("registering language generation workers failed (exit {code:?}): {stderr_tail}")
+    } else {
+        format!(
+            "language generation workers partially registered ({}); failed features: {}",
+            summary.registered.len(),
+            summary.failed_features.join(", ")
+        )
+    }
+}
+
 /// Resolve the binary + repo root and run the upsert, converting any failure
 /// into a `WorkerApplyFailed` warning instead of propagating it (fail-soft).
 pub(crate) async fn register_generation_workers(
-    jw_port: u16,
+    jobworkerp_url: &str,
     log_dir: &Path,
     warnings: &mut Vec<SidecarWarning>,
 ) {
@@ -162,7 +240,7 @@ pub(crate) async fn register_generation_workers(
         &bin,
         &repo_root,
         LANG_WORKER_CHANNEL,
-        jw_port,
+        jobworkerp_url,
         &native_log_dir,
     );
     let mut cmd = tokio::process::Command::from(std_cmd);
@@ -201,23 +279,23 @@ pub(crate) async fn register_generation_workers(
                 );
                 return;
             }
+            let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             // Keep the tail — the actionable cause (e.g. an empty prompt file
             // failing `read_non_empty`) is usually the last line.
             let lines: Vec<&str> = stderr.lines().collect();
-            let summary = lines[lines.len().saturating_sub(5)..].join("\n");
+            let tail = lines[lines.len().saturating_sub(5)..].join("\n");
+            let summary = summarize_upsert_output(&stdout, &stderr);
             tracing::warn!(
                 status = ?out.status.code(),
+                registered = summary.registered.len(),
+                failed_features = ?summary.failed_features,
                 stderr = %stderr,
                 "upsert-generation-workers failed (continuing)",
             );
             warnings.push(SidecarWarning {
                 kind: SidecarWarningKind::WorkerApplyFailed,
-                message: format!(
-                    "registering language generation workers failed (exit {:?}): {}",
-                    out.status.code(),
-                    summary
-                ),
+                message: failure_message(out.status.code(), &summary, &tail),
                 detail: Some(repo_root.display().to_string()),
             });
         }
@@ -235,6 +313,105 @@ pub(crate) async fn register_generation_workers(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn upsert_output_lists_registered_workers_and_skipped_features() {
+        let stdout = "upserted generation worker: memories-thread-summary-single-ja\n\
+                      upserted generation worker: memories-thread-summary-single-en\n";
+        let stderr = "warning: skipped generation feature thread-group-summary: read workflow yaml /x: No such file\n\
+                      Error: 1 generation feature(s) failed: thread-group-summary; 2 worker(s) registered\n";
+        assert_eq!(
+            summarize_upsert_output(stdout, stderr),
+            UpsertOutputSummary {
+                registered: vec![
+                    "memories-thread-summary-single-ja".into(),
+                    "memories-thread-summary-single-en".into(),
+                ],
+                failed_features: vec!["thread-group-summary".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn upsert_output_reads_dry_run_lines_and_ignores_unknown_ones() {
+        let stdout = "[dry-run] would upsert generation worker: memories-thread-reflection-single-ja\n\
+                      some unrelated log line\n";
+        assert_eq!(
+            summarize_upsert_output(stdout, "INFO noise\n"),
+            UpsertOutputSummary {
+                registered: vec!["memories-thread-reflection-single-ja".into()],
+                failed_features: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn upsert_output_reports_a_failure_without_any_registration() {
+        let stderr = "warning: skipped generation feature reflection: read prompt file a\n\
+                      warning: skipped generation feature thread-summary: read prompt file b\n\
+                      Error: 2 generation feature(s) failed: reflection, thread-summary; 0 worker(s) registered\n";
+        let summary = summarize_upsert_output("", stderr);
+        assert!(summary.registered.is_empty());
+        assert_eq!(
+            summary.failed_features,
+            vec!["reflection", "thread-summary"]
+        );
+    }
+
+    // Captured from the real `memories-import upsert-generation-workers
+    // --dry-run --feature all --language all --channel llm_workflow` output.
+    // Regenerate by running that command against `workers/lang-workers`
+    // (success) and a copy without `workers/thread-group-summary` (partial),
+    // replacing the temporary repo root with `<repo-root>`.
+    const SUCCESS_STDOUT: &str =
+        include_str!("../../tests/fixtures/memories_upsert_generation_workers_success.stdout");
+    const PARTIAL_STDOUT: &str =
+        include_str!("../../tests/fixtures/memories_upsert_generation_workers_partial.stdout");
+    const PARTIAL_STDERR: &str =
+        include_str!("../../tests/fixtures/memories_upsert_generation_workers_partial.stderr");
+
+    #[test]
+    fn contract_parses_real_dry_run_output_of_every_lang_worker() {
+        let summary = summarize_upsert_output(SUCCESS_STDOUT, "");
+        assert_eq!(summary.registered.len(), 16, "{summary:?}");
+        assert!(summary.failed_features.is_empty());
+        for name in [
+            "memories-thread-group-summary-single-ja",
+            "memories-thread-group-summary-single-en",
+        ] {
+            assert!(summary.registered.iter().any(|r| r == name), "{name}");
+        }
+    }
+
+    #[test]
+    fn contract_parses_real_partial_failure_output() {
+        let summary = summarize_upsert_output(PARTIAL_STDOUT, PARTIAL_STDERR);
+        assert_eq!(summary.registered.len(), 14, "{summary:?}");
+        assert_eq!(summary.failed_features, vec!["thread-group-summary"]);
+        assert!(
+            !summary
+                .registered
+                .iter()
+                .any(|name| name.starts_with("memories-thread-group-summary-single")),
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn partial_registration_names_the_failed_features() {
+        let summary = UpsertOutputSummary {
+            registered: vec!["a".into(), "b".into()],
+            failed_features: vec!["thread-group-summary".into()],
+        };
+        assert_eq!(
+            failure_message(Some(1), &summary, "tail"),
+            "language generation workers partially registered (2); failed features: thread-group-summary"
+        );
+        assert_eq!(
+            failure_message(Some(1), &UpsertOutputSummary::default(), "tail"),
+            "registering language generation workers failed (exit Some(1)): tail"
+        );
+    }
 
     /// Pull the argv (program + args) out of a std `Command` for assertions.
     fn argv(cmd: &Command) -> Vec<String> {
@@ -259,7 +436,7 @@ mod tests {
             &PathBuf::from("/bin/memories-import"),
             &PathBuf::from("/data/workers/lang-workers"),
             LANG_WORKER_CHANNEL,
-            9123,
+            "http://127.0.0.1:9123",
             &PathBuf::from("/logs"),
         );
         let args = argv(&cmd);
@@ -288,7 +465,7 @@ mod tests {
             &PathBuf::from("/bin/memories-import"),
             &PathBuf::from("/root"),
             LANG_WORKER_CHANNEL,
-            9000,
+            "http://127.0.0.1:9000",
             &PathBuf::from("/logs"),
         );
         let args = argv(&cmd);
@@ -301,7 +478,7 @@ mod tests {
             &PathBuf::from("/bin/memories-import"),
             &PathBuf::from("/root"),
             LANG_WORKER_CHANNEL,
-            9042,
+            "http://127.0.0.1:9042",
             &PathBuf::from("/var/log/lookback"),
         );
         assert_eq!(

@@ -61,10 +61,9 @@ async fn rag_chat_scaffolding_registers_cleanly() {
     // workflow good. Embedding is disabled in this smoke test, so the
     // inner `embedQuery` step is expected to fail — but the error must
     // come from THAT step, not from "Failed to load workflow".
-    let handle = lookback_tauri_lib::jobworkerp::JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
+    let handle = lookback_tauri_lib::jobworkerp::JobworkerpHandle::connect(
+        &report.endpoints.jobworkerp_url().expect("local jobworkerp"),
+    )
     .await
     .expect("connect");
     // Two dispatches exercise both jq branches of the summary-layer label
@@ -127,10 +126,9 @@ async fn lookback_recall_dispatch_unary_envelope_shape() {
     // `embedQuery` reveals whether the envelope has a `result` /
     // `output` / `sources` top-level key.
     let (root, sidecars, report) = common::start_chat_e2e_sidecars("recall-envelope").await;
-    let handle = lookback_tauri_lib::jobworkerp::JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
+    let handle = lookback_tauri_lib::jobworkerp::JobworkerpHandle::connect(
+        &report.endpoints.jobworkerp_url().expect("local jobworkerp"),
+    )
     .await
     .expect("connect");
 

@@ -1,0 +1,203 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: issue-resolution-apply
+  version: "1.0.0"
+
+# Writes one ResolveCandidate decision and confirms the durable operation.
+input:
+  schema:
+    document:
+      type: object
+      required: [candidate_id, candidate_revision, decision_payload, audit_reason, actor_id, idempotency_key, correlation_prefix, manager_contract, manager_store_identity, issue_tracker_grpc_host, issue_tracker_grpc_port]
+      properties:
+        candidate_id: { type: string, minLength: 1 }
+        # uint64 revisions arrive as JSON strings.
+        candidate_revision: { type: ["integer", "string"] }
+        decision_payload: { type: object }
+        audit_reason: { type: string, minLength: 1 }
+        actor_id: { type: string, minLength: 1 }
+        idempotency_key: { type: string, minLength: 1 }
+        correlation_prefix: { type: string, minLength: 1 }
+        manager_contract: { type: object }
+        manager_store_identity: { type: object }
+        issue_tracker_grpc_host: { type: string }
+        issue_tracker_grpc_port: { type: integer }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+
+timeout:
+  after:
+    hours: 1
+
+do:
+  - initState:
+      set:
+        candidate_id: "${ $workflow.input.candidate_id }"
+        candidate_revision: "${ $workflow.input.candidate_revision }"
+        decision_payload: "${ $workflow.input.decision_payload }"
+        manager_contract: "${ $workflow.input.manager_contract }"
+        manager_store_identity: "${ $workflow.input.manager_store_identity }"
+        operation_id: '${ "" }'
+        operation_state: '${ "" }'
+        resolution_response: "${ null }"
+        apply_failure_text: '${ "" }'
+        operation_confirmed: "${ false }"
+        conflicted_candidates: "${ [] }"
+        failed_candidates: "${ [] }"
+        last_error: "${ null }"
+
+  # The decision payload is one member of the request's `decision` oneof
+  # (reject, confirm_associated_issue, ...), which protobuf JSON places at
+  # the top level of the request.
+  - applyResolution:
+      try:
+        - invokeResolveCandidate:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.issue_tracker_grpc_host}"
+                  port: ${$workflow.input.issue_tracker_grpc_port}
+                  tls: ${$workflow.input.issue_tracker_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "issue_tracker.rpc.v1.ManagerConsumerService/ResolveCandidate"
+                  # The tracker rejects an audit reason over 1024 characters: keep
+                  # every thread ID and as many memory IDs as fit.
+                  json_body: >-
+                    ${ def fit_audit_reason:
+                         . as $reason
+                         | if length <= 1024 then $reason
+                           else (try capture("^(?<head>.*\\[evidence_memory_ids=)(?<ids>[^\\]]*)\\]$") catch null) as $m
+                                | if $m == null then $reason[:1024]
+                                  else ($m.ids | split(",")) as $ids
+                                       | ([range(($ids | length) - 1; -1; -1)
+                                           | . as $n
+                                           | $m.head + ($ids[:$n] | join(",")) + ",+" + ((($ids | length) - $n) | tostring) + " more]"
+                                           | select(length <= 1024)] | first) // $reason[:1024]
+                                  end
+                           end;
+                       {
+                        context: {
+                          method: "manager_resolve_candidate",
+                          target: ("candidate/" + $candidate_id),
+                          schema_fingerprint: ($manager_contract.schemaFingerprint // $manager_contract.schema_fingerprint // ""),
+                          data_root_id: ($manager_store_identity.dataRootId // $manager_store_identity.data_root_id // ""),
+                          contract_fingerprint: ($manager_contract.contractFingerprint // $manager_contract.contract_fingerprint // ""),
+                          idempotency_key: $workflow.input.idempotency_key,
+                          actor_audit: {
+                            actor_id: $workflow.input.actor_id,
+                            actor_kind: "ACTOR_KIND_INTERNAL_AGENT",
+                            reason: ($workflow.input.audit_reason | fit_audit_reason)
+                          },
+                          correlation_id: ($workflow.input.correlation_prefix + "-" + $candidate_id)
+                        },
+                        candidate_id: $candidate_id,
+                        expected_revision: $candidate_revision
+                      } + $decision_payload | tojson }
+                  as_json: true
+            export:
+              as:
+                resolution_response: "${ .jsonBody | fromjson }"
+        - requireResolutionReceipt:
+            if: >-
+              ${ (($resolution_response.success // null) == null)
+                 or (($resolution_response.success.operationId // $resolution_response.success.operation_id // "") == "") }
+            raise:
+              error:
+                type: "https://lookback.local/errors/issue-resolution/apply"
+                status: 502
+                title: "ResolveCandidate did not return a receipt"
+        - captureOperationId:
+            set:
+              operation_id: "${ $resolution_response.success.operationId // $resolution_response.success.operation_id }"
+        # The tracker commits through an outbox, so the first read after the
+        # receipt is often still pending.
+        - pollAppliedOperation:
+            for:
+              each: operation_poll_attempt
+              in: "${ [range(0; 10)] }"
+            while: '${ ($operation_state != "DURABLE_OPERATION_STATE_COMMITTED") and ($operation_state != "DURABLE_OPERATION_STATE_FAILED") }'
+            do:
+              - waitBetweenOperationReads:
+                  if: "${ $operation_poll_attempt > 0 }"
+                  wait:
+                    milliseconds: 500
+              - readAppliedOperation:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: unary
+                      settings:
+                        host: "${$workflow.input.issue_tracker_grpc_host}"
+                        port: ${$workflow.input.issue_tracker_grpc_port}
+                        tls: ${$workflow.input.issue_tracker_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "issue_tracker.rpc.v1.ManagerConsumerService/GetOperation"
+                        json_body: >-
+                          ${ {
+                              context: {
+                                correlation_id: ($workflow.input.correlation_prefix + "-receipt-" + $candidate_id + "-" + ($operation_poll_attempt | tostring)),
+                                schema_fingerprint: ($manager_contract.schemaFingerprint // $manager_contract.schema_fingerprint // ""),
+                                data_root_id: ($manager_store_identity.dataRootId // $manager_store_identity.data_root_id // ""),
+                                contract_fingerprint: ($manager_contract.contractFingerprint // $manager_contract.contract_fingerprint // "")
+                              },
+                              operation_id: $operation_id
+                            } | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      operation_state: '${ .jsonBody | fromjson | (.success.state // .success.operation.state // "") }'
+        - requireCommittedOperation:
+            if: >-
+              ${ $operation_state != "DURABLE_OPERATION_STATE_COMMITTED" }
+            raise:
+              error:
+                type: "https://lookback.local/errors/issue-resolution/unconfirmed"
+                status: 502
+                title: "ResolveCandidate receipt was not committed"
+        - markOperationConfirmed:
+            set:
+              operation_confirmed: "${ true }"
+      catch:
+        as: apply_error
+        do:
+          # A missing receipt raises a fixed error; the tracker's own error is
+          # in the response and decides whether this was a conflict.
+          - describeApplyFailure:
+              set:
+                apply_failure_text: >-
+                  ${ ($apply_error | tojson)
+                     + (if ($resolution_response.error // null) != null
+                        then " " + ($resolution_response.error | tojson) else "" end) }
+          - recordApplyFailure:
+              set:
+                conflicted_candidates: >-
+                  ${ if ($apply_failure_text | ascii_downcase | contains("conflict"))
+                     then $conflicted_candidates + [{ candidate_id: $candidate_id, reason: $apply_failure_text }]
+                     else $conflicted_candidates end }
+                # A rejection the candidate itself causes repeats on every run,
+                # so it is marked permanent and must not hold back a caller's
+                # progress; outages and unconfirmed results are retried. The
+                # suffixes match both the manager (ManagerErrorCode) and the
+                # runner (ErrorCode) enum names.
+                failed_candidates: >-
+                  ${ if ($apply_failure_text | ascii_downcase | contains("conflict"))
+                     then $failed_candidates
+                     else $failed_candidates + [{ candidate_id: $candidate_id, reason: $apply_failure_text, source: "tracker",
+                                                  permanent: ($resolution_response.error? // {}
+                                                              | (.code // .errorCode // .error_code // "") | tostring
+                                                              | test("(INVALID_ARGUMENT|NOT_FOUND|INVALID_STATE_TRANSITION|PRECONDITION_FAILED|RESOLUTION_REQUIRED|RESOURCE_LIMIT_EXCEEDED)$")) }] end }
+                last_error: "${ $apply_error }"
+
+output:
+  as:
+    operation_confirmed: "${ $operation_confirmed }"
+    operation_id: "${ $operation_id }"
+    conflicted_candidates: "${ $conflicted_candidates }"
+    # An entry with `permanent: true` fails the same way on every run; a
+    # caller that waits for retryable failures may go on without it.
+    failed_candidates: "${ $failed_candidates }"
+    last_error: "${ $last_error }"

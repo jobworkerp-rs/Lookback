@@ -94,6 +94,9 @@ enum RunnerType {
   // 'using' defaults to 'unary' if not specified
   GRPC = 32770;
 
+  // # Local microVM command runner with server and client streaming methods
+  SANDBOX = 32771;
+
   // Prevent reuse of removed enum values/names
   reserved -1, 65532, 65533, 65534, 65535;
   reserved "LLM_CHAT", "LLM_COMPLETION", "INLINE_WORKFLOW", "REUSABLE_WORKFLOW", "CREATE_WORKFLOW";

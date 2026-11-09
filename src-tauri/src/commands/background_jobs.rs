@@ -14,27 +14,29 @@ use crate::sidecar::SidecarEndpoints;
 
 use super::AppState;
 use super::analysis_dispatch::{
-    PERSONALITY_MERGE_WORKER_BASE, PERSONALITY_WORKER_NAME, SUMMARIES_PIPELINE_WORKER_NAME,
-    SUMMARY_WORKER_NAME,
+    PERSONALITY_MERGE_WORKER_BASE, PERSONALITY_WORKER_NAME, SUMMARY_WORKER_NAME,
+    THREAD_GROUP_ISSUE_RESOLUTION_WORKER_NAME, THREAD_GROUP_SUMMARY_WORKER_NAME,
+    THREAD_ISSUE_RESOLUTION_MANUAL_WORKER_NAME, THREAD_ISSUE_RESOLUTION_WORKER_NAME,
 };
 use super::import::PeriodKind;
 use super::reflection_dispatch::REFLECTION_WORKER_NAME;
 
 const EMBEDDING_CHANNELS: &[&str] = &["embedding", "embedding_workflow"];
 const PERIOD_KINDS: [PeriodKind; 3] = [PeriodKind::Daily, PeriodKind::Weekly, PeriodKind::Monthly];
-const SUMMARY_SINGLE_WORKER_BASES: &[&str] = &[
+pub(crate) const SUMMARY_SINGLE_WORKER_BASES: &[&str] = &[
     "memories-thread-summary-single",
+    "memories-thread-group-summary-single",
     "memories-daily-work-summary-single",
     "memories-weekly-work-summary-single",
     "memories-monthly-work-summary-single",
 ];
-const PERSONALITY_SINGLE_WORKER_BASE: &str = "memories-thread-personality-single";
-const REFLECTION_SINGLE_WORKER_BASE: &str = "memories-thread-reflection-single";
+pub(crate) const PERSONALITY_SINGLE_WORKER_BASE: &str = "memories-thread-personality-single";
+pub(crate) const REFLECTION_SINGLE_WORKER_BASE: &str = "memories-thread-reflection-single";
 
 fn local_jobworkerp_url(endpoints: Option<SidecarEndpoints>) -> AppResult<String> {
     endpoints
-        .map(|endpoints| endpoints.jobworkerp_url())
-        .ok_or_else(|| AppError::Config("local jobworkerp sidecar is not running".into()))
+        .ok_or_else(|| AppError::SidecarNotReady("local sidecars not started".into()))?
+        .require_jobworkerp_url()
 }
 
 fn extend_language_worker_names(names: &mut Vec<String>, base: &str) {
@@ -48,7 +50,7 @@ fn extend_language_worker_names(names: &mut Vec<String>, base: &str) {
 fn summary_worker_names() -> Vec<String> {
     let mut names = vec![
         SUMMARY_WORKER_NAME.to_string(),
-        SUMMARIES_PIPELINE_WORKER_NAME.to_string(),
+        THREAD_GROUP_SUMMARY_WORKER_NAME.to_string(),
     ];
     names.extend(
         PERIOD_KINDS
@@ -74,6 +76,14 @@ fn reflection_worker_names() -> Vec<String> {
     names
 }
 
+/// Group resolution is enqueued without waiting, so its queue is only
+/// visible here; same-thread and manual runs share the row.
+const ISSUE_RESOLUTION_WORKER_NAMES: [&str; 3] = [
+    THREAD_ISSUE_RESOLUTION_WORKER_NAME,
+    THREAD_ISSUE_RESOLUTION_MANUAL_WORKER_NAME,
+    THREAD_GROUP_ISSUE_RESOLUTION_WORKER_NAME,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundTaskKind {
@@ -81,6 +91,7 @@ pub enum BackgroundTaskKind {
     Summary,
     Personality,
     Reflection,
+    IssueResolution,
     LlmOther,
 }
 
@@ -193,17 +204,25 @@ pub async fn get_background_job_queue_status(
     // AppState::jobworkerp(): Remote browse mode intentionally redirects that
     // shared client to the configured remote service.
     let local_url = local_jobworkerp_url(state.sidecars.current_endpoints())?;
-    let handle = JobworkerpHandle::connect(&local_url).await?;
+    let handle = state.local_jobworkerp(&local_url).await?;
 
     let summary_names = summary_worker_names();
     let personality_names = personality_worker_names();
     let reflection_names = reflection_worker_names();
-    let (summary_ids, personality_ids, reflection_ids) = tokio::try_join!(
+    let (summary_ids, personality_ids, reflection_ids, issue_resolution_ids) = tokio::try_join!(
         worker_ids(&handle, &summary_names),
         worker_ids(&handle, &personality_names),
         worker_ids(&handle, &reflection_names),
+        worker_ids(&handle, &ISSUE_RESOLUTION_WORKER_NAMES),
     )?;
-    let (embedding_counts, summary_counts, personality_counts, reflection_counts, total_counts) = tokio::try_join!(
+    let (
+        embedding_counts,
+        summary_counts,
+        personality_counts,
+        reflection_counts,
+        issue_resolution_counts,
+        total_counts,
+    ) = tokio::try_join!(
         async {
             let counts = try_join_all(
                 EMBEDDING_CHANNELS
@@ -216,6 +235,7 @@ pub async fn get_background_job_queue_status(
         count_workers(&handle, summary_ids),
         count_workers(&handle, personality_ids),
         count_workers(&handle, reflection_ids),
+        count_workers(&handle, issue_resolution_ids),
         count_by_condition(&handle, None, None),
     )?;
 
@@ -224,6 +244,7 @@ pub async fn get_background_job_queue_status(
         &summary_counts,
         &personality_counts,
         &reflection_counts,
+        &issue_resolution_counts,
     ]
     .into_iter()
     .cloned()
@@ -245,6 +266,10 @@ pub async fn get_background_job_queue_status(
         BackgroundJobQueueRow {
             kind: BackgroundTaskKind::Reflection,
             counts: reflection_counts,
+        },
+        BackgroundJobQueueRow {
+            kind: BackgroundTaskKind::IssueResolution,
+            counts: issue_resolution_counts,
         },
         BackgroundJobQueueRow {
             kind: BackgroundTaskKind::LlmOther,
@@ -328,15 +353,16 @@ mod tests {
     }
 
     #[test]
-    fn summary_worker_names_cover_batch_and_period_pipeline() {
+    fn summary_worker_names_cover_batch_and_period_workers() {
         let names = summary_worker_names();
         assert!(names.contains(&"memories-summarize-batch".to_string()));
-        assert!(names.contains(&"memories-summaries-pipeline".to_string()));
         assert!(names.contains(&"memories-daily-summary-batch".to_string()));
         assert!(names.contains(&"memories-weekly-summary-batch".to_string()));
         assert!(names.contains(&"memories-monthly-summary-batch".to_string()));
+        assert!(names.contains(&"memories-thread-group-summary-batch".to_string()));
         for language in super::super::SUPPORTED_LANGUAGES {
             assert!(names.contains(&format!("memories-thread-summary-single-{language}")));
+            assert!(names.contains(&format!("memories-thread-group-summary-single-{language}")));
             assert!(names.contains(&format!("memories-daily-work-summary-single-{language}")));
             assert!(names.contains(&format!("memories-weekly-work-summary-single-{language}")));
             assert!(names.contains(&format!("memories-monthly-work-summary-single-{language}")));
@@ -363,11 +389,32 @@ mod tests {
     }
 
     #[test]
+    fn issue_resolution_worker_names_cover_every_resolution_worker() {
+        assert_eq!(
+            ISSUE_RESOLUTION_WORKER_NAMES,
+            [
+                "lookback-thread-issue-resolution",
+                "lookback-thread-issue-resolution-manual",
+                "lookback-thread-group-issue-resolution",
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_resolution_kind_serializes_for_the_settings_card() {
+        assert_eq!(
+            serde_json::to_value(BackgroundTaskKind::IssueResolution).unwrap(),
+            "issue_resolution"
+        );
+    }
+
+    #[test]
     fn local_jobworkerp_url_uses_live_sidecar_endpoint() {
         let endpoints = crate::sidecar::SidecarEndpoints {
-            jobworkerp_port: 19_000,
+            jobworkerp_port: Some(19_000),
+            issue_tracker_port: None,
             memories_port: Some(19_001),
-            conductor_port: 19_002,
+            conductor_port: Some(19_002),
             mcp_server_port: None,
         };
         assert_eq!(

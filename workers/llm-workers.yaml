@@ -21,13 +21,13 @@
 #                   needs (would otherwise deadlock).
 #   llm_batch     — concurrency 2. Batch workflows that fan out into
 #                   many `llm_workflow` jobs.
-#   llm_pipeline  — concurrency 1. The summaries-pipeline parent that
-#                   chains the per-thread/daily/weekly/monthly batches
-#                   sequentially. Separate channel from `llm_batch` so
-#                   it never competes for its children's slots.
 #   llm_periodic  — concurrency 1. Conductor-triggered Lookback periodic
 #                   wrapper. Serialized so scheduled runs do not stack up
 #                   and starve manual generation.
+#   thread_group_summary — concurrency 1. Serializes ThreadGroup aggregation
+#                   regardless of whether it originates from import, manual,
+#                   or periodic execution. It remains separate from
+#                   `llm_batch` because it invokes per-thread child batches.
 #
 # `use_static: true` keeps the loaded model resident across jobs so
 # the second and later jobs avoid the multi-second cold-start cost.
@@ -160,6 +160,16 @@ workers:
       workflow_data:
         $file: workflows/thread-summary/thread-summary-batch.yaml
 
+  - name: memories-thread-group-summary-batch
+    description: "Aggregates persisted per-thread summaries into summaries for active ThreadGroups without issue extraction."
+    runner: WORKFLOW
+    response_type: DIRECT
+    broadcast_results: true
+    channel: thread_group_summary
+    settings:
+      workflow_data:
+        $file: workflows/thread-group-summary/thread-group-summary-batch.yaml
+
   - name: memories-personality-batch
     description: "Extracts user personality signals from selected conversation threads and optionally merges them into a profile."
     runner: WORKFLOW
@@ -217,31 +227,6 @@ workers:
     settings:
       workflow_data:
         $file: workflows/monthly-work-summary/monthly-work-summary-batch.yaml
-
-  # ---- staged summaries pipeline parent ----
-  #
-  # Single entry point for the generate dialog's checkbox staging: chains
-  # per-thread → daily → weekly → monthly batches sequentially, each gated
-  # by a `run_<kind>` flag, with the lower layer's range derived from the
-  # top-most selected granularity (so a "weekly" run also produces the
-  # daily summaries weekly depends on). Stops on a *fatal* stage (every
-  # item failed) via `raise`; a partial success or a skip (nothing to do)
-  # lets the next stage run.
-  #
-  # `channel: llm_pipeline` (concurrency 1) keeps it OFF the `llm_batch`
-  # channel its children claim — sharing would deadlock (the parent holds
-  # the only batch slot while waiting for a child batch that can't start).
-  # DIRECT/broadcast contract identical to the batch parents above so the
-  # Tauri side can drain progress through enqueue_for_stream.
-  - name: memories-summaries-pipeline
-    description: "Runs the staged summary pipeline, generating thread, daily, weekly, and monthly summaries as requested."
-    runner: WORKFLOW
-    response_type: DIRECT
-    broadcast_results: true
-    channel: llm_pipeline
-    settings:
-      workflow_data:
-        $file: workflows/summaries-pipeline/summaries-pipeline.yaml
 
   - name: memories-lookback-periodic-run
     description: "Runs a configured Lookback periodic task from conductor CronScheduler."

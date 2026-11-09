@@ -22,6 +22,7 @@ const report: SidecarStartReport = {
   memories_port: 9010,
   conductor_port: 9020,
   mcp_server_port: null,
+  issue_tracker_port: null,
   warnings: [],
 };
 
@@ -45,6 +46,7 @@ describe("readyStatusFrom", () => {
       memories_port: 9010,
       conductor_port: 9020,
       mcp_server_port: null,
+      issue_tracker_port: null,
     });
     expect(status.warnings).toEqual([]);
   });
@@ -56,6 +58,21 @@ describe("readyStatusFrom", () => {
     });
     expect(status.warnings).toHaveLength(1);
     expect(hasLlmInitFailure(status)).toBe(true);
+  });
+});
+
+describe("hasLlmInitFailure", () => {
+  const withKind = (kind: SidecarStatus["warnings"][number]["kind"]): SidecarStatus => ({
+    phase: "ready",
+    warnings: [{ kind, message: "m", detail: null }],
+  });
+
+  it("treats an unreachable remote jobworkerp as an LLM failure", () => {
+    expect(hasLlmInitFailure(withKind("remote_jobworkerp_unavailable"))).toBe(true);
+  });
+
+  it("leaves an unprepared remote jobworkerp to its readiness panel", () => {
+    expect(hasLlmInitFailure(withKind("remote_jobworkerp_unprepared"))).toBe(false);
   });
 });
 
@@ -169,7 +186,7 @@ describe("applySnapshot", () => {
     expect(applySnapshot(starting, emptySnapshot)).toBe(starting);
   });
 
-  it("marks only the starting screen while the database migration gate runs", () => {
+  it("marks only the starting screen while the database migration runs", () => {
     const next = applySnapshot(starting, {
       ready: null,
       failure: null,
@@ -194,9 +211,55 @@ describe("applySnapshot", () => {
     });
   });
 
-  it("does not override an already-ready status (event won the race)", () => {
+  it("refreshes an already-ready status from the runtime snapshot", () => {
     const ready = readyStatusFrom(report);
+    const warnings = [
+      {
+        kind: "issue_tracker_unavailable" as const,
+        message: "unavailable",
+        detail: "connection refused",
+      },
+    ];
+    const snapshot: SidecarStatusSnapshot = {
+      ...readySnapshot,
+      ready: {
+        ...report,
+        issue_tracker_port: null,
+        warnings,
+      },
+    };
+    expect(applySnapshot(ready, snapshot)).toMatchObject({
+      phase: "ready",
+      warnings,
+    });
+  });
+
+  it("keeps the previous ready object when the runtime snapshot is unchanged", () => {
+    // The status is polled every second; a fresh object each tick re-renders
+    // the whole app even though nothing changed.
+    const ready = applySnapshot(starting, readySnapshot);
     expect(applySnapshot(ready, readySnapshot)).toBe(ready);
+    const withAvailability: SidecarStatusSnapshot = {
+      ...readySnapshot,
+      issue_tracker_availability: {
+        endpoint_connected: true,
+        gateway_ready: true,
+        mutation_ready: true,
+        reason: null,
+      },
+    };
+    const available = applySnapshot(ready, withAvailability);
+    expect(applySnapshot(available, structuredClone(withAvailability))).toBe(available);
+  });
+
+  it("returns a new ready object when the runtime snapshot changes", () => {
+    const ready = applySnapshot(starting, readySnapshot);
+    const changed = applySnapshot(ready, {
+      ...readySnapshot,
+      ready: { ...report, memories_port: 9011 },
+    });
+    expect(changed).not.toBe(ready);
+    expect(changed.endpoints?.memories_port).toBe(9011);
   });
 
   it("does not override an error status", () => {
@@ -241,11 +304,31 @@ describe("useSidecarStatus polling", () => {
     vi.clearAllMocks();
   });
 
-  it("polls serially while starting and stops after ready", async () => {
+  it("keeps polling after ready and refreshes runtime warnings", async () => {
     vi.useFakeTimers();
+    const unavailableSnapshot: SidecarStatusSnapshot = {
+      ...readySnapshot,
+      ready: {
+        ...report,
+        issue_tracker_port: null,
+        warnings: [
+          {
+            kind: "issue_tracker_unavailable",
+            message: "health check failed",
+            detail: "connection refused",
+          },
+        ],
+      },
+    };
+    const recoveredSnapshot: SidecarStatusSnapshot = {
+      ...readySnapshot,
+      ready: { ...report, issue_tracker_port: 9030 },
+    };
     mockedGetSidecarStatus
       .mockResolvedValueOnce(emptySnapshot)
-      .mockResolvedValueOnce(readySnapshot);
+      .mockResolvedValueOnce(readySnapshot)
+      .mockResolvedValueOnce(unavailableSnapshot)
+      .mockResolvedValueOnce(recoveredSnapshot);
 
     const { result } = renderHook(() => useSidecarStatus());
     await act(async () => {});
@@ -260,7 +343,21 @@ describe("useSidecarStatus polling", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
-    expect(mockedGetSidecarStatus).toHaveBeenCalledTimes(2);
+    expect(mockedGetSidecarStatus).toHaveBeenCalledTimes(3);
+    expect(result.current.warnings).toEqual([
+      {
+        kind: "issue_tracker_unavailable",
+        message: "health check failed",
+        detail: "connection refused",
+      },
+    ]);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(mockedGetSidecarStatus).toHaveBeenCalledTimes(4);
+    expect(result.current.warnings).toEqual([]);
+    expect(result.current.endpoints?.issue_tracker_port).toBe(9030);
   });
 
   it("stops polling after an error snapshot", async () => {

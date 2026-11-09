@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package llm_memory.service;
 
+import "llm_memory/data/embedding_space.proto";
 import "llm_memory/data/highlight.proto";
 import "llm_memory/data/thread.proto";
 import "llm_memory/data/memory_vector.proto";
@@ -68,21 +69,23 @@ message ThreadSearchResult {
 
 // ===== Thread embedding management =====
 
-message UpsertThreadEmbeddingRequest {
-  // Target Thread ID
+// N-row upsert for a thread's description embedding. A thread now owns N
+// rows keyed by (thread_id, vector_kind, chunk_index), mirroring the
+// memory_vector schema. `vector_kind` is always "text" for threads (no
+// image/caption axis). `VectorRow` is reused from
+// service/memory_vector.proto. Server path:
+//   - rows non-empty -> delete existing rows whose vector_kind is in
+//     replace_kinds, then insert rows.
+//   - rows empty + replace_kinds non-empty -> stale-delete only.
+//   - replace_kinds empty -> InvalidArgument.
+message BatchUpsertThreadEmbeddingsRowsRequest {
   int64 thread_id = 1;
-  // Embedding vector
-  llm_memory.data.EmbeddingVector embedding = 2;
-  // Model name used for embedding
-  optional string embedding_model = 3;
-}
-
-message UpsertThreadEmbeddingResponse {
-  bool success = 1;
-}
-
-message BatchUpsertThreadEmbeddingsRequest {
-  repeated UpsertThreadEmbeddingRequest items = 1;
+  optional string embedding_model = 2;
+  // (thread_id, vector_kind in replace_kinds) is deleted before insert.
+  repeated string replace_kinds = 3;
+  repeated VectorRow rows = 4;
+  // Token of the generation request; see BatchUpsertEmbeddingsRequest.
+  optional llm_memory.data.DispatchToken token = 5;
 }
 
 message BatchUpsertThreadEmbeddingsResponse {
@@ -144,6 +147,9 @@ message ThreadIndexStatsResponse {
   llm_memory.data.FtsTokenizerKind fts_tokenizer = 7;
   optional uint32 fts_ngram_min = 8;
   optional uint32 fts_ngram_max = 9;
+  // Embedding space recorded on this table and any in-progress
+  // embedding migration marker.
+  llm_memory.data.EmbeddingSpaceRecord embedding_space = 10;
 }
 
 // ===== Thread count requests =====
@@ -159,12 +165,18 @@ message ThreadSearchCountRequest {
   // Required for VECTOR / HYBRID.
   repeated llm_memory.data.EmbeddingVector query_vectors = 4;
   optional llm_memory.data.HybridSearchOptions hybrid_options = 5;
-  // Thread FTS uses a fixed column ("description"); fts_options is
-  // accepted for symmetry but currently has no effect.
+  // Thread FTS uses a fixed column (the per-chunk "content"); fts_options
+  // is accepted for symmetry but currently has no effect.
   optional llm_memory.data.FullTextSearchOptions fts_options = 6;
 }
 
 message ThreadSearchCountResponse {
+  // N-row note: unlike MemorySearchCountResponse (which reports
+  // `total == hard_cap` when truncated), the thread TEXT / VECTOR count
+  // de-dups chunk rows to distinct threads, so when the ANN/FTS row
+  // `limit` clips the stream `total` is the distinct-thread LOWER bound
+  // seen so far (not `hard_cap`). A single long thread saturating the row
+  // limit therefore reports `(1, true)` instead of `(hard_cap, true)`.
   uint64 total = 1;
   bool is_truncated = 2;
   CountSearchMode mode = 3;
@@ -178,15 +190,13 @@ service ThreadVectorService {
   rpc SearchByText(ThreadTextSearchRequest) returns (stream ThreadSearchResult);
   // Hybrid search (vector + keyword fusion)
   rpc HybridSearch(ThreadHybridSearchRequest) returns (stream ThreadSearchResult);
-  // Upsert embedding for a thread description
-  rpc UpsertEmbedding(UpsertThreadEmbeddingRequest) returns (UpsertThreadEmbeddingResponse);
-  // Batch upsert embeddings
-  rpc BatchUpsertEmbeddings(BatchUpsertThreadEmbeddingsRequest) returns (BatchUpsertThreadEmbeddingsResponse);
-  // Re-enqueue embedding jobs from RDB after a manual LanceDB reset.
-  rpc RedispatchEmbeddings(ThreadRedispatchEmbeddingsRequest) returns (ThreadRedispatchEmbeddingsResponse);
+  // N-row upsert of a thread description embedding (chunked).
+  rpc BatchUpsertEmbeddingsRows(BatchUpsertThreadEmbeddingsRowsRequest) returns (BatchUpsertThreadEmbeddingsResponse);
   // Reconcile RDB and LanceDB: removes orphaned LanceDB entries and reports threads
-  // missing from LanceDB. Missing threads require re-embedding via BatchUpsertEmbeddings.
+  // missing from LanceDB. Missing threads require re-embedding via RedispatchEmbeddings.
   rpc RebuildIndex(ThreadRebuildIndexRequest) returns (ThreadRebuildIndexResponse);
+  // Re-enqueue thread embedding jobs from RDB after a manual LanceDB reset.
+  rpc RedispatchEmbeddings(ThreadRedispatchEmbeddingsRequest) returns (ThreadRedispatchEmbeddingsResponse);
   // Get index statistics
   rpc GetIndexStats(ThreadGetIndexStatsRequest) returns (ThreadIndexStatsResponse);
   // Count matches for a given search filter.

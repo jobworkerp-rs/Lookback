@@ -47,6 +47,7 @@ async fn purge_stops_sidecars_and_removes_root() {
             lookback_tauri_lib::data::paths::llm_workers_yaml()
                 .expect("workers/llm-workers.yaml resolvable via CARGO_MANIFEST_DIR"),
         ],
+        issue_tracker_server_bin: None,
         function_set_yaml_paths: Vec::new(),
         reflection_dispatch_enabled: true,
         // Purge test only verifies stop+rm; keep embedding off so it doesn't

@@ -1,12 +1,17 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CATEGORY_GROUP_KEY, groupByPrefix } from "@/lib/labelPrefix";
-import type { LabelMatch, LabelWithCount } from "@/types/api";
+import type { LabelMatch } from "@/types/api";
+
+export interface LabelFilterItem {
+  label: string;
+  count?: number;
+}
 
 export interface LabelFilterProps {
-  labels: LabelWithCount[];
+  labels: LabelFilterItem[];
   /** When set, narrows the rendered list to selected ∪ co-occurring labels. */
-  coOccurringLabels?: LabelWithCount[];
+  coOccurringLabels?: LabelFilterItem[];
   selected: string[];
   match: LabelMatch;
   onToggle: (label: string) => void;
@@ -14,6 +19,7 @@ export interface LabelFilterProps {
   onSetMatch: (m: LabelMatch) => void;
   /** Hides the AND/OR control when the embedding page fixes the match mode. */
   showMatchToggle?: boolean;
+  onClear?: () => void;
   isLoading?: boolean;
 }
 
@@ -26,6 +32,7 @@ export function LabelFilter({
   onToggleMany,
   onSetMatch,
   showMatchToggle = true,
+  onClear,
   isLoading,
 }: LabelFilterProps) {
   const { t } = useTranslation();
@@ -39,13 +46,13 @@ export function LabelFilter({
   // co-occurring response, so selected labels keep their distinct count.
   const effective = useMemo(() => {
     if (!coOccurringLabels) return labels;
-    const coCount = new Map(coOccurringLabels.map((l) => [l.label, l.thread_count]));
-    const out: LabelWithCount[] = [];
+    const coCount = new Map(coOccurringLabels.map((l) => [l.label, l.count]));
+    const out: LabelFilterItem[] = [];
     for (const l of labels) {
       if (selectedSet.has(l.label)) {
         out.push(l);
       } else if (coCount.has(l.label)) {
-        out.push({ label: l.label, thread_count: coCount.get(l.label) ?? 0 });
+        out.push({ label: l.label, count: coCount.get(l.label) });
       }
     }
     return out;
@@ -67,37 +74,53 @@ export function LabelFilter({
       open={open}
       onToggle={(e) => setLocalOpen((e.currentTarget as HTMLDetailsElement).open)}
     >
-      <summary className="label-filter-fold-summary">
+      <summary className="label-filter-fold-summary" title={selected.join(", ") || undefined}>
         <span>{t("labelFilter.title", { count: selected.length })}</span>
-        {canSetMatch && (
-          <span className="segment label-match-toggle">
+        <span className="label-filter-summary-actions">
+          {canSetMatch && (
+            <span className="segment label-match-toggle">
+              <button
+                type="button"
+                className={`segment-btn${match === "any" ? " active" : ""}`}
+                aria-pressed={match === "any"}
+                onClick={(e) => {
+                  // Clicks inside <summary> toggle the <details> by default.
+                  e.preventDefault();
+                  onSetMatch("any");
+                }}
+                title={t("labelFilter.matchAnyHint")}
+              >
+                OR
+              </button>
+              <button
+                type="button"
+                className={`segment-btn${match === "all" ? " active" : ""}`}
+                aria-pressed={match === "all"}
+                onClick={(e) => {
+                  e.preventDefault();
+                  onSetMatch("all");
+                }}
+                title={t("labelFilter.matchAllHint")}
+              >
+                AND
+              </button>
+            </span>
+          )}
+          {selected.length > 0 && onClear && (
             <button
               type="button"
-              className={`segment-btn${match === "any" ? " active" : ""}`}
-              aria-pressed={match === "any"}
+              className="label-filter-clear"
               onClick={(e) => {
                 // Clicks inside <summary> toggle the <details> by default.
                 e.preventDefault();
-                onSetMatch("any");
+                setLocalOpen(false);
+                onClear();
               }}
-              title={t("labelFilter.matchAnyHint")}
             >
-              OR
+              {t("labelFilter.clear")}
             </button>
-            <button
-              type="button"
-              className={`segment-btn${match === "all" ? " active" : ""}`}
-              aria-pressed={match === "all"}
-              onClick={(e) => {
-                e.preventDefault();
-                onSetMatch("all");
-              }}
-              title={t("labelFilter.matchAllHint")}
-            >
-              AND
-            </button>
-          </span>
-        )}
+          )}
+        </span>
       </summary>
       <div className="label-filter-body">
         {groups.map((group) => {
@@ -131,7 +154,9 @@ export function LabelFilter({
                       onClick={() => onToggle(l.label)}
                     >
                       <span>{l.label}</span>
-                      <span className="label-filter-chip-count">({l.thread_count})</span>
+                      {l.count !== undefined && (
+                        <span className="label-filter-chip-count">({l.count})</span>
+                      )}
                     </button>
                   );
                 })}

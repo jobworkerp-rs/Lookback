@@ -61,6 +61,7 @@ async fn streaming_dispatch_against_live_sidecars() {
             lookback_tauri_lib::data::paths::llm_workers_yaml()
                 .expect("workers/llm-workers.yaml resolvable via CARGO_MANIFEST_DIR"),
         ],
+        issue_tracker_server_bin: None,
         function_set_yaml_paths: Vec::new(),
         reflection_dispatch_enabled: true,
         // Exercise the full embedding pipeline (Hybrid / intent search need
@@ -85,12 +86,10 @@ async fn streaming_dispatch_against_live_sidecars() {
 
     // Sub-test 1: register_workers is idempotent — sidecar already ran
     // register once, calling it again should re-upsert the same names.
-    let handle = JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
-    .await
-    .expect("connect");
+    let handle =
+        JobworkerpHandle::connect(&report.endpoints.jobworkerp_url().expect("local jobworkerp"))
+            .await
+            .expect("connect");
     let registered = handle
         .register_workers_from_yaml(&lookback_tauri_lib::data::paths::llm_workers_yaml().unwrap())
         .await
@@ -150,15 +149,37 @@ async fn streaming_dispatch_against_live_sidecars() {
         "expected not-found error, got: {err}"
     );
 
-    // Sub-test 4: client-side query embedding via the embedding worker.
-    // memories registered `memories-mm-embedding` because
-    // auto_embedding_enabled = true. A non-empty query must return a
-    // non-empty vector — the building block for Hybrid search.
+    // Sub-test 4: use the registered worker of the current space, never a
+    // fixed name that could belong to a previous configuration.
+    let memories_url = report.endpoints.memories_url().expect("memories endpoint");
+    let channel = lookback_tauri_lib::grpc::connect(&memories_url)
+        .await
+        .expect("memories connection");
+    let mut spaces = lookback_tauri_lib::grpc::proto::llm_memory::service::embedding_space_service_client::EmbeddingSpaceServiceClient::new(channel);
+    let worker = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let space = spaces
+                .get_embedding_space(lookback_tauri_lib::grpc::proto::llm_memory::service::GetEmbeddingSpaceRequest {})
+                .await
+                .expect("space lookup")
+                .into_inner();
+            if space.registration_state == 1 {
+                assert!(!space.mm_embedding_worker_name.is_empty());
+                break space.mm_embedding_worker_name;
+            }
+            assert_eq!(space.registration_state, 2, "known registration state");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("worker registration timeout");
     let vec = tokio::time::timeout(
         Duration::from_secs(120),
         lookback_tauri_lib::jobworkerp::embedding::embed_query(
             &handle,
+            &worker,
             "how do I fix a flaky integration test",
+            None,
         ),
     )
     .await

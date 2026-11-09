@@ -26,6 +26,7 @@
   --accent-soft: rgba(0, 122, 255, 0.12);
   --success: #34c759;
   --warning: #ff9500;
+  --warning-text: #754300;
   --danger: #ff3b30;
   --indigo: #5856d6;
   --teal: #5ac8fa;
@@ -76,6 +77,8 @@
   --accent-soft: rgba(10, 132, 255, 0.18);
   --success: #30d158;
   --warning: #ff9f0a;
+  /* Warning callouts need a readable foreground on the dark amber fill. */
+  --warning-text: #ffd38a;
   --danger: #ff453a;
   --indigo: #5e5ce6;
   --teal: #64d2ff;

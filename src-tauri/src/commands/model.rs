@@ -154,24 +154,9 @@ fn required_llm_files(rt: &super::llm_settings::LocalRuntime) -> Vec<String> {
     files
 }
 
-/// Resolve the embedding model identity from `embedding-settings.json` (the
-/// user's preset / custom choice). The settings file is authoritative — the
-/// committed `auto-embedding-workers.yaml` is fallback only and would always
-/// resolve to the original `Qwen/Qwen3-VL-Embedding-2B` regardless of what
-/// the user picked, making the Settings card mis-report "ready" against a
-/// preset whose weights aren't downloaded yet. Mirrors `llm_identity`'s
-/// settings-first design.
-///
-/// Uses the env-aware projection (`resolve_embedding_runtime_with_env`)
-/// so a dev `LOOKBACK_EMBEDDING_MODEL_ID` override — which the sidecar
-/// lifecycle DOES respect when no preset is saved — also drives the
-/// readiness scan. Without this, the override loads a different model
-/// than the readiness card filters for, and the card stays stuck on
-/// `preparing` even though the right weights are present.
-fn embedding_identity(data: &crate::data::DataPaths) -> ModelIdentity {
-    embedding_identity_with_env(data, super::process_env_lookup)
-}
-
+/// Resolve the embedding model identity from the persisted settings and the
+/// Sidecars instance's external env snapshot. Tests inject an explicit lookup
+/// to keep this projection independent of process-global environment state.
 fn embedding_identity_with_env<F>(data: &crate::data::DataPaths, env_lookup: F) -> ModelIdentity
 where
     F: Fn(&str) -> Option<String>,
@@ -192,9 +177,17 @@ where
 /// Missing directory yields an empty list (the cache isn't created yet).
 /// Used for both `gguf` (LLM weights) and `safetensors` (embedding weights);
 /// the resolved files live in `snapshots/<rev>/` as symlinks into `blobs/`.
+#[cfg(test)]
 fn list_model_files(dir: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_files(dir, ext, &mut out, 0);
+    let [out] = list_model_files_by_ext(dir, [ext]);
+    out
+}
+
+/// One walk of the cache that returns the matches per extension, in the same
+/// order separate `list_model_files` calls would.
+fn list_model_files_by_ext<const N: usize>(dir: &Path, exts: [&str; N]) -> [Vec<PathBuf>; N] {
+    let mut out = std::array::from_fn(|_| Vec::new());
+    collect_files(dir, &exts, &mut out, 0);
     out
 }
 
@@ -250,7 +243,7 @@ fn filter_files_for_required_names(files: Vec<PathBuf>, required_files: &[String
     }
 }
 
-fn collect_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>, depth: usize) {
+fn collect_files(dir: &Path, exts: &[&str], out: &mut [Vec<PathBuf>], depth: usize) {
     // 5 covers the multi-part GGUF layout where shards live one level
     // deeper than the usual `snapshots/<rev>/<file>` shape (e.g.
     // `…/snapshots/<rev>/UD-IQ4_XS/Qwen3.5-122B-…-00001-of-00003.gguf`).
@@ -285,19 +278,19 @@ fn collect_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>, depth: usize) {
                 continue;
             }
             if depth < MAX_DEPTH {
-                collect_files(&path, ext, out, depth + 1);
+                collect_files(&path, exts, out, depth + 1);
             }
         } else if (ft.is_file() || ft.is_symlink())
-            && path
+            && let Some(index) = path
                 .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+                .and_then(|e| exts.iter().position(|ext| e.eq_ignore_ascii_case(ext)))
         {
             // A plain file OR a symlink whose NAME ends in `ext`. For the
             // symlink we match on the link name only — we deliberately do not
             // `stat` the target to confirm it resolves (that's the crash), and
             // the HF cache guarantees a `snapshots/` symlink points at a
             // downloaded blob anyway.
-            out.push(path);
+            out[index].push(path);
         }
     }
 }
@@ -322,8 +315,7 @@ pub async fn get_model_status(state: State<'_, AppState>) -> AppResult<ModelStat
     // the live Metal-mmap'd GGUF it trips a macOS pmap_recycle_page kernel panic
     // (see ai-docs/external-to-local-llm-crash-investigation.md).
     let (gguf, safetensors) = tauri::async_runtime::spawn_blocking(move || {
-        let g = list_model_files(&models_dir, "gguf");
-        let s = list_model_files(&models_dir, "safetensors");
+        let [g, s] = list_model_files_by_ext(&models_dir, ["gguf", "safetensors"]);
         (g, s)
     })
     .await
@@ -342,7 +334,8 @@ pub async fn get_model_status(state: State<'_, AppState>) -> AppResult<ModelStat
     let last_error = state.sidecars.llm_blocking_error();
     // External LLM mode: no local model to download — always ready.
     let llm_id = llm_identity(&state.data);
-    let embedding_id = embedding_identity(&state.data);
+    let embedding_id =
+        embedding_identity_with_env(&state.data, |key| state.sidecars.embedding_env_lookup(key));
     let is_external = state.is_external_llm();
     let (llm_files, llm_ready, llm_error) = if is_external {
         // Sidecars still need to be up for the genai worker to function.
@@ -593,7 +586,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data = crate::data::DataPaths::with_root(tmp.path().to_path_buf());
         let id = embedding_identity_with_env(&data, |name| {
-            (name == "LOOKBACK_EMBEDDING_MODEL_ID").then(|| "dev/dev-model".to_string())
+            (name == "LOOKBACK_EMBEDDING_MODEL_ID").then(|| "dev/dev-model".into())
         });
         assert_eq!(id.name.as_deref(), Some("dev/dev-model"));
         assert_eq!(id.repo.as_deref(), Some("dev/dev-model"));
@@ -615,7 +608,7 @@ mod tests {
         )
         .unwrap();
         let id = embedding_identity_with_env(&data, |name| {
-            (name == "LOOKBACK_EMBEDDING_MODEL_ID").then(|| "stale/override".to_string())
+            (name == "LOOKBACK_EMBEDDING_MODEL_ID").then(|| "stale/override".into())
         });
         assert_eq!(id.name.as_deref(), Some("Qwen/Qwen3-Embedding-0.6B"));
     }
@@ -633,6 +626,25 @@ mod tests {
         // Both the nested .gguf and the case-insensitive top-level .GGUF
         // are detected; the .txt is ignored.
         assert_eq!(found.len(), 2, "found: {found:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn one_walk_splits_files_exactly_like_separate_walks() {
+        let dir = std::env::temp_dir().join(format!("lookback-split-test-{}", std::process::id()));
+        let snap = dir.join("models--org--name").join("snapshots").join("rev");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        std::fs::write(snap.join("a.gguf"), b"x").unwrap();
+        std::fs::write(snap.join("b.SAFETENSORS"), b"x").unwrap();
+        std::fs::write(dir.join("blobs").join("hidden.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+
+        let [gguf, safetensors] = list_model_files_by_ext(&dir, ["gguf", "safetensors"]);
+        assert_eq!(gguf, list_model_files(&dir, "gguf"));
+        assert_eq!(safetensors, list_model_files(&dir, "safetensors"));
+        assert_eq!((gguf.len(), safetensors.len()), (1, 1));
 
         std::fs::remove_dir_all(&dir).ok();
     }

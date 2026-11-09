@@ -15,9 +15,12 @@ import type { SummariesFocus } from "@/pages/Summaries";
  * - `open-summaries-focus`: the chip pointed at a period (daily / weekly /
  *   monthly) summary, so jump within the Summaries tab to the cited
  *   calendar card. Mirrors the `Chat` tab's `period_summary` deep-link.
+ * - `open-thread-group`: the chip pointed at a group summary, so open the
+ *   owning group's lineage detail.
  */
 export type SummaryRefNavTarget =
   | { kind: "open-thread"; open: OpenThreadState }
+  | { kind: "open-thread-group"; groupId: string }
   | { kind: "open-summaries-focus"; focus: SummariesFocus };
 
 /**
@@ -48,6 +51,10 @@ export async function resolveSummaryRefNavigation(
     const thread = synthesizeThreadSummary({ id: threadId });
     const highlight = await resolveThreadHighlight(threadId, ref.memory_id);
     return { kind: "open-thread", open: { thread, highlight } };
+  }
+
+  if (ref.kind === "thread-group") {
+    return ref.group_id ? { kind: "open-thread-group", groupId: ref.group_id } : null;
   }
 
   if (ref.kind && ref.period_key) {

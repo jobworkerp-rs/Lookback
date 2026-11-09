@@ -5,8 +5,13 @@
 # ONLY prompts (`prompts/<role>.<lang>.txt`) are machine-copied — they are
 # LLM-backend-agnostic, so a verbatim copy is safe. The single/batch YAML are
 # NOT copied: agent-app keeps a local-merged variant (LLM call stays on
-# `workerName: memories-llm`, batch keeps its progress-report steps), so those
-# are hand-maintained. Use `diff-memories-singles.sh` to review YAML drift.
+# `workerName: memories-llm`, plus issue-tracking steps), so those are
+# hand-maintained. Use `diff-memories-singles.sh` to review YAML drift.
+#
+# Features in HAND_MERGED_FEATURES (scripts/lib/hand-merged-features.sh)
+# carry agent-app prompt additions (the `has_unfinished_issue_candidates`
+# schema field), so a verbatim copy would drop them; they are skipped here and
+# reviewed with diff-memories-singles.sh.
 #
 # Usage: scripts/sync-memories-prompts.sh [MEMORIES_REPO_ROOT]
 #   MEMORIES_REPO_ROOT defaults to ../memories (sibling of agent-app).
@@ -28,6 +33,7 @@ fi
 # Generation features whose prompts live under workers/<feature>/prompts/.
 FEATURES=(
   thread-summary
+  thread-group-summary
   thread-reflection
   personality
   daily-work-summary
@@ -35,7 +41,22 @@ FEATURES=(
   monthly-work-summary
 )
 
+# shellcheck source=lib/hand-merged-features.sh
+source "${SCRIPT_DIR}/lib/hand-merged-features.sh"
+
+is_hand_merged() {
+  local feature="$1" merged
+  for merged in "${HAND_MERGED_FEATURES[@]}"; do
+    [[ "${merged}" == "${feature}" ]] && return 0
+  done
+  return 1
+}
+
 for feature in "${FEATURES[@]}"; do
+  if is_hand_merged "${feature}"; then
+    echo "skip ${feature}/prompts (hand-merged; review with diff-memories-singles.sh)"
+    continue
+  fi
   src="${SRC_BASE}/${feature}/prompts"
   dst="${DST_BASE}/${feature}/prompts"
   if [[ ! -d "${src}" ]]; then

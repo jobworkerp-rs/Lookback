@@ -1,0 +1,443 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: cross-thread-issue-resolution
+  version: "1.0.0"
+
+# Resolves review candidates from later threads other than their source.
+# "auto" runs once per saved thread summary and continues from the last
+# automatic run that finished without a transient failure; "manual" is the
+# operator's backfill and leaves that position alone.
+input:
+  schema:
+    document:
+      type: object
+      required: [user_id, memories_grpc_host, memories_grpc_port, issue_tracker_grpc_host, issue_tracker_grpc_port, policy_json]
+      properties:
+        user_id: { type: integer, minimum: 1 }
+        memories_grpc_host: { type: string }
+        memories_grpc_port: { type: integer }
+        memories_grpc_tls: { type: boolean, default: false }
+        issue_tracker_grpc_host: { type: string }
+        issue_tracker_grpc_port: { type: integer }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+        policy_json: { type: string, default: "" }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        mode: { type: string, enum: ["auto", "manual"], default: "auto" }
+        # Manual runs only: candidates and threads updated after this time.
+        since_ms: { type: integer, minimum: 0, default: 0 }
+        # Judge and report, but write nothing and record no position.
+        dry_run: { type: boolean, default: false }
+        # Manual runs only: judge just these candidates and at most this many
+        # (0 = all), e.g. to try a change on a few before the whole backlog.
+        candidate_ids: { type: array, items: { type: string }, default: [] }
+        max_candidates: { type: integer, minimum: 0, default: 0 }
+        search_limit: { type: integer, minimum: 1, default: 20 }
+        search_score_min: { type: number, default: 0 }
+        initial_lookback_ms: { type: integer, minimum: 0, default: 604800000 }
+        clock_skew_ms: { type: integer, minimum: 0, default: 300000 }
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  - initState:
+      set:
+        policy: "${ (try (($workflow.input.policy_json // \"\") | fromjson)) // {} }"
+        run_started_at: "${ now * 1000 | floor }"
+        mode: '${ $workflow.input.mode // "auto" }'
+        dry_run: "${ $workflow.input.dry_run // false }"
+        resolution_mode: '${ "DISABLED" }'
+        cross_thread_resolution_mode: '${ "DISABLED" }'
+        resolution_min_confidence: "${ 1.0 }"
+        last_watermark_at: "${ null }"
+        watermark_worker_id: "${ null }"
+        since_ms: "${ 0 }"
+        updated_threads: "${ [] }"
+        updated_thread_count: "${ 0 }"
+        thread_page_rows: "${ [] }"
+        thread_pages_exhausted: "${ false }"
+        review_listing: "${ null }"
+        manager_contract: "${ {} }"
+        manager_store_identity: "${ {} }"
+        scoped_rows: "${ [] }"
+        candidate_count: "${ 0 }"
+        unmatched_count: "${ 0 }"
+        applied_candidates: "${ [] }"
+        dry_run_candidates: "${ [] }"
+        kept_candidates: "${ [] }"
+        evaluations: "${ [] }"
+        contradicted_candidates: "${ [] }"
+        protected_candidates: "${ [] }"
+        skipped_candidates: "${ [] }"
+        conflicted_candidates: "${ [] }"
+        failed_candidates: "${ [] }"
+        watermark_written: "${ false }"
+        last_error: "${ null }"
+
+  - normalizePolicy:
+      set:
+        resolution_mode: '${ $policy.resolution_mode // "DISABLED" }'
+        cross_thread_resolution_mode: '${ $policy.cross_thread_resolution_mode // "DISABLED" }'
+        resolution_min_confidence: "${ (($policy.resolution_min_confidence // 1.0) | tonumber) }"
+
+  # Automatic runs need both switches. A manual dry run is how the operator
+  # evaluates the backlog before switching the automatic runs on.
+  - skipIfDisabled:
+      if: >-
+        ${ if $mode == "auto"
+           then ($resolution_mode != "APPLY") or ($cross_thread_resolution_mode != "APPLY")
+           else ($dry_run | not) and ($resolution_mode != "APPLY") end }
+      set:
+        skipped_candidates: '${ [{ candidate_id: "disabled", reason: "disabled" }] }'
+      export:
+        as:
+          result: "skipped: disabled"
+      then: exit
+
+  # A workflow that faults still ends as a successful job, so the position is
+  # an explicit marker job enqueued only after a clean run (writeWatermark).
+  - readWatermark:
+      if: '${ $mode == "auto" }'
+      do:
+        - findWatermarkWorker:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "%{LOOKBACK_JOBWORKERP_GRPC_HOST:-127.0.0.1}"
+                  port: ${ %{LOOKBACK_JOBWORKERP_GRPC_PORT:-9000} }
+                  tls: ${ %{LOOKBACK_JOBWORKERP_GRPC_TLS:-false} }
+                  useReflection: true
+                arguments:
+                  method: "/jobworkerp.service.WorkerService/FindByName"
+                  json_body: '${ { name: "lookback-cross-thread-issue-resolution-watermark" } | tojson }'
+                  as_json: true
+            export:
+              as:
+                watermark_worker_id: "${ .jsonBody | fromjson | .data.id.value // null }"
+        - findLastWatermark:
+            if: "${ $watermark_worker_id != null }"
+            run:
+              function:
+                runnerName: GRPC
+                using: streaming
+                settings:
+                  host: "%{LOOKBACK_JOBWORKERP_GRPC_HOST:-127.0.0.1}"
+                  port: ${ %{LOOKBACK_JOBWORKERP_GRPC_PORT:-9000} }
+                  tls: ${ %{LOOKBACK_JOBWORKERP_GRPC_TLS:-false} }
+                  useReflection: true
+                arguments:
+                  method: "/jobworkerp.service.JobResultService/FindListBy"
+                  json_body: >-
+                    ${ { worker_ids: [{ value: $watermark_worker_id }],
+                         statuses: ["SUCCESS"],
+                         sort_by: "JOB_RESULT_SORT_FIELD_END_TIME",
+                         ascending: false,
+                         limit: 1 } | tojson }
+                  as_json: true
+            export:
+              as:
+                last_watermark_at: >-
+                  ${ (.jsonBody // "[]") | fromjson
+                     | (if type == "array" then .[0] else . end) // {}
+                     | (.data.uniqKey // .data.uniq_key // "")
+                     | if startswith("lookback-cross-thread-watermark:")
+                       then (try (sub("^lookback-cross-thread-watermark:"; "") | tonumber) catch null)
+                       else null end }
+
+  - computeSince:
+      set:
+        since_ms: >-
+          ${ if $mode == "manual" then ($workflow.input.since_ms // 0)
+             elif $last_watermark_at != null
+             then ([$last_watermark_at - ($workflow.input.clock_skew_ms // 300000), 0] | max)
+             else ([$run_started_at - ($workflow.input.initial_lookback_ms // 604800000), 0] | max) end }
+
+  # Saving a summary rewrites the thread description, which advances the
+  # thread's updated_at on the server. Other edits do too; that only adds
+  # threads whose judgement finds nothing new.
+  - listUpdatedThreads:
+      # From time zero every candidate is in range by itself.
+      if: "${ $since_ms > 0 }"
+      for:
+        each: thread_page_number
+        in: '${ [range(0; 1000)] }'
+      while: '${ $thread_pages_exhausted | not }'
+      do:
+        - readThreadPage:
+            run:
+              function:
+                runnerName: GRPC
+                using: streaming
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.ThreadService/FindThreadListByUserId"
+                  json_body: >-
+                    ${ { user_id: { value: $workflow.input.user_id },
+                         thread_updated_after: $since_ms,
+                         sort: "THREAD_LIST_SORT_UPDATED_DESC",
+                         limit: 200,
+                         offset: ($thread_page_number * 200) } | tojson }
+                  as_json: true
+            export:
+              as:
+                thread_page_rows: >-
+                  ${ (.jsonBody // "[]") | fromjson
+                     | if type == "array" then . else (.data // []) end }
+        - collectThreadPage:
+            set:
+              updated_threads: >-
+                ${ $updated_threads
+                   + ($thread_page_rows
+                      | map({ thread_id: ((.id.value // .id // "") | tostring),
+                              labels: (.data.labels // []) })) }
+              thread_pages_exhausted: "${ ($thread_page_rows | length) < 200 }"
+              thread_page_rows: "${ [] }"
+
+  - listReviewCandidates:
+      run:
+        function:
+          workerName: lookback-issue-resolution-review-candidates
+          arguments:
+            input: >-
+              ${ {
+                  issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                  issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                  issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                  correlation_prefix: "cross-thread-issue-resolution",
+                  correlation_key: ($run_started_at | tostring),
+                  source_thread_ids: null
+                } | tojson }
+      export:
+        as:
+          review_listing: '${ .output | fromjson }'
+
+  # A candidate is in range when it was created or updated since the start
+  # of the range (it may be resolved by any thread), or when a thread of its
+  # project was updated (that thread may resolve it). The candidate's labels
+  # are its extraction-time snapshot and may hold raw remote URLs, so they
+  # are normalized as in the Thread Group resolution; thread labels are
+  # canonical since the repo label migration and compared as they are.
+  # Only the label snapshot of the metadata is kept: every later jq
+  # evaluation copies the whole context.
+  - scopeCandidates:
+      set:
+        scoped_rows: >-
+          ${ def repo_identity:
+               sub("^repo:"; "") as $raw
+               | (if ($raw | test("^[A-Za-z][A-Za-z0-9+.-]*://"))
+                  then ($raw | index("://")) as $scheme_end
+                       | ($raw[0:$scheme_end] | ascii_downcase) as $scheme
+                       | $raw[($scheme_end + 3):] as $rest
+                       | (($rest | index("/")) // ($rest | length)) as $slash
+                       | ($rest[0:$slash] | split("@") | last // "" | split(":")) as $host_port
+                       | { host: (if (($host_port | length) == 2)
+                                      and (({ http: "80", https: "443", ssh: "22", git: "9418" }[$scheme]) != $host_port[1])
+                                  then $host_port[0] + ":" + $host_port[1]
+                                  else $host_port[0] end),
+                           path: $rest[$slash:] }
+                  elif ($raw | test("^[^/]*:")) and (($raw | test("^[^/]*:[0-9]+(/|$)")) | not)
+                  then ($raw | index(":")) as $colon
+                       | { host: ($raw[0:$colon] | split("@") | last), path: $raw[($colon + 1):] }
+                  else (($raw | index("/")) // ($raw | length)) as $slash
+                       | { host: $raw[0:$slash], path: $raw[$slash:] }
+                  end)
+               | ((.host // "") | ascii_downcase | rtrimstr(".")) + "/"
+                 + (.path | sub("^/+"; "") | sub("/+$"; "") | sub("\\.[Gg][Ii][Tt]$"; ""));
+             def candidate_keys:
+               { repos: (map(select(startswith("repo:")) | repo_identity
+                             | select(test("^[^/]+/.+"))) | unique),
+                 paths: (map(select(startswith("path:"))) | unique) };
+             def thread_keys:
+               { repos: (map(select(startswith("repo:")) | sub("^repo:"; "")
+                             | select(test("^[^/]+/.+"))) | unique),
+                 paths: (map(select(startswith("path:"))) | unique) };
+             def has_keys: ((.repos | length) > 0) or ((.paths | length) > 0);
+             def matches($a; $b):
+               if (($a.repos | length) > 0) and (($b.repos | length) > 0)
+               then any($a.repos[]; . as $repo | any($b.repos[]; . == $repo))
+               else any($a.paths[]; . as $path | any($b.paths[]; . == $path)) end;
+             [ $updated_threads[] | { thread_id, keys: (.labels | thread_keys) } | select(.keys | has_keys) ] as $threads
+             | ($workflow.input.candidate_ids // []) as $only
+             | [ ($review_listing.review_rows // [])[]
+                 | select(($only | length) == 0
+                          or ((.candidate.candidateId // .candidate.candidate_id // "") as $id | ($only | index($id)) != null))
+                 | (.candidate.metadata // []) as $metadata
+                 | ($metadata
+                    | map(select((.key // "") == "lookback.source_label_snapshots_json"))
+                    | if length == 1
+                      then (try (.[0].value | fromjson
+                                 | if any(.[]; ((.thread_id // "") == "") or ((.extraction_run_id // "") == ""))
+                                   then null
+                                   else (map(.labels // []) | add // [] | unique) end)
+                            catch null)
+                      else null end) as $labels
+                 | select($labels != null)
+                 | ($labels | candidate_keys) as $keys
+                 | select($keys | has_keys)
+                 | ((.candidate.sourceEvidence // .candidate.source_evidence // [])
+                    | map((.threadId // .thread_id // "") | tostring)) as $sources
+                 | ((.candidate.updatedAt.unixEpochMillis // .candidate.updated_at.unix_epoch_millis // 0)
+                    | tonumber) as $updated_at
+                 | ($updated_at >= $since_ms) as $candidate_side
+                 | [ $threads[] | select(matches($keys; .keys)) | .thread_id
+                     | select(. as $thread | ($sources | index($thread)) == null) ] as $evidence_side
+                 | select($candidate_side or (($evidence_side | length) > 0))
+                 | { review_row: (.candidate.metadata
+                                  = ($metadata | map(select((.key // "") == "lookback.source_label_snapshots_json")))),
+                     candidate_keys: $keys,
+                     candidate_side: $candidate_side,
+                     updated_thread_ids: (if $candidate_side then [] else $evidence_side end) } ]
+             | if ($workflow.input.max_candidates // 0) > 0 then .[:$workflow.input.max_candidates] else . end }
+        manager_contract: "${ $review_listing.manager_contract // {} }"
+        manager_store_identity: "${ $review_listing.manager_store_identity // {} }"
+        candidate_count: "${ ($review_listing.review_rows // []) | length }"
+        review_listing: "${ null }"
+        updated_thread_count: "${ $updated_threads | length }"
+        updated_threads: "${ [] }"
+
+  # Each candidate runs in its own worker so this loop's context stays small.
+  - resolveEachCandidate:
+      for:
+        each: scoped
+        at: candidate_index
+        in: "${ $scoped_rows }"
+      onError: continue
+      do:
+        - reportProgress:
+            set:
+              progress_processed: "${ $candidate_index + 1 }"
+              progress_total: "${ $scoped_rows | length }"
+              candidate_result: "${ null }"
+        - resolveCandidate:
+            try:
+              - invokeCandidate:
+                  run:
+                    function:
+                      workerName: lookback-cross-thread-issue-resolution-candidate
+                      arguments:
+                        input: >-
+                          ${ $scoped + {
+                              user_id: $workflow.input.user_id,
+                              manager_contract: $manager_contract,
+                              manager_store_identity: $manager_store_identity,
+                              memories_grpc_host: $workflow.input.memories_grpc_host,
+                              memories_grpc_port: $workflow.input.memories_grpc_port,
+                              memories_grpc_tls: ($workflow.input.memories_grpc_tls // false),
+                              issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                              issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                              issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              resolution_min_confidence: $resolution_min_confidence,
+                              search_limit: $workflow.input.search_limit,
+                              search_score_min: $workflow.input.search_score_min,
+                              dry_run: $dry_run
+                            } | tojson }
+                  export:
+                    as:
+                      candidate_result: '${ .output | fromjson }'
+            catch:
+              as: candidate_error
+              do:
+                - recordCandidateFailure:
+                    set:
+                      failed_candidates: >-
+                        ${ $failed_candidates + [{ candidate_id: ($scoped.review_row.candidate.candidateId // ""),
+                            reason: ($candidate_error | tostring), source: "candidate_worker" }] }
+        - mergeCandidateResult:
+            if: "${ $candidate_result != null }"
+            set:
+              applied_candidates: "${ $applied_candidates + ($candidate_result.applied_candidates // []) }"
+              dry_run_candidates: "${ $dry_run_candidates + ($candidate_result.dry_run_candidates // []) }"
+              kept_candidates: "${ $kept_candidates + ($candidate_result.kept_candidates // []) }"
+              contradicted_candidates: "${ $contradicted_candidates + ($candidate_result.contradicted_candidates // []) }"
+              protected_candidates: "${ $protected_candidates + ($candidate_result.protected_candidates // []) }"
+              skipped_candidates: "${ $skipped_candidates + ($candidate_result.skipped_candidates // []) }"
+              conflicted_candidates: "${ $conflicted_candidates + ($candidate_result.conflicted_candidates // []) }"
+              failed_candidates: "${ $failed_candidates + ($candidate_result.failed_candidates // []) }"
+              unmatched_count: "${ $unmatched_count + (if ($candidate_result.unmatched // false) then 1 else 0 end) }"
+              evaluations: "${ $evaluations + ([$candidate_result.evaluation] | map(select(. != null))) }"
+              candidate_result: "${ null }"
+
+  - writeWatermark:
+      if: >-
+        ${ ($mode == "auto")
+           and ($dry_run | not)
+           and all($failed_candidates[]; .permanent == true) }
+      try:
+        - enqueueWatermark:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "%{LOOKBACK_JOBWORKERP_GRPC_HOST:-127.0.0.1}"
+                  port: ${ %{LOOKBACK_JOBWORKERP_GRPC_PORT:-9000} }
+                  tls: ${ %{LOOKBACK_JOBWORKERP_GRPC_TLS:-false} }
+                  useReflection: true
+                arguments:
+                  method: "/jobworkerp.service.JobService/Enqueue"
+                  # args is CommandArgs { command: "true" } encoded as protobuf.
+                  json_body: >-
+                    ${ { worker_name: "lookback-cross-thread-issue-resolution-watermark",
+                         args: "CgR0cnVl",
+                         uniq_key: ("lookback-cross-thread-watermark:" + ($run_started_at | tostring)) } | tojson }
+                  as_json: true
+        - markWatermarkWritten:
+            set:
+              watermark_written: "${ true }"
+      catch:
+        as: watermark_error
+        do:
+          # The next run then starts from the previous position again, which
+          # only repeats judgements.
+          - recordWatermarkFailure:
+              set:
+                last_error: "${ $watermark_error | tostring }"
+
+output:
+  as:
+    completed: "${ ($failed_candidates | length) == 0 }"
+    mode: '${ $mode }'
+    dry_run: "${ $dry_run }"
+    since_ms: "${ $since_ms }"
+    run_started_at: "${ $run_started_at }"
+    updated_thread_count: "${ $updated_thread_count }"
+    candidate_count: "${ $candidate_count }"
+    scoped_count: "${ $scoped_rows | length }"
+    unmatched_count: "${ $unmatched_count }"
+    processed_count: >-
+      ${ ($applied_candidates | length)
+         + ($dry_run_candidates | length)
+         + ($kept_candidates | length)
+         + ($contradicted_candidates | length)
+         + ($protected_candidates | length)
+         + ($skipped_candidates | length)
+         + ($conflicted_candidates | length)
+         + ($failed_candidates | length) }
+    applied_count: "${ $applied_candidates | length }"
+    dry_run_count: "${ $dry_run_candidates | length }"
+    kept_count: "${ $kept_candidates | length }"
+    contradicted_count: "${ $contradicted_candidates | length }"
+    protected_count: "${ $protected_candidates | length }"
+    skipped_count: "${ $skipped_candidates | length }"
+    conflicted_count: "${ $conflicted_candidates | length }"
+    failed_count: "${ $failed_candidates | length }"
+    applied_candidates: "${ $applied_candidates }"
+    dry_run_candidates: "${ $dry_run_candidates }"
+    contradicted_candidates: "${ $contradicted_candidates }"
+    protected_candidates: "${ $protected_candidates }"
+    skipped_candidates: "${ $skipped_candidates }"
+    conflicted_candidates: "${ $conflicted_candidates }"
+    failed_candidates: "${ $failed_candidates }"
+    # Per-candidate hits and judgements; filled by dry runs only.
+    evaluations: "${ $evaluations }"
+    watermark_written: "${ $watermark_written }"
+    last_error: "${ $last_error }"

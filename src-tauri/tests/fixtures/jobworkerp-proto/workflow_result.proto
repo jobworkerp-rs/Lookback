@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package jobworkerp.runner;
+
+message WorkflowResult {
+  // # Workflow Status
+  // Represents the current state of a workflow execution
+  enum WorkflowStatus {
+    // Workflow completed successfully
+    Completed = 0;
+    // Workflow failed due to an error
+    Faulted = 1;
+    // Workflow was explicitly cancelled
+    Cancelled = 2;
+    // States below should not appear in final results
+    // Pending status (should not appear in results - indicates a potential bug)
+    Pending = 3;
+    // Workflow is currently executing
+    Running = 4;
+    // Workflow is waiting for an external condition
+    Waiting = 5;
+  }
+
+  // # Workflow ID
+  // Unique identifier for the workflow (UUID v7 format)
+  string id = 1;
+
+  // # Output
+  // Result of the workflow execution
+  // Can be a plain string or JSON formatted string
+  string output = 2;
+
+  // # Position
+  // Position of the workflow execution with json pointer format
+  // This is an optional field that can be used to track the order of execution
+  // While the status is WAITING, this is the resume position: the position the
+  // checkpoint is saved under, usable as from_checkpoint.position.
+  string position = 3;
+
+  // # Status
+  // Current status of the workflow execution
+  WorkflowStatus status = 4;
+
+  // # Error Message
+  // Detailed error information if the workflow failed
+  // Only populated when status is Faulted
+  optional string error_message = 5;
+}

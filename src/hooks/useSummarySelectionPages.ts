@@ -1,12 +1,83 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listReflectionSelection, listSummariesForSelection } from "@/api";
-import type { ReflectionSelectionEntry, SelectableMemoryKind, SummaryEntry } from "@/types/api";
+import {
+  type SetStateAction,
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
+import {
+  listReflectionSelection,
+  listSummariesForSelection,
+  listSummaryPathCandidates,
+} from "@/api";
+import type {
+  ReflectionSelectionEntry,
+  SelectableMemoryKind,
+  SummaryEntry,
+  SummaryPathCandidate,
+} from "@/types/api";
 
 const PAGE_SIZE = 50;
 
 export type SelectionEntry = SummaryEntry | ReflectionSelectionEntry;
 
-function pageRequest(kind: SelectableMemoryKind, offset: number, cursor: string | undefined) {
+type PeriodScope = "overall" | "path";
+
+type PeriodFilters = {
+  periodScope: PeriodScope;
+  includeOverall: boolean;
+  pathBucketDigests: string[];
+  includeLegacy: boolean;
+};
+
+type PeriodFilterAction =
+  | { field: "periodScope"; next: SetStateAction<PeriodScope> }
+  | { field: "includeOverall"; next: SetStateAction<boolean> }
+  | { field: "pathBucketDigests"; next: SetStateAction<string[]> }
+  | { field: "includeLegacy"; next: SetStateAction<boolean> };
+
+const INITIAL_PERIOD_FILTERS: PeriodFilters = {
+  periodScope: "overall",
+  includeOverall: true,
+  pathBucketDigests: [],
+  includeLegacy: false,
+};
+
+function periodFiltersReducer(state: PeriodFilters, action: PeriodFilterAction): PeriodFilters {
+  switch (action.field) {
+    case "periodScope": {
+      const next = typeof action.next === "function" ? action.next(state.periodScope) : action.next;
+      return { ...state, periodScope: next };
+    }
+    case "includeOverall": {
+      const next =
+        typeof action.next === "function" ? action.next(state.includeOverall) : action.next;
+      return { ...state, includeOverall: next };
+    }
+    case "pathBucketDigests": {
+      const next =
+        typeof action.next === "function" ? action.next(state.pathBucketDigests) : action.next;
+      return { ...state, pathBucketDigests: next };
+    }
+    case "includeLegacy": {
+      const next =
+        typeof action.next === "function" ? action.next(state.includeLegacy) : action.next;
+      return { ...state, includeLegacy: next };
+    }
+  }
+}
+
+function pageRequest(
+  kind: SelectableMemoryKind,
+  offset: number,
+  cursor: string | undefined,
+  periodScope: PeriodScope,
+  includeOverall: boolean,
+  pathBucketDigests: string[],
+  includeLegacy: boolean,
+) {
   if (kind === "reflection") {
     return listReflectionSelection(
       cursor === undefined
@@ -14,12 +85,24 @@ function pageRequest(kind: SelectableMemoryKind, offset: number, cursor: string 
         : { limit: PAGE_SIZE, cursor_after_memory_id: cursor },
     );
   }
-  return listSummariesForSelection({ kind, limit: PAGE_SIZE, offset });
+  return listSummariesForSelection({
+    kind,
+    limit: PAGE_SIZE,
+    offset,
+    ...(kind === "thread-group"
+      ? {}
+      : {
+          rollup_scopes:
+            periodScope === "path" && includeOverall ? ["overall", "path"] : [periodScope],
+          path_bucket_digests: pathBucketDigests,
+          include_shadowed_legacy: includeLegacy,
+        }),
+  });
 }
 
 /** Owns a tab's page continuation and rejects responses from a superseded tab. */
 export function useSummarySelectionPages() {
-  const [kind, setKind] = useState<SelectableMemoryKind>("per-thread");
+  const [kind, setKind] = useState<SelectableMemoryKind>("thread-group");
   const activeKind = useRef(kind);
   const [entries, setEntries] = useState<SelectionEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -29,7 +112,16 @@ export function useSummarySelectionPages() {
   const [nextCursor, setNextCursor] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
-  const requestKey = useMemo(() => ({ kind, reloadKey }), [kind, reloadKey]);
+  const [periodFilters, dispatchPeriodFilter] = useReducer(
+    periodFiltersReducer,
+    INITIAL_PERIOD_FILTERS,
+  );
+  const [pathCandidates, setPathCandidates] = useState<SummaryPathCandidate[]>([]);
+  const { periodScope, includeOverall, pathBucketDigests, includeLegacy } = periodFilters;
+  const requestKey = useMemo(
+    () => ({ kind, reloadKey, periodScope, includeOverall, pathBucketDigests, includeLegacy }),
+    [kind, reloadKey, periodScope, includeOverall, pathBucketDigests, includeLegacy],
+  );
   const sessionGeneration = useRef(0);
 
   const updateContinuation = useCallback((response: Awaited<ReturnType<typeof pageRequest>>) => {
@@ -56,7 +148,15 @@ export function useSummarySelectionPages() {
     setNextOffset(0);
     setNextCursor(undefined);
     setLoadingMore(false);
-    void pageRequest(requestKey.kind, 0, undefined)
+    void pageRequest(
+      requestKey.kind,
+      0,
+      undefined,
+      requestKey.periodScope,
+      requestKey.includeOverall,
+      requestKey.pathBucketDigests,
+      requestKey.includeLegacy,
+    )
       .then((response) => {
         if (cancelled || !isCurrentGeneration(requestGeneration)) return;
         setEntries(response.entries);
@@ -75,6 +175,24 @@ export function useSummarySelectionPages() {
     };
   }, [isCurrentGeneration, requestKey, updateContinuation]);
 
+  useEffect(() => {
+    if (kind === "thread-group" || kind === "reflection") {
+      setPathCandidates([]);
+      return;
+    }
+    let cancelled = false;
+    void listSummaryPathCandidates({ kind })
+      .then((candidates) => {
+        if (!cancelled) setPathCandidates(candidates);
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [kind]);
+
   const selectKind = useCallback((nextKind: SelectableMemoryKind) => {
     if (nextKind === activeKind.current) return;
     sessionGeneration.current += 1;
@@ -86,6 +204,19 @@ export function useSummarySelectionPages() {
     sessionGeneration.current += 1;
     setReloadKey((current) => current + 1);
   }, []);
+  // A continuation is scoped by every period filter, not only by its tab.
+  // Invalidate an in-flight load-more response before changing any of those
+  // fields so it cannot append rows from a previous path/legacy scope.
+  const invalidateContinuation = useCallback(() => {
+    sessionGeneration.current += 1;
+  }, []);
+  const updatePeriodFilter = useCallback(
+    (action: PeriodFilterAction) => {
+      invalidateContinuation();
+      dispatchPeriodFilter(action);
+    },
+    [invalidateContinuation],
+  );
   const isCurrentKind = useCallback(
     (candidate: SelectableMemoryKind) => candidate === activeKind.current,
     [],
@@ -98,7 +229,15 @@ export function useSummarySelectionPages() {
     const requestedCursor = nextCursor;
     const requestGeneration = sessionGeneration.current;
     setLoadingMore(true);
-    void pageRequest(requestedKind, requestedOffset, requestedCursor)
+    void pageRequest(
+      requestedKind,
+      requestedOffset,
+      requestedCursor,
+      periodScope,
+      includeOverall,
+      pathBucketDigests,
+      includeLegacy,
+    )
       .then((response) => {
         if (!isCurrentGeneration(requestGeneration)) return;
         setEntries((current) => [...current, ...response.entries]);
@@ -112,7 +251,19 @@ export function useSummarySelectionPages() {
       .finally(() => {
         if (isCurrentGeneration(requestGeneration)) setLoadingMore(false);
       });
-  }, [hasMore, isCurrentGeneration, kind, loadingMore, nextCursor, nextOffset, updateContinuation]);
+  }, [
+    hasMore,
+    includeOverall,
+    includeLegacy,
+    isCurrentGeneration,
+    kind,
+    loadingMore,
+    nextCursor,
+    nextOffset,
+    pathBucketDigests,
+    periodScope,
+    updateContinuation,
+  ]);
 
   return {
     entries,
@@ -125,6 +276,19 @@ export function useSummarySelectionPages() {
     loadingMore,
     retry,
     selectKind,
+    periodScope,
+    setPeriodScope: (next: SetStateAction<PeriodScope>) =>
+      updatePeriodFilter({ field: "periodScope", next }),
+    includeOverall,
+    setIncludeOverall: (next: SetStateAction<boolean>) =>
+      updatePeriodFilter({ field: "includeOverall", next }),
+    pathBucketDigests,
+    setPathBucketDigests: (next: SetStateAction<string[]>) =>
+      updatePeriodFilter({ field: "pathBucketDigests", next }),
+    pathCandidates,
+    includeLegacy,
+    setIncludeLegacy: (next: SetStateAction<boolean>) =>
+      updatePeriodFilter({ field: "includeLegacy", next }),
     setError,
   };
 }

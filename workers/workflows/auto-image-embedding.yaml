@@ -1,0 +1,106 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: auto-image-embedding
+  version: "1.0.0"
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        memory_id:
+          type: string
+        media_object_id:
+          type: string
+        # Dispatch token issued by memories; forwarded unchanged to the
+        # write RPC so stale results are rejected there.
+        token:
+          type: object
+      required: [memory_id, media_object_id]
+do:
+  # Step 1: Resolve a short-lived GET URL for the media. The runner
+  # fetches the URL itself (no bytes are carried over gRPC); the size
+  # cap is enforced by the embedding runner's image_size_limit_bytes.
+  - generateAndStore:
+      try:
+        - resolveUrl:
+            run:
+              worker:
+                name: memories-media-resolve
+                using: unary
+                arguments:
+                  json_body: >-
+                    ${ {
+                      media_object_id: { value: $workflow.input.media_object_id }
+                    } | tojson }
+            # A GRPC (as_json) worker returns its response as a JSON STRING in
+            # `.jsonBody`; it must be `fromjson`-parsed before fields are read.
+            output:
+              as:
+                image_url: "${ .jsonBody | fromjson | .url }"
+
+        # Step 2: image embedding. 1 image = 1 vector, so chunk_index is fixed
+        # to 0 (begin_position is the image index, not reused as a chunk
+        # offset).
+        - generateImageEmbedding:
+            run:
+              worker:
+                name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
+                using: embed_image
+                arguments:
+                  # Each value must be a SINGLE ${...} expression — DSL
+                  # §Runtime Expressions forbids mixing literal text with
+                  # ${...} (the placeholder is then left unexpanded). So the
+                  # "memory:<id>" label is assembled inside jq.
+                  items:
+                    - url: "${ .image_url }"
+                      label: "${ \"memory:\" + ($workflow.input.memory_id | tostring) }"
+            output:
+              as:
+                model_name: "${ .model_info.model_name? // \"unknown\" }"
+                image_rows: >-
+                  ${ [ .embeddings[] | {
+                        vector_kind: "image",
+                        chunk_index: 0,
+                        begin_position: .begin_position,
+                        end_position: .end_position,
+                        content: .content,
+                        embedding: { values: .values }
+                      } ] }
+
+        # Step 3: Upsert the image rows. `replace_kinds: ["image"]` deletes only
+        # this memory's image rows; text and caption rows are owned by other
+        # dispatches (kind isolation).
+        - upsertVectors:
+            run:
+              worker:
+                name: memories-upsert-embedding
+                using: unary
+                arguments:
+                  json_body: >-
+                    ${ {
+                      memory_id: $workflow.input.memory_id,
+                      embedding_model: (.model_name // "unknown"),
+                      replace_kinds: ["image"],
+                      rows: .image_rows
+                    } + (if $workflow.input.token then {token: $workflow.input.token} else {} end)
+                    | tojson }
+      catch:
+        as: err
+        do:
+          - reportFailure:
+              if: "${ $workflow.input.token != null }"
+              run:
+                worker:
+                  name: memories-report-embedding-failure
+                  using: unary
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        token: $workflow.input.token,
+                        table: "memory",
+                        entity_id: ($workflow.input.memory_id | tonumber),
+                        vector_kind: "image",
+                        reason: "workflow_error",
+                        message: ($err | tostring)
+                      } | tojson }

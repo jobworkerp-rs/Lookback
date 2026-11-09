@@ -58,8 +58,14 @@ message ClientStreamRequest {
 
 service JobService {
   rpc Enqueue(JobRequest) returns (CreateJobResponse);
+  // Enqueue a non-streaming Direct-response job. The JobId is sent eagerly in
+  // x-job-id-bin metadata, followed by exactly one final JobResult message.
+  // Unlike JobResultService.Listen, this waits for the result returned directly
+  // by the job execution and does not require broadcast_results or result
+  // storage to be enabled. Disconnecting releases only the result subscription;
+  // it does not delete or cancel the enqueued job.
+  rpc EnqueueForResult(JobRequest) returns (stream jobworkerp.data.JobResult);
   // Direct response only, JobResult on metadata header of grpc response
-  // TODO Now support only for worker with storage_type: Scalable
   rpc EnqueueForStream(JobRequest)
       returns (stream jobworkerp.data.ResultOutputItem);
 
@@ -211,7 +217,9 @@ message CleanupResponse {
 
 // Purge stale job processing status records
 message PurgeStaleJobsRequest {
-  // Stale threshold in hours: records with updated_at older than this are candidates
+  // Stale threshold in hours: records with updated_at older than this are candidates.
+  // This value is still used as the candidate filter when orphaned_only=true,
+  // but the gRPC request validation only constrains it for bulk purge mode.
   uint64 stale_threshold_hours = 1;
 
   // When true, only purge stale RDB index rows whose job is no longer
@@ -279,7 +287,7 @@ service JobProcessingStatusService {
   //
   // Modes:
   // - orphaned_only=false (default): Purges all stale records in bulk.
-  // - orphaned_only=true: Purges stale records whose job_id is absent from BOTH the live JobProcessingStatusRepository (Redis/Memory) AND the `job` table. A zero threshold is allowed in this mode and selects every row older than the current instant.
+  // - orphaned_only=true: Purges stale records whose job_id is absent from BOTH the live JobProcessingStatusRepository (Redis/Memory) AND the `job` table.
   //
   // Redis/Memory is the source of truth for live job processing state; the
   // `job` table is the SoT for queue types without a live-status entry
@@ -292,7 +300,7 @@ service JobProcessingStatusService {
   // Requirements:
   // - JOB_STATUS_RDB_INDEXING=true (returns FAILED_PRECONDITION if disabled)
   // - AUTH_TOKEN environment variable must match jobworkerp-auth header (if set)
-  // - stale_threshold_hours must be > 0 when orphaned_only=false (returns INVALID_ARGUMENT if 0)
+  // - stale_threshold_hours is validated only when orphaned_only=false (> 0 and <= 8760)
   rpc PurgeStaleJobs(PurgeStaleJobsRequest) returns (PurgeStaleJobsResponse);
 }
 

@@ -6,7 +6,6 @@ import {
   DEFAULT_PERIODIC_DRAFT,
   draftFromTask,
   formatExecutionTime,
-  PERIODIC_COMBINED_SOURCE,
   periodicKindLabel,
   periodicSourceLabel,
   periodicStatusLabel,
@@ -148,6 +147,7 @@ describe("periodicTask form logic", () => {
       ...DEFAULT_PERIODIC_DRAFT,
       name: "生成なし",
       run_summary_thread: false,
+      run_summary_thread_group: false,
       run_summary_daily: false,
       run_personality: false,
       run_reflection: false,
@@ -172,6 +172,93 @@ describe("periodicTask form logic", () => {
     expect(daily.run_personality).toBe(true);
     expect(daily.run_reflection).toBe(true);
     expect(draftFromTask(daily).run_summary_thread).toBe(true);
+  });
+
+  it("keeps ThreadGroup opt-in dependent on thread summaries for every task kind", () => {
+    const regular = toTaskArgs({
+      ...DEFAULT_PERIODIC_DRAFT,
+      name: "定期グループ",
+      run_summary_thread: false,
+      run_summary_daily: false,
+      run_summary_thread_group: true,
+    });
+    expect(regular.force_thread_summary).toBe(true);
+    expect(regular.run_summary_thread_group).toBe(true);
+
+    const weekly = toTaskArgs({
+      ...DEFAULT_PERIODIC_DRAFT,
+      name: "週次グループ",
+      task_kind: "weekly",
+      run_summary_thread_group: true,
+    });
+    expect(weekly.force_thread_summary).toBe(true);
+    expect(weekly.run_summary_thread_group).toBe(true);
+  });
+
+  it("defaults legacy regular ThreadGroup generation from force_thread_summary only", () => {
+    const regular = draftFromTask({
+      name: "旧定期",
+      source: "codex",
+      task_kind: "regular",
+      hour: 9,
+      minute: 0,
+      interval_hours: 24,
+      interval_days: null,
+      weekly_day: null,
+      monthly_day: null,
+      lookback_days: 7,
+      force_thread_summary: true,
+    });
+    const weekly = draftFromTask({
+      name: "旧週次",
+      source: "codex",
+      task_kind: "weekly",
+      hour: 9,
+      minute: 0,
+      interval_hours: null,
+      interval_days: null,
+      weekly_day: 1,
+      monthly_day: null,
+      lookback_days: 7,
+      force_thread_summary: true,
+    });
+
+    expect(regular.run_summary_thread_group).toBe(true);
+    expect(weekly.run_summary_thread_group).toBe(false);
+  });
+
+  it("preserves an explicit persisted ThreadGroup value", () => {
+    const regularOptOut = draftFromTask({
+      name: "明示無効",
+      source: "codex",
+      task_kind: "regular",
+      hour: 9,
+      minute: 0,
+      interval_hours: 24,
+      interval_days: null,
+      weekly_day: null,
+      monthly_day: null,
+      lookback_days: 7,
+      force_thread_summary: true,
+      run_summary_thread_group: false,
+    });
+    const monthlyOptIn = draftFromTask({
+      name: "明示有効",
+      source: "codex",
+      task_kind: "monthly",
+      hour: 9,
+      minute: 0,
+      interval_hours: null,
+      interval_days: null,
+      weekly_day: null,
+      monthly_day: 1,
+      lookback_days: 7,
+      force_thread_summary: true,
+      run_summary_thread_group: true,
+    });
+
+    expect(regularOptOut.run_summary_thread_group).toBe(false);
+    expect(monthlyOptIn.run_summary_thread_group).toBe(true);
   });
 
   it("restores legacy regular tasks without enabling newly added generators", () => {
@@ -217,17 +304,74 @@ describe("periodicTask form logic", () => {
     expect(periodicKindLabel(t, "monthly")).toBe("月次");
   });
 
-  it("serializes the combined codex and claude-code source mode", () => {
+  it("serializes a single selected source as-is", () => {
+    const task = toTaskArgs({
+      ...DEFAULT_PERIODIC_DRAFT,
+      name: "codexのみ",
+      sources: ["codex"],
+    });
+
+    expect(task.source).toBe("codex");
+    expect(task.sources).toEqual(["codex"]);
+    expect(periodicSourceLabel(t, task.source, task.sources)).toBe("codex");
+  });
+
+  it("serializes all three sources with a joined display source", () => {
     const task = toTaskArgs({
       ...DEFAULT_PERIODIC_DRAFT,
       name: "まとめて要約",
-      source: PERIODIC_COMBINED_SOURCE,
+      sources: ["opencode", "claude-code", "codex"],
     });
 
-    expect(task.source).toBe(PERIODIC_COMBINED_SOURCE);
+    expect(task.source).toBe("codex+claude-code+opencode");
+    // Canonical order regardless of the user's checkbox click order.
+    expect(task.sources).toEqual(["codex", "claude-code", "opencode"]);
+    expect(periodicSourceLabel(t, task.source, task.sources)).toBe(
+      "codex + claude-code + opencode",
+    );
+  });
+
+  it("rejects an empty source selection", () => {
+    expect(
+      validatePeriodicDraft({
+        ...DEFAULT_PERIODIC_DRAFT,
+        name: "選択なし",
+        sources: [],
+      }),
+    ).toContain("periodic.validation.sourceRequired");
+  });
+
+  it("rejects a source outside the periodic vocabulary", () => {
+    expect(
+      validatePeriodicDraft({
+        ...DEFAULT_PERIODIC_DRAFT,
+        name: "plain",
+        sources: ["plain"],
+      }),
+    ).toContain("periodic.validation.sourceInvalid");
+  });
+
+  it("restores the legacy combined codex and claude-code source mode and round-trips it", () => {
+    const legacy: Parameters<typeof draftFromTask>[0] = {
+      name: "まとめて要約",
+      source: "codex+claude-code",
+      sources: ["codex", "claude-code"],
+      task_kind: "regular",
+      hour: 9,
+      minute: 0,
+      interval_hours: 24,
+      interval_days: null,
+      weekly_day: null,
+      monthly_day: null,
+      lookback_days: 7,
+      force_thread_summary: true,
+    };
+    const draft = draftFromTask(legacy);
+
+    expect(draft.sources).toEqual(["codex", "claude-code"]);
+    const task = toTaskArgs(draft);
+    expect(task.source).toBe("codex+claude-code");
     expect(task.sources).toEqual(["codex", "claude-code"]);
-    expect(periodicSourceLabel(t, task.source, task.sources)).toBe("codex + claude-code");
-    expect(draftFromTask(task).source).toBe(PERIODIC_COMBINED_SOURCE);
   });
 
   it("accepts zero lookback for the current day and rejects negative values", () => {
@@ -251,7 +395,7 @@ describe("periodicTask form logic", () => {
       validatePeriodicDraft({
         ...DEFAULT_PERIODIC_DRAFT,
         name: "",
-        source: "",
+        sources: [],
       }),
     ).toEqual(["periodic.validation.nameRequired", "periodic.validation.sourceRequired"]);
 
@@ -268,7 +412,7 @@ describe("periodicTask form logic", () => {
       validatePeriodicDraft({
         ...DEFAULT_PERIODIC_DRAFT,
         name: "plain",
-        source: "plain",
+        sources: ["plain"],
       }),
     ).toContain("periodic.validation.sourceInvalid");
   });

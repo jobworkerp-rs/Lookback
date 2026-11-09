@@ -1,0 +1,28 @@
+[package]
+name = "coding-agent-executor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "coding_agent_executor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coding-agent-executor"
+path = "src/main.rs"
+
+[dependencies]
+fs2 = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

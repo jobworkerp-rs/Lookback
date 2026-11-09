@@ -15,7 +15,7 @@ vi.mock("@/api", () => ({
   listTimezones: () => listTimezones(),
   // Extra Settings APIs are harmless here; keep the mock shape broad so this
   // focused test stays isolated from Settings imports when components move.
-  applySettings: () => Promise.resolve({ restarted: true, backup_path: null }),
+  applySettings: () => Promise.resolve({ restarted: true }),
   createDataRoot: () => Promise.resolve(),
   getConnectionConfig: () => Promise.resolve(null),
   getEmbeddingSettings: () => Promise.resolve(null),
@@ -43,6 +43,7 @@ function appSettings(timezone: string | null): AppSettingsResponse {
     data_root_override: null,
     timezone,
     effective_timezone: timezone ?? "Asia/Tokyo",
+    migration_backup: { enabled: true, keep: 1 },
     resolved: {
       current_data_root: "/tmp/lookback",
       default_data_root: "/tmp/lookback",

@@ -1,0 +1,74 @@
+.settings-hint {
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+.settings-hint-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  margin: -8px;
+  padding: 0;
+  color: var(--label-secondary);
+  font: inherit;
+  line-height: 1;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.settings-hint-button:hover,
+.settings-hint-button:focus-visible {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.settings-hint--warning .settings-hint-button {
+  color: var(--warning);
+}
+
+.settings-hint--warning .settings-hint-button:hover,
+.settings-hint--warning .settings-hint-button:focus-visible {
+  color: var(--warning-text);
+}
+
+.settings-hint--info .settings-hint-button {
+  color: var(--accent);
+}
+
+.settings-hint-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
+.settings-hint-tooltip {
+  position: fixed;
+  z-index: 1000;
+  box-sizing: border-box;
+  max-width: min(30rem, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  padding: 8px 10px;
+  color: var(--label);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  overflow-y: auto;
+  pointer-events: auto;
+  background: var(--elevated);
+  border: 1px solid var(--separator-opaque);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-2);
+}
+
+.settings-hint-tooltip--warning {
+  border-color: var(--warning);
+}
+
+.settings-hint-tooltip--info {
+  border-color: var(--accent);
+}

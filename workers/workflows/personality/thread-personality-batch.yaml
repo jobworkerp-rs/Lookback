@@ -106,10 +106,6 @@ input:
             context further (via `max_signals`). When `force_reextract` is
             true the cap is ignored and every eligible thread is re-processed.
 
-timeout:
-  after:
-    hours: 24
-
 do:
   - normalizePersonalityUserId:
       set:
@@ -364,6 +360,7 @@ do:
         # `failed_count` counts caught errors (LLM 429 etc.).
         succeeded_count: "${ 0 }"
         failed_count: "${ 0 }"
+        last_error: "${ null }"
 
   # Per-thread fan-out. `onError: continue` isolates failures so one
   # bad thread does not block the rest of the batch.
@@ -379,9 +376,6 @@ do:
   # regardless of the cap; only already-processed re-extractions are
   # gated by the budget.
   - personalityEach:
-      timeout:
-        after:
-          hours: 24
       for:
         each: thread
         # `at` exposes the 0-based loop index for the (processed/total) progress
@@ -447,9 +441,6 @@ do:
             if: "${ $should_run_iteration == true }"
             try:
               - invokeSingle:
-                  timeout:
-                    after:
-                      minutes: 30
                   run:
                     function:
                       # Resolve the language-specific single worker by name.
@@ -478,8 +469,7 @@ do:
                   # Stage the unwrapped output as a context variable here so
                   # the next `set` step can reason over it without relying
                   # on `.` (which only resolves to the previous run's output
-                  # inside an `export.as:` — same pattern as
-                  # `summaries-pipeline.yaml`).
+                  # inside an `export.as:`).
                   export:
                     as:
                       single_result: >-
@@ -510,6 +500,21 @@ do:
                       failed_count: "${ $failed_count + 1 }"
                       last_error: "${ $error }"
 
+  # An item whose own try timed out is skipped by `onError: continue` without
+  # reaching its catch. Count such items as failed so an incomplete run is
+  # never reported as completed.
+  - collectUnaccountedThreads:
+      set:
+        unaccounted_count: >-
+          ${ [($target_threads | length) - $succeeded_count - $failed_count - $budget_skipped_count, 0] | max }
+  - recordUnaccountedThreads:
+      if: "${ $unaccounted_count > 0 }"
+      set:
+        failed_count: "${ $failed_count + $unaccounted_count }"
+        last_error: >-
+          ${ $last_error // (($unaccounted_count | tostring)
+             + " item(s) ended without an outcome (timed out or aborted)") }
+
   # Layer 2: aggregate the per-thread signals just written into the single
   # user-level profile. Runs here (inside the batch) so both dispatch paths
   # — the standalone "generate personality" button and the import pipeline —
@@ -529,9 +534,6 @@ do:
   # be retried on the next run.
   - userPersonalityMerge:
       if: "${ $merge_enabled }"
-      timeout:
-        after:
-          hours: 3
       try:
         - invokeMerge:
             run:

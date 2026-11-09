@@ -10,6 +10,9 @@
 
 use std::path::PathBuf;
 
+#[cfg(any(debug_assertions, feature = "experimental-issues"))]
+use std::sync::Arc;
+
 use lookback_tauri_lib::data::DataPaths;
 use lookback_tauri_lib::error::AppError;
 use lookback_tauri_lib::sidecar::{SidecarConfig, Sidecars};
@@ -32,8 +35,9 @@ fn make_sidecars(tmp: PathBuf) -> Sidecars {
         memories_db_migrate_bin: PathBuf::from("/bin/true"),
         startup_database_migration_enabled: false,
         conductor_bin: sleep,
-        data,
+        data: data.clone(),
         worker_yaml_paths: Vec::new(),
+        issue_tracker_server_bin: None,
         function_set_yaml_paths: Vec::new(),
         reflection_dispatch_enabled: false,
         auto_embedding_enabled: false,
@@ -47,6 +51,168 @@ fn make_sidecars(tmp: PathBuf) -> Sidecars {
         env_file: None,
     };
     Sidecars::new(config)
+}
+
+#[cfg(any(debug_assertions, feature = "experimental-issues"))]
+fn staged_binary(dir: &std::path::Path, name: &str) -> PathBuf {
+    std::fs::read_dir(dir)
+        .expect("read staged sidecar directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with(&format!("{name}-")))
+        })
+        .unwrap_or_else(|| panic!("staged {name} binary is missing from {}", dir.display()))
+}
+
+#[tokio::test]
+#[ignore = "requires staged sidecar binaries; opt in with LOOKBACK_SIDECAR_BIN_DIR"]
+#[cfg(any(debug_assertions, feature = "experimental-issues"))]
+async fn issue_tracker_toggle_controls_child_status_and_endpoint_environment() {
+    let bin_dir = PathBuf::from(
+        std::env::var("LOOKBACK_SIDECAR_BIN_DIR").expect("LOOKBACK_SIDECAR_BIN_DIR is required"),
+    );
+    let root = tmp_root("issue-tracker-full-start");
+    let data = DataPaths::with_root(root.clone());
+    let lance_home = data.lance_language_model_home();
+    let sidecars = Sidecars::new(SidecarConfig {
+        jobworkerp_bin: staged_binary(&bin_dir, "all-in-one"),
+        memories_bin: staged_binary(&bin_dir, "front"),
+        memories_db_migrate_bin: PathBuf::from("/bin/true"),
+        startup_database_migration_enabled: false,
+        conductor_bin: staged_binary(&bin_dir, "conductor-main"),
+        data: data.clone(),
+        worker_yaml_paths: Vec::new(),
+        issue_tracker_server_bin: Some(staged_binary(&bin_dir, "issue-tracker-server")),
+        function_set_yaml_paths: Vec::new(),
+        reflection_dispatch_enabled: false,
+        auto_embedding_enabled: false,
+        workflows_dir: None,
+        lance_language_model_home: lance_home,
+        lindera_dict_staged: false,
+        llm_model: None,
+        llm_hf_repo: None,
+        llm_ctx_size: None,
+        llm_kv_cache_type: None,
+        env_file: None,
+    });
+    let availability = Arc::new(lookback_tauri_lib::commands::IssueTrackerAvailability::default());
+    sidecars.bind_issue_tracker_availability(Arc::clone(&availability));
+
+    let set_tracker_enabled = |enabled| {
+        lookback_tauri_lib::commands::issue_tracker_settings::save_issue_tracker_settings(
+            &data.issue_tracker_settings_path(),
+            &lookback_tauri_lib::commands::issue_tracker_settings::IssueTrackerSettings {
+                enabled: Some(enabled),
+            },
+        )
+        .expect("write Issue Tracker setting");
+    };
+    let endpoint_keys = [
+        "ISSUE_TRACKER_GRPC_HOST",
+        "ISSUE_TRACKER_GRPC_PORT",
+        "ISSUE_TRACKER_GATEWAY_WORKER_HOST",
+        "ISSUE_TRACKER_GATEWAY_WORKER_PORT",
+    ];
+
+    // Explicit OFF is tested even though this ignored test may run in a debug
+    // profile. The setting must override the build default and prevent the
+    // child/ports/workflow endpoint from being created.
+    set_tracker_enabled(false);
+    unsafe {
+        for key in endpoint_keys {
+            std::env::set_var(key, "stale");
+        }
+    }
+    let off_report = sidecars
+        .start()
+        .await
+        .expect("sidecars start with tracker OFF");
+    assert!(
+        sidecars
+            .current_endpoints()
+            .unwrap()
+            .issue_tracker_port
+            .is_none()
+    );
+    assert!(sidecars.issue_tracker_url().is_none());
+    let off_snapshot = availability.snapshot();
+    assert!(!off_snapshot.endpoint_connected);
+    assert!(!off_snapshot.gateway_ready);
+    assert!(!off_snapshot.mutation_ready);
+    assert!(!off_report.warnings.iter().any(|warning| {
+        matches!(
+            warning.kind,
+            lookback_tauri_lib::sidecar::SidecarWarningKind::IssueTrackerUnavailable
+        )
+    }));
+    assert!(endpoint_keys.iter().all(|key| std::env::var(key).is_err()));
+    sidecars.stop().await.expect("stop after tracker OFF");
+
+    // OFF → ON must be picked up by the same Sidecars instance after the
+    // persisted setting changes; this is the release-build opt-in path.
+    set_tracker_enabled(true);
+    let on_report = sidecars
+        .start()
+        .await
+        .expect("sidecars start with tracker ON");
+    assert!(
+        on_report.warnings.iter().all(|warning| {
+            !matches!(
+                warning.kind,
+                lookback_tauri_lib::sidecar::SidecarWarningKind::IssueTrackerUnavailable
+            )
+        }),
+        "Issue Tracker startup warning: {:?}",
+        on_report.warnings
+    );
+    assert!(
+        sidecars
+            .current_endpoints()
+            .unwrap()
+            .issue_tracker_port
+            .is_some()
+    );
+    assert!(sidecars.issue_tracker_url().is_some());
+    assert!(availability.require_ready().is_ok());
+    sidecars.stop().await.expect("stop after tracker ON");
+
+    // ON → OFF must reset the long-lived availability snapshot and clear the
+    // inherited endpoint env, not merely hide the UI warning.
+    set_tracker_enabled(false);
+    unsafe {
+        for key in endpoint_keys {
+            std::env::set_var(key, "stale");
+        }
+    }
+    let final_off_report = sidecars
+        .start()
+        .await
+        .expect("sidecars restart with tracker OFF");
+    assert!(
+        sidecars
+            .current_endpoints()
+            .unwrap()
+            .issue_tracker_port
+            .is_none()
+    );
+    assert!(sidecars.issue_tracker_url().is_none());
+    let final_off_snapshot = availability.snapshot();
+    assert!(!final_off_snapshot.endpoint_connected);
+    assert!(!final_off_snapshot.gateway_ready);
+    assert!(!final_off_snapshot.mutation_ready);
+    assert!(!final_off_report.warnings.iter().any(|warning| {
+        matches!(
+            warning.kind,
+            lookback_tauri_lib::sidecar::SidecarWarningKind::IssueTrackerUnavailable
+        )
+    }));
+    assert!(endpoint_keys.iter().all(|key| std::env::var(key).is_err()));
+    sidecars.stop().await.expect("final stop");
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

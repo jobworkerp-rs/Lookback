@@ -21,6 +21,7 @@ vi.mock("@/api", () => ({
   listReflectionSelection: vi.fn(),
   listSummaries: vi.fn(),
   listSummariesForSelection: vi.fn(),
+  listSummaryPathCandidates: vi.fn().mockResolvedValue([]),
   parseSummaryContent: (summary: { content_json: string }) => {
     let parsed: Record<string, unknown> | null = null;
     try {
@@ -50,9 +51,10 @@ beforeAll(() => {
 function entry(memory_id: string): SummaryEntry {
   return {
     memory_id,
-    thread_id: "20",
-    external_id: null,
-    kind: "per-thread",
+    thread_id: null,
+    group_id: "30",
+    external_id: "thread-group-summary:30",
+    kind: "thread-group",
     period_key: null,
     scope_key: null,
     content_json: JSON.stringify({ body: `summary-${memory_id}` }),
@@ -103,20 +105,38 @@ beforeEach(() => {
 });
 
 describe("SummarySelectionModal", () => {
-  it("separates thread summaries from reflection in five tabs", async () => {
+  it("separates thread-group summaries from reflection in five tabs", async () => {
     mockListSummaries.mockResolvedValue([entry("summary-1")]);
     mockListReflectionSelection.mockResolvedValue(reflectionPage([reflection("900")]));
     renderWithProviders(
       <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
     expect(screen.getAllByRole("tab")).toHaveLength(5);
-    expect(screen.getByRole("tab", { name: "スレッド要約" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "スレッドグループ要約" })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "スレッド" })).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "自省" })).toBeInTheDocument();
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
     fireEvent.click(screen.getByRole("tab", { name: "自省" }));
     await screen.findAllByText("reflection-900");
     expect(mockListReflectionSelection).toHaveBeenCalledWith({ limit: 50 });
-    expect(screen.queryByText("thread #20")).not.toBeInTheDocument();
+    expect(screen.queryByText("group #30")).not.toBeInTheDocument();
+  });
+
+  it("does not render an internal per-thread row returned by a stale endpoint", async () => {
+    mockListSummaries.mockResolvedValue([
+      {
+        ...entry("internal"),
+        kind: "per-thread",
+        group_id: null,
+        thread_id: "20",
+        external_id: "summary:20",
+      },
+    ]);
+    renderWithProviders(
+      <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    await waitFor(() => expect(screen.queryAllByRole("checkbox")).toHaveLength(0));
   });
 
   it("loads reflection pages with the last memory cursor and selects canonical content", async () => {
@@ -186,8 +206,8 @@ describe("SummarySelectionModal", () => {
     fireEvent.click(await screen.findByRole("tab", { name: "自省" }));
     await waitFor(() => expect(screen.getAllByRole("checkbox")).toHaveLength(50));
     fireEvent.click(screen.getByRole("button", { name: "さらに読み込む" }));
-    fireEvent.click(screen.getByRole("tab", { name: "スレッド要約" }));
-    await screen.findByText("thread #20");
+    fireEvent.click(screen.getByRole("tab", { name: "スレッドグループ要約" }));
+    await screen.findByText("group #30");
     resolveMore?.([reflection("stale-reflection")]);
     await waitFor(() =>
       expect(screen.queryByText("stale-reflection", { exact: false })).not.toBeInTheDocument(),
@@ -233,14 +253,14 @@ describe("SummarySelectionModal", () => {
     renderWithProviders(
       <SummarySelectionModal selected={[]} onConfirm={onConfirm} onClose={vi.fn()} />,
     );
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
     fireEvent.click(screen.getByRole("checkbox"));
     await waitFor(() => expect(screen.getByRole("checkbox")).toBeChecked());
     expect(mockGetSummaryContent).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "選択を確定" }));
     expect(onConfirm).toHaveBeenCalledWith(
       expect.arrayContaining([
-        expect.objectContaining({ memory_id: "1", source_thread_ids: ["20"] }),
+        expect.objectContaining({ memory_id: "1", kind: "thread-group", group_id: "30" }),
       ]),
     );
   });
@@ -258,7 +278,7 @@ describe("SummarySelectionModal", () => {
     renderWithProviders(
       <SummarySelectionModal selected={[]} onConfirm={onConfirm} onClose={vi.fn()} />,
     );
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
 
     fireEvent.click(screen.getByRole("checkbox"));
     fireEvent.click(screen.getByRole("button", { name: "選択を解除" }));
@@ -289,7 +309,9 @@ describe("SummarySelectionModal", () => {
             resolveMore = resolve;
           }),
       )
-      .mockResolvedValueOnce([{ ...entry("daily-1"), kind: "daily", period_key: "2026-07-25" }]);
+      .mockResolvedValueOnce([
+        { ...entry("daily-1"), kind: "daily", group_id: null, period_key: "2026-07-25" },
+      ]);
     renderWithProviders(
       <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
@@ -310,19 +332,21 @@ describe("SummarySelectionModal", () => {
             resolveInitial = resolve;
           }),
       )
-      .mockResolvedValueOnce([{ ...entry("daily"), kind: "daily", period_key: "2026-08-09" }])
-      .mockResolvedValueOnce([{ ...entry("fresh"), thread_id: "fresh" }]);
+      .mockResolvedValueOnce([
+        { ...entry("daily"), kind: "daily", group_id: null, period_key: "2026-08-09" },
+      ])
+      .mockResolvedValueOnce([{ ...entry("fresh"), group_id: "fresh" }]);
     renderWithProviders(
       <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
 
     fireEvent.click(screen.getByRole("tab", { name: "日次" }));
     await screen.findByText("daily: 2026-08-09");
-    fireEvent.click(screen.getByRole("tab", { name: "スレッド要約" }));
-    await screen.findByText("thread #fresh");
-    resolveInitial?.([{ ...entry("stale"), thread_id: "stale" }]);
+    fireEvent.click(screen.getByRole("tab", { name: "スレッドグループ要約" }));
+    await screen.findByText("group #fresh");
+    resolveInitial?.([{ ...entry("stale"), group_id: "stale" }]);
 
-    await waitFor(() => expect(screen.queryByText("thread #stale")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText("group #stale")).not.toBeInTheDocument());
   });
 
   it("resets loading-more and ignores an old load-more failure after switching tabs", async () => {
@@ -339,6 +363,7 @@ describe("SummarySelectionModal", () => {
         Array.from({ length: 50 }, (_, index) => ({
           ...entry(`daily-${index + 1}`),
           kind: "daily" as const,
+          group_id: null,
           period_key: `2026-07-${index + 1}`,
         })),
       );
@@ -379,7 +404,7 @@ describe("SummarySelectionModal", () => {
     renderWithProviders(
       <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
     expect(screen.queryByText("確認したい末尾", { exact: false })).not.toBeInTheDocument();
     fireEvent.click(screen.getByText("全文を確認"));
     await screen.findByText("確認したい末尾", { exact: false });
@@ -395,7 +420,7 @@ describe("SummarySelectionModal", () => {
     renderWithProviders(
       <SummarySelectionModal selected={[]} onConfirm={onConfirm} onClose={vi.fn()} />,
     );
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
     expect(mockGetSummaryContent).not.toHaveBeenCalled();
     expect(screen.getByText("list excerpt")).toBeInTheDocument();
     fireEvent.click(screen.getByText("全文を確認"));
@@ -419,7 +444,7 @@ describe("SummarySelectionModal", () => {
       <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
 
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
     fireEvent.click(screen.getByRole("checkbox"));
     await screen.findByText(/summary content is unavailable/);
     expect(screen.getByRole("checkbox")).not.toBeChecked();
@@ -463,7 +488,7 @@ describe("SummarySelectionModal", () => {
       <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
 
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
     fireEvent.click(screen.getByText("全文を確認"));
     const preview = await screen.findByLabelText("全文を確認");
 
@@ -494,7 +519,7 @@ describe("SummarySelectionModal", () => {
       <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
 
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
     fireEvent.click(screen.getByText("全文を確認"));
     const preview = await screen.findByLabelText("全文を確認");
 
@@ -525,7 +550,7 @@ describe("SummarySelectionModal", () => {
     fireEvent.click(screen.getByRole("button", { name: "さらに読み込む" }));
     await waitFor(() =>
       expect(mockListSummaries).toHaveBeenLastCalledWith({
-        kind: "per-thread",
+        kind: "thread-group",
         limit: 50,
         offset: 50,
       }),
@@ -539,11 +564,11 @@ describe("SummarySelectionModal", () => {
     renderWithProviders(
       <SummarySelectionModal selected={[]} onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
-    await screen.findByText("thread #20");
+    await screen.findByText("group #30");
     fireEvent.click(screen.getByRole("button", { name: "さらに読み込む" }));
     await waitFor(() =>
       expect(mockListSummariesForSelection).toHaveBeenLastCalledWith({
-        kind: "per-thread",
+        kind: "thread-group",
         limit: 50,
         offset: 50,
       }),

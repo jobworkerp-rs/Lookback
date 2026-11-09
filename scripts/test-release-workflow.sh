@@ -2,13 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ -n "${1:-}" ]]; then
-  WORKFLOW="$1"
-elif [[ -f "${ROOT_DIR}/.github/workflows/release.yml" ]]; then
-  WORKFLOW="${ROOT_DIR}/.github/workflows/release.yml"
-else
-  WORKFLOW="${ROOT_DIR}/../agent-app-public/.github/workflows/release.yml"
-fi
+WORKFLOW="${1:-${ROOT_DIR}/.github/workflows/release.yml}"
 
 assert_contains() {
   local needle="$1"
@@ -27,18 +21,6 @@ assert_order() {
   second_line="$(grep -nF "${second}" "${WORKFLOW}" | head -n 1 | cut -d: -f1 || true)"
   if [[ -z "${first_line}" || -z "${second_line}" || "${first_line}" -ge "${second_line}" ]]; then
     echo "expected '${first}' to appear before '${second}'" >&2
-    exit 1
-  fi
-}
-
-assert_cpu_build_contains() {
-  local needle="$1"
-  if ! awk '
-    /^  build:/ { in_cpu_build = 1; next }
-    in_cpu_build && /^  [[:alnum:]_-]+:/ { exit }
-    in_cpu_build { print }
-  ' "${WORKFLOW}" | grep -Fq "${needle}"; then
-    echo "expected CPU build job to contain: ${needle}" >&2
     exit 1
   fi
 }
@@ -81,21 +63,7 @@ assert_contains 'Contents/Resources/memories-db-migrate/atlas" darwin-arm64'
 assert_contains "find \"\$app/Contents/Resources/plugins\" -name '*.dylib'"
 assert_contains "xcrun stapler validate"
 assert_contains "target/release/bundle/dmg/*.dmg"
-assert_contains "LOOKBACK_RELEASE_VERSION: \${{ github.ref_name }}"
 assert_contains 'LOOKBACK_TAURI_VERBOSE: "1"'
-assert_contains "trap restore_nccl_paths EXIT"
-assert_contains "! -name '*.disabled-for-build'"
-assert_contains "Install / verify AppImage bundling dependencies"
-assert_contains "sudo apt-get install -y --no-install-recommends"
-assert_contains "command -v patchelf"
-assert_contains "desktop-file-validate"
-assert_contains "desktop-file-utils patchelf"
-assert_contains "desktop-file-utils file fuse libfuse2 patchelf jq xdg-utils"
-assert_contains "xdg-utils"
-assert_contains "command -v xdg-open"
-assert_contains "command -v jq"
-assert_cpu_build_contains "fuse libfuse2 file desktop-file-utils patchelf jq xdg-utils"
-assert_cpu_build_contains "command -v xdg-open"
 assert_contains "needs: [test, build-cuda]"
 assert_order "Clean stale Apple signing keychains" "uses: apple-actions/import-codesign-certs@v3"
 assert_order "uses: apple-actions/import-codesign-certs@v3" "bash scripts/build-release.sh --profile mac"

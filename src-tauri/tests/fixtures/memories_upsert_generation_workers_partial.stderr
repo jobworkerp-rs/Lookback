@@ -1,0 +1,2 @@
+warning: skipped generation feature thread-group-summary: read workflow yaml <repo-root>/workers/thread-group-summary/thread-group-summary-single.yaml: No such file or directory (os error 2)
+Error: 1 generation feature(s) failed: thread-group-summary; 14 worker(s) registered

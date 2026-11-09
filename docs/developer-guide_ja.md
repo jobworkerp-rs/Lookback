@@ -8,7 +8,7 @@
 src/                 React UI、hooks、API ラッパー、Vitest テスト
 src-tauri/           Tauri アプリ、Rust コマンド、バックエンドプロセスのライフサイクル、gRPC クライアント
 workers/             Lookback 用 worker / workflow YAML バンドル
-proto/               Rust gRPC client が使う vendored protobuf 定義
+proto/               Rust gRPC client が使う vendored protobuf（jobworkerp、llm_memory、conductor、issue_tracker）
 dict/                memory-store 用に配置する任意の検索用辞書
 docs/                公開用の開発者ドキュメント
 ```
@@ -47,8 +47,11 @@ Rust テストにはバックエンド相当のポートやデータディレク
    - [`memory-store`](https://github.com/jobworkerp-rs/memory-store) の `front`
    - [`jobworkerp-conductor`](https://github.com/jobworkerp-rs/jobworkerp-conductor) の `conductor-main`
    - [`memory-store`](https://github.com/jobworkerp-rs/memory-store) の `memories-import`
-   - `protoc`: staging スクリプトが公式 protobuf リリース（自己完結バイナリ）から自動取得します。
-     自前の自己完結 protoc を使う場合は `PROTOC` で上書きできます
+   - [リリースビルドの詳細](#リリースビルドの詳細)に記載する公開 source pin の `issue-tracker-server`
+   - runtime `protoc`: staging スクリプトが固定版の自己完結バイナリを app 用に自動取得します。
+     `PROTOC` で development staging の入力を上書きできます。この runtime binary は release build の
+     preflight が `PATH` 上に要求する host compiler とは別物です。`PROTOC` を指定しても host `protoc`
+     の check は満たされず、host `jq` も必要です。
 2. 必要な jobworkerp ランナープラグインを対象 OS 向け共有ライブラリとしてビルドし、プラグインディレクトリに配置します。
    - [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner): ローカル LLM 実行用
    - [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner): 埋め込み生成用
@@ -71,28 +74,41 @@ LOOKBACK_JOBWORKERP_BIN=/path/to/all-in-one \
 LOOKBACK_MEMORIES_BIN=/path/to/front \
 LOOKBACK_CONDUCTOR_BIN=/path/to/conductor-main \
 LOOKBACK_MEMORIES_IMPORT_BIN=/path/to/memories-import \
+LOOKBACK_ISSUE_TRACKER_SERVER_BIN=/path/to/issue-tracker-server \
 PROTOC=/path/to/protoc \
 LOOKBACK_PLUGINS_SRC=/path/to/plugins \
 pnpm tauri:dev
 ```
 
-`pnpm tauri:dev` と `pnpm tauri dev` は、起動前に `scripts/stage-dev-external-bins.sh` を実行し、Tauri が検証する `src-tauri/bin/<name>-<target-triple>` を実バイナリで配置します。配置元の解決順序はアプリ実行時と同じく、環境変数、`PATH`、workspace 相対の予備パスです。たとえば Linux x86_64 では `src-tauri/bin/all-in-one-x86_64-unknown-linux-gnu` が必要です。
+`pnpm tauri:dev` と `pnpm tauri dev` は、起動前に `scripts/stage-dev-external-bins.sh` を実行し、Tauri が検証する `src-tauri/bin/<name>-<target-triple>` を実バイナリで配置します。配置元の解決順序はアプリ実行時と同じく、環境変数、`PATH`、workspace 相対の予備パスです。たとえば Linux x86_64 では `src-tauri/bin/all-in-one-x86_64-unknown-linux-gnu` が必要です。MCP を有効にした場合、sidecar は `MCP_ENABLED=true` で起動します。必要な jobworkerp revision で `cargo build --release -p jobworkerp-main --bin all-in-one` を実行するか、互換バイナリを `LOOKBACK_JOBWORKERP_BIN` に指定してください。
 
-この処理は Memories の公式 SQLite migration bundle も `src-tauri/migration-bundle/` へ配置します。`LOOKBACK_MEMORIES_DB_MIGRATE_BUNDLE` を指定した場合はその bundle を厳密に検証し、不正なら自動生成へフォールバックせず起動を中止します。未指定の場合は、隣接する `../memories` checkout の `target/memories-db-migrate-sqlite/` を検証して使用します。成果物がない、または不正な場合は、すでに配置された bundle が現行 release 契約を満たせば再利用します。それも利用できなければ、同じ checkout の `scripts/build-memories-db-migrate-sqlite.sh` を一時ディレクトリ向けに実行し、検証成功後にのみ配置します。初回は coordinator のコンパイルや Atlas の取得に時間がかかることがあります。並行する dev 起動は直列化され、生成・検証に失敗しても既存の配置済み bundle は保持されます。
+Linux x86_64 では同じ staging が `coding-agent-executor` を debug build し、開発用 coding-agent パッケージ（executor、配置済みの `all-in-one`、作業ツリーの dirty 状態をそのまま記録した manifest）を dev 時の `resource_dir()` である `target/debug/coding-agent/` に配置します。debug build のアプリだけがこのパッケージを受け付け、設定画面の診断には開発用パッケージと表示されます。release bundle には含まれません。要件と上書き変数は [docs/coding-agent-executor-install.md](coding-agent-executor-install.md) の "Development staging" を参照してください。
 
-書き込みやビルドをせず解決・生成予定だけを確認するには、次を実行します。
+### Experimental Issues ビルド
+
+Issue 候補の抽出は debug ビルドで有効です。通常の release ビルドでは Issues UI を非表示にし、利用者が以前に有効なポリシーを保存していても抽出を強制的に無効化します。experimental として明示的に有効化した release を作成するには、Tauri 経由でアプリの Cargo feature を指定します。
+
+```bash
+pnpm tauri build --features experimental-issues
+```
+
+`pnpm tauri build`（`pnpm tauri:build` を含む）は開発用 staging や migration bundle の生成・再利用を行いません。package 前に、同じ pinned Memories build から得た target-specific `front`、`memories-import`、migration bundle が配置され、各 artifact digest が provenance manifest と一致する必要があります。wrapper と Tauri の build/bundle hook は provenance 欠損や不一致を拒否します。pinned source からの build/staging には `scripts/build-release.sh` を使ってください。手動 package の場合は clean な pinned source と release pin を `scripts/lib/write-migration-source-provenance.mjs` に渡し、`pnpm verify:packaging-migration` を通してから build します。`pnpm tauri:dev` は起動のたびに隣接する `../memories` の `scripts/build-memories-db-migrate-sqlite.sh` で migration bundle を生成し、`bundle-manifest.json` の content digest がステージ済みの bundle と異なる場合だけ差し替えます。memories の作業ツリーを変更すれば、次の `pnpm tauri:dev` で反映されます。
+
+開発用 staging の解決予定を、書き込みやビルドをせず確認するには次を実行します。
 
 ```bash
 scripts/stage-dev-external-bins.sh --dry-run
 ```
 
-同じ staging で、Tauri が検証する `plugins/*.so*` / `*.dylib` も満たします。この glob は `src-tauri` 基準なので、bundle 用の staging 先は `agent-app/src-tauri/plugins/` です。Linux は `plugins/*.so*` で通常の plugin `.so` と、CUDA runtime の `libcudart.so.12` や SONAME symlink のような versioned 共有ライブラリをまとめて含めます。`LOOKBACK_PLUGINS_SRC` が指定されていればその配下を再帰的に探し、未指定の場合は従来の workspace 配置である `agent-app/../../plugins/cuda_runner/` と `agent-app/../../plugins/` から共有ライブラリを探して、`agent-app/src-tauri/plugins/` へコピーします。dev/release staging は `agent-app/../plugins/` には書き込みません。
+同じ staging で、Tauri が検証する `plugins/*.so*` / `*.dylib` も満たします。この glob は `src-tauri` 基準なので、bundle 用の staging 先は `agent-app/src-tauri/plugins/` です。Linux は `plugins/*.so*` で通常の plugin `.so` と、CUDA runtime の `libcudart.so.12` や SONAME symlink のような versioned 共有ライブラリをまとめて含めます。`LOOKBACK_PLUGINS_SRC` が指定されていればその配下を再帰的に探し、未指定の場合は従来の workspace 配置である `agent-app/../../plugins/cuda_runner/` と `agent-app/../../plugins/` から共有ライブラリを探して、`agent-app/src-tauri/plugins/` へコピーします。standalone の `issue-tracker-server` は target-triple 付き external binary として別に配置します。`LOOKBACK_ISSUE_TRACKER_SERVER_BIN` を指定するとそのバイナリを使い、未指定時は sibling の `issue-tracker-server` checkout で `issue-tracker-front --bin issue-tracker-server` をビルドします。`LOOKBACK_ISSUE_TRACKER_SERVER_DIR` で checkout を上書きでき、旧 `LOOKBACK_ISSUE_TRACKER_RUNNER_DIR` も互換用に受け付けます。loopback listener、runtime 設定、health check、private data root は Lookback が管理し、この server は jobworkerp worker、plugin、FunctionSet、MCP tool として公開しません。dev/release staging は `agent-app/../plugins/` には書き込みません。
+
+実行時は Lookback が配置した共有ライブラリ名と digest を runtime plugin directory の manifest に記録します。次回 staging で source から消えたライブラリは、この manifest に記録されたものだけを削除します。manifest が欠損または破損している場合は削除せず再作成するため、利用者が配置した共有ライブラリは保持されます。
 
 macOS で動いて Linux で `resource path bin/all-in-one-x86_64-unknown-linux-gnu doesn't exist` になる場合、macOS 側には `src-tauri/bin/*-aarch64-apple-darwin` または `*-x86_64-apple-darwin` が既に残っていて、Linux 用の `*-x86_64-unknown-linux-gnu` が未配置であることが原因です。`scripts/build-release.sh` は release build の中でこの配置を行いますが、通常の dev 起動では release script を通らないため、dev 用 staging が必要です。
 
 Linux の `pnpm tauri:dev` は、Tauri が Rust crate をビルドしている間も Vite 開発サーバーを同時に起動します。Vite は `src-tauri/` と `target/` を監視対象から除外しているため、Cargo が `target/debug/build/*/rustc*` のような一時ディレクトリを作成・削除しても、Vite の file watcher はそのディレクトリを走査しません。
 
-Linux の dev 起動では、WebKitGTK / GDK が Wayland で `Gdk-Message: Error 71 ... dispatching to Wayland display` を出して終了する環境を避けるため、`pnpm tauri dev` は既定で `GDK_BACKEND=x11` と `WEBKIT_DISABLE_DMABUF_RENDERER=1` を設定します。明示的に Wayland を試す場合は、起動時に `GDK_BACKEND=wayland WEBKIT_DISABLE_DMABUF_RENDERER=0 pnpm tauri dev` のように指定すると、その値が優先されます。
+Linux の開発時・パッケージ版の起動では、Lookback は既定で `GDK_BACKEND=wayland,x11` と `WEBKIT_DISABLE_DMABUF_RENDERER=1` を設定します。GTK はネイティブ Wayland を先に試し、利用できない場合は X11 へフォールバックします。AppImage では linuxdeploy の GTK hook にも同じ規則を適用し、deb / rpm では GTK 初期化前にアプリケーションが設定します。明示的な値が優先されるため、X11 を強制するには `GDK_BACKEND=x11`、DMA-BUF renderer 有効のネイティブ Wayland を試すには `GDK_BACKEND=wayland WEBKIT_DISABLE_DMABUF_RENDERER=0 pnpm tauri dev` のように指定します。
 
 `Unknown system error -116` の `scandir .../target/debug/build/.../rustc*` で停止する場合の確認手順:
 
@@ -118,17 +134,64 @@ AppImage 版で初期設定ウィザードの保存先選択が進まない場�
 
 ## リリースビルドの詳細
 
-`scripts/build-release.sh --profile mac`（または `--profile linux-cuda`）は、以下の clone・
+`scripts/build-release.sh --profile mac`（または `--profile linux-cuda`）は、依存 repository の clone・
 GPU feature 付きビルド・バイナリ/プラグイン/lindera の配置・Tauri パッケージングまでを自動化
 します。前提条件とフラグはルート README「ソースからビルド」を参照してください。以下の手動手順は
 スクリプトが行う内容を記述したもので、部分ビルドやカスタムビルドの参考用です。
 
+pipeline の互換用論理名 `memory-store` は、非互換の `memory-store/main` ではなく、次の公開 GitHub tag と解決済み commit を指します。
+
+| Build input | 公開 repository | Tag | peeled commit |
+| --- | --- | --- | --- |
+| `memory-store`（Memories） | [`jobworkerp-rs/memory-store`](https://github.com/jobworkerp-rs/memory-store) | `v0.0.19` | `8253e725708264592e131af3b92d1b4c7719054a` |
+| `issue-tracker-server` | [`sutr-app/issue-tracker-server`](https://github.com/sutr-app/issue-tracker-server) | `v0.0.1` | `5974330a31ae19fb04db99841be73f305958d0d8` |
+
+release は同じ pinned Memories checkout から `front`、`memories-import`、`memories-db-migrate` をビルドします。ビルド前に選択した ref が固定 full revision を含むことと、release に必要な入力が揃っていることを検査します。移行 task や schema の内容は Lookback では検査せず、Memories の build script が bundle 生成時に `memories-db-migrate bundle verify` で検査します。
+
+全 platform の release-build preflight は host `protoc` と `jq` が `PATH` 上にあることを要求します。app に同梱する runtime `protoc` は別途 download されるため、`PROTOC=/path/to/protoc` だけでは host compiler の check を満たしません。古い Gitea source の clone が `.build-deps/` に残っている場合も、build は origin を自動変更しません。公開 source 用の新しい clean build root を使ってください（macOS の例: `scripts/build-release.sh --profile mac --workdir "$HOME/.cache/lookback-public-deps"`）。
+
+SQLite migration bundle の provenance（format version 3）には、credential を除いた Git origin/ref/full revision、生成時の `bundle-manifest.json` の content digest、各成果物と task catalog/history・最新 migration の digest を記録します。provenance の追加や macOS の署名で bundle の内容が変わるため、package 時の検証は `bundle verify` ではなく、この provenance と Atlas lock との一致で行います。`memory-store` という `--only` / build-cache 名は互換性のため維持しています。
+
+カスタム source の環境変数は次のとおりです。
+
+| Variable | 用途 |
+| --- | --- |
+| `LOOKBACK_MEMORY_STORE_REPO_URL` | clone する Memories remote URL。上書き時は ref と revision も明示します。URL に token/password を埋め込まず、Git credential helper を使います。 |
+| `LOOKBACK_MEMORY_STORE_REF` | release source ref（branch）。remote override と local source の両方で指定します。 |
+| `LOOKBACK_MEMORY_STORE_REVISION` | 期待する full 40 桁 Git revision。選択 ref から到達可能で、checkout の HEAD と一致する必要があります。 |
+| `LOOKBACK_MEMORY_STORE_SOURCE_DIR` | clone せずに使う既存 local Git checkout の root。`REF` と `REVISION` も必須です。source の origin と commit provenance を検査します。 |
+| `LOOKBACK_ISSUE_TRACKER_SERVER_REPO_URL` | Issue Tracker server の remote URL 上書き。`REF` と `REVISION` も明示します。URL に token/password を埋め込まず、Git credential helper を使います。 |
+| `LOOKBACK_ISSUE_TRACKER_SERVER_REF` | Issue Tracker server の reviewed source ref。 |
+| `LOOKBACK_ISSUE_TRACKER_SERVER_REVISION` | Issue Tracker server の期待する full 40 桁 Git revision。selected ref と checkout の HEAD に一致する必要があります。 |
+
+remote URL override の例:
+
+```bash
+LOOKBACK_MEMORY_STORE_REPO_URL=https://git.example.invalid/team/LLM-Memories.git \
+LOOKBACK_MEMORY_STORE_REF=reviewed-release \
+LOOKBACK_MEMORY_STORE_REVISION=0123456789abcdef0123456789abcdef01234567 \
+scripts/build-release.sh --profile mac
+```
+
+local checkout の例:
+
+```bash
+LOOKBACK_MEMORY_STORE_SOURCE_DIR=/work/LLM-Memories \
+LOOKBACK_MEMORY_STORE_REF=reviewed-release \
+LOOKBACK_MEMORY_STORE_REVISION=0123456789abcdef0123456789abcdef01234567 \
+scripts/build-release.sh --profile mac
+```
+
+custom source は `memories-db-migrate` の `local apply` / `local restore` / `bundle manifest` / `bundle verify` を提供する Memories revision である必要があります。`--skip-clone` は pin と一致する既存 checkout のみ再利用します。
+
+起動時の移行、移行前バックアップの設定、失敗時の操作については [データベース移行の運用](database-migration_ja.md) を参照してください。
+
 Tauri のパッケージングを実行する前に、バックエンドバイナリとリソースを配置する必要があります。
 
-1. `all-in-one`、`front`、`conductor-main`、`memories-import`、`protoc` のリリースバイナリをビルドします。
+1. `all-in-one`、`front`、`conductor-main`、`memories-import`、`issue-tracker-server`、`protoc` のリリースバイナリをビルドします。
 2. [../src-tauri/tauri.conf.json](../src-tauri/tauri.conf.json) の `externalBin` ベース名と一致する名前で `src-tauri/bin/` に配置します。
-3. Tauri のパッケージング用に、対象プラットフォームに対応したプラットフォームトリプルのサフィックス付きバイナリも用意します。
-4. [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner) と [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner) からランナープラグインの共有ライブラリを対象 OS 向けにビルドし、リポジトリルートの `plugins/` に配置します。
+3. Tauri のパッケージング用に、対象プラットフォームに対応したプラットフォームトリプルのサフィックス付きバイナリも用意します。レビュー済みの jobworkerp revision を使う場合は `LOOKBACK_JOBWORKERP_REF` を指定します。
+4. [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner) と [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner) のランナープラグイン共有ライブラリを対象 OS 向けにビルドし、`src-tauri/plugins/` に配置します。`issue-tracker-front` crate から `issue-tracker-server` をビルドし、target-triple サフィックス付きで `src-tauri/bin/` に配置します。`--only` で Tauri packaging を行う場合も `issue-tracker-server` を含める必要があります。部分的な backend build だけを行う場合は `--skip-frontend` を指定します。
 5. パッケージに含める `memory-store` の `front` ビルドが Lindera FTS を必要とする場合は、
    `dict/lindera/ipadic` に IPADIC 検索用辞書を配置します。`dict/` 配下は **git 管理外** です。
    `scripts/build-release.sh --lindera-only` で lindera 3.0.7 release 辞書を取得すると、IPADIC
@@ -158,14 +221,17 @@ GTK IM module も補完します。`XMODIFIERS` が desktop launcher 経由で�
 ホストの fcitx/ibus module が AppImage 同梱 GLib より新しい GLib でビルドされている環境では
 module 初期化が拒否されるため、ホスト cache を使う場合だけホスト GLib 系ライブラリとその依存を
 `LD_PRELOAD` で先に読ませます。該当 cache がない場合は AppImage 内の cache にフォールバックします。
-CUDA GitHub Actions job は依存 crate の build script が NCCL を自動検出しないように、build 前だけ
-`nccl.h` / `libnccl*` を一時 rename します。この step は `EXIT` trap で元の名前へ戻し、
-`*.disabled-for-build` は対象外にするため、self-hosted runner の再実行で隠し済み NCCL ファイルが
-蓄積しません。
-Linux release runner（CPU / CUDA）には、`memory-store` の SQLite migration bundle 作成時に Atlas の固定リリース情報を読む
-`jq` と、Tauri が linuxdeploy を実行する前提として `appimagetool`、`patchelf`、`desktop-file-utils`、
-`xdg-utils` が提供する `xdg-open` が必要です。workflow はこれらを明示的に確認し、runner image の依存不足を
-長い release build の最後ではなく AppImage bundling 前に失敗させます。
+GitHub Actions の Linux job は self-hosted runner `lookback-linux-cuda` で動きます。この runner では job に
+root 権限が無く、FUSE もマウントできません。runner image には NCCL が入っていないため、依存 crate の
+build script が NCCL を自動検出することはありません。Linux job が使うシステムツールは、すべて runner image に
+入っている必要があります。必要なツールの一覧は `test` job の `Verify runner image tools` step にあり、
+この step がどの job も upload する前に確認するので、runner image の依存不足は run の早い段階で失敗します。
+workflow からはパッケージを install できないため、足りないパッケージは runner 管理者に image への追加を
+依頼します。Linux の build job は `APPIMAGE_EXTRACT_AND_RUN=1` を設定し、linuxdeploy と `appimagetool` を
+FUSE でマウントせず展開して実行させます。
+この runner は共有されているため、タグ push の場合も含めて、runner 上の job には読み取り専用の
+`GITHUB_TOKEN` だけを渡し、checkout でもトークンを残さず、secrets は参照しません。build した bundle は
+workflow の artifact として渡し、GitHub-hosted runner で動く `publish-linux` job が GitHub Release に添付します。
 CUDA plugin はホスト提供の NVIDIA driver である `libcuda.so.1` に link しますが、これは bundle
 してはいけません。build container の `ldconfig` に実 driver library がない場合、
 `scripts/build-release.sh` は一時的な `LD_LIBRARY_PATH` で CUDA toolkit stub を linuxdeploy にだけ
@@ -180,42 +246,47 @@ CUDA ビルドでは同じ展開 root で NVIDIA driver library の除去も行�
 bash scripts/test-appimage-hooks.sh
 ```
 
-### GitHub Actions のディスク容量確保
+### runner image の変更を確認する
 
-GitHub hosted runner の Linux リリースジョブは、Tauri の deb/AppImage bundling 前に
-`scripts/ci-free-disk-space.sh` を実行します。これは Android SDK、.NET、GHC、CodeQL、言語別
-toolcache など、このリリースビルドで使わない大きなプリインストール済みディレクトリを削除し、
-削除前後の `df -h` をログに残します。
+release workflow を手動実行すると、何も公開せずに Linux の bundle を build し直せます。runner 管理者が
+`lookback-linux-cuda` の image を変更した後に、次の手順で確認します。
 
-容量不足を調査する手順:
-
-1. GitHub Actions の `Build Linux bundles (cpu)` ジョブで `Free runner disk space` ステップを開きます。
-2. `Disk usage (before)` と `Disk usage (after)` の空き容量を確認します。
-3. bundling がまだ `No space left on device` で失敗する場合は、同じジョブの後続ログで `target/`、
-   `.build-deps/`、`dict/` の増加量を確認します。
-4. 削除対象を増やす場合は `scripts/ci-free-disk-space.sh` の `cleanup_paths` に、このビルドで
-   使わない GitHub runner 標準ディレクトリだけを追加します。
-5. 変更後は `bash scripts/test-ci-free-disk-space.sh` で root prefix と dry-run の挙動を確認します。
+1. 公開側の GitHub リポジトリで Actions > Release を開き、default branch で Run workflow を実行します。
+   workflow に `workflow_dispatch` が入っている必要があります。workflow の変更は、リリースの同期でしか
+   GitHub に反映されません。
+2. この run は `test`、`build-cuda`、`build` を実行し、`build-macos` と `publish-linux` はスキップします。
+   リリースのバージョンは埋め込まず、artifact も残さず、GitHub Release への upload も行いません。
+3. `Verify runner image tools` が失敗した場合は、表示されたツールを runner 管理者に連絡します。
 
 ### GitHub Actions の macOS 署名付きリリース
 
-公開リポジトリの `.github/workflows/release.yml` はタグ push で起動し、`test`、`build-macos`、
-`build-cuda`、Linux CPU の `build` の順に実行します。`build-macos` は `self-hosted`、`macOS`、
-`lookback-macos` label の runner で `scripts/build-release.sh --profile mac` を実行し、生成された
-DMG を同じ GitHub Release に添付します。
-macOS profile では、Tauri packaging の前に `src-tauri/plugins/*.dylib` と migration bundle の実行ファイル
-（`memories-db-migrate`、`atlas/bin/atlas`）を `APPLE_SIGNING_IDENTITY` で明示的に署名します。Atlas は署名前に
-upstream lock で検証し、署名後の SHA-256 を bundled lock に記録します。このとき upstream SHA-256 は
-`source_sha256` として保持するため、upstream の来歴を保ったまま runtime の完全性検証と notarization の両方を
-満たします。この処理は macOS
-限定で、Linux の `.so` plugin や CUDA runtime staging には影響しません。workflow は証明書 import の前に、self-hosted runner の前回
-試行で残った `signing_temp*.keychain-db` を削除し、その後 `apple-actions/import-codesign-certs` で
-`.p12` を run ごとの keychain に import します。さらに keychain 内の署名 identity と
-`notarytool history` による notarization 認証を検証します。これを省略すると、plugin `.dylib` の
-明示署名が `The specified item could not be found in the keychain` で失敗したり、長時間ビルド後の
-notarization で Apple ID / Team ID / app-specific password の誤りが判明したりします。
-Tauri build 後は workflow 側で各 migration 実行ファイルの署名と、packaging 後 Atlas の SHA-256 を検証し、DMG に `notarytool submit --wait` と
-`stapler staple` を明示的に実行して、Release へ添付する前に `stapler validate` と Gatekeeper 判定を行います。
+公開リポジトリの `.github/workflows/release.yml` はタグ push で起動します。`test` の成功後、署名付き
+macOS build と Linux CUDA build は並列実行でき、Linux CPU build は CUDA 完了後に開始します。
+macOS job は `self-hosted`、`macOS`、`lookback-macos` label の runner を使い、host `protoc` と `jq` を
+Homebrew で install します。Linux の job は、これらを runner image から使います。
+lint job では、`tauri-build` の path validation を通すためだけに空の external-binary/plugin placeholder と
+空の migration resource directory も作成します。これらは release artifact ではありません。
+
+macOS では `scripts/build-release.sh --profile mac` が Tauri に unsigned `.app` の組み立てを依頼し、
+検証前に Tauri が external-binary bytes を書き換えないようにします。build 後に
+`scripts/finalize-macos-bundle.sh` が source/package の migration provenance、Atlas lock、実際に package された
+resource hash を検証してから signing します。検証済みの nested Mach-O file と plugin を先に署名し、upstream
+source hash を保持したまま署名後の migration/Atlas hash を記録した後、外側の `.app` を seal します。
+DMG の作成・署名はこれらの検査後に行います。これは Tauri packaging 前の plugin/migration signing に代わる処理です。
+Linux `.so` plugin と CUDA runtime staging は変更しません。workflow は従来どおり `.p12` を run ごとの keychain に
+import し、keychain の signing identity と長時間 build 前の `notarytool history` 認証確認を行います。
+
+workflow は finalizer が作成した DMG を `notarytool submit --wait` で送信して ticket を staple します。その後、
+実際に package された resource tree に対する migration provenance、code signature、stapled ticket、Gatekeeper 判定を
+確認してから artifact を upload します。finalizer の optional `--notarize` は既存の
+`APPLE_NOTARY_KEYCHAIN_PROFILE` を使いますが、release workflow は従来の Apple ID / Team ID / app-specific password
+Secrets を使う別の notarization step を維持します。
+
+`.github/` (release workflow と actionlint の runner label 設定) は上流の source リポジトリで管理され、
+リリースごとの同期で公開リポジトリに反映されます。公開側で直接編集しても次の同期で上書きされます。
+すべての job は `if: github.server_url == 'https://github.com'` で GitHub 上でのみ実行されます。
+`node scripts/test-public-release-workflow.mjs` は、この制限と release job dependencies、signing Secrets、
+provenance check、artifact flow を検証します。
 
 macOS release build では、jobworkerp は plugin の検出と依存 dylib の解決の両方で、署名済みの
 `.app/Contents/Resources/plugins` を直接使います。data directory へコピーされた plugin は参照しないため、
@@ -243,28 +314,61 @@ macOS release build では、jobworkerp は plugin の検出と依存 dylib の�
    | `APPLE_PASSWORD` | Apple ID の app-specific password |
    | `APPLE_TEAM_ID` | Apple Developer Team ID |
 
-5. リリースタグを push します。macOS job が成功したあとに Linux CPU job が始まります。
-6. 失敗時は `Build signed macOS bundles` のログで、証明書 import、codesign、notarization の
-   どこで止まっているかを確認します。
+5. リリースタグを push します。`test` 後に macOS と CUDA job が開始し、CPU job は CUDA 完了後に開始します。
+6. macOS job が失敗した場合は `Build signed macOS bundles` と後続 verification step のログから、証明書 import、
+   provenance validation、codesign、notarization のどこで止まったかを確認します。
 
-公開リポジトリのワークフローを変更した場合は `bash scripts/test-release-workflow.sh` で、
-macOS job の存在、Linux CPU job との依存関係、署名用 Secrets、事前認証チェック、DMG の Release
-添付対象を検証してください。
+release workflow を変更した場合は、`node scripts/test-public-release-workflow.mjs` と
+`bash scripts/test-release-workflow.sh` を実行して、GitHub 限定の制限、macOS job、Linux dependency、署名用 Secrets、
+事前認証チェック、DMG の Release 添付対象を検証してください。
 macOS plugin / migration 署名ロジックを変更した場合は
 `bash scripts/test-build-release-macos-signing.sh` で、macOS の `.dylib` と
 `memories-db-migrate` と Atlas が署名対象となり、Linux では no-op になることを検証してください。
 `bash scripts/test-verify-atlas-lock.sh` は upstream と署名済み Atlas の checksum guard を検証します。
 
-### リモート memories 接続の診断
+### 接続先の設定とリモート接続の診断
 
-設定画面の Connection で Remote server を選んだ場合、保存時は URL 形式と workflow callback 用の
-host/port/tls 分解を検証します。実際の gRPC 到達確認は Connection の `接続をテスト` を押して行います。
+設定画面の Connection では、jobworkerp・memories・Issue tracker・conductor のそれぞれについて
+Local sidecar か Remote server かを選びます。Local にしたサービスだけをアプリが起動します。
+組み合わせには次の制約があり、満たさない選択肢は理由とともに選べなくなります。
 
-リモート設定後に memories の一覧や検索が空に見える場合の確認手順:
+- jobworkerp を Remote にするには、memories と Issue tracker（Issue tracking が有効な場合）も
+  Remote にします。リモートの jobworkerp からこのマシンの sidecar には接続できないためです。
+- conductor を Remote にするには、jobworkerp も Remote にします。conductor が Local のまま
+  jobworkerp だけを Remote にすることはできます（定期実行はリモートの jobworkerp に投入されます）。
+
+旧形式の `connection.json`（`mode` が 1 つだけの形式）は、jobworkerp と memories に同じ mode を
+当てはめて読み込みます。ファイルは自動では書き換えず、次に保存したときに新しい形式になります。
+Issue tracker のデータと conductor の scheduler は Local と Remote で別々であり、移行しません。
+
+保存時は URL 形式と workflow 用の host/port/tls 分解を検証します。実際の gRPC 到達確認は
+Connection の `接続をテスト` を押して行います。プロキシ越しなどで jobworkerp・conductor から見た
+アドレスが異なる場合は、「jobworkerp・conductor から見たアドレス」で上書きします。
+
+#### リモート jobworkerp を使う手順
+
+1. memories（と Issue tracker）を Remote にし、URL を入力します。Issue tracker には gateway の
+   control URL と worker URL も入力します。
+2. jobworkerp を Remote にして URL を入力します。定期 import を使う場合は「jobworkerp ホスト上の
+   パス」に memories-import・opencode DB・作業ディレクトリのパスを入力します。
+3. `接続をテスト` で到達を確認してから、画面下の「保存して適用」で保存します。
+4. 「リモート jobworkerp の準備状況」で不足を確認し、`worker を登録` を押します。
+5. 不足する channel・plugin runner・環境変数は、表示された設定例をリモート jobworkerp に設定し、
+   再起動後に `再確認` を押します。何が必要かは `workers/README.md` の「リモート jobworkerp で
+   使う」を参照してください。
+6. 起動時にも準備状況を確認し、不足があればサイドバーに「リモート jobworkerp の準備が必要」と
+   表示されます。アプリの更新後に「別のバージョン」と表示された場合は、手順 4 で登録し直します。
+   リモートの jobworkerp に接続できない場合も起動は止めず、「リモート jobworkerp に接続できない」と
+   表示します。接続設定から接続先を直してください。
+
+jobworkerp が Remote の間は、coding agent と chat の Issue ツールは使えません。Timezone の変更も
+無効になるため、リモート側の `TZ` を設定してください。
+
+#### リモート memories の一覧や検索が空に見える場合
 
 1. Connection の `接続をテスト` を押し、jobworkerp と memories の両方に到達できるか確認します。
 2. Semantic / Hybrid 検索を使う場合は、Settings の Embedding model をリモートサーバ側の
-   embedding モデル・ベクトル次元と同じ設定にします。Remote server 接続中はローカルで各記事の
+   embedding モデル・ベクトル次元と同じ設定にします。memories が Remote の間はローカルで各記事の
    embedding は生成されず、検索クエリの embedding だけがこの設定に依存します。この変更では
    ローカル embedding インデックスのリセットや再生成は行いません。
 3. 失敗した場合は画面のエラー、または `<data-root>/log/lookback.log` を確認します。接続失敗は
@@ -297,9 +401,32 @@ conductor scheduler や jobworkerp periodic worker は使わず、Tauri 側か�
 
 ## 環境変数
 
+### スレッドグループ要約の timeout と失敗ログ
+
+要約タブの手動生成は、アプリがスレッド要約・ThreadGroup・日次・週次・月次を別ジョブとして
+順に実行します。各段の進捗と結果を行別に表示し、画面を開き直した場合も実行中の状態を復元します。
+手動の段階生成同士は直列実行し、import の進捗状態とは独立して管理します。
+スレッドグループの一括要約は、手動生成では対応する batch の job timeout を使い、定期実行では
+子バッチ呼び出しを最大121時間に制限します。メンバー要約の更新はスレッドごとに thread-summary single を
+1件ずつ呼び、各件の前に件数を出します。グループ内の LLM 呼び出しや 1 件ごとの single 呼び出しには、jobworkerp の
+run / call の既定（1時間）が適用されます。timeout の規約と値は `workers/README.md` の
+「タイムアウト」を参照してください。
+要約タブ・定期実行・Import からの一括要約は、指定期間（定期実行は lookback 日数、Import は
+取り込んだ会話の期間）に会話のあるメンバーを持つグループだけを対象にします。グループ要約は
+対象グループの現在の全メンバーから生成します。定期実行のスレッド要約も同じ期間に会話の
+あるスレッドだけを対象にします（期間外の未要約スレッドの扱いは `workers/README.md` の
+「定期実行 workflow」を参照）。
+Import とグループ単体の再生成では、グループごとの失敗を `thread_group_summary`
+ターゲットの短い WARN（グループ ID と理由コード）に記録します。失敗の詳細は
+DEBUG（最大400文字）でのみ記録します。Import のグループ要約ステージは生の進捗・
+終端チャンクを INFO/DEBUG に出力しません。実行が全体 timeout に達した場合も、
+既に記録されたグループ別 WARN は残ります。定期実行ではグループ要約を子 workflow として
+呼ぶため、その子の途中結果が同じログに記録されるとは限りません。完了前に止まった子 workflow
+の診断には子ジョブの結果やトレースが必要です。
+
 ### サイドカーのログ既定値
 
-常駐する `jobworkerp`、`memories`、`conductor` サイドカーの `RUST_LOG` は
+常駐する `jobworkerp`、`memories`、`conductor`、`issue-tracker` サイドカーの `RUST_LOG` は
 ビルドプロファイルで決まります。
 
 - `pnpm tauri dev`（debug ビルド）では、`info` 基準です。
@@ -340,7 +467,8 @@ release では 256 MiB の容量掃除にも含めます。未知のファイル
 ローテーション済みログの確認手順:
 
 1. Settings または `LOOKBACK_*` の起動設定から data root を確認し、`<data-root>/log/` と
-   `native/` 配下を一覧します。
+   `native/` 配下を一覧します。Issue Tracker が利用不能な場合は、まず
+   `issue-tracker.stdout.log` と `issue-tracker.stderr.log` を確認します。
 2. まず固定名のアクティブログを確認します。ローテーション前のイベントを探す場合は、対象 stream の
    UTC タイムスタンプ付きアーカイブを開きます。アーカイブは通常の text/JSONL なので、アプリ実行中でも
    コピーできます。
@@ -355,8 +483,12 @@ release では 256 MiB の容量掃除にも含めます。未知のファイル
 | `LOOKBACK_MEMORIES_BIN` | `front` のパス |
 | `LOOKBACK_CONDUCTOR_BIN` | `conductor-main` のパス |
 | `LOOKBACK_MEMORIES_IMPORT_BIN` | `memories-import` のパス |
+| `LOOKBACK_ISSUE_TRACKER_SERVER_BIN` | dev staging 用の事前ビルド済み `issue-tracker-server` のパス |
+| `LOOKBACK_ISSUE_TRACKER_SERVER_DIR` | dev staging でビルドする sibling `issue-tracker-server` checkout の上書き |
+| `LOOKBACK_ISSUE_TRACKER_MAINTENANCE_INTERVAL_SECS` | Issue Tracker のメンテナンス間隔（秒）。既定値は `5` 秒で、`1` 未満は `1` 秒にクランプし、無効な値は `5` 秒にフォールバック |
 | `PROTOC` | `protoc` のパス |
 | `LOOKBACK_PLUGINS_SRC` | プラグイン共有ライブラリのソースディレクトリ |
+| `LOOKBACK_ISSUE_TRACKER_RUNNER_DIR` | 旧 checkout 上書き環境変数（互換用） |
 | `LOOKBACK_LINDERA_SRC` | `memory-store` 用に配置する IPADIC 検索用辞書ファイルのソースディレクトリ |
 | `LOOKBACK_WORKERS_DIR` | worker / workflow YAML バンドルの上書き |
 | `LOOKBACK_ENV_FILE` | バックエンドプロセスに渡す `.env` テンプレート |

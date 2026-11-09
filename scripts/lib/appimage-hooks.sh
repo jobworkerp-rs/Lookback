@@ -3,17 +3,43 @@
 #
 # Sourced by scripts/build-release.sh and shell tests.
 
+patch_linuxdeploy_gtk_hook_for_wayland_backend() {
+  local root=$1
+  local hook="${root}/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+  if [[ ! -f "${hook}" ]]; then
+    echo "missing linuxdeploy GTK backend hook: ${hook}" >&2
+    return 2
+  fi
+
+  # shellcheck disable=SC2016 # This is the literal line written into the hook.
+  local desired='export GDK_BACKEND="${GDK_BACKEND:-wayland,x11}"'
+  grep -Fqx "${desired}" "${hook}" && return 1
+  if ! grep -Eq '^export GDK_BACKEND=x11([[:space:]]*(#.*)?)?$' "${hook}"; then
+    echo "unrecognized linuxdeploy GTK backend hook: ${hook}" >&2
+    return 2
+  fi
+
+  local tmp="${hook}.tmp"
+  awk -v desired="${desired}" '
+    /^export GDK_BACKEND=x11([[:space:]]*(#.*)?)?$/ { print desired; next }
+    { print }
+  ' "${hook}" > "${tmp}"
+  mv "${tmp}" "${hook}"
+}
+
 patch_linuxdeploy_gtk_hook_for_host_ime() {
   local root=$1
   local hook="${root}/apprun-hooks/linuxdeploy-plugin-gtk.sh"
   [[ -f "${hook}" ]] || return 1
 
-  local needle='export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache"'
-  grep -Fqx "${needle}" "${hook}" || return 1
+  # linuxdeploy derives this path from pkg-config's libdir, which differs
+  # across distributions (for example, /usr/lib vs. Debian multiarch paths).
+  local immodules_cache_pattern='^export GTK_IM_MODULE_FILE="\$APPDIR/.*/gtk-3\.0/[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+/immodules\.cache"$'
+  grep -Eq "${immodules_cache_pattern}" "${hook}" || return 1
 
   local tmp="${hook}.tmp"
-  awk -v needle="${needle}" '
-    $0 == needle {
+  awk '
+    /^export GTK_IM_MODULE_FILE="\$APPDIR\/.*\/gtk-3\.0\/[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+\/immodules\.cache"$/ {
       print "# Prefer the host GTK input-method cache when it exposes fcitx/ibus. The"
       print "# bundled linuxdeploy cache only contains generic modules and can route"
       print "# Japanese input through XIM, which freezes WebKitGTK text fields on some"
@@ -86,7 +112,7 @@ patch_linuxdeploy_gtk_hook_for_host_ime() {
       print "    fi"
       print "  fi"
       print "else"
-      print "  export GTK_IM_MODULE_FILE=\"$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache\""
+      print "  " $0
       print "fi"
       print "if [ \"${LOOKBACK_DEBUG_IME:-}\" = \"1\" ]; then"
       print "  echo \"Lookback GTK IME: GTK_IM_MODULE=${GTK_IM_MODULE:-}\" >&2"

@@ -7,6 +7,7 @@ import {
   searchReflections,
   searchReflectionsHybrid,
 } from "@/api";
+import { AnalysisProgress } from "@/components/AnalysisProgress";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DateInput } from "@/components/DateInput";
 import { MarkdownBody } from "@/components/MarkdownMessage";
@@ -32,17 +33,17 @@ import type { ConnectionMode, ReflectionEntry, ThreadSummary } from "@/types/api
 export function Reflections({
   reflectionProgress,
   sidecar,
-  connectionMode = "local",
+  memoriesMode = "local",
 }: {
   reflectionProgress: ReflectionProgressHandle;
   sidecar: SidecarStatus;
-  connectionMode?: ConnectionMode | null;
+  memoriesMode?: ConnectionMode | null;
 }) {
   const { t } = useTranslation();
   // Date filter anchored to midnight in the display timezone (matches the
   // rendered card timestamps; see Threads for the boundary rationale).
   const timezone = useTimezone();
-  const vectorDisabled = isVectorDegraded(sidecar, connectionMode) != null;
+  const vectorDisabled = isVectorDegraded(sidecar, memoriesMode) != null;
   const [selectedOutcomes, setSelectedOutcomes] = useState<number[]>([]);
   const [createdAfter, setCreatedAfter] = useState<string>("");
   const [queryText, setQueryText] = useState<string>("");
@@ -185,52 +186,11 @@ export function Reflections({
           </div>
         </div>
 
-        {enqueueError && (
-          <div style={{ color: "var(--danger)", fontSize: 12, marginBottom: 8 }}>
-            {enqueueError}
-          </div>
-        )}
-        {reflectionProgress.progress && (
-          <div
-            className={`reflection-progress ${reflectionProgress.progress.status}`}
-            style={{ fontSize: 12, marginBottom: 8 }}
-          >
-            <strong>
-              {reflectionProgress.progress.status === "done"
-                ? t("reflections.progress.done")
-                : reflectionProgress.progress.status === "failed"
-                  ? t("reflections.progress.failed")
-                  : t("reflections.progress.active")}
-            </strong>
-            {reflectionProgress.progress.message && (
-              <pre
-                style={{
-                  marginTop: 4,
-                  fontSize: 11,
-                  whiteSpace: "pre-wrap",
-                  maxHeight: 160,
-                  overflow: "auto",
-                  background: "var(--fill-secondary)",
-                  padding: "6px 8px",
-                  borderRadius: 4,
-                }}
-              >
-                {reflectionProgress.progress.message}
-              </pre>
-            )}
-            {(reflectionProgress.progress.status === "done" ||
-              reflectionProgress.progress.status === "failed") && (
-              <button
-                type="button"
-                className="btn"
-                style={{ marginTop: 4 }}
-                onClick={reflectionProgress.clear}
-              >
-                {t("reflections.progress.close")}
-              </button>
-            )}
-          </div>
-        )}
+        <AnalysisProgress
+          progress={reflectionProgress.progress}
+          error={enqueueError}
+          onClose={reflectionProgress.clear}
+        />
 
         {(reflections.error || hybridSearch.error) && (
           <div style={{ color: "var(--danger)", fontSize: 12 }}>

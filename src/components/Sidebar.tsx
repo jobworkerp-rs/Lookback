@@ -11,6 +11,7 @@ export type Route =
   | "reflections"
   | "personality"
   | "chat"
+  | "issues"
   | "periodic"
   | "settings";
 
@@ -19,10 +20,12 @@ export interface SidebarProps {
   onChange: (route: Route) => void;
   threadCount: number | null;
   threadCountTruncated?: boolean;
+  threadGroupCount?: number | null;
   summaryCount: number | null;
   sidecar: SidecarStatus;
   theme: ThemeControl;
   locale: LocaleControl;
+  experimentalIssuesEnabled?: boolean;
 }
 
 interface NavEntry {
@@ -43,18 +46,22 @@ export function Sidebar({
   onChange,
   threadCount,
   threadCountTruncated = false,
+  threadGroupCount = null,
   summaryCount,
   sidecar,
   theme,
   locale,
+  experimentalIssuesEnabled = true,
 }: SidebarProps) {
   const { t } = useTranslation();
   const badges: Partial<Record<Route, string>> = {
     threads:
-      threadCount != null
-        ? threadCountTruncated
-          ? `${threadCount}+`
-          : `${threadCount}`
+      (threadGroupCount ?? threadCount) != null
+        ? threadGroupCount != null
+          ? `${threadGroupCount}`
+          : threadCountTruncated
+            ? `${threadCount}+`
+            : `${threadCount}`
         : undefined,
     summaries: summaryCount != null ? `${summaryCount}` : undefined,
   };
@@ -63,7 +70,10 @@ export function Sidebar({
       <div className="brand">Lookback</div>
 
       <div className="nav-section">{t("nav.section.browse")}</div>
-      {BROWSE_ENTRIES.map((entry) => (
+      {[
+        ...BROWSE_ENTRIES,
+        ...(experimentalIssuesEnabled ? [{ key: "issues" as const, labelKey: "nav.issues" }] : []),
+      ].map((entry) => (
         <button
           key={entry.key}
           type="button"
@@ -127,53 +137,70 @@ export function Sidebar({
         </div>
       </div>
 
-      <SidecarStatusPanel status={sidecar} />
+      <SidecarStatusPanel status={sidecar} experimentalIssuesEnabled={experimentalIssuesEnabled} />
     </aside>
   );
 }
 
-function SidecarStatusPanel({ status }: { status: SidecarStatus }) {
+function SidecarStatusPanel({
+  status,
+  experimentalIssuesEnabled,
+}: {
+  status: SidecarStatus;
+  experimentalIssuesEnabled: boolean;
+}) {
   const { t } = useTranslation();
   const phaseLabel = t(`sidecar.phase.${status.phase}`);
   const dotClass = PHASE_DOT[status.phase];
+  const issueTrackerWarning = status.warnings.find((w) => w.kind === "issue_tracker_unavailable");
+  // Once started, a service without a port is one the app does not run here.
+  const portLabel = (port: number | null | undefined) =>
+    port != null ? `:${port}` : status.endpoints ? t("sidecar.remote") : phaseLabel;
   return (
     <div className="sidecar-status">
       <div style={{ fontWeight: 600 }}>{t("sidecar.title")}</div>
       <div className="sidecar-row">
         <span className={`dot ${dotClass}`} />
         <span>jobworkerp</span>
-        <span className="port">
-          {status.endpoints ? `:${status.endpoints.jobworkerp_port}` : phaseLabel}
-        </span>
+        <span className="port">{portLabel(status.endpoints?.jobworkerp_port)}</span>
       </div>
+      {experimentalIssuesEnabled && (
+        <div className="sidecar-row">
+          <span className={`dot ${issueTrackerWarning ? "warn" : dotClass}`} />
+          <span>issue-tracker</span>
+          <span className="port" title={issueTrackerWarning?.detail ?? undefined}>
+            {status.endpoints?.issue_tracker_port != null
+              ? `:${status.endpoints.issue_tracker_port}`
+              : issueTrackerWarning
+                ? t("sidecar.unavailable")
+                : phaseLabel}
+          </span>
+        </div>
+      )}
       <div className="sidecar-row">
         <span className={`dot ${dotClass}`} />
         <span>memories</span>
-        <span className="port">
-          {status.endpoints?.memories_port != null
-            ? `:${status.endpoints.memories_port}`
-            : phaseLabel}
-        </span>
+        <span className="port">{portLabel(status.endpoints?.memories_port)}</span>
       </div>
       <div className="sidecar-row">
         <span className={`dot ${dotClass}`} />
         <span>conductor</span>
-        <span className="port">
-          {status.endpoints ? `:${status.endpoints.conductor_port}` : phaseLabel}
-        </span>
+        <span className="port">{portLabel(status.endpoints?.conductor_port)}</span>
       </div>
       {/* No phase=error branch here: when the sidecar fails to start
           App.tsx unconditionally swaps to the BootError full-screen
           surface, so Sidebar never mounts in that state. */}
-      {status.warnings.map((w) => (
-        <div key={`${w.kind}:${w.detail ?? ""}`} className="sidecar-warning">
-          <span className="dot warn" />
-          <span className="sidecar-warning-label">{t(`sidecar.warning.${w.kind}`, w.kind)}</span>
-          <span className="sidecar-warning-msg" title={w.detail ?? undefined}>
-            {w.message}
-          </span>
-        </div>
-      ))}
+      {status.warnings
+        .filter((w) => experimentalIssuesEnabled || w.kind !== "issue_tracker_unavailable")
+        .map((w) => (
+          <div key={`${w.kind}:${w.detail ?? ""}`} className="sidecar-warning">
+            <span className="dot warn" />
+            <span className="sidecar-warning-label">{t(`sidecar.warning.${w.kind}`, w.kind)}</span>
+            <span className="sidecar-warning-msg" title={w.detail ?? undefined}>
+              {w.message}
+            </span>
+          </div>
+        ))}
     </div>
   );
 }

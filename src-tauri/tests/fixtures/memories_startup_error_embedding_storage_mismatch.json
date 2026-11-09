@@ -1,0 +1,1 @@
+{"timestamp":"2026-10-10T00:00:00Z","level":"ERROR","fields":{"message":"embedding storage mismatch","code":"embedding_storage_mismatch","mismatches":"[{\"left\":\"rdb\",\"right\":\"memory_vector\"}]"},"target":"app::startup_error"}

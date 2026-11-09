@@ -35,18 +35,21 @@ workers:
   #    registered in ALL modes — the text path needs it even when
   #    MEMORY_IMAGE_SEARCH_MODE=none (GPU required is a confirmed
   #    decision).
-  - name: memories-mm-embedding
+  #
+  #    The worker NAME is the `MEMORY_MM_EMBEDDING_WORKER` env placeholder
+  #    (default `memories-mm-embedding`): this registration is the single
+  #    definition, and every consumer — the workflow YAMLs that reference
+  #    it by name and the Rust query paths (memory_vector SearchSemantic /
+  #    SearchByMedia and reflection F-S8 via
+  #    `mm_embedding_worker_name()`) — resolves the same env var, so a name
+  #    override can never split query vectors from stored vectors.
+  - name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: MultimodalEmbeddingRunner
     use_static: true
     channel: embedding
     settings:
       model_id: Qwen/Qwen3-VL-Embedding-2B
-      # Lookback uses Metal for local macOS embedding.
-      # so the Apple-Silicon sidecar build can run the multimodal
-      # embedding runner on the platform GPU. The mm-embedding-runner
-      # crate must be built with `--features metal` for this device
-      # value; otherwise it fails registration with UnsupportedDevice.
-      device: Metal
+      device: CUDA
       dtype: F16
       max_sequence_length: 8192
       image_size_limit_bytes: 10485760
@@ -65,15 +68,24 @@ workers:
   - name: memories-upsert-embedding
     runner: GRPC
     settings:
-      # Quoted so the document is valid YAML on its own (e.g. for the Settings
-      # model-status reader, which parses this file directly). jobworkerp's
-      # loader runs `expand_env` BEFORE parsing, so quoting does not change how
-      # the placeholder is substituted there. Mirrors llm-workers.yaml.
-      host: "%{MEMORY_GRPC_HOST}"
-      port: "%{MEMORY_GRPC_PORT}"
-      tls: %{MEMORY_GRPC_TLS:-false}
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
       use_reflection: true
       method: llm_memory.service.MemoryVectorService/BatchUpsertEmbeddings
+      as_json: true
+
+  # 2b. GRPC worker that reports a failed generation back to this server
+  #     (EmbeddingSpaceService/ReportEmbeddingFailure) with the request's
+  #     dispatch token, so the target is counted as failed instead of
+  #     staying missing. Used from the catch branch of every embedding
+  #     workflow.
+  - name: memories-report-embedding-failure
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.EmbeddingSpaceService/ReportEmbeddingFailure
       as_json: true
 
   # 3. WORKFLOW worker that orchestrates the embed → upsert pipeline.
@@ -92,7 +104,7 @@ workers:
   #    - A separate single-slot channel serializes the workflow itself,
   #      keeps each run within ~ embedding-time + ~50ms upsert, and lets
   #      backlog pile up in the channel queue without timing out.
-  - name: memories-auto-embedding
+  - name: "memories-auto-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: WORKFLOW
     response_type: NO_RESULT
     channel: embedding_workflow

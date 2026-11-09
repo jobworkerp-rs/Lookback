@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package jobworkerp.runner;
+
+// # Workflow Run Arguments
+// Arguments for executing a workflow with the 'run' method
+// Note: workflow_source should be pre-configured in WorkflowRunnerSettings,
+//       or can be overridden here if needed
+message WorkflowRunArgs {
+  // # Workflow Source (optional override)
+  // If workflow_source was not specified in settings, it must be provided here
+  // If specified in both settings and args, args takes precedence
+  oneof workflow_source {
+    // # Workflow URL
+    // Path or URL to the workflow definition file (JSON or YAML)
+    string workflow_url = 1;
+    // # Workflow Data
+    // The workflow definition as a JSON or YAML string
+    string workflow_data = 2;
+  }
+
+  // # Input
+  // String input for the workflow context
+  // Must conform to the schema defined in the workflow definition
+  // (Can be a plain string or JSON formatted string, runtime expression available)
+  string input = 3;
+
+  // # Workflow Context
+  // Additional context information for workflow execution
+  // Can be a plain string or JSON formatted string
+  // NOTE: If workflow_context is also set in WorkflowRunnerSettings, both are merged (settings keys take precedence).
+  optional string workflow_context = 4;
+
+  // # Execution ID
+  // Unique identifier for the workflow execution instance
+  // Used to track and manage the execution state if specified
+  optional string execution_id = 5;
+
+  message Checkpoint {
+    message WorkflowCheckPointContext {
+      // Unique name for the workflow
+      string name = 1;
+      // Input data for the workflow execution (JSON)
+      string input = 2;
+      // Context variables for the workflow execution (JSON)
+      string context_variables = 3;
+    }
+    message TaskCheckPointContext {
+      // Processed input data for the task execution (JSON)
+      string input = 1;
+      // Processed output data from the task execution (JSON)
+      string output = 2;
+      // Context variables for the task execution (JSON)
+      string context_variables = 3;
+      // Flow directive for the task execution (e.g. "continue", "end", "exit", and task name)
+      string flow_directive = 4;
+    }
+    message CheckPointContext {
+      // Workflow checkpoint context
+      WorkflowCheckPointContext workflow = 1;
+      // Task checkpoint context
+      TaskCheckPointContext task = 2;
+    }
+
+    // # Checkpoint Data
+    // If specified, it will override the context data for this checkpoint
+    optional CheckPointContext data = 1;
+
+    // # Checkpoint Position
+    // The position as json pointer in the workflow where this checkpoint is defined
+    // Must be a valid position string as defined in the workflow definition
+    string position = 2;
+  }
+
+  // # Checkpoint
+  // Optional checkpoint data for the workflow execution
+  // This is used to restart the workflow execution from a specific point
+  optional Checkpoint from_checkpoint = 6;
+}

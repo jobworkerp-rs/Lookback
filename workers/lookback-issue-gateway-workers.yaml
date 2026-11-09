@@ -1,0 +1,155 @@
+# Gateway-bound worker tools. The worker listener exposes only the five
+# claim-lifecycle operations and applies the registered work-eligibility policy.
+defaults:
+  response_type: DIRECT
+  store_failure: true
+  broadcast_results: false
+
+workers:
+  - name: lookback_issue_list_ready
+    description: |-
+      format: jobworkerp-description
+      version: 1
+      rpc: issue_tracker.rpc.v1.IssueGateway/ListReady
+      description: |-
+        List issues that are currently eligible for work and choose a target before claiming it.
+        Listing an issue does not claim it. Read either success or error in the response. When a
+        success response has a next-page token, pass that exact opaque value to a later call to
+        continue listing; otherwise do not create or guess another token. Claim a selected issue
+        with lookback_issue_claim___unary before changing it.
+      parameters:
+        pageSize:
+          description: Number of issues requested in one page. Omit it or use 0 to let the server choose its default; do not assume a deployment-specific limit.
+        pageToken:
+          description: Omit on the first page. For a later page, pass the opaque token returned by the previous successful ListReady response unchanged; never generate or infer a token.
+    runner: GRPC
+    settings:
+      host: "%{ISSUE_TRACKER_GATEWAY_WORKER_HOST}"
+      port: "%{ISSUE_TRACKER_GATEWAY_WORKER_PORT}"
+      tls: %{ISSUE_TRACKER_GATEWAY_WORKER_TLS:-false}
+      use_reflection: true
+      method: issue_tracker.rpc.v1.IssueGateway/ListReady
+      as_json: true
+  - name: lookback_issue_claim
+    description: |-
+      format: jobworkerp-description
+      version: 1
+      rpc: issue_tracker.rpc.v1.IssueGateway/Claim
+      description: |-
+        Claim one issue selected from a successful ListReady response before working on it.
+        Check whether the response contains success or an error. On success, retain issueId,
+        capabilityId, and revision for Heartbeat, Release, or Transition. A claim does not
+        complete the issue. Reuse an idempotency key only when retrying the same logical claim
+        with unchanged input; use a new key for another operation.
+      parameters:
+        issueId:
+          description: ID of the issue selected from a successful ListReady response.
+        expectedRevision:
+          description: Current revision returned for the selected issue. It is required; 0 is valid. Pass the observed decimal value and do not guess a newer revision.
+          examples:
+            - "0"
+            - "123"
+        idempotencyKey:
+          description: Non-empty key for this logical claim operation. Keep it unchanged only when retrying the identical claim after an uncertain response.
+    runner: GRPC
+    settings:
+      host: "%{ISSUE_TRACKER_GATEWAY_WORKER_HOST}"
+      port: "%{ISSUE_TRACKER_GATEWAY_WORKER_PORT}"
+      tls: %{ISSUE_TRACKER_GATEWAY_WORKER_TLS:-false}
+      use_reflection: true
+      method: issue_tracker.rpc.v1.IssueGateway/Claim
+      as_json: true
+  - name: lookback_issue_heartbeat
+    description: |-
+      format: jobworkerp-description
+      version: 1
+      rpc: issue_tracker.rpc.v1.IssueGateway/Heartbeat
+      description: |-
+        Extend a claim that is still held while work remains in progress.
+        Check whether the response contains success or an error. On success, retain the returned
+        revision for the next claim operation. Use the capability obtained from Claim and do not
+        use it after Release or a successful terminal Transition. Reuse an idempotency key only
+        for a retry of the identical heartbeat.
+      parameters:
+        issueId:
+          description: ID returned by the successful Claim response for the claim being extended.
+        capabilityId:
+          description: Capability ID returned by the successful Claim response. It authorizes this claim while it remains active.
+        expectedRevision:
+          description: Latest revision from the most recent successful Claim, Heartbeat, or non-terminal Transition. It is required and 0 is valid.
+          examples:
+            - "0"
+            - "123"
+        idempotencyKey:
+          description: Non-empty key for this logical heartbeat. Keep it unchanged only when retrying the same heartbeat with unchanged input.
+    runner: GRPC
+    settings:
+      host: "%{ISSUE_TRACKER_GATEWAY_WORKER_HOST}"
+      port: "%{ISSUE_TRACKER_GATEWAY_WORKER_PORT}"
+      tls: %{ISSUE_TRACKER_GATEWAY_WORKER_TLS:-false}
+      use_reflection: true
+      method: issue_tracker.rpc.v1.IssueGateway/Heartbeat
+      as_json: true
+  - name: lookback_issue_release
+    description: |-
+      format: jobworkerp-description
+      version: 1
+      rpc: issue_tracker.rpc.v1.IssueGateway/Release
+      description: |-
+        Release an active claim and atomically return the Issue to OPEN when work is not being
+        completed. A successful release makes the Issue available for another worker to claim, so
+        do not use it to report completed work. Check whether the response contains success or an
+        error. After a successful release, the capability is no longer valid for Heartbeat or
+        Transition. This operation does not take a revision or idempotency key.
+      parameters:
+        issueId:
+          description: ID of the issue whose active claim is being released.
+        capabilityId:
+          description: Capability ID returned by Claim for the active claim to release.
+    runner: GRPC
+    settings:
+      host: "%{ISSUE_TRACKER_GATEWAY_WORKER_HOST}"
+      port: "%{ISSUE_TRACKER_GATEWAY_WORKER_PORT}"
+      tls: %{ISSUE_TRACKER_GATEWAY_WORKER_TLS:-false}
+      use_reflection: true
+      method: issue_tracker.rpc.v1.IssueGateway/Release
+      as_json: true
+  - name: lookback_issue_transition
+    description: |-
+      format: jobworkerp-description
+      version: 1
+      rpc: issue_tracker.rpc.v1.IssueGateway/Transition
+      description: |-
+        Change the state of an issue while holding its claim. Check whether the response contains
+        success or an error and retain the returned revision after a non-terminal transition.
+        Done requires completion and no cancellation. Canceled requires cancellation with a
+        non-unspecified classification and no completion. Other states require both reports to be
+        omitted. A successful Done or Canceled transition invalidates the capability; do not use
+        it for Heartbeat, Release, or another Transition. Reuse an idempotency key only for a
+        retry of the identical transition with unchanged input.
+      parameters:
+        issueId:
+          description: ID returned by Claim for the issue whose state will change.
+        targetState:
+          description: Target issue-state enum. Choose Done only with completion, Canceled only with cancellation, and omit both reports for every other state.
+        capabilityId:
+          description: Active capability ID returned by Claim. Do not reuse it after Release or a successful terminal transition.
+        expectedRevision:
+          description: Latest revision from the most recent successful Claim, Heartbeat, or non-terminal Transition. It is required and 0 is valid.
+          examples:
+            - "0"
+            - "123"
+        idempotencyKey:
+          description: Non-empty key for this logical state transition. Keep it unchanged only when retrying the identical transition with unchanged input.
+        completion:
+          description: Completion report required only when targetState is Done. Choose exactly one of verified or unverified. Verified lists observed evidence with kind and summary, plus uri when useful. Unverified gives the reason completion could not be verified and its residual risk.
+        cancellation:
+          description: Cancellation report required only when targetState is Canceled. Set classification to a valid non-unspecified cancellation enum and omit completion.
+    runner: GRPC
+    settings:
+      host: "%{ISSUE_TRACKER_GATEWAY_WORKER_HOST}"
+      port: "%{ISSUE_TRACKER_GATEWAY_WORKER_PORT}"
+      tls: %{ISSUE_TRACKER_GATEWAY_WORKER_TLS:-false}
+      use_reflection: true
+      method: issue_tracker.rpc.v1.IssueGateway/Transition
+      as_json: true

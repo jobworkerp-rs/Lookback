@@ -2,32 +2,49 @@ syntax = "proto3";
 
 package llm_memory.service;
 
+import "llm_memory/data/embedding_space.proto";
 import "llm_memory/data/memory_vector.proto";
 import "llm_memory/data/reflection.proto";
 import "llm_memory/data/reflection_filter.proto";
 import "llm_memory/service/common.proto";
 import "llm_memory/service/memory_vector.proto";
 
-// Intent-vector specific RPCs for reflections. Summary embeddings
-// reuse the existing MemoryVectorService.UpsertEmbedding because they
-// land in the existing memory_vector LanceDB table (only the dispatcher
-// differs); intent embeddings live in the dedicated
+// Intent-vector specific RPCs for reflections. Reflection search-document
+// embeddings use the generic MemoryVectorService text path and land in
+// memory_vector; intent embeddings live in the dedicated
 // reflection_intent_vector table and need their own surface.
 
-message UpsertIntentEmbeddingRequest {
+// N-row upsert for a reflection's intent embedding. A reflection now
+// owns N rows keyed by (memory_id, vector_kind, chunk_index), mirroring
+// the memory_vector schema. `vector_kind` is always "text" for intents.
+// `VectorRow` is reused from service/memory_vector.proto. Server path:
+//   - rows non-empty -> delete existing rows whose vector_kind is in
+//     replace_kinds, then insert rows.
+//   - rows empty + replace_kinds non-empty -> stale-delete only
+//     (success with success_count=0; the workflow marks it FAILED so the
+//     empty-embedding status branch is preserved).
+//   - replace_kinds empty -> InvalidArgument.
+message BatchUpsertIntentEmbeddingsRowsRequest {
   llm_memory.data.ReflectionId reflection_id = 1;
-  llm_memory.data.EmbeddingVector embedding = 2;
-  optional string embedding_model = 3;
+  optional string embedding_model = 2;
+  repeated string replace_kinds = 3;
+  repeated VectorRow rows = 4;
+  // Token of the generation request; see BatchUpsertEmbeddingsRequest.
+  optional llm_memory.data.DispatchToken token = 5;
 }
 
 message RedispatchReflectionEmbeddingsRequest {
   // SUMMARY / INTENT / BOTH selector. UNSPECIFIED is rejected.
   llm_memory.data.EmbeddingKind kind = 1;
-  // Filter the reflections to redispatch (origin_user_id /
-  // origin_thread_id / prompt_version / *_embedding_status / period).
-  // Existing MemoryVectorService.RedispatchEmbeddings cannot be reused
-  // because it cannot filter the reflection-specific index fields.
+  // Filter the reflections to redispatch. SUMMARY and BOTH are a
+  // compatibility path for sidecar-filtered search-document redispatch
+  // and require a non-empty filter; all reflection search documents
+  // should be redispatched via MemoryVectorService.RedispatchEmbeddings
+  // with user_id=300000. INTENT may omit the filter and defaults to
+  // PENDING/FAILED intent statuses.
   optional llm_memory.data.ReflectionSearchFilter filter = 2;
+  // SUMMARY/BOTH use this as an internal memory_id-desc page size.
+  // INTENT uses it as the maximum number of rows returned by one call.
   optional uint32 batch_size = 3;
 }
 
@@ -44,8 +61,9 @@ message RedispatchReflectionEmbeddingsResponse {
 // shapes are identical.
 
 service ReflectionVectorService {
-  rpc UpsertIntentEmbedding(UpsertIntentEmbeddingRequest)
-      returns (UpsertEmbeddingResponse);
+  // N-row upsert of a reflection intent embedding (chunked).
+  rpc BatchUpsertIntentEmbeddings(BatchUpsertIntentEmbeddingsRowsRequest)
+      returns (BatchUpsertEmbeddingsResponse);
   rpc RedispatchReflectionEmbeddings(RedispatchReflectionEmbeddingsRequest)
       returns (RedispatchReflectionEmbeddingsResponse);
   rpc RebuildIntentIndex(RebuildIndexRequest) returns (RebuildIndexResponse);

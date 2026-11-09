@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
-use crate::jobworkerp::{StreamEvent, run_cancellable_named_stream};
+use crate::jobworkerp::{StreamEvent, job_timeouts, run_cancellable_named_stream};
 
-use super::connection::MemoriesCallback;
+use super::connection::GrpcAddress;
 use super::import::{
     REFLECTION_PROMPT_VERSION, summarize_workflow_chunk, summarize_workflow_error,
+    terminal_batch_outcome,
 };
 use super::{
     AppState, GeneratedRefreshScope, StepStatus, cancel_dispatch_inner, emit_event,
@@ -66,6 +67,7 @@ pub async fn enqueue_reflection_job(
     state: State<'_, AppState>,
     req: EnqueueReflectionJobRequest,
 ) -> AppResult<EnqueueReflectionJobResponse> {
+    let dispatch_admission = state.lock_llm_settings_dispatch_gate().await;
     // Reflection generation writes intent embeddings into the local vector
     // store; refuse when it is degraded (local mode only).
     state.ensure_local_embedding_available()?;
@@ -94,7 +96,9 @@ pub async fn enqueue_reflection_job(
 
     let args = super::wrap_workflow_run_args(&input);
 
-    let handle = state.jobworkerp().await?;
+    let handle = state
+        .jobworkerp_with_timeout(job_timeouts::REFLECTION_BATCH)
+        .await?;
     let job_id = req
         .dispatch_id
         .filter(|s| !s.is_empty())
@@ -106,7 +110,8 @@ pub async fn enqueue_reflection_job(
         &[crate::search_index_maintenance::MaintenanceTable::Thread],
     )
     .await?;
-    let entry = state.dispatch_register(&job_id).await;
+    let entry = state.dispatch_register_admitted(&job_id).await;
+    drop(dispatch_admission);
     let cancel = entry.token.clone();
     let current_job_id = entry.current_job_id.clone();
 
@@ -147,8 +152,7 @@ pub async fn enqueue_reflection_job(
                             &job_id_for_emit,
                             vec![GeneratedRefreshScope::Reflection],
                         );
-                        let digest = msg.map(|raw| summarize_workflow_chunk(raw, last_progress).0);
-                        (StepStatus::Done, digest)
+                        terminal_batch_outcome(msg, last_progress)
                     }
                     StreamEvent::Failed(msg) => {
                         emit_generated_refresh(
@@ -213,7 +217,7 @@ fn resolve_reflection_batch_yaml() -> Option<PathBuf> {
 /// is added so a remote HTTPS target dials back over TLS.
 fn build_workflow_input(
     user_id: i64,
-    callback: &MemoriesCallback,
+    callback: &GrpcAddress,
     output_language: &str,
     prompt_version: &str,
     last_message_after_ms: Option<i64>,
@@ -238,8 +242,8 @@ fn build_workflow_input(
 mod tests {
     use super::*;
 
-    fn dummy_callback() -> MemoriesCallback {
-        MemoriesCallback {
+    fn dummy_callback() -> GrpcAddress {
+        GrpcAddress {
             host: "127.0.0.1".into(),
             port: 9010,
             tls: false,
@@ -332,7 +336,7 @@ mod tests {
     fn workflow_input_propagates_remote_tls() {
         let v = build_workflow_input(
             1,
-            &MemoriesCallback {
+            &GrpcAddress {
                 host: "memories.example.com".into(),
                 port: 8443,
                 tls: true,

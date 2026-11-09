@@ -46,6 +46,28 @@ describe("SummaryCalendar", () => {
     expect(day10).toBeDisabled();
   });
 
+  it("marks a recovery-only period as selectable without treating it as a summary", () => {
+    const onSelectKey = vi.fn();
+    renderWithProviders(
+      <SummaryCalendar
+        kind="daily"
+        month="2026-05"
+        periodKeys={[]}
+        warningPeriodKeys={["2026-05-10"]}
+        selectedKey={null}
+        onSelectKey={onSelectKey}
+        onMonthChange={vi.fn()}
+      />,
+    );
+    const day10 = screen
+      .getAllByRole("button")
+      .find((button) => button.textContent?.trim().startsWith("10"));
+    expect(day10).toHaveAttribute("title", "要約未完了");
+    expect(day10).not.toBeDisabled();
+    if (day10) fireEvent.click(day10);
+    expect(onSelectKey).toHaveBeenCalledWith("2026-05-10");
+  });
+
   it("reports the ISO week key when a weekly cell is clicked", () => {
     const onSelectKey = vi.fn();
     renderWithProviders(
@@ -79,6 +101,25 @@ describe("SummaryCalendar", () => {
     );
     const monthBtn = screen.getByText("この月の要約");
     fireEvent.click(monthBtn);
+    expect(onSelectKey).toHaveBeenCalledWith("2026-05");
+  });
+
+  it("offers the monthly recovery-only state as an incomplete warning", () => {
+    const onSelectKey = vi.fn();
+    renderWithProviders(
+      <SummaryCalendar
+        kind="monthly"
+        month="2026-05"
+        periodKeys={[]}
+        warningPeriodKeys={["2026-05"]}
+        selectedKey={null}
+        onSelectKey={onSelectKey}
+        onMonthChange={vi.fn()}
+      />,
+    );
+    const warning = screen.getByRole("button", { name: "要約未完了" });
+    expect(warning).not.toBeDisabled();
+    fireEvent.click(warning);
     expect(onSelectKey).toHaveBeenCalledWith("2026-05");
   });
 

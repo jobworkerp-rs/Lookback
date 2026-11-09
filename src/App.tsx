@@ -1,21 +1,21 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  countSummaries,
+  getAppCapabilities,
   getAppSettings,
   getConnectionConfig,
-  getPersonality,
   getSetupStatus,
   setOutputLanguage,
 } from "@/api";
 import { BootError } from "@/components/BootError";
 import { BootScreen } from "@/components/BootScreen";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmbeddingSpaceStatus } from "@/components/EmbeddingSpaceStatus";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ImportDialog } from "@/components/ImportDialog";
-import { ImportToast } from "@/components/ImportToast";
 import { SetupWizard } from "@/components/SetupWizard";
 import { type Route, Sidebar } from "@/components/Sidebar";
 import { VectorDegradedBanner } from "@/components/VectorDegradedBanner";
@@ -26,18 +26,22 @@ import { useLocale } from "@/hooks/useLocale";
 import { useRagChat } from "@/hooks/useRagChat";
 import { useReflectionProgress } from "@/hooks/useReflectionProgress";
 import { useSettingsDirty } from "@/hooks/useSettingsDirty";
+import { useSidebarCounts } from "@/hooks/useSidebarCounts";
 import { isVectorDegraded, useSidecarStatus } from "@/hooks/useSidecarStatus";
+import { useSummaryGenerationProgress } from "@/hooks/useStagedProgress";
 import { usePersonalityProgress, useSummaryProgress } from "@/hooks/useStepStreamProgress";
 import { useTheme } from "@/hooks/useTheme";
 import { TimezoneContext } from "@/hooks/useTimezone";
-import { PERSONALITY_QUERY_KEY } from "@/lib/queryKeys";
+import { connectionSignature } from "@/lib/connectionConfig";
 import { Chat } from "@/pages/Chat";
+import { Issues } from "@/pages/Issues";
 import { PeriodicTasks } from "@/pages/PeriodicTasks";
 import { Personality } from "@/pages/Personality";
 import { Reflections } from "@/pages/Reflections";
 import { type EmbeddingFocus, Settings } from "@/pages/Settings";
 import { Summaries, type SummariesFocus } from "@/pages/Summaries";
 import { Threads } from "@/pages/Threads";
+import type { EmbeddingMigrationFailedEvent } from "@/types/api";
 
 export function App() {
   const { t } = useTranslation();
@@ -51,6 +55,13 @@ export function App() {
   // backend-resolved zone (explicit selection → env/OS fallback); the Settings
   // save invalidates `["app-settings"]`, so a change re-renders all timestamps.
   const appSettings = useQuery({ queryKey: ["app-settings"], queryFn: getAppSettings });
+  const appCapabilities = useQuery({
+    queryKey: ["app-capabilities"],
+    queryFn: getAppCapabilities,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const experimentalIssuesEnabled = appCapabilities.data?.experimental_issues_enabled === true;
+  const issueTrackingConfigurable = appCapabilities.data?.issue_tracking_configurable === true;
   const timezone = appSettings.data?.effective_timezone;
   const [route, setRoute] = useState<Route>("threads");
   // Pending navigation parked while the leave-guard confirm is open.
@@ -61,6 +72,7 @@ export function App() {
   // running in the background keeps streaming and its progress survives when
   // the user switches tabs (the pages mount/unmount on route change).
   const summaryProgress = useSummaryProgress();
+  const summaryGenerationProgress = useSummaryGenerationProgress();
   const personalityProgress = usePersonalityProgress();
   const reflectionProgress = useReflectionProgress();
   // Same reason as the progress hooks above: the Chat page unmounts on
@@ -73,12 +85,16 @@ export function App() {
   // source pill so the user lands on the cited calendar entry instead of
   // the top-level tab. `Summaries` clears it via `onFocusConsumed`.
   const [summariesFocus, setSummariesFocus] = useState<SummariesFocus | null>(null);
+  const [threadGroupFocus, setThreadGroupFocus] = useState<string | null>(null);
   // Deep-link seed for the Settings tab's embedding card — set by the
   // vector-degraded banner's CTA so the user lands directly on the embedding
   // model settings (advanced view + scrolled into view). `Settings` clears it
   // via `onEmbeddingFocusConsumed`.
   const [embeddingFocus, setEmbeddingFocus] = useState<EmbeddingFocus | null>(null);
   const queryClient = useQueryClient();
+  const [sidecarReadyEpoch, setSidecarReadyEpoch] = useState(0);
+  const [embeddingMigrationFailure, setEmbeddingMigrationFailure] =
+    useState<EmbeddingMigrationFailedEvent | null>(null);
   useGeneratedRefresh(queryClient);
   useImportRefresh(queryClient, importProgress.snapshot);
   const setupStatus = useQuery({
@@ -92,11 +108,53 @@ export function App() {
     queryFn: getConnectionConfig,
     enabled: sidecar.phase === "ready",
   });
+  const lastConnectionSignature = useRef<string | null>(null);
+  const targetSignature = connectionConfig.data ? connectionSignature(connectionConfig.data) : null;
+  useEffect(() => {
+    if (!targetSignature) return;
+    if (
+      lastConnectionSignature.current !== null &&
+      lastConnectionSignature.current !== targetSignature
+    ) {
+      void queryClient.invalidateQueries({ queryKey: ["embedding-space"] });
+    }
+    lastConnectionSignature.current = targetSignature;
+  }, [targetSignature, queryClient]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenReady: (() => void) | undefined;
+    let unlistenFailure: (() => void) | undefined;
+    void listen("sidecar://ready", () => {
+      setSidecarReadyEpoch((epoch) => epoch + 1);
+      void queryClient.invalidateQueries({ queryKey: ["embedding-space"] });
+      void queryClient.invalidateQueries({ queryKey: ["embedding-migration-inspect"] });
+      setEmbeddingMigrationFailure(null);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenReady = unlisten;
+    });
+    void listen<EmbeddingMigrationFailedEvent>("embedding_migration_failed", (event) => {
+      setEmbeddingMigrationFailure(event.payload);
+      // The event is a warning only. The migration panel always inspects the
+      // actual service state before making any operation available.
+      void queryClient.invalidateQueries({ queryKey: ["embedding-space"] });
+      void queryClient.invalidateQueries({ queryKey: ["embedding-migration-inspect"] });
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenFailure = unlisten;
+    });
+    return () => {
+      disposed = true;
+      unlistenReady?.();
+      unlistenFailure?.();
+    };
+  }, [queryClient]);
   // Vector-store degraded diagnostics (null unless the sidecar restarted with
-  // vectors disabled). It only gates local connection mode; remote targets own
-  // their vector store state independently from the local sidecar warning.
-  const connectionMode = connectionConfig.data?.mode ?? null;
-  const degraded = isVectorDegraded(sidecar, connectionMode);
+  // vectors disabled). It only gates a local memories; a remote one owns its
+  // vector store state independently from the local sidecar warning.
+  const memoriesMode = connectionConfig.data?.memories.mode ?? null;
+  const degraded = isVectorDegraded(sidecar, memoriesMode);
 
   // Mirror the resolved UI locale into the backend's `app-settings.json` so
   // headless generation (conductor periodic runs, which never touch the
@@ -125,23 +183,7 @@ export function App() {
     }
   };
 
-  // Sidebar's thread count piggybacks on the Personality query —
-  // `get_personality` already returns `thread_count` (derived server-side
-  // because `ThreadService.Count` has no user_id filter). Sharing the
-  // query key dedupes with the Personality tab.
-  const personality = useQuery({
-    queryKey: PERSONALITY_QUERY_KEY,
-    queryFn: () => getPersonality({ user_id: 1 }),
-    enabled: sidecar.phase === "ready",
-    refetchInterval: 30_000,
-  });
-
-  const summaryCount = useQuery({
-    queryKey: ["count-summaries"],
-    queryFn: () => countSummaries(),
-    enabled: sidecar.phase === "ready",
-    refetchInterval: 15000,
-  });
+  const sidebarCounts = useSidebarCounts(sidecar.phase === "ready");
 
   const importBin = useQuery({
     queryKey: ["resolve-memories-import-bin"],
@@ -215,12 +257,14 @@ export function App() {
         <Sidebar
           current={route}
           onChange={guardedSetRoute}
-          threadCount={personality.data?.thread_count ?? null}
-          threadCountTruncated={personality.data?.thread_count_truncated ?? false}
-          summaryCount={summaryCount.data ?? null}
+          threadCount={sidebarCounts.threadCount}
+          threadCountTruncated={sidebarCounts.threadCountTruncated}
+          threadGroupCount={sidebarCounts.threadGroupCount}
+          summaryCount={sidebarCounts.summaryCount}
           sidecar={sidecar}
           theme={theme}
           locale={locale}
+          experimentalIssuesEnabled={experimentalIssuesEnabled}
         />
         <main className="main">
           {/* Non-fatal degraded banner: the sidecar came up but the local
@@ -235,6 +279,14 @@ export function App() {
               }}
             />
           )}
+          {(["threads", "summaries", "reflections", "chat"] as const).includes(
+            route as "threads" | "summaries" | "reflections" | "chat",
+          ) && (
+            <EmbeddingSpaceStatus
+              readyEpoch={sidecarReadyEpoch}
+              failureEvent={embeddingMigrationFailure}
+            />
+          )}
           {/* Keyed by route so a crash in one tab shows a fallback while the
             sidebar stays usable, and switching tabs remounts the boundary
             (clearing the error). */}
@@ -243,23 +295,34 @@ export function App() {
               <Threads
                 onOpenImport={() => setImportOpen(true)}
                 sidecar={sidecar}
-                connectionMode={connectionMode}
+                memoriesMode={memoriesMode}
+                importSnapshot={importProgress.snapshot}
+                importBusy={importProgress.busy}
+                onCancelImport={importProgress.cancel}
+                onClearImportProgress={importProgress.clear}
+                initialGroupId={threadGroupFocus}
+                onInitialGroupConsumed={() => setThreadGroupFocus(null)}
+                summaryProgress={summaryProgress}
               />
             )}
             {route === "summaries" && (
               <Summaries
-                summaryProgress={summaryProgress}
+                summaryGenerationProgress={summaryGenerationProgress}
                 sidecar={sidecar}
-                connectionMode={connectionMode}
+                memoriesMode={memoriesMode}
                 focus={summariesFocus}
                 onFocusConsumed={() => setSummariesFocus(null)}
+                onNavigateThreadGroup={(groupId) => {
+                  setThreadGroupFocus(groupId);
+                  setRoute("threads");
+                }}
               />
             )}
             {route === "reflections" && (
               <Reflections
                 reflectionProgress={reflectionProgress}
                 sidecar={sidecar}
-                connectionMode={connectionMode}
+                memoriesMode={memoriesMode}
               />
             )}
             {route === "personality" && (
@@ -273,14 +336,21 @@ export function App() {
                   setSummariesFocus(focus);
                   setRoute("summaries");
                 }}
+                onNavigateThreadGroup={(groupId) => {
+                  setThreadGroupFocus(groupId);
+                  setRoute("threads");
+                }}
               />
             )}
             {route === "periodic" && <PeriodicTasks />}
+            {route === "issues" && experimentalIssuesEnabled && <Issues />}
             {route === "settings" && (
               <Settings
                 dirty={settingsDirty}
                 embeddingFocus={embeddingFocus}
                 onEmbeddingFocusConsumed={() => setEmbeddingFocus(null)}
+                experimentalIssuesEnabled={experimentalIssuesEnabled}
+                issueTrackingConfigurable={issueTrackingConfigurable}
               />
             )}
           </ErrorBoundary>
@@ -312,14 +382,6 @@ export function App() {
           resolveError={importBin.error ? String(importBin.error) : null}
           sidecar={sidecar}
         />
-
-        {importProgress.snapshot && (
-          <ImportToast
-            snapshot={importProgress.snapshot}
-            onClose={importProgress.clear}
-            onCancel={importProgress.cancel}
-          />
-        )}
       </div>
     </TimezoneContext.Provider>
   );

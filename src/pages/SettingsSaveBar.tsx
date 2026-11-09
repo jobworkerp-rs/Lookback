@@ -5,9 +5,9 @@
  *
  * Hidden entirely when nothing is dirty. When the pending embedding change
  * actually changes the model id / vector dimension, a prominent destructive
- * warning is shown because the vectordb will be reset (evacuated or deleted)
- * on save. A dtype / max-seq / tokenizer / multimodal-only embedding edit is
- * saveable but leaves the index intact, so it must NOT raise this warning.
+ * warning is shown because the vectordb will be reset on save. A dtype /
+ * max-seq / tokenizer / multimodal-only embedding edit is saveable but
+ * leaves the index intact, so it must NOT raise this warning.
  */
 export interface SettingsSaveBarProps {
   /** Number of dirty restart-bearing cards (0 ⇒ the bar is not rendered). */
@@ -19,6 +19,9 @@ export interface SettingsSaveBarProps {
   saving: boolean;
   onDiscard: () => void;
   onSave: () => void;
+  showRestartHint?: boolean;
+  saveDisabled?: boolean;
+  saveDisabledReason?: string;
 }
 
 import { useTranslation } from "react-i18next";
@@ -29,6 +32,9 @@ export function SettingsSaveBar({
   saving,
   onDiscard,
   onSave,
+  showRestartHint = true,
+  saveDisabled = false,
+  saveDisabledReason,
 }: SettingsSaveBarProps) {
   const { t } = useTranslation();
   if (dirtyCount === 0) return null;
@@ -41,17 +47,33 @@ export function SettingsSaveBar({
         {/* Every LLM / embedding / HF_HOME change restarts the sidecar (the
             backend may hot-reload some External-only swaps in place, but the
             UI can't prove which, so it always warns about a restart). */}
-        <span className="settings-save-bar-hint">{t("settingsSaveBar.restartHint")}</span>
+        {showRestartHint && (
+          <span className="settings-save-bar-hint">{t("settingsSaveBar.restartHint")}</span>
+        )}
         {resetsVectordb && (
           <span className="settings-save-bar-warning">{t("settingsSaveBar.resetWarning")}</span>
+        )}
+        {saveDisabled && saveDisabledReason && (
+          <span className="settings-save-bar-warning" role="alert">
+            {saveDisabledReason}
+          </span>
         )}
       </div>
       <div className="settings-save-bar-actions">
         <button type="button" className="btn" onClick={onDiscard} disabled={saving}>
           {t("settingsSaveBar.discard")}
         </button>
-        <button type="button" className="btn primary" onClick={onSave} disabled={saving}>
-          {saving ? t("settingsSaveBar.saving") : t("settingsSaveBar.save")}
+        <button
+          type="button"
+          className="btn primary"
+          onClick={onSave}
+          disabled={saving || saveDisabled}
+        >
+          {saving
+            ? t("settingsSaveBar.saving")
+            : t(showRestartHint ? "settingsSaveBar.save" : "settingsSaveBar.saveNoRestart", {
+                defaultValue: "保存して適用",
+              })}
         </button>
       </div>
     </section>

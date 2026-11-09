@@ -8,12 +8,16 @@ import type { McpSettingsResponse, SetMcpSettingsRequest } from "@/types/api";
 import { McpServerCard } from "./Settings";
 
 const getMcpSettings = vi.fn();
+const generateMcpAuthToken = vi.fn();
+const rotateMcpAuthToken = vi.fn();
 
 vi.mock("@/api", () => ({
   getMcpSettings: () => getMcpSettings(),
+  generateMcpAuthToken: () => generateMcpAuthToken(),
+  rotateMcpAuthToken: () => rotateMcpAuthToken(),
   // McpServerCard does not call these, but Settings.tsx re-exports them in the
   // same module — stub so the mocked module is complete.
-  applySettings: () => Promise.resolve({ restarted: true, backup_path: null }),
+  applySettings: () => Promise.resolve({ restarted: true }),
   createDataRoot: () => Promise.resolve(),
   getAppSettings: () => Promise.resolve(null),
   getConnectionConfig: () => Promise.resolve(null),
@@ -36,12 +40,17 @@ vi.mock("@/api", () => ({
 
 const DISABLED_LOCAL: McpSettingsResponse = {
   enabled: false,
+  allow_unauthenticated_requests: false,
   exclude_runner_as_tool: null,
   exclude_worker_as_tool: null,
   streaming: null,
   request_timeout_sec: null,
-  set_name: "lookback-mcp-rag",
+  rag_default_period_scope: "overall_only",
+  set_name: "lookback-mcp",
   active_port: null,
+  auth_token_configured: false,
+  runtime_status: "disabled",
+  unavailable_reason: null,
 };
 
 function renderCard(onDirtyChange = vi.fn()) {
@@ -69,6 +78,8 @@ describe("McpServerCard", () => {
   beforeEach(() => {
     i18n.changeLanguage("ja");
     getMcpSettings.mockReset();
+    generateMcpAuthToken.mockReset();
+    rotateMcpAuthToken.mockReset();
   });
 
   it("reports a payload and edited=true when the toggle is flipped on", async () => {
@@ -78,11 +89,33 @@ describe("McpServerCard", () => {
     // Initially clean (matches persisted disabled state).
     await waitFor(() => expect(lastPayload(onDirty)).toBeNull());
 
-    const toggle = screen.getByRole("checkbox") as HTMLInputElement;
+    const toggle = screen.getByRole("checkbox", { name: /MCP サーバ/ }) as HTMLInputElement;
+    expect(toggle.parentElement).toHaveClass("settings-checkbox-row");
+    expect(toggle.nextElementSibling).toHaveTextContent("MCP サーバ");
+    expect(toggle.parentElement).toHaveTextContent("有効にする");
     fireEvent.click(toggle);
     await waitFor(() => {
       expect(lastEdited(onDirty)).toBe(true);
       expect(lastPayload(onDirty)).toMatchObject({ enabled: true });
+    });
+  });
+
+  it("persists the selected MCP period-summary recall scope", async () => {
+    getMcpSettings.mockResolvedValue(DISABLED_LOCAL);
+    const { onDirtyChange: onDirty } = renderCard();
+    await waitFor(() => expect(getMcpSettings).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByLabelText("RAG の既定期間要約範囲")).toHaveValue("overall_only"),
+    );
+
+    fireEvent.change(screen.getByLabelText("RAG の既定期間要約範囲"), {
+      target: { value: "overall_and_path" },
+    });
+
+    await waitFor(() => {
+      expect(lastPayload(onDirty)).toMatchObject({
+        rag_default_period_scope: "overall_and_path",
+      });
     });
   });
 
@@ -92,7 +125,7 @@ describe("McpServerCard", () => {
     getMcpSettings.mockResolvedValue(DISABLED_LOCAL);
     const { onDirtyChange: onDirty } = renderCard();
     await waitFor(() => expect(getMcpSettings).toHaveBeenCalled());
-    const toggle = screen.getByRole("checkbox") as HTMLInputElement;
+    const toggle = screen.getByRole("checkbox", { name: /MCP サーバ/ }) as HTMLInputElement;
     expect(toggle.disabled).toBe(false);
     // Toggle inside waitFor: the query resolves asynchronously, so a single
     // pre-load click would build a null payload (buildPayload bails on
@@ -109,6 +142,124 @@ describe("McpServerCard", () => {
     renderCard();
     await waitFor(() => expect(screen.getByText("http://127.0.0.1:39010/mcp")).toBeInTheDocument());
     expect(screen.getByText(/"url": "http:\/\/127.0.0.1:39010\/mcp"/)).toBeInTheDocument();
+    expect(screen.getByText(/"Authorization": "Bearer <copied-token>"/)).toBeInTheDocument();
+  });
+
+  it("allows tokenless MCP requests and omits the Authorization header from its config", async () => {
+    getMcpSettings.mockResolvedValue({
+      ...DISABLED_LOCAL,
+      enabled: true,
+      allow_unauthenticated_requests: true,
+      active_port: 39010,
+    });
+    const { onDirtyChange: onDirty } = renderCard();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/警告: この MCP endpoint に接続可能なクライアント/),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Generate and copy a token before enabling MCP.")).toBeNull();
+    expect(screen.queryByText(/"Authorization": "Bearer <copied-token>"/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /MCP auth tokenなし/ }));
+    await waitFor(() =>
+      expect(lastPayload(onDirty)).toMatchObject({ allow_unauthenticated_requests: false }),
+    );
+  });
+
+  it("shows the unconfigured state and displays a generated token only until it is dismissed", async () => {
+    getMcpSettings.mockResolvedValue(DISABLED_LOCAL);
+    generateMcpAuthToken.mockResolvedValue("generated-token");
+    const { onDirtyChange: onDirty } = renderCard();
+
+    await waitFor(() => expect(getMcpSettings).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByText("Not configured")).toBeInTheDocument());
+    expect(screen.getByText("Generate and copy a token before enabling MCP.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Generate auth token" }));
+    expect(generateMcpAuthToken).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => expect(screen.getByText("generated-token")).toBeInTheDocument());
+    expect(generateMcpAuthToken).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/will not be shown again/i)).toBeInTheDocument();
+    expect(lastPayload(onDirty)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide token" }));
+    expect(screen.queryByText("generated-token")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /show.*token/i })).not.toBeInTheDocument();
+  });
+
+  it("defers rotating an existing token until save when MCP is enabled", async () => {
+    getMcpSettings.mockResolvedValue({
+      ...DISABLED_LOCAL,
+      enabled: true,
+      auth_token_configured: true,
+    });
+    const { onDirtyChange: onDirty } = renderCard();
+
+    await waitFor(() => expect(screen.getByText("Configured")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Generate auth token" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Regenerate auth token" }));
+
+    await waitFor(() => expect(lastPayload(onDirty)).toMatchObject({ rotate_auth_token: true }));
+    expect(generateMcpAuthToken).not.toHaveBeenCalled();
+    expect(rotateMcpAuthToken).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/保存時に jobworkerp を再起動して新しい token を反映します/),
+    ).toBeInTheDocument();
+  });
+
+  it("discards a pending token rotation when disabling MCP", async () => {
+    getMcpSettings.mockResolvedValue({
+      ...DISABLED_LOCAL,
+      enabled: true,
+      auth_token_configured: true,
+    });
+    const { onDirtyChange: onDirty } = renderCard();
+
+    await screen.findByText("Configured");
+    fireEvent.click(screen.getByRole("button", { name: "Regenerate auth token" }));
+    await screen.findByText(/保存時に jobworkerp を再起動して新しい token を反映します/);
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /MCP サーバ/ }));
+
+    await waitFor(() => {
+      const payload = lastPayload(onDirty);
+      expect(payload).toMatchObject({ enabled: false });
+      expect(payload).not.toHaveProperty("rotate_auth_token");
+      expect(lastEdited(onDirty)).toBe(true);
+    });
+    expect(
+      screen.queryByText(/保存時に jobworkerp を再起動して新しい token を反映します/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("rotates an existing token immediately while MCP is disabled", async () => {
+    getMcpSettings.mockResolvedValue({ ...DISABLED_LOCAL, auth_token_configured: true });
+    rotateMcpAuthToken.mockResolvedValue("rotated-token");
+    const { onDirtyChange: onDirty } = renderCard();
+
+    await screen.findByText("Configured");
+    fireEvent.click(screen.getByRole("button", { name: "Regenerate auth token" }));
+
+    await screen.findByText("rotated-token");
+    expect(rotateMcpAuthToken).toHaveBeenCalledTimes(1);
+    expect(lastPayload(onDirty)).toBeNull();
+  });
+
+  it("keeps the token unconfigured and reports an error when generation fails", async () => {
+    getMcpSettings.mockResolvedValue(DISABLED_LOCAL);
+    generateMcpAuthToken.mockRejectedValue(new Error("keyring unavailable"));
+    renderCard();
+
+    await waitFor(() => expect(getMcpSettings).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByText("Not configured")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Generate auth token" }));
+    expect(generateMcpAuthToken).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => expect(screen.getByText("keyring unavailable")).toBeInTheDocument());
+    expect(screen.getByText("Not configured")).toBeInTheDocument();
+    expect(screen.queryByText(/will not be shown again/i)).not.toBeInTheDocument();
   });
 
   it("prompts to save when enabled but no port is bound yet", async () => {
@@ -117,6 +268,25 @@ describe("McpServerCard", () => {
     await waitFor(() =>
       expect(screen.getByText(/保存して sidecar が再起動すると表示されます/)).toBeInTheDocument(),
     );
+  });
+
+  it("shows a toolset-unavailable reason instead of a pending URL", async () => {
+    getMcpSettings.mockResolvedValue({
+      ...DISABLED_LOCAL,
+      enabled: true,
+      runtime_status: "unavailable",
+      unavailable_reason: "RAG tools could not be resolved",
+    });
+    renderCard();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/MCP は利用できません: RAG tools could not be resolved/),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByText(/保存して sidecar が再起動すると表示されます/),
+    ).not.toBeInTheDocument();
   });
 
   it("rejects an out-of-range timeout (mirrors the backend [1,3600] bound)", async () => {

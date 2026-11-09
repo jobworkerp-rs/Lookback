@@ -7,7 +7,8 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5180",
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build && pnpm verify:migration-bundle"
+    "beforeBuildCommand": "pnpm build && pnpm verify:migration-bundle && pnpm verify:packaging-migration",
+    "beforeBundleCommand": "pnpm verify:packaging-migration"
   },
   "app": {
     "windows": [
@@ -49,11 +50,13 @@
       "bin/all-in-one",
       "bin/front",
       "bin/conductor-main",
+      "bin/issue-tracker-server",
       "bin/memories-import",
       "bin/protoc"
     ],
     "resources": {
       "../workers/": "workers/",
+      "../resources/coding-agent/": "coding-agent/",
       "../dict/": "dict/",
       "migration-bundle/": "memories-db-migrate/"
     }

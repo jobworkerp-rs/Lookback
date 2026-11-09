@@ -9,6 +9,7 @@ describe("AnalysisProgress", () => {
     ["done", "生成完了"],
     ["warning", "一部失敗"],
     ["failed", "生成失敗"],
+    ["cancelled", "中断"],
   ] as const)("shows a close action for terminal %s progress", (status, label) => {
     i18n.changeLanguage("ja");
     const onClose = vi.fn();

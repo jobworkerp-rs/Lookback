@@ -1,4 +1,6 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { I18nextProvider } from "react-i18next";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
@@ -8,9 +10,29 @@ import { ThreadDetail } from "./ThreadDetail";
 
 const findMemoriesByThreadId = vi.fn();
 const findThread = vi.fn();
+const getThreadIssueResolutionStatus = vi.fn();
+const enqueueThreadIssueResolutionJob = vi.fn();
+const getAppCapabilities = vi.fn();
 vi.mock("@/api", () => ({
+  getAppCapabilities: () => getAppCapabilities(),
   findMemoriesByThreadId: (req: unknown) => findMemoriesByThreadId(req),
   findThread: (id: string) => findThread(id),
+  getThreadIssueResolutionStatus: (req: unknown) => getThreadIssueResolutionStatus(req),
+  enqueueThreadIssueResolutionJob: (req: unknown) => enqueueThreadIssueResolutionJob(req),
+}));
+
+const progressMocks = vi.hoisted(() => ({
+  progress: null as { job_id: string; status: string; message: string | null } | null,
+  start: vi.fn(),
+}));
+vi.mock("@/hooks/useStepStreamProgress", () => ({
+  useSummaryProgress: () => ({
+    progress: progressMocks.progress,
+    busy: progressMocks.progress?.status === "active",
+    start: progressMocks.start,
+    clear: vi.fn(),
+    cancel: vi.fn(),
+  }),
 }));
 
 // jsdom lacks both APIs the component relies on.
@@ -54,6 +76,13 @@ describe("ThreadDetail", () => {
   beforeEach(() => {
     i18n.changeLanguage("ja");
     findThread.mockReset();
+    getAppCapabilities.mockReset().mockResolvedValue({ experimental_issues_enabled: true });
+    getThreadIssueResolutionStatus.mockReset().mockResolvedValue({ status: "NOT_STARTED" });
+    enqueueThreadIssueResolutionJob
+      .mockReset()
+      .mockResolvedValue({ job_id_hint: "thread-resolution-job" });
+    progressMocks.progress = null;
+    progressMocks.start.mockReset();
     // Default: the synthesized-summary hydration finds nothing, so the header
     // falls back to the prop (matches the pre-hydration behaviour these tests
     // were written against).
@@ -252,5 +281,156 @@ describe("ThreadDetail", () => {
     expect(
       screen.getByText((_, el) => el?.textContent === "codex · agent:codex"),
     ).toBeInTheDocument();
+  });
+
+  it("offers manual issue re-evaluation without a warning when it has never run", async () => {
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hello")]);
+
+    renderWithProviders(<ThreadDetail thread={thread} onClose={() => {}} />);
+
+    const button = await screen.findByRole("button", { name: "Issue 解決を再評価" });
+    expect(button).toBeEnabled();
+    expect(getThreadIssueResolutionStatus).toHaveBeenCalledWith({ thread_id: "10" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("結果未確認、手動再評価可")).not.toBeInTheDocument();
+  });
+
+  it("hides experimental Issue controls when this build disables Issues", async () => {
+    getAppCapabilities.mockResolvedValueOnce({ experimental_issues_enabled: false });
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hello")]);
+    renderWithProviders(<ThreadDetail thread={thread} onClose={() => {}} />);
+
+    expect(await screen.findByText("hello")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Issue 解決を再評価" })).toBeNull();
+    expect(getThreadIssueResolutionStatus).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["PENDING", "結果未確認、手動再評価可"],
+    ["COMPLETE", "再評価結果を確認済み"],
+    ["UNKNOWN", "状態不明です。手動で再評価してください。"],
+  ])("shows %s without treating it as an enqueue success", async (status, label) => {
+    getThreadIssueResolutionStatus.mockResolvedValueOnce({ status });
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hello")]);
+
+    renderWithProviders(<ThreadDetail thread={thread} onClose={() => {}} />);
+
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    if (status === "UNKNOWN") {
+      expect(screen.getByRole("alert")).toHaveTextContent(label);
+      expect(screen.getByRole("button", { name: "Issue 解決を再評価" })).toBeEnabled();
+    } else {
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    }
+  });
+
+  it("shows the accepted job id, but does not claim that re-evaluation completed", async () => {
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hello")]);
+
+    renderWithProviders(<ThreadDetail thread={thread} onClose={() => {}} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Issue 解決を再評価" }));
+
+    expect(
+      await screen.findByText("受付済み・結果未確認（ジョブ ID: thread-resolution-job）"),
+    ).toBeInTheDocument();
+    expect(enqueueThreadIssueResolutionJob).toHaveBeenCalledWith({ target_thread_id: "10" });
+    expect(progressMocks.start).toHaveBeenCalledWith("thread-resolution-job");
+    expect(screen.queryByText("再評価結果を確認済み")).not.toBeInTheDocument();
+  });
+
+  it("disables the manual button only while the enqueue request is pending", async () => {
+    let finishDispatch: ((value: { job_id_hint: string }) => void) | undefined;
+    enqueueThreadIssueResolutionJob.mockImplementationOnce(
+      () => new Promise((resolve) => (finishDispatch = resolve)),
+    );
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hello")]);
+
+    renderWithProviders(<ThreadDetail thread={thread} onClose={() => {}} />);
+    const button = await screen.findByRole("button", { name: "Issue 解決を再評価" });
+    fireEvent.click(button);
+
+    expect(button).toBeDisabled();
+
+    finishDispatch?.({ job_id_hint: "thread-resolution-job" });
+    await waitFor(() => expect(button).toBeEnabled());
+  });
+
+  it("surfaces backend admission errors and keeps manual re-evaluation available", async () => {
+    enqueueThreadIssueResolutionJob.mockRejectedValueOnce(
+      new Error("Issue resolution mode is disabled"),
+    );
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hello")]);
+
+    renderWithProviders(<ThreadDetail thread={thread} onClose={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Issue 解決を再評価" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Issue resolution mode is disabled");
+    expect(screen.getByRole("button", { name: "Issue 解決を再評価" })).toBeEnabled();
+  });
+
+  it("surfaces status read errors instead of hiding them", async () => {
+    getThreadIssueResolutionStatus.mockRejectedValueOnce(new Error("memories unavailable"));
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hello")]);
+
+    renderWithProviders(<ThreadDetail thread={thread} onClose={() => {}} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("memories unavailable");
+    expect(screen.getByRole("button", { name: "Issue 解決を再評価" })).toBeEnabled();
+  });
+
+  it("refreshes persisted status when the summary progress stream reaches a terminal event", async () => {
+    findMemoriesByThreadId.mockResolvedValueOnce([row("1", "hello")]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const renderTree = () => (
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={queryClient}>
+          <ThreadDetail thread={thread} onClose={() => {}} />
+        </QueryClientProvider>
+      </I18nextProvider>
+    );
+
+    const { rerender } = render(renderTree());
+    fireEvent.click(await screen.findByRole("button", { name: "Issue 解決を再評価" }));
+    await screen.findByText("受付済み・結果未確認（ジョブ ID: thread-resolution-job）");
+    const requestCountAfterEnqueue = getThreadIssueResolutionStatus.mock.calls.length;
+
+    progressMocks.progress = {
+      job_id: "thread-resolution-job",
+      status: "done",
+      message: "complete",
+    };
+    rerender(renderTree());
+
+    await waitFor(() =>
+      expect(getThreadIssueResolutionStatus.mock.calls.length).toBeGreaterThan(
+        requestCountAfterEnqueue,
+      ),
+    );
+  });
+
+  it("reads the latest persisted status again when the thread detail is reopened", async () => {
+    findMemoriesByThreadId.mockResolvedValue([row("1", "hello")]);
+    getThreadIssueResolutionStatus
+      .mockResolvedValueOnce({ status: "NOT_STARTED" })
+      .mockResolvedValueOnce({ status: "COMPLETE" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const renderTree = () => (
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={queryClient}>
+          <ThreadDetail thread={thread} onClose={() => {}} />
+        </QueryClientProvider>
+      </I18nextProvider>
+    );
+
+    const first = render(renderTree());
+    await screen.findByRole("button", { name: "Issue 解決を再評価" });
+    expect(getThreadIssueResolutionStatus).toHaveBeenCalledTimes(1);
+    first.unmount();
+
+    render(renderTree());
+    await screen.findByRole("button", { name: "Issue 解決を再評価" });
+    expect(await screen.findByText("再評価結果を確認済み")).toBeInTheDocument();
+    expect(getThreadIssueResolutionStatus).toHaveBeenCalledTimes(2);
   });
 });

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["src-tauri"]
+members = ["src-tauri", "coding-agent-executor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,9 +11,10 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Tauri v2
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 
 # async runtime
@@ -52,11 +53,15 @@ parking_lot = "0.12"
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
+percent-encoding = "2"
 which = "8"
 dotenvy = "0.15"
-rusqlite = { version = "0.32", features = ["backup"] }
+rusqlite = "0.32"
 fs2 = "0.4"
 open = "5.4"
+libc = "0.2"
+reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
+sha2 = "0.10"
 
 [profile.release]
 codegen-units = 1
@@ -64,3 +69,8 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# The native coding-agent bootstrap re-hashes the staged executor package
+# (hundreds of MB); unoptimized SHA-256 makes that take seconds in dev builds.
+[profile.dev.package.sha2]
+opt-level = 3

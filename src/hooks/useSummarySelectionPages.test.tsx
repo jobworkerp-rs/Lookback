@@ -1,12 +1,17 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { listReflectionSelection, listSummariesForSelection } from "@/api";
+import {
+  listReflectionSelection,
+  listSummariesForSelection,
+  listSummaryPathCandidates,
+} from "@/api";
 import type { SummaryEntry } from "@/types/api";
 import { useSummarySelectionPages } from "./useSummarySelectionPages";
 
 vi.mock("@/api", () => ({
   listReflectionSelection: vi.fn(),
   listSummariesForSelection: vi.fn(),
+  listSummaryPathCandidates: vi.fn(),
 }));
 
 const mockListSummariesForSelection = vi.mocked(listSummariesForSelection);
@@ -14,9 +19,10 @@ const mockListSummariesForSelection = vi.mocked(listSummariesForSelection);
 function entry(memory_id: string): SummaryEntry {
   return {
     memory_id,
-    thread_id: "20",
-    external_id: null,
-    kind: "per-thread",
+    thread_id: null,
+    group_id: "30",
+    external_id: "thread-group-summary:30",
+    kind: "thread-group",
     period_key: null,
     scope_key: null,
     content_json: "summary",
@@ -27,6 +33,8 @@ function entry(memory_id: string): SummaryEntry {
 beforeEach(() => {
   mockListSummariesForSelection.mockReset();
   vi.mocked(listReflectionSelection).mockReset();
+  vi.mocked(listSummaryPathCandidates).mockReset();
+  vi.mocked(listSummaryPathCandidates).mockResolvedValue([]);
 });
 
 describe("useSummarySelectionPages", () => {
@@ -42,7 +50,7 @@ describe("useSummarySelectionPages", () => {
     );
     const { result } = renderHook(() => useSummarySelectionPages());
 
-    act(() => result.current.selectKind("per-thread"));
+    act(() => result.current.selectKind("thread-group"));
     act(() => resolveInitial?.({ entries: [entry("loaded")], next_offset: null }));
 
     await waitFor(() => expect(result.current.entries).toEqual([entry("loaded")]));
@@ -65,7 +73,7 @@ describe("useSummarySelectionPages", () => {
 
     await waitFor(() => expect(result.current.hasMore).toBe(true));
     act(() => result.current.loadMore());
-    act(() => result.current.selectKind("per-thread"));
+    act(() => result.current.selectKind("thread-group"));
     act(() => resolveMore?.({ entries: [entry("second")], next_offset: null }));
 
     await waitFor(() => expect(result.current.entries).toEqual([entry("first"), entry("second")]));
@@ -116,5 +124,32 @@ describe("useSummarySelectionPages", () => {
     act(() => rejectMore?.(new Error("stale failure")));
 
     await waitFor(() => expect(result.current.error).toBeNull());
+  });
+
+  it("ignores a load-more response after a period filter changes", async () => {
+    let resolveMore:
+      | ((page: { entries: SummaryEntry[]; next_offset: number | null }) => void)
+      | undefined;
+    mockListSummariesForSelection
+      .mockResolvedValueOnce({ entries: [], next_offset: null })
+      .mockResolvedValueOnce({ entries: [entry("daily-first")], next_offset: 1 })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveMore = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({ entries: [entry("legacy-filter")], next_offset: null });
+    const { result } = renderHook(() => useSummarySelectionPages());
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    act(() => result.current.selectKind("daily"));
+    await waitFor(() => expect(result.current.entries).toEqual([entry("daily-first")]));
+    act(() => result.current.loadMore());
+    act(() => result.current.setIncludeLegacy(true));
+    await waitFor(() => expect(result.current.entries).toEqual([entry("legacy-filter")]));
+    act(() => resolveMore?.({ entries: [entry("stale-path")], next_offset: null }));
+
+    await waitFor(() => expect(result.current.entries).toEqual([entry("legacy-filter")]));
   });
 });

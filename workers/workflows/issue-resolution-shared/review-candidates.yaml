@@ -1,0 +1,178 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: issue-resolution-review-candidates
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [issue_tracker_grpc_host, issue_tracker_grpc_port, correlation_prefix, correlation_key]
+      properties:
+        issue_tracker_grpc_host: { type: string }
+        issue_tracker_grpc_port: { type: integer }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+        correlation_prefix: { type: string, minLength: 1 }
+        correlation_key: { type: string }
+        # Thread IDs whose candidates are wanted; null keeps every candidate.
+        source_thread_ids: { type: ["array", "null"], default: null }
+
+timeout:
+  after:
+    hours: 1
+
+do:
+  - initState:
+      set:
+        source_thread_filter: "${ $workflow.input.source_thread_ids // null }"
+        review_rows: "${ [] }"
+        review_candidate_ids: "${ [] }"
+        review_page_token: '${ "" }'
+        review_page_seen_tokens: "${ [] }"
+        review_pages_exhausted: "${ false }"
+        review_page_count: "${ 0 }"
+        review_composite_snapshot: "${ null }"
+
+  - fetchManagerContract:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.issue_tracker_grpc_host}"
+            port: ${$workflow.input.issue_tracker_grpc_port}
+            tls: ${$workflow.input.issue_tracker_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "issue_tracker.rpc.v1.ManagerInfoService/GetContractInfo"
+            json_body: >-
+              ${ { context: {
+                    correlation_id: (($workflow.input.correlation_prefix + "-contract-") + ($workflow.input.correlation_key | tostring))
+                  } } | tojson }
+            as_json: true
+      export:
+        as:
+          manager_contract: "${ .jsonBody | fromjson | .success // {} }"
+
+  - selectManagerStore:
+      set:
+        manager_store_identity: >-
+          ${ ($manager_contract.storeIdentities // $manager_contract.store_identities // [])
+             | map(select((.role // "") == "STORE_ROLE_MANAGER"
+                         or (.role // "") == "MANAGER"
+                         or (.role // 0) == 1))
+             | .[0] // {} }
+
+  # This workflow deliberately uses only the generic trusted-consumer read/write APIs.
+  # The server clamps page_size to 100 and never reports totalSize for this
+  # composite read model, so every page is read and completeness is proven by
+  # token exhaustion, one composite snapshot across pages, and unique IDs.
+  - listReviewCandidates:
+      for:
+        each: review_page_number
+        in: '${ [range(0; 1000)] }'
+      # Stop once the last page is read: every idle iteration would still copy
+      # the whole context (jobworkerp-rs #355).
+      while: '${ $review_pages_exhausted | not }'
+      do:
+        - readReviewCandidatePage:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.issue_tracker_grpc_host}"
+                  port: ${$workflow.input.issue_tracker_grpc_port}
+                  tls: ${$workflow.input.issue_tracker_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "issue_tracker.rpc.v1.ManagerConsumerService/ListReviewCandidates"
+                  json_body: >-
+                    ${ {
+                        context: {
+                          correlation_id: (($workflow.input.correlation_prefix + "-list-") + ($workflow.input.correlation_key | tostring)),
+                          schema_fingerprint: ($manager_contract.schemaFingerprint // $manager_contract.schema_fingerprint // ""),
+                          data_root_id: ($manager_store_identity.dataRootId // $manager_store_identity.data_root_id // ""),
+                          contract_fingerprint: ($manager_contract.contractFingerprint // $manager_contract.contract_fingerprint // "")
+                        },
+                        page: ({ page_size: 100 }
+                               + (if $review_page_token == "" then {} else { page_token: $review_page_token } end)),
+                        filter: {}
+                      } | tojson }
+                  as_json: true
+            export:
+              as:
+                review_page_rows: '${ (.jsonBody | fromjson | .success.rows // []) }'
+                review_page_info: '${ (.jsonBody | fromjson | .success.page // null) }'
+                review_page_snapshot: '${ (.jsonBody | fromjson | (.success.compositeSnapshot // .success.composite_snapshot // null)) }'
+                review_page_next_token: '${ (.jsonBody | fromjson | (.success.page.nextPageToken // .success.page.next_page_token // "")) | tostring }'
+
+        - validateReviewCandidatePage:
+            if: >-
+              ${ (($review_page_info == null)
+                       or ($review_page_snapshot == null)
+                       or (($review_page_rows | type) != "array")
+                       or (any($review_page_rows[];
+                             (.candidate == null)
+                             or ((.candidate.candidateId // .candidate.candidate_id // "") == "")
+                             or ((.candidate.status // "") == "")
+                             or ((.candidate.title // "") == "")
+                             or ((.candidate.description // "") == "")
+                             or ((.integrity // "") == "")
+                             or ((.resolutionState // .resolution_state // "") == "")))
+                       or (($review_page_count > 0)
+                           and (($review_page_snapshot | tojson) != ($review_composite_snapshot | tojson)))
+                       or (($review_page_next_token != "")
+                           and (($review_page_seen_tokens | index($review_page_next_token)) != null))) }
+            raise:
+              error:
+                type: "https://lookback.local/errors/issue-resolution/review-page"
+                status: 502
+                title: "Review candidate page is incomplete or inconsistent"
+
+        - collectReviewCandidatePage:
+            set:
+              # Every jq evaluation copies the whole workflow context, so a caller
+              # interested in some threads keeps only rows citing one of them; all
+              # IDs stay for the duplicate check.
+              review_rows: >-
+                ${ $review_rows
+                   + (if $source_thread_filter == null then $review_page_rows
+                      else ($review_page_rows
+                            | map(select(any((.candidate.sourceEvidence // .candidate.source_evidence // [])[];
+                                (((.threadId // .thread_id // "") | tostring) as $source | ($source_thread_filter | index($source)) != null)))))
+                      end) }
+              review_candidate_ids: >-
+                ${ $review_candidate_ids
+                   + ($review_page_rows | map((.candidate.candidateId // .candidate.candidate_id // "") | tostring)) }
+              review_composite_snapshot: '${ $review_composite_snapshot // $review_page_snapshot }'
+              review_page_seen_tokens: >-
+                ${ if $review_page_token == "" then $review_page_seen_tokens
+                   else $review_page_seen_tokens + [$review_page_token] end }
+              review_page_token: '${ $review_page_next_token }'
+              review_page_count: '${ $review_page_count + 1 }'
+              review_pages_exhausted: '${ $review_page_next_token == "" }'
+
+  - failIfReviewPaginationIncomplete:
+      if: '${ ($review_pages_exhausted | not) }'
+      raise:
+        error:
+          type: "https://lookback.local/errors/issue-resolution/review-pagination-incomplete"
+          status: 502
+          title: "Review candidate traversal did not reach its final page"
+
+  - verifyUniqueReviewCandidates:
+      if: '${ (($review_candidate_ids | unique | length) != ($review_candidate_ids | length)) }'
+      raise:
+        error:
+          type: "https://lookback.local/errors/issue-resolution/review-duplicate"
+          status: 502
+          title: "Review candidate traversal returned duplicate candidate IDs"
+
+output:
+  as:
+    manager_contract: "${ $manager_contract }"
+    manager_store_identity: "${ $manager_store_identity }"
+    review_rows: "${ $review_rows }"
+    review_candidate_count: "${ $review_candidate_ids | length }"

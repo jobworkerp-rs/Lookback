@@ -3,6 +3,14 @@ import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GeneratedRefreshEvent } from "@/types/api";
 
+const { incrementUiMemoryCounterMock } = vi.hoisted(() => ({
+  incrementUiMemoryCounterMock: vi.fn(),
+}));
+
+vi.mock("@/lib/uiMemoryDiagnostics", () => ({
+  incrementUiMemoryCounter: incrementUiMemoryCounterMock,
+}));
+
 let captured: ((e: { payload: GeneratedRefreshEvent }) => void) | null = null;
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -24,6 +32,7 @@ function emit(payload: GeneratedRefreshEvent) {
 describe("useGeneratedRefresh", () => {
   beforeEach(() => {
     captured = null;
+    incrementUiMemoryCounterMock.mockClear();
   });
 
   it("invalidates the matching caches from generated refresh events", async () => {
@@ -42,5 +51,10 @@ describe("useGeneratedRefresh", () => {
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["reflections"] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["reflection-hybrid-search"] });
+    expect(incrementUiMemoryCounterMock.mock.calls).toEqual([
+      ["generated_refresh_total"],
+      ["summaries_invalidated_total"],
+      ["generated_refresh_total"],
+    ]);
   });
 });

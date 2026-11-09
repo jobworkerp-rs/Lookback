@@ -7,6 +7,7 @@ use tauri::State;
 use tracing::warn;
 
 use crate::error::AppResult;
+use crate::experimental_features::{AppCapabilities, ISSUE_TRACKING_BUILD_ALLOWS};
 use crate::sidecar::{SidecarErrorPayload, SidecarStartReport};
 
 use super::AppState;
@@ -17,7 +18,6 @@ pub struct SettingsSnapshot {
     pub data_root: PathBuf,
 
     pub sqlite_path: PathBuf,
-    pub lancedb_path: PathBuf,
     pub plugins_path: PathBuf,
     pub models_path: PathBuf,
     pub log_path: PathBuf,
@@ -33,13 +33,31 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsSnapshot> {
     Ok(SettingsSnapshot {
         data_root: data.root.clone(),
         sqlite_path: data.sqlite_path(),
-        lancedb_path: data.lancedb_dir(),
         plugins_path: data.plugins_dir(),
         models_path: data.models_dir(),
         log_path: data.log_dir(),
-        jobworkerp_url: eps.as_ref().map(|e| e.jobworkerp_url()),
+        jobworkerp_url: eps.as_ref().and_then(|e| e.jobworkerp_url()),
         memories_url: eps.and_then(|e| e.memories_url()),
     })
+}
+
+#[tauri::command]
+pub fn get_app_capabilities(state: State<'_, AppState>) -> AppCapabilities {
+    capabilities_for(&state.data, ISSUE_TRACKING_BUILD_ALLOWS)
+}
+
+pub(crate) fn capabilities_for(
+    data: &crate::data::DataPaths,
+    build_allows: bool,
+) -> AppCapabilities {
+    AppCapabilities {
+        experimental_issues_enabled:
+            crate::commands::issue_tracker_settings::effective_issue_tracking_enabled_with_build_allows(
+                data,
+                build_allows,
+            ),
+        issue_tracking_configurable: build_allows,
+    }
 }
 
 /// Immediate snapshot of the most recent sidecar lifecycle outcome
@@ -55,14 +73,22 @@ pub struct SidecarStatusSnapshot {
     pub ready: Option<SidecarStartReport>,
     pub failure: Option<SidecarErrorPayload>,
     pub database_migration_in_progress: bool,
+    pub issue_tracker_availability: Option<crate::commands::IssueTrackerAvailabilitySnapshot>,
 }
 
 #[tauri::command]
 pub fn get_sidecar_status(state: State<'_, AppState>) -> AppResult<SidecarStatusSnapshot> {
+    let issue_tracking_enabled =
+        crate::commands::issue_tracker_settings::effective_issue_tracking_enabled(&state.data);
     Ok(SidecarStatusSnapshot {
-        ready: state.sidecars.last_report(),
+        ready: state
+            .sidecars
+            .last_report_with_issue_tracking(issue_tracking_enabled),
         failure: state.sidecars.last_start_failure(),
         database_migration_in_progress: state.sidecars.database_migration_in_progress(),
+        issue_tracker_availability: state
+            .sidecars
+            .issue_tracker_availability_with_issue_tracking(issue_tracking_enabled),
     })
 }
 
@@ -119,6 +145,31 @@ pub async fn purge_all_data(state: State<'_, AppState>) -> AppResult<PurgeReport
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_for_reports_effective_tracking_and_configuration_capability() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = crate::data::DataPaths::with_root(directory.path());
+
+        for (enabled, build_allows, expected_effective) in [
+            (None, false, false),
+            (Some(false), false, false),
+            (Some(true), false, false),
+            (None, true, true),
+            (Some(false), true, false),
+            (Some(true), true, true),
+        ] {
+            crate::commands::issue_tracker_settings::save_issue_tracker_settings(
+                &data.issue_tracker_settings_path(),
+                &crate::commands::issue_tracker_settings::IssueTrackerSettings { enabled },
+            )
+            .unwrap();
+
+            let capabilities = capabilities_for(&data, build_allows);
+            assert_eq!(capabilities.experimental_issues_enabled, expected_effective);
+            assert_eq!(capabilities.issue_tracking_configurable, build_allows);
+        }
+    }
 
     #[test]
     fn purge_restore_keeps_completed_bootstrap_and_override() {

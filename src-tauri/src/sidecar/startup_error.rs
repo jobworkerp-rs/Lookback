@@ -79,6 +79,36 @@ pub enum StartupFailure {
         component: String,
         message: String,
     },
+    EmbeddingSpaceMismatch {
+        table: String,
+        current_space_id: String,
+        current_space: String,
+        recorded_space_id: String,
+        recorded_space: String,
+    },
+    EmbeddingSpaceUnknown {
+        table: String,
+        row_models: String,
+    },
+    EmbeddingRebuildInconsistent {
+        markers: String,
+    },
+    EmbeddingRebuildConfigChanged {
+        attempt_id: String,
+    },
+    EmbeddingSwitchIncomplete {
+        attempt_id: String,
+    },
+    EmbeddingFinalizeIncomplete {
+        attempt_id: String,
+    },
+    EmbeddingCancelIncomplete {
+        attempt_id: String,
+        operation: String,
+    },
+    EmbeddingStorageMismatch {
+        mismatches: String,
+    },
     Other {
         component: String,
         message: String,
@@ -98,6 +128,14 @@ impl StartupFailure {
             Self::RdbPoolInitFailed { .. } => "rdb_pool_init_failed",
             Self::EnvVarInvalid { .. } => "env_var_invalid",
             Self::ConfigLoadFailed { .. } => "config_load_failed",
+            Self::EmbeddingSpaceMismatch { .. } => "embedding_space_mismatch",
+            Self::EmbeddingSpaceUnknown { .. } => "embedding_space_unknown",
+            Self::EmbeddingRebuildInconsistent { .. } => "embedding_rebuild_inconsistent",
+            Self::EmbeddingRebuildConfigChanged { .. } => "embedding_rebuild_config_changed",
+            Self::EmbeddingSwitchIncomplete { .. } => "embedding_switch_incomplete",
+            Self::EmbeddingFinalizeIncomplete { .. } => "embedding_finalize_incomplete",
+            Self::EmbeddingCancelIncomplete { .. } => "embedding_cancel_incomplete",
+            Self::EmbeddingStorageMismatch { .. } => "embedding_storage_mismatch",
             Self::Other { .. } => "other",
         }
     }
@@ -176,21 +214,21 @@ pub enum SidecarErrorPayload {
     Structured {
         failure: StartupFailure,
     },
-    MemoryKindMigrationRequired {
-        db_path: String,
-    },
-    MemoryKindDatabaseSchemaInvalid {
-        db_path: String,
-        reason: String,
-    },
-    MemoryKindDatabaseCheckFailed {
-        db_path: String,
-        reason: String,
+    RecoveryFailed {
+        failure: StartupFailure,
+        recovery_error: String,
     },
     DatabaseMigrationFailed {
-        phase: String,
-        reason: String,
+        stage: String,
+        error_code: String,
+        resolution: String,
         backup_path: String,
+        detail: String,
+    },
+    EmbeddingMigrationFailed {
+        failure: Option<crate::sidecar::memories_migration::EmbeddingMigrationFailure>,
+        detail: String,
+        inspect_required: bool,
     },
     Raw {
         message: String,
@@ -198,43 +236,42 @@ pub enum SidecarErrorPayload {
 }
 
 impl SidecarErrorPayload {
-    /// Lift an `AppError` into a frontend-shaped payload. Known startup and
-    /// database-gate failures keep their structured recovery fields;
-    /// everything else collapses into a raw message so the BootError UI can
-    /// still render a meaningful fallback.
+    /// Lift an `AppError` into a frontend-shaped payload. Known startup,
+    /// database migration, and embedding migration failures keep their
+    /// structured recovery fields; everything else collapses into a raw
+    /// message so the BootError UI can still render a meaningful fallback.
     pub fn from_app_error(err: &crate::error::AppError) -> Self {
         if let crate::error::AppError::SidecarStartupFailed(failure) = err {
             return Self::Structured {
-                failure: failure.clone(),
-            };
-        }
-        if let crate::error::AppError::MemoryKindMigrationRequired { db_path } = err {
-            return Self::MemoryKindMigrationRequired {
-                db_path: db_path.clone(),
-            };
-        }
-        if let crate::error::AppError::MemoryKindDatabaseSchemaInvalid { db_path, reason } = err {
-            return Self::MemoryKindDatabaseSchemaInvalid {
-                db_path: db_path.clone(),
-                reason: reason.clone(),
-            };
-        }
-        if let crate::error::AppError::MemoryKindDatabaseCheckFailed { db_path, reason } = err {
-            return Self::MemoryKindDatabaseCheckFailed {
-                db_path: db_path.clone(),
-                reason: reason.clone(),
+                failure: failure.as_ref().clone(),
             };
         }
         if let crate::error::AppError::DatabaseMigrationFailed {
-            phase,
-            reason,
+            stage,
+            error_code,
+            resolution,
             backup_path,
+            detail,
         } = err
         {
             return Self::DatabaseMigrationFailed {
-                phase: phase.clone(),
-                reason: reason.clone(),
+                stage: stage.clone(),
+                error_code: error_code.clone(),
+                resolution: resolution.clone(),
                 backup_path: backup_path.clone(),
+                detail: detail.clone(),
+            };
+        }
+        if let crate::error::AppError::EmbeddingMigrationFailed {
+            failure,
+            detail,
+            inspect_required,
+        } = err
+        {
+            return Self::EmbeddingMigrationFailed {
+                failure: failure.as_ref().map(|failure| failure.as_ref().clone()),
+                detail: detail.clone(),
+                inspect_required: *inspect_required,
             };
         }
         Self::Raw {
@@ -266,6 +303,27 @@ mod tests {
         include_str!("../../tests/fixtures/memories_startup_error_config_load_failed.json");
     const FIXTURE_OTHER: &str =
         include_str!("../../tests/fixtures/memories_startup_error_other.json");
+    const FIXTURE_EMBEDDING_SPACE_MISMATCH: &str =
+        include_str!("../../tests/fixtures/memories_startup_error_embedding_space_mismatch.json");
+    const FIXTURE_EMBEDDING_SPACE_UNKNOWN: &str =
+        include_str!("../../tests/fixtures/memories_startup_error_embedding_space_unknown.json");
+    const FIXTURE_EMBEDDING_REBUILD_INCONSISTENT: &str = include_str!(
+        "../../tests/fixtures/memories_startup_error_embedding_rebuild_inconsistent.json"
+    );
+    const FIXTURE_EMBEDDING_REBUILD_CONFIG_CHANGED: &str = include_str!(
+        "../../tests/fixtures/memories_startup_error_embedding_rebuild_config_changed.json"
+    );
+    const FIXTURE_EMBEDDING_SWITCH_INCOMPLETE: &str = include_str!(
+        "../../tests/fixtures/memories_startup_error_embedding_switch_incomplete.json"
+    );
+    const FIXTURE_EMBEDDING_FINALIZE_INCOMPLETE: &str = include_str!(
+        "../../tests/fixtures/memories_startup_error_embedding_finalize_incomplete.json"
+    );
+    const FIXTURE_EMBEDDING_CANCEL_INCOMPLETE: &str = include_str!(
+        "../../tests/fixtures/memories_startup_error_embedding_cancel_incomplete.json"
+    );
+    const FIXTURE_EMBEDDING_STORAGE_MISMATCH: &str =
+        include_str!("../../tests/fixtures/memories_startup_error_embedding_storage_mismatch.json");
     // Negative samples live inline rather than as files: their only job
     // is to assert the parser rejects shapes that differ from the
     // positive fixtures by exactly one field, and a tiny one-line
@@ -289,36 +347,129 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_error_payload_preserves_memory_kind_gate_failures() {
-        let migration = crate::error::AppError::MemoryKindMigrationRequired {
-            db_path: "/data/memories/default.sqlite3".into(),
+    fn sidecar_error_payload_preserves_database_migration_classification() {
+        let error = crate::error::AppError::DatabaseMigrationFailed {
+            stage: "preflight".into(),
+            error_code: "legacy_schema_unsupported".into(),
+            resolution: "legacy_upgrade_required".into(),
+            backup_path: String::new(),
+            detail: "the database predates memory_kind".into(),
         };
-        assert!(matches!(
-            SidecarErrorPayload::from_app_error(&migration),
-            SidecarErrorPayload::MemoryKindMigrationRequired { db_path }
-                if db_path == "/data/memories/default.sqlite3"
-        ));
 
-        let invalid = crate::error::AppError::MemoryKindDatabaseSchemaInvalid {
-            db_path: "/data/memories/default.sqlite3".into(),
-            reason: "only memory has memory_kind".into(),
-        };
-        assert!(matches!(
-            SidecarErrorPayload::from_app_error(&invalid),
-            SidecarErrorPayload::MemoryKindDatabaseSchemaInvalid { reason, .. }
-                if reason == "only memory has memory_kind"
-        ));
+        let value = serde_json::to_value(SidecarErrorPayload::from_app_error(&error)).unwrap();
 
-        let check_failed = crate::error::AppError::MemoryKindDatabaseCheckFailed {
-            db_path: "/data/memories/default.sqlite3".into(),
-            reason: "unable to open database file".into(),
+        assert_eq!(value["kind"], "database_migration_failed");
+        assert_eq!(value["stage"], "preflight");
+        assert_eq!(value["error_code"], "legacy_schema_unsupported");
+        assert_eq!(value["resolution"], "legacy_upgrade_required");
+        assert_eq!(value["backup_path"], "");
+        assert_eq!(value["detail"], "the database predates memory_kind");
+    }
+
+    #[test]
+    fn sidecar_error_payload_preserves_embedding_migration_failure_metadata() {
+        use crate::sidecar::memories_migration::{
+            AttemptStage, BackupMode, CliCommand, CliErrorCode, CliResolution, CliStage,
+            EmbeddingAttemptInfo, EmbeddingMigrationFailure, VerificationCounts,
         };
-        assert!(matches!(
-            SidecarErrorPayload::from_app_error(&check_failed),
-            SidecarErrorPayload::MemoryKindDatabaseCheckFailed { db_path, reason }
-                if db_path == "/data/memories/default.sqlite3"
-                    && reason == "unable to open database file"
-        ));
+
+        let error = crate::error::AppError::EmbeddingMigrationFailed {
+            failure: Some(Box::new(EmbeddingMigrationFailure {
+                command: CliCommand::Finalize,
+                stage: CliStage::Verify,
+                error_code: CliErrorCode::RebuildHasFailures,
+                resolution: CliResolution::ResolveFailures,
+                attempt: Some(EmbeddingAttemptInfo {
+                    attempt: "attempt-42".into(),
+                    stage: AttemptStage::RebuildPending,
+                    backup_mode: BackupMode::Backup,
+                }),
+                backup: Some("/backups/attempt-42".into()),
+                cancel_operation: None,
+                verification_counts: Some(VerificationCounts {
+                    missing_memory_text: 1,
+                    stale_memory_text: 2,
+                    unverified_memory_text: 3,
+                    failed_memory_text: 4,
+                    missing_memory_media: 5,
+                    stale_memory_media: 6,
+                    unverified_memory_media: 7,
+                    failed_memory_media: 8,
+                    missing_thread: 9,
+                    stale_thread: 10,
+                    unverified_thread: 11,
+                    failed_thread: 12,
+                    missing_reflection_intent: 13,
+                    stale_reflection_intent: 14,
+                    unverified_reflection_intent: 15,
+                    failed_reflection_intent: 16,
+                    orphan: 17,
+                }),
+            })),
+            detail: "finalize requires resolving failures".into(),
+            inspect_required: true,
+        };
+
+        let value = serde_json::to_value(SidecarErrorPayload::from_app_error(&error)).unwrap();
+
+        assert_eq!(value["kind"], "embedding_migration_failed");
+        assert_eq!(value["failure"]["command"], "finalize");
+        assert_eq!(value["failure"]["stage"], "verify");
+        assert_eq!(value["failure"]["error_code"], "rebuild_has_failures");
+        assert_eq!(value["failure"]["resolution"], "resolve_failures");
+        assert_eq!(value["failure"]["attempt"]["attempt"], "attempt-42");
+        assert_eq!(value["failure"]["attempt"]["stage"], "rebuild_pending");
+        assert_eq!(value["failure"]["attempt"]["backup_mode"], "backup");
+        assert_eq!(value["failure"]["backup"], "/backups/attempt-42");
+        assert_eq!(
+            value["failure"]["verification_counts"]["missing_memory_text"],
+            1
+        );
+        assert_eq!(value["failure"]["verification_counts"]["orphan"], 17);
+        assert_eq!(value["detail"], "finalize requires resolving failures");
+        assert_eq!(value["inspect_required"], true);
+    }
+
+    #[test]
+    fn embedding_migration_payload_keeps_unparsed_failure_and_inspect_state() {
+        let error = crate::error::AppError::EmbeddingMigrationFailed {
+            failure: None,
+            detail: "structured result unavailable".into(),
+            inspect_required: false,
+        };
+
+        let value = serde_json::to_value(SidecarErrorPayload::from_app_error(&error)).unwrap();
+
+        assert_eq!(value["kind"], "embedding_migration_failed");
+        assert!(value["failure"].is_null());
+        assert_eq!(value["detail"], "structured result unavailable");
+        assert_eq!(value["inspect_required"], false);
+    }
+
+    #[test]
+    fn recovery_failed_payload_preserves_structured_failure_and_recovery_error() {
+        let failure = StartupFailure::Other {
+            component: "memories".into(),
+            message: "startup failed".into(),
+        };
+        let payload = SidecarErrorPayload::RecoveryFailed {
+            failure: failure.clone(),
+            recovery_error: "rollback failed".into(),
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["kind"], "recovery_failed");
+        assert_eq!(value["failure"]["code"], "other");
+        assert_eq!(value["failure"]["component"], failure_component(&failure));
+        assert_eq!(value["recovery_error"], "rollback failed");
+    }
+
+    fn failure_component(failure: &StartupFailure) -> &str {
+        match failure {
+            StartupFailure::Other { component, .. } => component,
+            _ => unreachable!("test fixture must be StartupFailure::Other"),
+        }
     }
 
     #[test]
@@ -427,6 +578,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_all_embedding_space_startup_failures_and_roundtrips_them() {
+        let fixtures = [
+            (FIXTURE_EMBEDDING_SPACE_MISMATCH, "embedding_space_mismatch"),
+            (FIXTURE_EMBEDDING_SPACE_UNKNOWN, "embedding_space_unknown"),
+            (
+                FIXTURE_EMBEDDING_REBUILD_INCONSISTENT,
+                "embedding_rebuild_inconsistent",
+            ),
+            (
+                FIXTURE_EMBEDDING_REBUILD_CONFIG_CHANGED,
+                "embedding_rebuild_config_changed",
+            ),
+            (
+                FIXTURE_EMBEDDING_SWITCH_INCOMPLETE,
+                "embedding_switch_incomplete",
+            ),
+            (
+                FIXTURE_EMBEDDING_FINALIZE_INCOMPLETE,
+                "embedding_finalize_incomplete",
+            ),
+            (
+                FIXTURE_EMBEDDING_CANCEL_INCOMPLETE,
+                "embedding_cancel_incomplete",
+            ),
+            (
+                FIXTURE_EMBEDDING_STORAGE_MISMATCH,
+                "embedding_storage_mismatch",
+            ),
+        ];
+
+        for (fixture, expected_code) in fixtures {
+            let failure = parse_stdout_line(fx(fixture)).expect("embedding failure fixture parses");
+            let encoded = serde_json::to_value(&failure).unwrap();
+            let decoded: StartupFailure = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, failure);
+            assert_eq!(failure.code(), expected_code);
+        }
+    }
+
+    #[test]
+    fn missing_required_embedding_failure_fields_use_raw_fallback_path() {
+        let missing_attempt_id = r#"{"level":"ERROR","fields":{"code":"embedding_switch_incomplete"},"target":"app::startup_error"}"#;
+        let missing_space_component = r#"{"level":"ERROR","fields":{"code":"embedding_space_mismatch","table":"memory","current_space_id":"current","recorded_space_id":"old","recorded_space":"{}"},"target":"app::startup_error"}"#;
+
+        assert!(parse_stdout_line(missing_attempt_id).is_none());
+        assert!(parse_stdout_line(missing_space_component).is_none());
+    }
+
+    #[test]
     fn parse_stdout_line_rejects_target_mismatch() {
         assert!(parse_stdout_line(fx(FIXTURE_NEG_TARGET)).is_none());
     }
@@ -488,6 +688,14 @@ mod tests {
             "rdb_pool_init_failed",
             "env_var_invalid",
             "config_load_failed",
+            "embedding_space_mismatch",
+            "embedding_space_unknown",
+            "embedding_rebuild_inconsistent",
+            "embedding_rebuild_config_changed",
+            "embedding_switch_incomplete",
+            "embedding_finalize_incomplete",
+            "embedding_cancel_incomplete",
+            "embedding_storage_mismatch",
             "other",
         ]
         .into_iter()
@@ -529,6 +737,36 @@ mod tests {
                 component: String::new(),
                 message: String::new(),
             },
+            StartupFailure::EmbeddingSpaceMismatch {
+                table: String::new(),
+                current_space_id: String::new(),
+                current_space: String::new(),
+                recorded_space_id: String::new(),
+                recorded_space: String::new(),
+            },
+            StartupFailure::EmbeddingSpaceUnknown {
+                table: String::new(),
+                row_models: String::new(),
+            },
+            StartupFailure::EmbeddingRebuildInconsistent {
+                markers: String::new(),
+            },
+            StartupFailure::EmbeddingRebuildConfigChanged {
+                attempt_id: String::new(),
+            },
+            StartupFailure::EmbeddingSwitchIncomplete {
+                attempt_id: String::new(),
+            },
+            StartupFailure::EmbeddingFinalizeIncomplete {
+                attempt_id: String::new(),
+            },
+            StartupFailure::EmbeddingCancelIncomplete {
+                attempt_id: String::new(),
+                operation: String::new(),
+            },
+            StartupFailure::EmbeddingStorageMismatch {
+                mismatches: String::new(),
+            },
             StartupFailure::Other {
                 component: String::new(),
                 message: String::new(),
@@ -559,7 +797,7 @@ mod tests {
             expected_fingerprint: String::new(),
             actual_fingerprint: String::new(),
         };
-        let err = crate::error::AppError::SidecarStartupFailed(failure.clone());
+        let err = crate::error::AppError::SidecarStartupFailed(Box::new(failure.clone()));
         match SidecarErrorPayload::from_app_error(&err) {
             SidecarErrorPayload::Structured { failure: inner } => assert_eq!(inner, failure),
             other => panic!("expected Structured, got {other:?}"),

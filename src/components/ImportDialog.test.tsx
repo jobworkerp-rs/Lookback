@@ -87,6 +87,7 @@ describe("ImportDialog since date timezone", () => {
     expect(startImport).toHaveBeenCalled();
     const req = startImport.mock.calls[0]?.[0];
     expect(req.since).toBe("2025-12-31T05:00:00.000Z");
+    expect(req.sources).toEqual(["claude-code", "codex", "opencode"]);
   });
 
   it("keeps a user-edited since date when the dialog closes and reopens", async () => {
@@ -111,6 +112,17 @@ describe("ImportDialog since date timezone", () => {
   });
 });
 
+describe("ImportDialog source defaults", () => {
+  it("checks claude-code, codex, and opencode while leaving plain unchecked", () => {
+    renderDialog();
+
+    expect(screen.getByLabelText(/claude-code/)).toBeChecked();
+    expect(screen.getByLabelText(/codex/)).toBeChecked();
+    expect(screen.getByLabelText(/opencode/)).toBeChecked();
+    expect(screen.getByLabelText(i18n.t("import.targetPlain"))).not.toBeChecked();
+  });
+});
+
 describe("ImportDialog plain source", () => {
   it("reveals the plain sub-block only when the plain checkbox is on", () => {
     renderDialog();
@@ -131,9 +143,10 @@ describe("ImportDialog plain source", () => {
   it("sends sources with plain and a plain config on submit", async () => {
     openDialog.mockResolvedValue("/Users/me/notes");
     renderDialog();
-    // Drop the auto-on claude/codex so the request isolates the plain path.
+    // Drop the auto-on agent sources so the request isolates the plain path.
     fireEvent.click(screen.getByLabelText(/claude-code/));
     fireEvent.click(screen.getByLabelText(/codex/));
+    fireEvent.click(screen.getByLabelText(/opencode/));
     enablePlain();
     fireEvent.click(screen.getByText(i18n.t("import.plainChoose")));
     await waitFor(() => screen.getByText("/Users/me/notes"));

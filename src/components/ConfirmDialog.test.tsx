@@ -104,4 +104,77 @@ describe("ConfirmDialog", () => {
     expect(screen.getByText("スレッドを削除")).toBeInTheDocument();
     expect(screen.getByText("削除に失敗しました")).toBeInTheDocument();
   });
+
+  it("supports a disabled primary action while cancel and secondary remain available", () => {
+    const onSecondary = vi.fn();
+    const onCancel = vi.fn();
+    renderWithProviders(
+      <ConfirmDialog
+        title="設定を保存しますか?"
+        message="変更があります"
+        cancelLabel="編集を続ける"
+        confirmLabel="保存"
+        confirmVariant="primary"
+        confirmDisabled
+        secondaryAction={{ label: "破棄", onClick: onSecondary }}
+        onConfirm={vi.fn()}
+        onCancel={onCancel}
+      />,
+    );
+
+    const confirm = screen.getByRole("button", { name: "保存" });
+    expect(confirm).toBeDisabled();
+    expect(confirm).toHaveClass("primary");
+    expect(confirm).not.toHaveClass("danger");
+    fireEvent.click(screen.getByRole("button", { name: "破棄" }));
+    fireEvent.click(screen.getByRole("button", { name: "編集を続ける" }));
+    expect(onSecondary).toHaveBeenCalledTimes(1);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the cancel button as the initial focus target when focus management is enabled", () => {
+    renderWithProviders(
+      <ConfirmDialog
+        title="設定を保存しますか?"
+        message="変更があります"
+        cancelLabel="編集を続ける"
+        focusManagement
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "編集を続ける" })).toHaveFocus();
+  });
+
+  it("keeps every action disabled while busy", () => {
+    renderWithProviders(
+      <ConfirmDialog
+        title="設定を保存しますか?"
+        message="変更があります"
+        secondaryAction={{ label: "破棄", onClick: vi.fn() }}
+        busy
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "破棄" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "キャンセル" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "削除中…" })).toBeDisabled();
+  });
+
+  it("opts into an alertdialog role without changing the default role", () => {
+    renderWithProviders(
+      <ConfirmDialog
+        title="設定を保存しますか?"
+        message="変更があります"
+        role="alertdialog"
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("alertdialog", { name: "設定を保存しますか?" })).toBeInTheDocument();
+  });
 });

@@ -64,6 +64,18 @@ message ReleaseStaticWorkerRequest {
   }
 }
 
+message LoadWorkerRequest {
+  // Target worker to load. A target is required (error if neither is set).
+  oneof target {
+    jobworkerp.data.WorkerId worker_id = 1;
+    string name = 2;
+  }
+  // Maximum wait for the load to complete, in milliseconds.
+  // Large LLM model downloads may take a long time; the server uses a
+  // generous default when this is unset.
+  optional uint64 timeout_ms = 3;
+}
+
 service WorkerService {
   rpc Create(jobworkerp.data.WorkerData) returns (CreateWorkerResponse);
   rpc UpsertByName(jobworkerp.data.WorkerData) returns (CreateWorkerResponse);
@@ -83,4 +95,12 @@ service WorkerService {
   // Note: When releasing all (no target specified), worker definition caches for
   // all workers (including non-static) are also cleared as a side effect.
   rpc ReleaseStaticWorker(ReleaseStaticWorkerRequest) returns (SuccessResponse);
+  // Run the worker's Runner load() for config validation and pre-loading.
+  // Executes load() with the worker's runner_settings just as a job would
+  // before execution: for use_static=true the runner pool is warmed up
+  // (an initialized runner stays resident), and for use_static=false a
+  // runner is instantiated and loaded to verify the settings, then dropped.
+  // Use this to detect errors (e.g. a missing LLM model) ahead of time and
+  // to trigger model download/load before the first job runs.
+  rpc Load(LoadWorkerRequest) returns (SuccessResponse);
 }

@@ -275,7 +275,7 @@ pub struct FindMemoriesRequest {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MemoryRow {
     #[serde(with = "crate::serde_id")]
     pub id: i64,
@@ -352,6 +352,22 @@ pub struct MemoryThreadPosition {
     pub thread_total: i32,
 }
 
+/// A Memory plus each Thread location that can be opened from a direct ID
+/// lookup. A Memory may be shared by multiple Threads, so no membership is
+/// silently discarded here.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MemoryReference {
+    pub memory: MemoryRow,
+    pub locations: Vec<MemoryReferenceLocation>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MemoryReferenceLocation {
+    pub thread: ThreadSummary,
+    pub position: i32,
+    pub thread_total: i32,
+}
+
 /// Resolve a memory's thread-internal position so a `memory_ids` cross-link
 /// (personality signals) can scroll to it. `FindMemoriesByThreadId` streams
 /// in `thread_memory.position` order, so the running index of the target —
@@ -404,6 +420,65 @@ pub async fn find_memory_thread_position(
     }))
 }
 
+/// Resolve a Memory ID into its renderable row and every still-existing Thread
+/// membership. This keeps direct navigation precise when a Memory is shared.
+#[tauri::command]
+pub async fn resolve_memory_reference(
+    state: State<'_, AppState>,
+    req: FindMemoryThreadPositionRequest,
+) -> AppResult<Option<MemoryReference>> {
+    let channel = state.memories_channel().await?;
+    let mut memory_client = MemoryServiceClient::new(channel.clone());
+    let Some(memory) = memory_client
+        .find(mem_data::MemoryId {
+            value: req.memory_id,
+        })
+        .await?
+        .into_inner()
+        .data
+    else {
+        return Ok(None);
+    };
+    let thread_ids = memory
+        .data
+        .as_ref()
+        .map(|data| {
+            data.thread_ids
+                .iter()
+                .map(|id| id.value)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let Some(memory) = memory_to_row(memory) else {
+        return Ok(None);
+    };
+
+    let mut thread_client = ThreadServiceClient::new(channel.clone());
+    let mut locations = Vec::new();
+    for thread_id in thread_ids {
+        let Some(thread) = thread_client
+            .find(mem_data::ThreadId { value: thread_id })
+            .await?
+            .into_inner()
+            .data
+            .and_then(thread_to_summary)
+        else {
+            continue;
+        };
+        let Some(position) =
+            find_memory_position_in_thread(channel.clone(), thread_id, memory.id).await?
+        else {
+            continue;
+        };
+        locations.push(MemoryReferenceLocation {
+            thread,
+            position: position.position,
+            thread_total: position.thread_total,
+        });
+    }
+    Ok(Some(MemoryReference { memory, locations }))
+}
+
 async fn find_memory_position_in_thread(
     channel: tonic::transport::Channel,
     thread_id: i64,
@@ -448,13 +523,6 @@ fn compute_position(ids: &[i64], target: i64) -> Option<MemoryPosition> {
         })
 }
 
-#[tauri::command]
-pub async fn count_threads(state: State<'_, AppState>) -> AppResult<i64> {
-    let mut client = ThreadServiceClient::new(state.memories_channel().await?);
-    let resp = client.count(mem_svc::FindCondition {}).await?;
-    Ok(resp.into_inner().total)
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeleteThreadRequest {
     #[serde(with = "crate::serde_id")]
@@ -483,7 +551,8 @@ pub async fn delete_thread(state: State<'_, AppState>, req: DeleteThreadRequest)
         .map(|_| ());
     let finish = super::finish_search_index_write(&state, registered).await;
     result?;
-    finish
+    finish?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -661,6 +730,42 @@ mod tests {
 
         assert_eq!(row.metadata.as_deref(), Some(r#"{"source":"codex"}"#));
         assert_eq!(row.external_id.as_deref(), Some("codex:line:10"));
+    }
+
+    #[test]
+    fn memory_reference_serializes_nested_ids_as_strings() {
+        let reference = MemoryReference {
+            memory: MemoryRow {
+                id: 9_007_199_254_740_993,
+                role: 0,
+                content_type: 0,
+                content: "message".into(),
+                created_at_ms: 0,
+                metadata: None,
+                external_id: None,
+            },
+            locations: vec![MemoryReferenceLocation {
+                thread: ThreadSummary {
+                    id: 9_007_199_254_740_994,
+                    user_id: 1,
+                    description: None,
+                    channel: None,
+                    labels: vec![],
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    first_message_at_ms: None,
+                    last_message_at_ms: None,
+                },
+                position: 1,
+                thread_total: 2,
+            }],
+        };
+        let value = serde_json::to_value(reference).unwrap();
+        assert_eq!(value.pointer("/memory/id").unwrap(), "9007199254740993");
+        assert_eq!(
+            value.pointer("/locations/0/thread/id").unwrap(),
+            "9007199254740994"
+        );
     }
 
     #[test]

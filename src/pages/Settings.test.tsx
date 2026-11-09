@@ -6,7 +6,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type {
   BackgroundJobQueueStatus,
-  ConnectionConfig,
   EmbeddingSettingsResponse,
   LlmSettingsResponse,
   MemoryEmbeddingStats,
@@ -19,14 +18,10 @@ import {
   BACKGROUND_JOB_QUEUE_REFETCH_INTERVAL_MS,
   BackgroundJobQueueCard,
   backgroundJobQueueRefetchInterval,
-  ConnectionCard,
   LlmProviderCard,
   MemoryEmbeddingCard,
 } from "./Settings";
 
-const getConnectionConfig = vi.fn();
-const setConnectionConfig = vi.fn();
-const testConnectionConfig = vi.fn();
 const getLlmSettings = vi.fn();
 const getEmbeddingSettings = vi.fn();
 const getMemoryEmbeddingStats = vi.fn();
@@ -35,9 +30,6 @@ const redispatchMemoryEmbeddings = vi.fn();
 const listLlmPresets = vi.fn();
 const listEmbeddingPresets = vi.fn();
 vi.mock("@/api", () => ({
-  getConnectionConfig: () => getConnectionConfig(),
-  setConnectionConfig: (cfg: unknown) => setConnectionConfig(cfg),
-  testConnectionConfig: (cfg: unknown) => testConnectionConfig(cfg),
   getLlmSettings: () => getLlmSettings(),
   getEmbeddingSettings: () => getEmbeddingSettings(),
   getMemoryEmbeddingStats: () => getMemoryEmbeddingStats(),
@@ -61,6 +53,7 @@ vi.mock("@/api", () => ({
       data_root_override: null,
       timezone: null,
       effective_timezone: "Asia/Tokyo",
+      migration_backup: { enabled: true, keep: 1 },
       resolved: {
         current_data_root: "/tmp/lookback",
         default_data_root: "/tmp/lookback",
@@ -138,123 +131,6 @@ const EMBEDDING_PRESETS_FIXTURE = [
   },
 ];
 
-const LOCAL_CONFIG: ConnectionConfig = {
-  mode: "local",
-  remote_jobworkerp_url: null,
-  remote_memories_url: null,
-};
-
-function renderCard() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const invalidateSpy = vi.spyOn(client, "invalidateQueries");
-  const ui: ReactElement = (
-    <ConnectionCard
-      localJobworkerpUrl="http://127.0.0.1:9000"
-      localMemoriesUrl="http://127.0.0.1:9010"
-    />
-  );
-  const result = render(
-    <I18nextProvider i18n={i18n}>
-      <QueryClientProvider client={client}>{ui}</QueryClientProvider>
-    </I18nextProvider>,
-  );
-  return { ...result, invalidateSpy };
-}
-
-async function switchToRemoteAndFill() {
-  fireEvent.click(screen.getByText("Remote server"));
-  fireEvent.change(screen.getByPlaceholderText("http://host:9000"), {
-    target: { value: "http://10.0.0.2:9000" },
-  });
-  fireEvent.change(screen.getByPlaceholderText("http://host:9010"), {
-    target: { value: "http://10.0.0.2:9010" },
-  });
-}
-
-describe("ConnectionCard", () => {
-  beforeEach(() => {
-    i18n.changeLanguage("ja");
-    getConnectionConfig.mockReset();
-    setConnectionConfig.mockReset();
-    testConnectionConfig.mockReset();
-    getConnectionConfig.mockResolvedValue(LOCAL_CONFIG);
-  });
-
-  it("invalidates every query after a successful remote save", async () => {
-    setConnectionConfig.mockResolvedValue(undefined);
-    const { invalidateSpy } = renderCard();
-
-    await switchToRemoteAndFill();
-    fireEvent.click(screen.getByText("接続先を保存"));
-
-    await screen.findByText("保存しました");
-    expect(setConnectionConfig).toHaveBeenCalledWith({
-      mode: "remote",
-      remote_jobworkerp_url: "http://10.0.0.2:9000",
-      remote_memories_url: "http://10.0.0.2:9010",
-    });
-    // The whole cache must be dropped (no queryKey filter): listing one
-    // instance's threads while detail/link queries hit another is exactly the
-    // half-broken state this guards against.
-    expect(invalidateSpy).toHaveBeenCalledTimes(1);
-    expect(invalidateSpy).toHaveBeenCalledWith();
-  });
-
-  it("does not touch the cache when the save fails", async () => {
-    setConnectionConfig.mockRejectedValue(new Error("connect refused"));
-    const { invalidateSpy } = renderCard();
-
-    await switchToRemoteAndFill();
-    fireEvent.click(screen.getByText("接続先を保存"));
-
-    await screen.findByText("connect refused");
-    // A failed save must keep the existing (working) data on screen, not blank
-    // it by refetching against an unreachable target.
-    expect(invalidateSpy).not.toHaveBeenCalled();
-  });
-
-  it("tests the edited remote target without saving it", async () => {
-    testConnectionConfig.mockResolvedValue({
-      jobworkerp_url: "http://10.0.0.2:9000",
-      memories_url: "http://10.0.0.2:9010",
-    });
-    const { invalidateSpy } = renderCard();
-
-    await switchToRemoteAndFill();
-    fireEvent.click(screen.getByText("接続をテスト"));
-
-    await screen.findByText("接続できました");
-    expect(testConnectionConfig).toHaveBeenCalledWith({
-      mode: "remote",
-      remote_jobworkerp_url: "http://10.0.0.2:9000",
-      remote_memories_url: "http://10.0.0.2:9010",
-    });
-    expect(setConnectionConfig).not.toHaveBeenCalled();
-    expect(invalidateSpy).not.toHaveBeenCalled();
-  });
-
-  it("shows remote test failures without touching the query cache", async () => {
-    testConnectionConfig.mockRejectedValue(
-      new Error("remote memories connection failed (http://10.0.0.2:9010): refused"),
-    );
-    const { invalidateSpy } = renderCard();
-
-    await switchToRemoteAndFill();
-    fireEvent.click(screen.getByText("接続をテスト"));
-
-    await screen.findByText("remote memories connection failed (http://10.0.0.2:9010): refused");
-    expect(invalidateSpy).not.toHaveBeenCalled();
-  });
-
-  it("shows local URLs read-only and offers no editable fields in local mode", async () => {
-    renderCard();
-    // Seed effect runs from the mocked config (local).
-    await waitFor(() => expect(getConnectionConfig).toHaveBeenCalled());
-    expect(screen.queryByPlaceholderText("http://host:9000")).toBeNull();
-    expect(screen.getByDisplayValue("http://127.0.0.1:9010")).toBeInTheDocument();
-  });
-});
-
 // LlmProviderCard tests cover the api_key tri-state contract with the
 // backend (`null` = no change, `""` = delete, `"x"` = update). Save NEVER
 // produces `""` — that would let "edit temperature without re-typing the
@@ -276,6 +152,24 @@ const LLM_SETTINGS_BASE: LlmSettingsResponse = {
   local_hf_repo: null,
   local_ctx_size: null,
   local_kv_cache_type: null,
+  summary_output_guidance: {
+    small: {
+      daily: { item_chars: 200, total_chars: 8000 },
+      weekly: { item_chars: 350, total_chars: 18000 },
+      monthly: { item_chars: 500, total_chars: 40000 },
+    },
+    standard: {
+      daily: { item_chars: 300, total_chars: 12000 },
+      weekly: { item_chars: 500, total_chars: 30000 },
+      monthly: { item_chars: 800, total_chars: 80000 },
+    },
+    large: {
+      daily: { item_chars: 500, total_chars: 20000 },
+      weekly: { item_chars: 800, total_chars: 50000 },
+      monthly: { item_chars: 1200, total_chars: 120000 },
+    },
+    limits: { daily: 10, weekly: 20, monthly: 50, max_source_memory_ids: 10 },
+  },
 };
 
 const EXTERNAL_NO_KEY: LlmSettingsResponse = {
@@ -357,6 +251,13 @@ describe("LlmProviderCard api_key payload", () => {
     await waitFor(() => expect(llmPayload(onDirty)).toBeNull());
   });
 
+  it("leaves Temperature blank when no override is persisted", async () => {
+    getLlmSettings.mockResolvedValue(LLM_SETTINGS_BASE);
+    renderLlmCard();
+    await screen.findByPlaceholderText("4000");
+    expect(screen.queryByPlaceholderText("0.3")).toBeNull();
+  });
+
   it("preserves temperature=0 instead of falling back to the chat default", async () => {
     // Regression: `Number("0") || null` collapsed legitimate `0` into null.
     const LOCAL_WITH_TEMP: LlmSettingsResponse = { ...LLM_SETTINGS_BASE, temperature: 0.5 };
@@ -391,8 +292,8 @@ describe("LlmProviderCard api_key payload", () => {
   it("keeps Max tokens / Temperature editable in Local mode (chat overrides apply to both)", async () => {
     getLlmSettings.mockResolvedValue(LOCAL_WITH_OVERRIDES);
     const onDirty = renderLlmCard();
-    const maxTokensInput = await screen.findByDisplayValue("8000");
-    const temperatureInput = screen.getByDisplayValue("0.7");
+    const maxTokensInput = await screen.findByPlaceholderText("4000");
+    const temperatureInput = await screen.findByDisplayValue("0.7");
     fireEvent.change(maxTokensInput, { target: { value: "2000" } });
     fireEvent.change(temperatureInput, { target: { value: "0.1" } });
     await waitFor(() =>
@@ -407,12 +308,33 @@ describe("LlmProviderCard api_key payload", () => {
   it("clears persisted Max tokens / Temperature when the inputs are blanked", async () => {
     getLlmSettings.mockResolvedValue(LOCAL_WITH_OVERRIDES);
     const onDirty = renderLlmCard();
-    const maxTokensInput = await screen.findByDisplayValue("8000");
-    const temperatureInput = screen.getByDisplayValue("0.7");
+    const maxTokensInput = await screen.findByPlaceholderText("4000");
+    const temperatureInput = await screen.findByDisplayValue("0.7");
     fireEvent.change(maxTokensInput, { target: { value: "" } });
     fireEvent.change(temperatureInput, { target: { value: "" } });
     await waitFor(() =>
       expect(llmPayload(onDirty)).toMatchObject({ max_tokens: null, temperature: null }),
+    );
+  });
+
+  it("restores and edits the model output limit independently of chat and writing guidance", async () => {
+    getLlmSettings.mockResolvedValue({ ...LOCAL_WITH_OVERRIDES, model_max_output_tokens: 128000 });
+    const onDirty = renderLlmCard();
+    const input = await screen.findByLabelText("モデルの出力上限（期間要約）");
+    await waitFor(() => expect(input).toHaveValue(128000));
+    fireEvent.change(input, { target: { value: "64000" } });
+    await waitFor(() =>
+      expect(llmPayload(onDirty)).toMatchObject({
+        model_max_output_tokens: 64000,
+        max_tokens: 8000,
+        summary_output_guidance: LLM_SETTINGS_BASE.summary_output_guidance,
+      }),
+    );
+    fireEvent.change(input, { target: { value: "0" } });
+    await waitFor(() => expect(llmPayload(onDirty)).toBeNull());
+    fireEvent.change(input, { target: { value: "" } });
+    await waitFor(() =>
+      expect(llmPayload(onDirty)).toMatchObject({ model_max_output_tokens: null }),
     );
   });
 });
@@ -569,7 +491,6 @@ describe("LlmProviderCard local LLM presets", () => {
       custom_dtype: null,
       custom_max_sequence_length: null,
       custom_is_multimodal: null,
-      evacuate_vectordb: true,
     };
     renderLlmCard(undefined, { pendingEmbeddingSettings: pendingEmbedding });
 
@@ -739,6 +660,7 @@ const BACKGROUND_QUEUE: BackgroundJobQueueStatus = {
     { kind: "summary", pending: 2, running: 0, wait_result: 1, cancelling: 0 },
     { kind: "personality", pending: 0, running: 0, wait_result: 0, cancelling: 0 },
     { kind: "reflection", pending: 0, running: 0, wait_result: 0, cancelling: 0 },
+    { kind: "issue_resolution", pending: 4, running: 1, wait_result: 0, cancelling: 0 },
     { kind: "llm_other", pending: 1, running: 0, wait_result: 0, cancelling: 0 },
   ],
 };
@@ -763,7 +685,23 @@ describe("BackgroundJobQueueCard", () => {
     await screen.findByText("Embedding");
     expect(screen.getByText("要約")).toBeInTheDocument();
     expect(screen.getByText("3")).toBeInTheDocument();
-    expect(screen.getAllByText("1")).toHaveLength(3);
+    expect(screen.getAllByText("1")).toHaveLength(4);
+  });
+
+  it("shows issue resolution jobs in their own row", async () => {
+    getBackgroundJobQueueStatus.mockResolvedValue(BACKGROUND_QUEUE);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={client}>
+          <BackgroundJobQueueCard />
+        </QueryClientProvider>
+      </I18nextProvider>,
+    );
+
+    const label = await screen.findByText("Issue 解決照合");
+    const cells = Array.from(label.parentElement?.children ?? []).map((cell) => cell.textContent);
+    expect(cells).toEqual(["Issue 解決照合", "4", "1", "0", "0"]);
   });
 
   it("uses a slower interval while queues are idle", () => {

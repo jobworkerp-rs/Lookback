@@ -1,4 +1,34 @@
+pub mod issue_tracker;
 pub mod proto;
+
+#[path = "../issue_chat_gateway.rs"]
+pub mod issue_chat_gateway;
+
+/// Generated messages and loopback services for Issue tools and agent proposals.
+pub mod issue_chat_proto {
+    #![allow(clippy::all, clippy::pedantic, clippy::nursery)]
+    #![allow(unused_qualifications, missing_docs, rustdoc::broken_intra_doc_links)]
+
+    pub use crate::grpc::proto::issue_tracker;
+
+    pub mod lookback {
+        pub mod chat {
+            pub mod issue {
+                pub mod v1 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/lookback_chat_generated/lookback.chat.issue.v1.rs"
+                    ));
+                }
+            }
+        }
+    }
+
+    pub use lookback::chat::issue::v1::*;
+}
+
+pub const LOOKBACK_CHAT_ISSUE_DESCRIPTOR_SET: &[u8] =
+    tonic::include_file_descriptor_set!("lookback_chat_issue_descriptor");
 
 use std::time::Duration;
 

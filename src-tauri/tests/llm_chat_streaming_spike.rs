@@ -88,6 +88,7 @@ async fn llm_chat_emits_per_token_chunks() {
             lookback_tauri_lib::data::paths::llm_workers_yaml()
                 .expect("workers/llm-workers.yaml resolvable via CARGO_MANIFEST_DIR"),
         ],
+        issue_tracker_server_bin: None,
         function_set_yaml_paths: Vec::new(),
         reflection_dispatch_enabled: true,
         auto_embedding_enabled: false,
@@ -115,12 +116,10 @@ async fn llm_chat_emits_per_token_chunks() {
         }
     }
 
-    let handle = JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
-    .await
-    .expect("connect");
+    let handle =
+        JobworkerpHandle::connect(&report.endpoints.jobworkerp_url().expect("local jobworkerp"))
+            .await
+            .expect("connect");
 
     // `Sidecars::start` already registered the workers from
     // `config.worker_yaml_paths` (see `register_workers_from_yaml` call

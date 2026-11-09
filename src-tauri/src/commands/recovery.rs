@@ -9,9 +9,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tokio::sync::{Mutex, MutexGuard};
 
-use super::embedding_settings::{
-    EvacuateMode, evacuate_vectordb, load_embedding_settings, save_embedding_settings,
-};
+use super::embedding_settings::{load_embedding_settings, save_embedding_settings};
 use super::{AppState, embedding_presets};
 use crate::error::{AppError, AppResult};
 
@@ -34,7 +32,7 @@ pub enum DatabaseRestoreState {
 }
 
 /// A successful database restore intentionally leaves every sidecar stopped.
-/// Starting the migration gate is a separate, explicit user action.
+/// Running the migration again is a separate, explicit user action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DatabaseRestoreResult {
@@ -55,50 +53,6 @@ where
 {
     let _recovery_guard = lock_database_migration_recovery(lock).await;
     operation().await
-}
-
-/// Stop the sidecars, rename the existing lancedb tree under
-/// `<data>/lancedb-backup/lancedb-<ts>/`, then re-run the standard
-/// startup pipeline.
-#[tauri::command]
-pub async fn recover_evacuate_lancedb(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> AppResult<RecoveryResult> {
-    with_database_migration_recovery_lock(&state.database_migration_recovery, || async {
-        run_lancedb_recovery(&app, &state, EvacuateMode::Evacuate).await
-    })
-    .await
-}
-
-/// Same as [`recover_evacuate_lancedb`] but deletes the existing lancedb tree.
-#[tauri::command]
-pub async fn recover_purge_lancedb(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> AppResult<RecoveryResult> {
-    with_database_migration_recovery_lock(&state.database_migration_recovery, || async {
-        run_lancedb_recovery(&app, &state, EvacuateMode::Delete).await
-    })
-    .await
-}
-
-async fn run_lancedb_recovery(
-    app: &AppHandle,
-    state: &AppState,
-    mode: EvacuateMode,
-) -> AppResult<RecoveryResult> {
-    state.invalidate_clients().await;
-    state.sidecars.stop().await?;
-    let backup_path = evacuate_vectordb(&state.data, mode)?;
-
-    crate::stage_and_start_sidecars(app, &state.sidecars, &state.data).await;
-    let restart_error = state.sidecars.last_start_error();
-    Ok(RecoveryResult {
-        restarted: restart_error.is_none(),
-        backup_path,
-        restart_error,
-    })
 }
 
 /// Null out a `preset_id` that no longer exists in the curated list, then
@@ -133,7 +87,8 @@ pub async fn retry_database_migration(
             return Err(AppError::AnotherInstanceRunning);
         }
         state.invalidate_clients().await;
-        crate::sidecar::migration_gate::request_explicit_retry(&state.data)?;
+        // The migration tool decides from its own attempt record whether a
+        // retry is safe, so retrying is simply starting again.
         crate::stage_and_start_sidecars(&app, &state.sidecars, &state.data).await;
         let restart_error = state.sidecars.last_start_error();
         Ok(RecoveryResult {
@@ -194,16 +149,18 @@ async fn run_database_restore(
 async fn run_database_restore_with_sidecars(
     state: &AppState,
     requested_backup: &Path,
-    restore: impl FnOnce(&Path) -> AppResult<PathBuf>,
 ) -> AppResult<DatabaseRestoreResult> {
     state
         .sidecars
         .with_maintenance_lock(|| async {
             state.invalidate_clients().await;
-            let backup_path = restore(requested_backup)?;
+            state
+                .sidecars
+                .restore_memories_backup(requested_backup)
+                .await?;
             Ok(DatabaseRestoreResult {
                 state: DatabaseRestoreState::SafeStopped,
-                backup_path,
+                backup_path: requested_backup.to_path_buf(),
             })
         })
         .await
@@ -215,10 +172,7 @@ pub async fn restore_database_migration_backup(
     backup_path: String,
 ) -> AppResult<DatabaseRestoreResult> {
     with_database_migration_recovery_lock(&state.database_migration_recovery, || async {
-        run_database_restore_with_sidecars(&state, Path::new(&backup_path), |requested| {
-            crate::sidecar::migration_gate::restore_backup(&state.data, requested)
-        })
-        .await
+        run_database_restore_with_sidecars(&state, Path::new(&backup_path)).await
     })
     .await
 }
@@ -254,7 +208,13 @@ fn open_log_dir_at(dir: &Path, opener: impl FnOnce(&Path) -> std::io::Result<()>
 /// Cleanly quit the app from the BootError UI.
 #[tauri::command]
 pub async fn quit_app(state: tauri::State<'_, AppState>, app: AppHandle) -> AppResult<()> {
-    let _ = state.sidecars.stop().await;
+    // ExitRequested owns the single reconciliation/stop sequence shared with
+    // tray, native menu, and operating-system shutdown requests.
+    if !state.window_lifecycle.request_quit() {
+        return Err(AppError::Config(
+            "application quit is already in progress".into(),
+        ));
+    }
     app.exit(0);
     Ok(())
 }

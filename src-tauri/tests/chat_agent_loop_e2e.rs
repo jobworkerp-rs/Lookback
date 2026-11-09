@@ -34,12 +34,10 @@ async fn agent_loop_dispatches_tool_call() {
         eprintln!("warning: {:?} {} ({:?})", w.kind, w.message, w.detail);
     }
 
-    let handle = JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
-    .await
-    .expect("connect");
+    let handle =
+        JobworkerpHandle::connect(&report.endpoints.jobworkerp_url().expect("local jobworkerp"))
+            .await
+            .expect("connect");
 
     // ---- (1) tools_json contract ---------------------------------------
 
@@ -170,12 +168,10 @@ async fn agent_loop_with_production_payload() {
     let (root, sidecars, report) = common::start_chat_e2e_sidecars("chat-agent-loop-prod").await;
     eprintln!("sidecars ready: {:?}", report.endpoints);
 
-    let handle = JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
-    .await
-    .expect("connect");
+    let handle =
+        JobworkerpHandle::connect(&report.endpoints.jobworkerp_url().expect("local jobworkerp"))
+            .await
+            .expect("connect");
 
     let raw_tools_json = handle
         .fetch_function_set_as_tools_json("lookback-rag")
@@ -204,11 +200,6 @@ async fn agent_loop_with_production_payload() {
             "client_tools_json": tools_json,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
-            // Qwen3 with thinking on plans tool calls inside <think> but
-            // often forgets to emit them afterwards (QwenLM/Qwen3 #1817).
-            // Mirror commands::chat::build_chat_args so the reproduction
-            // tracks the production fix.
-            "chat_template_kwargs": "{\"enable_thinking\":false}",
         }
     });
 
@@ -282,12 +273,10 @@ async fn agent_loop_with_user_reported_query() {
     let (root, sidecars, report) = common::start_chat_e2e_sidecars("chat-agent-loop-userq").await;
     eprintln!("sidecars ready: {:?}", report.endpoints);
 
-    let handle = JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
-    .await
-    .expect("connect");
+    let handle =
+        JobworkerpHandle::connect(&report.endpoints.jobworkerp_url().expect("local jobworkerp"))
+            .await
+            .expect("connect");
 
     let raw_tools_json = handle
         .fetch_function_set_as_tools_json("lookback-rag")
@@ -312,7 +301,6 @@ async fn agent_loop_with_user_reported_query() {
             "client_tools_json": tools_json,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
-            "chat_template_kwargs": "{\"enable_thinking\":false}",
         }
     });
 
@@ -420,12 +408,10 @@ async fn agent_loop_drain_path_preserves_pending_tool_calls() {
 
     let (root, sidecars, report) =
         common::start_chat_e2e_sidecars("chat-agent-loop-drain-path").await;
-    let handle = JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
-    .await
-    .expect("connect");
+    let handle =
+        JobworkerpHandle::connect(&report.endpoints.jobworkerp_url().expect("local jobworkerp"))
+            .await
+            .expect("connect");
 
     let raw_tools_json = handle
         .fetch_function_set_as_tools_json("lookback-rag")
@@ -450,7 +436,6 @@ async fn agent_loop_drain_path_preserves_pending_tool_calls() {
             "client_tools_json": tools_json,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
-            "chat_template_kwargs": "{\"enable_thinking\":false}",
         }
     });
 
@@ -567,12 +552,10 @@ async fn agent_loop_completes_after_tool_result() {
         common::start_chat_e2e_sidecars("chat-agent-loop-multihop").await;
     eprintln!("sidecars ready: {:?}", report.endpoints);
 
-    let handle = JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
-    .await
-    .expect("connect");
+    let handle =
+        JobworkerpHandle::connect(&report.endpoints.jobworkerp_url().expect("local jobworkerp"))
+            .await
+            .expect("connect");
 
     let raw_tools_json = handle
         .fetch_function_set_as_tools_json("lookback-rag")
@@ -599,7 +582,6 @@ async fn agent_loop_completes_after_tool_result() {
             "client_tools_json": tools_json,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
-            "chat_template_kwargs": "{\"enable_thinking\":false}",
         }
     });
 
@@ -638,7 +620,7 @@ async fn agent_loop_completes_after_tool_result() {
     assert!(saw_done, "hop1 must terminate with done=true");
     assert!(
         !pending.is_empty(),
-        "hop1: model must emit a tool call when enable_thinking=false"
+        "hop1: model must emit a tool call for the tool-calling request"
     );
     let call = pending.into_iter().next().unwrap();
     eprintln!(
@@ -692,7 +674,6 @@ async fn agent_loop_completes_after_tool_result() {
             "client_tools_json": tools_json,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
-            "chat_template_kwargs": "{\"enable_thinking\":false}",
         }
     });
 
@@ -763,12 +744,10 @@ async fn agent_loop_cancels_on_demand() {
     let (root, sidecars, report) = common::start_chat_e2e_sidecars("chat-agent-loop-cancel").await;
     eprintln!("sidecars ready: {:?}", report.endpoints);
 
-    let handle = JobworkerpHandle::connect(&format!(
-        "http://127.0.0.1:{}",
-        report.endpoints.jobworkerp_port
-    ))
-    .await
-    .expect("connect");
+    let handle =
+        JobworkerpHandle::connect(&report.endpoints.jobworkerp_url().expect("local jobworkerp"))
+            .await
+            .expect("connect");
 
     let raw_tools_json = handle
         .fetch_function_set_as_tools_json("lookback-rag")
@@ -792,7 +771,6 @@ async fn agent_loop_cancels_on_demand() {
             "client_tools_json": tools_json,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
-            "chat_template_kwargs": "{\"enable_thinking\":false}",
         }
     });
 

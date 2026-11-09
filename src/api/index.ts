@@ -1,21 +1,53 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AppCapabilities,
+  ApplyIssueAdminActionRequest,
   ApplySettingsRequest,
   ApplySettingsResponse,
   ApplySetupRequest,
   ApplySetupResponse,
   AppSettingsResponse,
+  AutoIssuePolicySnapshot,
   BackgroundJobQueueStatus,
   ChatAskRequest,
   ChatAskResponse,
+  ChatToolApprovalSettings,
+  CodingAgentApproveAndStartRequest,
+  CodingAgentApproveNativeBackendRequest,
+  CodingAgentBackendStatus,
+  CodingAgentDelegationPlan,
+  CodingAgentEvidenceReference,
+  CodingAgentEvidenceResponse,
+  CodingAgentNativeSetupResponse,
+  CodingAgentReassessmentRequest,
+  CodingAgentRepositoryHostCheckRequest,
+  CodingAgentRepositoryHostCheckResponse,
+  CodingAgentReviewActionRequest,
+  CodingAgentReviewActionResponse,
+  CodingAgentReviewSnapshot,
+  CodingAgentRunActionResponse,
+  CodingAgentRunOwnerResponse,
+  CodingAgentRunPreview,
+  CodingAgentRunPreviewRequest,
+  CodingAgentRunStatus,
+  CodingAgentSemanticReassessment,
+  CodingAgentSettingsResponse,
+  CodingAgentUpdateSettingsRequest,
   ConnectionConfig,
   ConnectionTestReport,
   CountSummariesRequest,
+  CreateIssueFromCanceledRequest,
   DatabaseRestoreResult,
   DataRootValidation,
   DebugPersonalityInventoryRequest,
+  EmbeddingBackup,
+  EmbeddingMigrationOperationResponse,
+  EmbeddingMigrationResult,
   EmbeddingPreset,
+  EmbeddingRebuildProgressView,
+  EmbeddingReconcileProgressView,
   EmbeddingSettingsResponse,
+  EmbeddingSpaceView,
   EnqueueAnalysisJobResponse,
   EnqueuePeriodSummaryJobRequest,
   EnqueuePersonalityJobRequest,
@@ -23,6 +55,9 @@ import type {
   EnqueueReflectionJobRequest,
   EnqueueReflectionJobResponse,
   EnqueueSummaryJobRequest,
+  EnqueueThreadGroupIssueResolutionJobRequest,
+  EnqueueThreadGroupSummaryJobRequest,
+  EnqueueThreadIssueResolutionJobRequest,
   FindCoOccurringLabelsRequest,
   FindDistinctLabelsRequest,
   FindMemoriesRequest,
@@ -30,7 +65,19 @@ import type {
   FindMemoryThreadPositionRequest,
   GenerateSummariesRequest,
   GetPersonalityRequest,
+  GetThreadIssueResolutionStatusRequest,
+  GetThreadIssueResolutionStatusResponse,
+  IssueDuplicate,
+  IssueEvidence,
+  IssueHistoryPageOutcome,
+  IssueHistoryResponse,
+  IssueListItem,
+  IssueOperationStatus,
+  IssueReviewItem,
+  IssueTrackerSettingsResponse,
   LabelWithCount,
+  ListIssueDirectHistoryRequest,
+  ListIssueReviewRequest,
   ListPeriodicTasksRequest,
   ListPersonalitySignalsRequest,
   ListReflectionSelectionRequest,
@@ -39,7 +86,10 @@ import type {
   ListSummariesForSelectionRequest,
   ListSummariesForSelectionResponse,
   ListSummariesRequest,
+  ListSummaryPathCandidatesRequest,
+  ListSummaryPathChildrenRequest,
   ListSummaryPeriodKeysRequest,
+  ListThreadGroupsRequest,
   ListThreadsRequest,
   LlmPreset,
   LlmSettingsResponse,
@@ -49,17 +99,20 @@ import type {
   McpSettingsResponse,
   MemoryEmbeddingStats,
   MemoryPosition,
+  MemoryReference,
   MemoryRow,
   MemoryThreadPosition,
   ModelStatusReport,
+  OwnershipDiagnosisView,
+  PendingIssueOperationView,
   PeriodicExecutionHistoryEntry,
   PeriodicExecutionSummary,
   PeriodicTaskEntry,
   PersonalityInventoryReport,
   PersonalityProfileContent,
   PersonalityResponse,
-  PersonalitySignal,
   PersonalitySignalContent,
+  PersonalitySignalPage,
   PurgeReport,
   RecoveryResult,
   RedispatchEmbeddingsResult,
@@ -68,14 +121,21 @@ import type {
   ReflectionEntry,
   ReflectionIntentIndexStats,
   ReflectionSelectionContent,
+  RemoteJobworkerpReadiness,
+  RemoteJobworkerpRegistration,
   ResolvedSummaryMemoryRef,
+  ResolveIssueOperationRequest,
+  ResolveIssueReviewRequest,
+  RetryPendingIssueOperationRequest,
   SavePeriodicTaskRequest,
   SearchIndexMaintenanceStatus,
   SearchReflectionsByIntentRequest,
   SearchReflectionsHybridRequest,
   SearchReflectionsRequest,
+  SearchThreadGroupsRequest,
   SearchThreadsRequest,
   SelectedMemoryLimits,
+  SetAutoIssuePolicyRequest,
   SetEmbeddingSettingsRequest,
   SetEmbeddingSettingsResponse,
   SetHfHomeRequest,
@@ -84,16 +144,343 @@ import type {
   SettingsSnapshot,
   SetupStatus,
   SidecarStatusSnapshot,
+  SpaceValue,
+  StagedProgressKind,
+  StagedProgressSnapshot,
+  StartEmbeddingRebuildRequest,
+  StartEmbeddingRebuildResult,
+  StartEmbeddingReconcileRequest,
+  StartEmbeddingReconcileResult,
   StartImportRequest,
   StartImportResponse,
   SummaryContent,
   SummaryEntry,
+  SummaryPathCandidate,
+  SummaryPathChildEntry,
+  SummaryRecoveryStatus,
+  ThreadGroupLineageView,
+  ThreadGroupListItem,
+  ThreadGroupRecoveryStatus,
+  ThreadGroupSearchPage,
+  ThreadGroupSummaryEntryView,
+  ThreadGroupSummaryView,
   ThreadHit,
   ThreadSummary,
+  UpdateIssueCandidateRequest,
 } from "@/types/api";
+
+/** Read the versioned coding-agent profile document without exposing secret values. */
+export async function codingAgentGetSettings(): Promise<CodingAgentSettingsResponse> {
+  return invoke<CodingAgentSettingsResponse>("coding_agent_get_settings");
+}
+
+/** Persist a complete settings snapshot using the backend's compare-and-swap revision. */
+export async function codingAgentUpdateSettings(
+  request: CodingAgentUpdateSettingsRequest,
+): Promise<CodingAgentSettingsResponse> {
+  return invoke<CodingAgentSettingsResponse>("coding_agent_update_settings", { request });
+}
+
+export async function codingAgentPrepareProfileHome(request: {
+  expectedRevision: number;
+  profileId: string;
+}): Promise<CodingAgentSettingsResponse> {
+  return invoke<CodingAgentSettingsResponse>("coding_agent_prepare_profile_home", { request });
+}
+
+export async function codingAgentCheckRepositoryHost(
+  request: CodingAgentRepositoryHostCheckRequest,
+): Promise<CodingAgentRepositoryHostCheckResponse> {
+  return invoke<CodingAgentRepositoryHostCheckResponse>("coding_agent_check_repository_host", {
+    request,
+  });
+}
+
+export async function codingAgentGetBackendStatus(): Promise<CodingAgentBackendStatus> {
+  return invoke<CodingAgentBackendStatus>("coding_agent_get_backend_status");
+}
+
+export async function codingAgentGetNativeSetup(): Promise<CodingAgentNativeSetupResponse> {
+  return invoke<CodingAgentNativeSetupResponse>("coding_agent_get_native_setup");
+}
+
+export async function codingAgentApproveNativeBackend(
+  request: CodingAgentApproveNativeBackendRequest,
+): Promise<CodingAgentNativeSetupResponse> {
+  return invoke<CodingAgentNativeSetupResponse>("coding_agent_approve_native_backend", { request });
+}
+
+/** The preview is server-derived and its digest must be echoed for approval. */
+export async function codingAgentPreviewRun(
+  request: CodingAgentRunPreviewRequest,
+): Promise<CodingAgentRunPreview> {
+  return invoke<CodingAgentRunPreview>("coding_agent_preview_run", { request });
+}
+
+export async function codingAgentApproveAndStart(
+  request: CodingAgentApproveAndStartRequest,
+): Promise<import("@/types/api").CodingAgentStartResponse> {
+  return invoke<import("@/types/api").CodingAgentStartResponse>("coding_agent_approve_and_start", {
+    request,
+  });
+}
+
+export async function codingAgentListDelegationPlans(
+  issueId: string,
+): Promise<CodingAgentDelegationPlan[]> {
+  return invoke("coding_agent_list_delegation_plans", { issueId });
+}
+
+export async function codingAgentListRuns(): Promise<CodingAgentRunStatus[]> {
+  return invoke<CodingAgentRunStatus[]>("coding_agent_list_runs");
+}
+
+export async function codingAgentGetRun(runId: string): Promise<CodingAgentRunStatus> {
+  return invoke<CodingAgentRunStatus>("coding_agent_get_run", { runId });
+}
+
+export async function codingAgentAttachRun(runId: string): Promise<CodingAgentRunOwnerResponse> {
+  return invoke<CodingAgentRunOwnerResponse>("coding_agent_attach_run", { runId });
+}
+
+export async function codingAgentCancelRun(runId: string): Promise<CodingAgentRunActionResponse> {
+  return invoke<CodingAgentRunActionResponse>("coding_agent_cancel_run", { runId });
+}
+
+export async function codingAgentListEvidence(
+  runId: string,
+): Promise<CodingAgentEvidenceReference[]> {
+  return invoke<CodingAgentEvidenceReference[]>("coding_agent_list_evidence", { runId });
+}
+
+export async function codingAgentReadEvidence(
+  runId: string,
+  evidenceId: string,
+): Promise<CodingAgentEvidenceResponse> {
+  return invoke<CodingAgentEvidenceResponse>("coding_agent_read_evidence", { runId, evidenceId });
+}
+
+export async function codingAgentGetReview(runId: string): Promise<CodingAgentReviewSnapshot> {
+  return invoke<CodingAgentReviewSnapshot>("coding_agent_get_review", { runId });
+}
+
+export async function codingAgentApplyReviewAction(
+  request: CodingAgentReviewActionRequest,
+): Promise<CodingAgentReviewActionResponse> {
+  return invoke<CodingAgentReviewActionResponse>("coding_agent_apply_review_action", { request });
+}
+
+export async function codingAgentReassess(
+  request: CodingAgentReassessmentRequest,
+): Promise<CodingAgentSemanticReassessment> {
+  return invoke("coding_agent_reassess", { request });
+}
+
+export async function listIssueReviewItems(
+  req: ListIssueReviewRequest = {},
+): Promise<IssueReviewItem[]> {
+  return issueInvoke<IssueReviewItem[]>("list_issue_review_items", { req });
+}
+
+export async function getAppCapabilities(): Promise<AppCapabilities> {
+  return invoke<AppCapabilities>("get_app_capabilities");
+}
+
+export async function getIssueTrackerSettings(): Promise<IssueTrackerSettingsResponse> {
+  return invoke<IssueTrackerSettingsResponse>("get_issue_tracker_settings");
+}
+
+export async function listIssues(req: { states?: string[] } = {}): Promise<IssueListItem[]> {
+  return invoke<IssueListItem[]>("list_issues", { req });
+}
+
+export async function getIssueDetail(issueId: string): Promise<IssueListItem> {
+  return invoke<IssueListItem>("get_issue_detail", { issueId });
+}
+
+export async function listIssueOwnershipDiagnostics(
+  issueId?: string,
+): Promise<OwnershipDiagnosisView[]> {
+  return issueInvoke<OwnershipDiagnosisView[]>("list_issue_ownership_diagnostics", { issueId });
+}
+
+export async function applyIssueAdminAction(
+  req: ApplyIssueAdminActionRequest,
+): Promise<IssueOperationStatus> {
+  return issueInvoke<IssueOperationStatus>("apply_issue_admin_action", { req });
+}
+
+export async function getIssueOperationStatus(
+  req: import("@/types/api").GetIssueOperationStatusRequest,
+): Promise<IssueOperationStatus> {
+  return issueInvoke<IssueOperationStatus>("get_issue_operation_status", { req });
+}
+
+export async function resolveIssueOperation(
+  req: ResolveIssueOperationRequest,
+): Promise<IssueOperationStatus> {
+  return issueInvoke<IssueOperationStatus>("resolve_issue_operation", { req });
+}
+
+export async function listIssueDirectHistoryPage(
+  req: ListIssueDirectHistoryRequest,
+): Promise<IssueHistoryPageOutcome> {
+  return issueInvoke<IssueHistoryPageOutcome>("list_issue_direct_history", { req });
+}
+
+export async function listPendingIssueOperations(): Promise<PendingIssueOperationView[]> {
+  return issueInvoke<PendingIssueOperationView[]>("list_pending_issue_operations");
+}
+
+export async function retryPendingIssueOperation(
+  req: RetryPendingIssueOperationRequest,
+): Promise<IssueOperationStatus> {
+  return issueInvoke<IssueOperationStatus>("retry_pending_issue_operation", {
+    req,
+  });
+}
+
+export async function getIssueEvidence(itemId: string): Promise<IssueEvidence[]> {
+  return issueInvoke<IssueEvidence[]>("get_issue_evidence", { itemId });
+}
+
+export async function getIssueDuplicates(itemId: string): Promise<IssueDuplicate[]> {
+  return invoke<IssueDuplicate[]>("get_issue_duplicates", { itemId });
+}
+
+export async function listIssueHistory(): Promise<IssueHistoryResponse> {
+  return invoke<IssueHistoryResponse>("list_issue_history");
+}
+
+export async function resolveIssueReview(req: ResolveIssueReviewRequest): Promise<void> {
+  return issueInvoke<void>("resolve_issue_review", { req });
+}
+
+export async function updateIssueCandidate(req: UpdateIssueCandidateRequest): Promise<void> {
+  return invoke<void>("update_issue_candidate", { req });
+}
+
+export async function createExplicitIssueFromCandidate(
+  req: import("@/types/api").CreateExplicitIssueRequest,
+): Promise<void> {
+  return invoke<void>("create_explicit_issue_from_candidate", { req });
+}
+
+export async function createIssueFromCanceled(
+  req: CreateIssueFromCanceledRequest,
+): Promise<IssueListItem> {
+  return invoke<IssueListItem>("create_issue_from_canceled", { req });
+}
+
+export async function reextractRejectedCandidate(
+  candidateId: string,
+): Promise<EnqueueAnalysisJobResponse> {
+  return issueInvoke<EnqueueAnalysisJobResponse>("reextract_rejected_candidate", {
+    req: { candidate_id: candidateId },
+  });
+}
+
+async function issueInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    if (error instanceof Error) throw error;
+    throw new Error(typeof error === "string" ? error : String(error));
+  }
+}
+
+export async function transitionIssueState(
+  req: import("@/types/api").TransitionIssueStateRequest,
+): Promise<void> {
+  return invoke("transition_issue_state", { req });
+}
+
+export async function getWorkEligibility(): Promise<{
+  work_eligibility: "REVIEWED_ONLY" | "INCLUDE_AUTO_REGISTERED";
+}> {
+  return invoke("get_work_eligibility");
+}
+
+export async function setWorkEligibility(req: {
+  work_eligibility: "REVIEWED_ONLY" | "INCLUDE_AUTO_REGISTERED";
+}): Promise<{ work_eligibility: "REVIEWED_ONLY" | "INCLUDE_AUTO_REGISTERED" }> {
+  return invoke("set_work_eligibility", { req });
+}
+
+export async function getIssueReviewPolicy(): Promise<import("@/types/api").IssueReviewPolicy> {
+  return invoke("get_issue_review_policy");
+}
+
+export async function setIssueReviewPolicy(
+  req: import("@/types/api").SetIssueReviewPolicyRequest,
+): Promise<import("@/types/api").IssueReviewPolicy> {
+  return invoke("set_issue_review_policy", { req });
+}
+
+export async function getAutoIssuePolicy(): Promise<AutoIssuePolicySnapshot> {
+  return invoke<AutoIssuePolicySnapshot>("get_auto_issue_policy");
+}
+
+export async function setAutoIssuePolicy(
+  req: SetAutoIssuePolicyRequest,
+): Promise<AutoIssuePolicySnapshot> {
+  return invoke<AutoIssuePolicySnapshot>("set_auto_issue_policy", { req });
+}
 
 export async function listThreads(req: ListThreadsRequest): Promise<ThreadSummary[]> {
   return invoke<ThreadSummary[]>("list_threads", { req });
+}
+
+export async function listThreadGroups(
+  req: ListThreadGroupsRequest = {},
+): Promise<ThreadGroupListItem[]> {
+  return invoke<ThreadGroupListItem[]>("list_thread_groups", { req });
+}
+
+export async function searchThreadGroups(
+  req: SearchThreadGroupsRequest,
+): Promise<ThreadGroupSearchPage> {
+  return invoke<ThreadGroupSearchPage>("search_thread_groups", { req });
+}
+
+export async function findThreadGroup(
+  group_id: string,
+  group_owner_user_id?: number,
+): Promise<ThreadGroupLineageView> {
+  return invoke<ThreadGroupLineageView>("find_thread_group", {
+    req: { group_id, group_owner_user_id },
+  });
+}
+
+export async function findThreadGroupSummary(
+  group_id: string,
+  group_owner_user_id?: number,
+): Promise<ThreadGroupSummaryView | null> {
+  return invoke<ThreadGroupSummaryView | null>("find_thread_group_summary", {
+    req: { group_id, group_owner_user_id },
+  });
+}
+
+/** Summaries for many groups in one IPC/RPC round trip, in request order. */
+export async function findThreadGroupSummaries(
+  group_ids: string[],
+  group_owner_user_id?: number,
+): Promise<ThreadGroupSummaryEntryView[]> {
+  return invoke<ThreadGroupSummaryEntryView[]>("find_thread_group_summaries", {
+    req: { group_ids, group_owner_user_id },
+  });
+}
+
+export async function countActiveThreadGroups(group_owner_user_id?: number): Promise<number> {
+  return invoke<number>("count_active_thread_groups", { groupOwnerUserId: group_owner_user_id });
+}
+
+export async function countThreadGroupSummaries(group_owner_user_id?: number): Promise<number> {
+  return invoke<number>("count_thread_group_summaries", { groupOwnerUserId: group_owner_user_id });
+}
+
+export async function getThreadGroupRecoveryStatus(): Promise<ThreadGroupRecoveryStatus> {
+  return invoke<ThreadGroupRecoveryStatus>("get_thread_group_recovery_status");
 }
 
 /** Fetch a single thread row by id; `null` if it no longer exists. Used to
@@ -127,12 +514,13 @@ export async function findMemoryThreadPosition(
   return invoke<MemoryThreadPosition | null>("find_memory_thread_position", { req });
 }
 
-export async function findMemoriesByThreadId(req: FindMemoriesRequest): Promise<MemoryRow[]> {
-  return invoke<MemoryRow[]>("find_memories_by_thread_id", { req });
+/** Fetch a Memory plus every available Thread location for direct ID navigation. */
+export async function resolveMemoryReference(memory_id: string): Promise<MemoryReference | null> {
+  return invoke<MemoryReference | null>("resolve_memory_reference", { req: { memory_id } });
 }
 
-export async function countThreads(): Promise<number> {
-  return invoke<number>("count_threads");
+export async function findMemoriesByThreadId(req: FindMemoriesRequest): Promise<MemoryRow[]> {
+  return invoke<MemoryRow[]>("find_memories_by_thread_id", { req });
 }
 
 /** Delete a thread and (server cascade) every Memory attached to it. */
@@ -152,10 +540,23 @@ export async function listSummariesForSelection(
   return invoke<ListSummariesForSelectionResponse>("list_summaries_for_selection", { req });
 }
 
+/** Path children of one v2 Overall period summary. Bodies remain lazy-loaded. */
+export async function listSummaryPathChildren(
+  req: ListSummaryPathChildrenRequest,
+): Promise<SummaryPathChildEntry[]> {
+  return invoke<SummaryPathChildEntry[]>("list_summary_path_children", { req });
+}
+
 /** Fetch complete summary content for selection and preview. `null` means the
  * listed memory no longer exists or is no longer a summary. */
 export async function getSummaryContent(memory_id: string): Promise<string | null> {
   return invoke<string | null>("get_summary_content", { req: { memory_id } });
+}
+
+export async function listSummaryPathCandidates(
+  req: ListSummaryPathCandidatesRequest,
+): Promise<SummaryPathCandidate[]> {
+  return invoke<SummaryPathCandidate[]>("list_summary_path_candidates", { req });
 }
 
 /** Labels attached to per-thread summary threads, excluding internal period axes. */
@@ -200,14 +601,22 @@ export async function startImport(req: StartImportRequest): Promise<StartImportR
   return invoke<StartImportResponse>("start_import", { req });
 }
 
+/** Restore the latest active staged process of one kind without sharing its
+ *  identity or progress sequence with other process kinds. */
+export async function getActiveStagedProgress(
+  kind: StagedProgressKind,
+): Promise<StagedProgressSnapshot | null> {
+  return invoke<StagedProgressSnapshot | null>("get_active_staged_progress", { kind });
+}
+
 /** Cancel an in-flight import pipeline. Idempotent: a finished or
- *  unknown dispatch id resolves silently so the toast can fire-and-forget. */
+ *  unknown dispatch id resolves silently so callers can safely retry. */
 export async function startImportCancel(dispatchId: string): Promise<void> {
   return invoke<void>("start_import_cancel", { dispatchId });
 }
 
 /** Cancel an in-flight analysis dispatch (summary / personality / period
- *  summary / staged summaries pipeline) by its dispatch id. Idempotent. */
+ *  summary / staged summary generation) by its dispatch id. Idempotent. */
 export async function analysisCancel(dispatchId: string): Promise<void> {
   return invoke<void>("analysis_cancel", { dispatchId });
 }
@@ -218,6 +627,14 @@ export async function getSettings(): Promise<SettingsSnapshot> {
 
 export async function getSearchIndexMaintenanceStatus(): Promise<SearchIndexMaintenanceStatus> {
   return invoke<SearchIndexMaintenanceStatus>("get_search_index_maintenance_status");
+}
+
+export async function getSummaryRecoveryStatus(): Promise<SummaryRecoveryStatus> {
+  return invoke<SummaryRecoveryStatus>("get_summary_recovery_status");
+}
+
+export async function resetSummaryRecoveryState(): Promise<SummaryRecoveryStatus> {
+  return invoke<SummaryRecoveryStatus>("reset_summary_recovery_state");
 }
 
 export async function startSearchIndexMaintenance(): Promise<void> {
@@ -292,8 +709,8 @@ export async function getPersonality(
 
 export async function listPersonalitySignals(
   req: ListPersonalitySignalsRequest = {},
-): Promise<PersonalitySignal[]> {
-  return invoke<PersonalitySignal[]>("list_personality_signals", { req });
+): Promise<PersonalitySignalPage> {
+  return invoke<PersonalitySignalPage>("list_personality_signals", { req });
 }
 
 /** Delete a single layer-1 personality signal by its backing Memory row id. */
@@ -444,6 +861,34 @@ export async function enqueueSummaryJob(
   return invoke<EnqueueAnalysisJobResponse>("enqueue_summary_job", { req });
 }
 
+export async function enqueueThreadGroupSummaryJob(
+  req: EnqueueThreadGroupSummaryJobRequest = {},
+): Promise<EnqueueAnalysisJobResponse> {
+  return invoke<EnqueueAnalysisJobResponse>("enqueue_thread_group_summary_job", { req });
+}
+
+/** Reconcile Issue candidates for one ThreadGroup without regenerating its summary. */
+export async function enqueueThreadGroupIssueResolutionJob(
+  req: EnqueueThreadGroupIssueResolutionJobRequest,
+): Promise<EnqueueAnalysisJobResponse> {
+  return invoke<EnqueueAnalysisJobResponse>("enqueue_thread_group_issue_resolution_job", { req });
+}
+
+/** Re-evaluate Issue resolution for a saved thread summary without regenerating the summary. */
+export async function enqueueThreadIssueResolutionJob(
+  req: EnqueueThreadIssueResolutionJobRequest,
+): Promise<EnqueueAnalysisJobResponse> {
+  return invoke<EnqueueAnalysisJobResponse>("enqueue_thread_issue_resolution_job", { req });
+}
+
+export async function getThreadIssueResolutionStatus(
+  req: GetThreadIssueResolutionStatusRequest,
+): Promise<GetThreadIssueResolutionStatusResponse> {
+  return invoke<GetThreadIssueResolutionStatusResponse>("get_thread_issue_resolution_status", {
+    req,
+  });
+}
+
 /** Run the personality batch later, after an import-only run. */
 export async function enqueuePersonalityJob(
   req: EnqueuePersonalityJobRequest = {},
@@ -470,9 +915,9 @@ export async function enqueuePeriodSummaryJob(
   return invoke<EnqueueAnalysisJobResponse>("enqueue_period_summary_job", { req });
 }
 
-/** Staged generate: runs the per-thread → daily → weekly → monthly chain in a
- *  single pipeline workflow gated by the `run_*` flags. The range is already
- *  expanded per layer by the caller. Progress streams on `summary://step`. */
+/** Dispatch manual staged summary generation. The range is already expanded
+ *  per layer by the caller; stage snapshots stream on `staged://step` and use
+ *  `dispatch_id` as their identity. */
 export async function generateSummaries(
   req: GenerateSummariesRequest,
 ): Promise<EnqueueAnalysisJobResponse> {
@@ -490,6 +935,52 @@ export async function chatAsk(req: ChatAskRequest): Promise<ChatAskResponse> {
  *  Idempotent — an unknown / finished jobId resolves silently. */
 export async function chatCancel(jobId: string): Promise<void> {
   return invoke<void>("chat_cancel", { jobId });
+}
+
+/** Read the persisted, app-wide policy for chat tool approvals. */
+export async function getChatToolSettings(): Promise<ChatToolApprovalSettings> {
+  return invoke<ChatToolApprovalSettings>("get_chat_tool_settings");
+}
+
+/** Persist the app-wide policy for chat tool approvals. */
+export async function setChatToolSettings(
+  req: ChatToolApprovalSettings,
+): Promise<ChatToolApprovalSettings> {
+  return invoke<ChatToolApprovalSettings>("set_chat_tool_settings", { req });
+}
+
+/** Resolve one backend approval pause using both correlation ids. */
+export async function chatRespondToolApproval(
+  jobId: string,
+  callId: string,
+  approved: boolean,
+): Promise<void> {
+  return invoke<void>("chat_respond_tool_approval", { jobId, callId, approved });
+}
+
+export interface PendingChatIssueOperation {
+  operation_key: string;
+  issue_id: string;
+  method: string;
+  created_at_ms: number;
+}
+
+export interface ChatIssueOperationResult {
+  issue_id: string;
+  operation_id: string;
+  operation_state: string;
+  revision: string;
+  resulting_state: string;
+}
+
+export async function listPendingChatIssueOperations(): Promise<PendingChatIssueOperation[]> {
+  return invoke<PendingChatIssueOperation[]>("list_pending_chat_issue_operations");
+}
+
+export async function retryPendingChatIssueOperation(
+  operationKey: string,
+): Promise<ChatIssueOperationResult> {
+  return invoke<ChatIssueOperationResult>("retry_pending_chat_issue_operation", { operationKey });
 }
 
 export async function getSelectedMemoryLimits(): Promise<SelectedMemoryLimits> {
@@ -515,6 +1006,16 @@ export async function setConnectionConfig(cfg: ConnectionConfig): Promise<void> 
  *  the user navigates to a data page and only sees an empty result. */
 export async function testConnectionConfig(cfg: ConnectionConfig): Promise<ConnectionTestReport> {
   return invoke<ConnectionTestReport>("test_connection_config", { cfg });
+}
+
+/** Report what the active remote jobworkerp lacks for Lookback. */
+export async function inspectRemoteJobworkerp(): Promise<RemoteJobworkerpReadiness> {
+  return invoke<RemoteJobworkerpReadiness>("inspect_remote_jobworkerp");
+}
+
+/** Register Lookback's workers on the active remote jobworkerp. */
+export async function registerRemoteJobworkerpWorkers(): Promise<RemoteJobworkerpRegistration> {
+  return invoke<RemoteJobworkerpRegistration>("register_remote_jobworkerp_workers");
 }
 
 /** Read LLM provider settings (local vs external). */
@@ -587,6 +1088,65 @@ export async function getEmbeddingSettings(): Promise<EmbeddingSettingsResponse>
   return invoke<EmbeddingSettingsResponse>("get_embedding_settings");
 }
 
+/** Read the embedding space and table markers from the selected Memories endpoint. */
+export async function getEmbeddingSpace(): Promise<EmbeddingSpaceView> {
+  return invoke<EmbeddingSpaceView>("get_embedding_space");
+}
+
+export async function startEmbeddingRebuild(
+  req: StartEmbeddingRebuildRequest,
+): Promise<StartEmbeddingRebuildResult> {
+  return invoke<StartEmbeddingRebuildResult>("start_embedding_rebuild", { req });
+}
+
+export async function getEmbeddingRebuildProgress(
+  attemptId: string,
+): Promise<EmbeddingRebuildProgressView> {
+  return invoke<EmbeddingRebuildProgressView>("get_embedding_rebuild_progress", { attemptId });
+}
+
+export async function startEmbeddingReconcile(
+  req: StartEmbeddingReconcileRequest = {},
+): Promise<StartEmbeddingReconcileResult> {
+  return invoke<StartEmbeddingReconcileResult>("start_embedding_reconcile", { req });
+}
+
+export async function getEmbeddingReconcileProgress(
+  taskId: string,
+): Promise<EmbeddingReconcileProgressView> {
+  return invoke<EmbeddingReconcileProgressView>("get_embedding_reconcile_progress", { taskId });
+}
+
+/** Read actual Memories-owned migration state before exposing any recovery operation. */
+export async function inspectEmbeddingMigration(): Promise<EmbeddingMigrationResult> {
+  return invoke<EmbeddingMigrationResult>("inspect_embedding_migration");
+}
+
+export async function planEmbeddingChange(
+  req: SetEmbeddingSettingsRequest,
+): Promise<EmbeddingMigrationResult> {
+  return invoke<EmbeddingMigrationResult>("plan_embedding_change", { req });
+}
+
+export async function switchEmbeddingSpace(req: {
+  settings: SetEmbeddingSettingsRequest;
+  expected_space: SpaceValue;
+  backup: EmbeddingBackup;
+}): Promise<EmbeddingMigrationOperationResponse> {
+  return invoke<EmbeddingMigrationOperationResponse>("switch_embedding_space", { req });
+}
+
+export type EmbeddingMigrationRecoveryAction = "resume" | "finalize" | "restore" | "abandon";
+
+export async function recoverEmbeddingMigration(req: {
+  action: EmbeddingMigrationRecoveryAction;
+  attempt_id: string;
+  accept_failed?: number;
+  settings?: SetEmbeddingSettingsRequest;
+}): Promise<EmbeddingMigrationOperationResponse> {
+  return invoke<EmbeddingMigrationOperationResponse>("recover_embedding_migration", { req });
+}
+
 /** Save embedding settings. Triggers a sidecar restart and (when the
  *  vector dimension changes) the vectordb reset / backup pipeline. */
 export async function setEmbeddingSettings(
@@ -606,6 +1166,16 @@ export async function applySettings(req: ApplySettingsRequest): Promise<ApplySet
 
 export async function getMcpSettings(): Promise<McpSettingsResponse> {
   return invoke<McpSettingsResponse>("get_mcp_settings");
+}
+
+/** Generate and persist an MCP bearer token, returning it for this display only. */
+export async function generateMcpAuthToken(): Promise<string> {
+  return invoke<string>("generate_mcp_auth_token");
+}
+
+/** Replace the MCP bearer token, returning the replacement for this display only. */
+export async function rotateMcpAuthToken(): Promise<string> {
+  return invoke<string>("rotate_mcp_auth_token");
 }
 
 /** Save MCP server settings. Triggers a sidecar restart (the `MCP_ENABLED`
@@ -696,19 +1266,6 @@ export function parsePersonalitySignalContent(signal: {
 // deliberately separate: it leaves sidecars stopped until the user selects
 // migration retry.
 
-/** Rename the existing lancedb tree to a timestamped backup directory
- * and restart the sidecars. Use when the user wants the dimension
- * mismatch fixed without losing the existing vectors. */
-export function recoverEvacuateLancedb(): Promise<RecoveryResult> {
-  return invoke<RecoveryResult>("recover_evacuate_lancedb");
-}
-
-/** Delete the existing lancedb tree and restart. Last resort when disk
- * pressure makes the backup-rename infeasible. */
-export function recoverPurgeLancedb(): Promise<RecoveryResult> {
-  return invoke<RecoveryResult>("recover_purge_lancedb");
-}
-
 /** Reset a stored `preset_id` that is no longer in the curated list
  * (typically after a release that retired a preset) to `null`, then
  * restart. Does NOT touch lancedb. */
@@ -733,4 +1290,41 @@ export function openLogDir(): Promise<void> {
 /** Cleanly stop the sidecars and quit the app. */
 export function quitApp(): Promise<void> {
   return invoke<void>("quit_app");
+}
+
+export type CloseChoice = "quit" | "background" | "cancel";
+export type BackgroundUnavailableReason = "unverified" | "unavailable" | "hide_failed";
+export type CloseActionResult =
+  | "accepted"
+  | "backgroundUnavailable"
+  | "hideFailed"
+  | "staleRequest"
+  | "invalidState";
+
+export interface CloseChoiceRequest {
+  requestId: number;
+  windowLabel: string;
+  backgroundAvailable: boolean;
+  backgroundUnavailableReason: BackgroundUnavailableReason | null;
+}
+
+export async function registerCloseChoiceUi(locale: "ja" | "en"): Promise<{
+  pendingRequest: CloseChoiceRequest | null;
+}> {
+  return invoke("register_close_choice_ui", { locale });
+}
+
+export async function syncCloseChoiceLocale(locale: "ja" | "en"): Promise<void> {
+  return invoke("sync_close_choice_locale", { locale });
+}
+
+export async function acknowledgeCloseChoiceRequest(requestId: number): Promise<boolean> {
+  return invoke("acknowledge_close_choice_request", { requestId });
+}
+
+export async function chooseCloseAction(
+  requestId: number,
+  choice: CloseChoice,
+): Promise<CloseActionResult> {
+  return invoke("choose_close_action", { requestId, choice });
 }

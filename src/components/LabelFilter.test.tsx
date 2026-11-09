@@ -2,17 +2,16 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
-import type { LabelWithCount } from "@/types/api";
 import { LabelFilter } from "./LabelFilter";
 
-const labels: LabelWithCount[] = [
+const labels = [
   // Category (no prefix) — pinned first by LABEL_PREFIX_PRIORITY
-  { label: "summary", thread_count: 20 },
-  { label: "coding_agent", thread_count: 8 },
+  { label: "summary", count: 20 },
+  { label: "coding_agent", count: 8 },
   // branch precedes dir in the fixed priority regardless of label count
-  { label: "branch:main", thread_count: 7 },
-  { label: "dir:/foo", thread_count: 5 },
-  { label: "dir:/bar", thread_count: 3 },
+  { label: "branch:main", count: 7 },
+  { label: "dir:/foo", count: 5 },
+  { label: "dir:/bar", count: 3 },
 ];
 
 function noop() {}
@@ -38,7 +37,7 @@ describe("LabelFilter", () => {
     // category section; branch precedes dir even though dir has more labels.
     const { container } = renderWithProviders(
       <LabelFilter
-        labels={[...labels, { label: "agent:codex", thread_count: 1 }]}
+        labels={[...labels, { label: "agent:codex", count: 1 }]}
         selected={["summary"]} // open the fold
         match="any"
         onToggle={noop}
@@ -81,6 +80,55 @@ describe("LabelFilter", () => {
       />,
     );
     expect(container.querySelector("details")?.hasAttribute("open")).toBe(true);
+  });
+
+  it("omits the count when a chip has no count", () => {
+    render(
+      <LabelFilter
+        labels={[{ label: "source:repo" }]}
+        selected={["source:repo"]}
+        match="any"
+        onToggle={noop}
+        onToggleMany={noop}
+        onSetMatch={noop}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "source:repo" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /source:repo \(/ })).toBeNull();
+  });
+
+  it("shows selected labels in the summary title and clears them without toggling the fold", () => {
+    const onClear = vi.fn();
+    const { container, rerender } = render(
+      <LabelFilter
+        labels={labels}
+        selected={["summary", "branch:main"]}
+        match="any"
+        onToggle={noop}
+        onToggleMany={noop}
+        onSetMatch={noop}
+        onClear={onClear}
+      />,
+    );
+    const summary = screen.getByText("ラベルで絞り込む (2)");
+    expect(summary.closest("summary")).toHaveAttribute("title", "summary, branch:main");
+    const details = summary.closest("details");
+    expect(details).toHaveAttribute("open");
+    fireEvent.click(screen.getByRole("button", { name: "クリア" }));
+    expect(onClear).toHaveBeenCalledOnce();
+    expect(details).toHaveAttribute("open");
+    rerender(
+      <LabelFilter
+        labels={labels}
+        selected={[]}
+        match="any"
+        onToggle={noop}
+        onToggleMany={noop}
+        onSetMatch={noop}
+        onClear={onClear}
+      />,
+    );
+    expect(container.querySelector("details")).not.toHaveAttribute("open");
   });
 
   it("marks a selected chip as pressed", () => {
@@ -217,7 +265,7 @@ describe("LabelFilter", () => {
     render(
       <LabelFilter
         labels={labels}
-        coOccurringLabels={[{ label: "branch:main", thread_count: 7 }]}
+        coOccurringLabels={[{ label: "branch:main", count: 7 }]}
         selected={["summary"]}
         match="all"
         onToggle={noop}
@@ -241,7 +289,7 @@ describe("LabelFilter", () => {
     render(
       <LabelFilter
         labels={labels}
-        coOccurringLabels={[{ label: "branch:main", thread_count: 2 }]}
+        coOccurringLabels={[{ label: "branch:main", count: 2 }]}
         selected={["summary"]}
         match="all"
         onToggle={noop}

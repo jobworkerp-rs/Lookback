@@ -32,6 +32,7 @@ pub const APP_LOG_FILE: &str = "lookback.log";
 pub enum LogSource {
     Jobworkerp,
     Memories,
+    IssueTracker,
     /// Lookback's own Rust-side log (`<root>/log/lookback.log`). Carries the
     /// `memories-import` child's forwarded stdout/stderr, so it's where a
     /// remote-import failure surfaces. Single file — `LogStream` is ignored.
@@ -43,6 +44,7 @@ impl LogSource {
         match self {
             LogSource::Jobworkerp => "jobworkerp",
             LogSource::Memories => "memories",
+            LogSource::IssueTracker => "issue-tracker",
             // App is a single file (APP_LOG_FILE), not a `<stem>.<stream>.log`
             // pair, so `log_file_name` short-circuits before reading this.
             LogSource::App => "lookback",

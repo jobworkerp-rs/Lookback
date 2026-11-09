@@ -1,15 +1,32 @@
 import { act, renderHook } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatStepUpdate } from "@/types/api";
 
 const chatAskMock = vi.fn(async () => ({ job_id: "ignored" }));
 const chatCancelMock = vi.fn(async (_jobId: string): Promise<void> => undefined);
+const chatRespondToolApprovalMock = vi.fn(
+  async (_jobId: string, _callId: string, _approved: boolean): Promise<void> => undefined,
+);
+const getChatToolSettingsMock = vi.fn(async () => ({ require_approval: true }));
+const setChatToolSettingsMock = vi.fn(async (req: { require_approval: boolean }) => req);
+const chatStepListeners = vi.hoisted(() => [] as Array<(payload: unknown) => void>);
 vi.mock("@/api", () => ({
   chatAsk: () => chatAskMock(),
   chatCancel: (jobId: string) => chatCancelMock(jobId),
+  chatRespondToolApproval: (jobId: string, callId: string, approved: boolean) =>
+    chatRespondToolApprovalMock(jobId, callId, approved),
+  getChatToolSettings: () => getChatToolSettingsMock(),
+  setChatToolSettings: (req: { require_approval: boolean }) => setChatToolSettingsMock(req),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(() => Promise.resolve(() => {})),
+  listen: vi.fn((_event: string, handler: (event: { payload: unknown }) => void) => {
+    const listener = (payload: unknown) => handler({ payload });
+    chatStepListeners.push(listener);
+    return Promise.resolve(() => {
+      const index = chatStepListeners.indexOf(listener);
+      if (index >= 0) chatStepListeners.splice(index, 1);
+    });
+  }),
 }));
 
 import { buildHistoryMessages, type ChatTurn, mergeChatEvent, useRagChat } from "./useRagChat";
@@ -31,7 +48,35 @@ function ev(partial: Omit<ChatStepUpdate, "job_id">): ChatStepUpdate {
   return { job_id: "chat-1", ...partial };
 }
 
+function emitChatEvent(event: ChatStepUpdate) {
+  for (const listener of chatStepListeners) listener(event);
+}
+
+beforeEach(() => {
+  chatAskMock.mockClear();
+  chatCancelMock.mockClear();
+  chatRespondToolApprovalMock.mockClear();
+  getChatToolSettingsMock.mockReset().mockResolvedValue({ require_approval: true });
+  setChatToolSettingsMock.mockReset().mockImplementation(async (req) => req);
+  chatStepListeners.length = 0;
+});
+
 describe("mergeChatEvent — TEST-CHAT-8", () => {
+  it("retains confirmed Issue receipts when the LLM answer omits them", () => {
+    const receipt = {
+      tool_name: "lookback_issue_create",
+      issue_id: "issue-42",
+      operation_id: "op-42",
+      operation_state: "COMMITTED",
+      audit_reason: "requested by the user",
+    };
+    const afterMutation = mergeChatEvent(
+      [baseTurn()],
+      ev({ phase: "issue-mutation", issue_mutation: receipt }),
+    );
+    const done = mergeChatEvent(afterMutation, ev({ phase: "done" }));
+    expect(done[0]?.issueMutations).toEqual([receipt]);
+  });
   it("appends a token delta to the matching turn's answer", () => {
     const turns = [baseTurn()];
     const next = mergeChatEvent(turns, ev({ phase: "token", token_delta: "Hello" }));
@@ -72,9 +117,9 @@ describe("mergeChatEvent — TEST-CHAT-8", () => {
         phase: "source",
         sources: [
           {
-            source_kind: "thread_summary",
+            source_kind: "thread_group_summary",
             memory_id: "333",
-            source_thread_id: "444",
+            group_id: "444",
             snippet: "second",
             score: 0.8,
           },
@@ -83,7 +128,7 @@ describe("mergeChatEvent — TEST-CHAT-8", () => {
     );
     expect(b[0]?.sources.length).toBe(2);
     expect(b[0]?.sources[0]?.source_kind).toBe("raw_memory");
-    expect(b[0]?.sources[1]?.source_kind).toBe("thread_summary");
+    expect(b[0]?.sources[1]?.source_kind).toBe("thread_group_summary");
   });
 
   it("flips phase to done on the terminal event", () => {
@@ -139,6 +184,23 @@ describe("mergeChatEvent — TEST-CHAT-8", () => {
     const next = mergeChatEvent(turns, ev({ phase: "token", token_delta: "" }));
     expect(next[0]?.phase).toBe("searching");
     expect(next[0]?.answer).toBe("");
+  });
+
+  it("keeps the tool name and exact arguments visible while approval is pending", () => {
+    const approval = {
+      call_id: "call-4",
+      tool_name: "lookback_issue_create",
+      arguments_json: '{"title":"Fix the flaky test"}',
+    };
+
+    const pending = mergeChatEvent(
+      [baseTurn({ answer: "I can create that issue.", phase: "token" })],
+      ev({ phase: "approval-required", tool_approval: approval }),
+    );
+    expect(pending[0]).toMatchObject({ phase: "approval-required", pendingApproval: approval });
+
+    const settled = mergeChatEvent(pending, ev({ phase: "done", message: "finished" }));
+    expect(settled[0]?.pendingApproval).toBeNull();
   });
 });
 
@@ -249,5 +311,132 @@ describe("useRagChat.cancel — OPEN-CHAT-2", () => {
       await result.current.cancel();
     });
     expect(chatCancelMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects an outstanding tool approval before cancelling its turn", async () => {
+    const { result } = renderHook(() => useRagChat());
+    await act(async () => {
+      await result.current.ask("create an issue");
+    });
+    const jobId = result.current.turns[0]?.jobId;
+    expect(jobId).toBeDefined();
+    act(() => result.current.setApprovalUiActive(true));
+
+    await act(async () => {
+      emitChatEvent({
+        job_id: jobId ?? "",
+        phase: "approval-required",
+        tool_approval: {
+          call_id: "call-cancel",
+          tool_name: "lookback_issue_create",
+          arguments_json: '{"title":"New issue"}',
+        },
+      });
+    });
+    await act(async () => {
+      await result.current.cancel();
+    });
+
+    expect(chatRespondToolApprovalMock).toHaveBeenCalledWith(jobId, "call-cancel", false);
+    expect(chatCancelMock).toHaveBeenCalledWith(jobId);
+    expect(chatRespondToolApprovalMock.mock.invocationCallOrder[0]).toBeLessThan(
+      chatCancelMock.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+  });
+
+  it("rejects tool calls that arrive while the Chat screen is not mounted", async () => {
+    const { result } = renderHook(() => useRagChat());
+    await act(async () => {
+      await result.current.ask("create an issue");
+    });
+    const jobId = result.current.turns[0]?.jobId;
+
+    await act(async () => {
+      emitChatEvent({
+        job_id: jobId ?? "",
+        phase: "approval-required",
+        tool_approval: {
+          call_id: "call-hidden",
+          tool_name: "lookback_issue_create",
+          arguments_json: '{"title":"New issue"}',
+        },
+      });
+      await Promise.resolve();
+    });
+
+    expect(chatRespondToolApprovalMock).toHaveBeenCalledWith(jobId, "call-hidden", false);
+    expect(result.current.turns[0]?.pendingApproval).toBeNull();
+  });
+
+  it("automatically approves tool calls when the persisted policy is off", async () => {
+    const { result } = renderHook(() => useRagChat());
+    await act(async () => {
+      await result.current.setRequireApproval(false);
+      await result.current.ask("create an issue");
+    });
+    const jobId = result.current.turns[0]?.jobId;
+    act(() => result.current.setApprovalUiActive(true));
+
+    await act(async () => {
+      emitChatEvent({
+        job_id: jobId ?? "",
+        phase: "approval-required",
+        tool_approval: {
+          call_id: "call-auto",
+          tool_name: "lookback_issue_create",
+          arguments_json: '{"title":"New issue"}',
+        },
+      });
+      await Promise.resolve();
+    });
+
+    expect(chatRespondToolApprovalMock).toHaveBeenCalledWith(jobId, "call-auto", true);
+    expect(result.current.turns[0]).toMatchObject({ phase: "searching", pendingApproval: null });
+  });
+
+  it("releases an already pending approval when the user switches the policy off", async () => {
+    const { result } = renderHook(() => useRagChat());
+    await act(async () => {
+      await result.current.ask("create an issue");
+    });
+    const jobId = result.current.turns[0]?.jobId ?? "";
+    act(() => result.current.setApprovalUiActive(true));
+    await act(async () => {
+      emitChatEvent({
+        job_id: jobId,
+        phase: "approval-required",
+        tool_approval: {
+          call_id: "pending-1",
+          tool_name: "lookback_issue_create",
+          arguments_json: "{}",
+        },
+      });
+      await Promise.resolve();
+    });
+    expect(result.current.turns[0]?.pendingApproval?.call_id).toBe("pending-1");
+    await act(async () => {
+      await result.current.setRequireApproval(false);
+    });
+    expect(chatRespondToolApprovalMock).toHaveBeenCalledWith(jobId, "pending-1", true);
+    expect(result.current.turns[0]?.pendingApproval).toBeNull();
+  });
+
+  it("loads persisted approval mode but keeps approval enabled if reading settings fails", async () => {
+    getChatToolSettingsMock.mockResolvedValueOnce({ require_approval: false });
+    const { result, rerender } = renderHook(() => useRagChat());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.requireApproval).toBe(false);
+
+    rerender();
+    expect(result.current.requireApproval).toBe(false);
+
+    getChatToolSettingsMock.mockRejectedValueOnce(new Error("settings unavailable"));
+    const fallback = renderHook(() => useRagChat());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fallback.result.current.requireApproval).toBe(true);
   });
 });

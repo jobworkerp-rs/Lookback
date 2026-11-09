@@ -8,9 +8,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use lookback_tauri_lib::data::DataPaths;
+use lookback_tauri_lib::grpc::{
+    connect,
+    issue_tracker::{IssueTrackerGrpcService, IssueTrackerServerConfig},
+};
 use lookback_tauri_lib::sidecar::{SidecarConfig, SidecarStartReport, Sidecars};
+use tokio::process::Child;
 
 /// Resolve a required env var to a binary/path. Panics with a
 /// human-readable message so an undeclared `LOOKBACK_*_BIN` fails the
@@ -81,6 +87,7 @@ pub async fn start_chat_e2e_sidecars(label: &str) -> (PathBuf, Arc<Sidecars>, Si
             lookback_tauri_lib::data::paths::llm_workers_yaml()
                 .expect("workers/llm-workers.yaml resolvable via CARGO_MANIFEST_DIR"),
         ],
+        issue_tracker_server_bin: None,
         function_set_yaml_paths: vec![
             lookback_tauri_lib::data::paths::function_sets_yaml()
                 .expect("workers/function-sets.yaml resolvable via CARGO_MANIFEST_DIR"),
@@ -102,4 +109,83 @@ pub async fn start_chat_e2e_sidecars(label: &str) -> (PathBuf, Arc<Sidecars>, Si
     let sidecars = Arc::new(Sidecars::new(config));
     let report = sidecars.start().await.expect("sidecars start");
     (root, sidecars, report)
+}
+
+pub fn reserve_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve port")
+        .local_addr()
+        .expect("read reserved port")
+        .port()
+}
+
+pub struct RunningIssueTrackerServer {
+    child: Child,
+    pub config: IssueTrackerServerConfig,
+}
+
+impl RunningIssueTrackerServer {
+    pub async fn start(
+        config: IssueTrackerServerConfig,
+        binary: impl AsRef<Path>,
+        ready_timeout: Duration,
+        label: &str,
+    ) -> Self {
+        std::fs::write(config.config_path(), config.toml()).expect("write private config");
+        let child = tokio::process::Command::new(binary.as_ref())
+            .arg("--config")
+            .arg(config.config_path())
+            .spawn()
+            .expect("spawn Issue Tracker server");
+        let server = Self { child, config };
+        server.wait_until_ready(ready_timeout, label).await;
+        server
+    }
+
+    async fn wait_until_ready(&self, ready_timeout: Duration, label: &str) {
+        let service = IssueTrackerGrpcService::new(self.config.listen_url());
+        let deadline = tokio::time::Instant::now() + ready_timeout;
+        loop {
+            if connect(&self.config.listen_url()).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{label} did not open its loopback listener"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        service
+            .run_outbox_cycle(&format!("{label}-bootstrap"))
+            .await
+            .expect("bootstrap outbox cycle");
+        loop {
+            if service.health(&format!("{label}-health")).await.is_ok() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{label} did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub fn endpoint(&self) -> String {
+        self.config.listen_url()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.config
+            .listen_url()
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .expect("Issue Tracker listen port")
+    }
+
+    pub async fn stop(mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
 }

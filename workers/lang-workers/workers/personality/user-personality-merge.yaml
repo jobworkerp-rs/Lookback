@@ -50,10 +50,6 @@ input:
             signals are dropped from the oldest end (signal_updated_at
             ascending) so the most recent preferences always win.
 
-timeout:
-  after:
-    hours: 6
-
 do:
   - normalizePersonalityUserId:
       set:
@@ -413,9 +409,6 @@ do:
                end }
 
   - mergeProfile:
-      timeout:
-        after:
-          hours: 3
       run:
         function:
           workerName: "${$workflow.input.llm_worker_name}"

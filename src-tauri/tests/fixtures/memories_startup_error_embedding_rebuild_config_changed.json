@@ -1,0 +1,1 @@
+{"timestamp":"2026-10-10T00:00:00Z","level":"ERROR","fields":{"message":"chunking configuration changed during embedding rebuild","code":"embedding_rebuild_config_changed","attempt_id":"attempt-1"},"target":"app::startup_error"}

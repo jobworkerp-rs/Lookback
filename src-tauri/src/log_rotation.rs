@@ -17,10 +17,10 @@ mod tests {
         tempfile::tempdir().expect("temporary log directory")
     }
 
-    fn archive_path_at(dir: &Path, timestamp: chrono::DateTime<Utc>, sequence: u32) -> PathBuf {
+    fn archive_path_at(dir: &Path, timestamp: DateTime<Utc>, sequence: u32) -> PathBuf {
         dir.join(format!(
             "lookback.log.rotated-{}-{sequence}",
-            timestamp.format("%Y%m%dT%H%M%SZ")
+            timestamp.format("%Y%m%dT%H%M%S%.3fZ")
         ))
     }
 

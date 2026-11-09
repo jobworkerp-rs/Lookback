@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib/appimage-hooks.sh
 source "${SCRIPT_DIR}/lib/appimage-hooks.sh"
+gtk_plugin="${SCRIPT_DIR}/assets/linuxdeploy-plugin-gtk.sh"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -25,6 +26,12 @@ assert_no_exact_line() {
   ! grep -Fxq "${unexpected}" "${file}" || fail "expected ${file} not to contain exact line: ${unexpected}"
 }
 
+assert_cache_normalization_is_guarded() {
+  local cache_var=$1
+  grep -Fq "if [ -f \"\$APPDIR/\$${cache_var}\" ]; then" "${gtk_plugin}" \
+    || fail "expected ${cache_var} normalization to skip a missing cache"
+}
+
 tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
 
@@ -34,9 +41,16 @@ mkdir -p "$(dirname "${hook}")"
 cat > "${hook}" <<'EOF'
 export APPDIR="${APPDIR:-"$(dirname "$(realpath "$0")")"}"
 export GTK_PATH="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0:/usr/lib/x86_64-linux-gnu/gtk-3.0"
-export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache"
+export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/gtk-3.0/3.0.0/immodules.cache"
+export GDK_BACKEND=x11 # linuxdeploy's stock Wayland workaround
 export GDK_PIXBUF_MODULE_FILE="$APPDIR//usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache"
 EOF
+
+patch_linuxdeploy_gtk_hook_for_wayland_backend "${root}" \
+  || fail "expected linuxdeploy GTK backend patch to report a change"
+
+assert_contains "${hook}" 'export GDK_BACKEND="${GDK_BACKEND:-wayland,x11}"'
+assert_no_exact_line "${hook}" 'export GDK_BACKEND=x11'
 
 patch_linuxdeploy_gtk_hook_for_host_ime "${root}" \
   || fail "expected linuxdeploy GTK hook patch to report a change"
@@ -55,20 +69,60 @@ assert_contains "${hook}" 'pgrep -x -u "$(id -u)" fcitx5 >/dev/null 2>&1'
 assert_contains "${hook}" 'pgrep -x -u "$(id -u)" ibus-daemon >/dev/null 2>&1'
 assert_contains "${hook}" 'Lookback GTK IME: GTK_IM_MODULE=${GTK_IM_MODULE:-}'
 assert_contains "${hook}" 'Lookback GTK IME: LD_PRELOAD=${LD_PRELOAD:-}'
-assert_contains "${hook}" 'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache"'
-assert_no_exact_line "${hook}" 'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache"'
+assert_contains "${hook}" 'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/gtk-3.0/3.0.0/immodules.cache"'
+assert_no_exact_line "${hook}" 'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/gtk-3.0/3.0.0/immodules.cache"'
 assert_contains "${hook}" 'export GDK_PIXBUF_MODULE_FILE='
+
+# Optional host query tools may be unavailable. With `set -e`, normalizing a
+# cache that was not generated would otherwise abort the whole AppImage build.
+assert_cache_normalization_is_guarded "gtk3_immodules_cache_file"
+assert_cache_normalization_is_guarded "gdk_pixbuf_cache_file"
 
 before=$(mktemp)
 cp "${hook}" "${before}"
+if patch_linuxdeploy_gtk_hook_for_wayland_backend "${root}"; then
+  fail "expected already-patched backend hook to report no change"
+fi
+cmp -s "${before}" "${hook}" || fail "expected already-patched backend hook to stay unchanged"
+
 if patch_linuxdeploy_gtk_hook_for_host_ime "${root}"; then
   fail "expected already-patched hook to report no change"
 fi
 cmp -s "${before}" "${hook}" || fail "expected already-patched hook to stay unchanged"
 
+debian_root="${tmpdir}/debian-root"
+debian_hook="${debian_root}/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+mkdir -p "$(dirname "${debian_hook}")"
+printf '%s\n' \
+  'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache"' \
+  > "${debian_hook}"
+patch_linuxdeploy_gtk_hook_for_host_ime "${debian_root}" \
+  || fail "expected Debian multiarch GTK cache path to be patched"
+assert_contains "${debian_hook}" 'LOOKBACK_HOST_GTK_IM_MODULE_FILE=""'
+assert_contains "${debian_hook}" 'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache"'
+assert_no_exact_line "${debian_hook}" 'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache"'
+
 missing_root="${tmpdir}/missing-root"
 if patch_linuxdeploy_gtk_hook_for_host_ime "${missing_root}"; then
   fail "expected missing hook to report no change"
+fi
+
+if patch_linuxdeploy_gtk_hook_for_wayland_backend "${missing_root}"; then
+  fail "expected missing backend hook to fail"
+else
+  status=$?
+  [[ "${status}" == 2 ]] || fail "expected missing backend hook status 2, got ${status}"
+fi
+
+invalid_root="${tmpdir}/invalid-root"
+invalid_hook="${invalid_root}/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+mkdir -p "$(dirname "${invalid_hook}")"
+printf '%s\n' 'export GDK_BACKEND=wayland' >"${invalid_hook}"
+if patch_linuxdeploy_gtk_hook_for_wayland_backend "${invalid_root}"; then
+  fail "expected unexpected backend hook format to fail"
+else
+  status=$?
+  [[ "${status}" == 2 ]] || fail "expected unexpected backend hook format status 2, got ${status}"
 fi
 
 printf 'PASS: AppImage GTK hook patch keeps host IME modules available\n'

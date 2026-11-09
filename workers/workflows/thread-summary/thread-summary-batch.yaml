@@ -24,6 +24,15 @@ input:
           description: >-
             Authoritative import target set. Presence takes precedence over
             thread_ids; an explicitly empty array targets zero threads.
+        rejected_candidate_ids_to_unsuppress_by_thread:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+          description: >-
+            Optional one-shot rejected Candidate suppression override, keyed
+            by thread ID. The value is forwarded only when exactly one
+            target_thread_ids entry selects the invoked thread.
         labels_filter:
           type: array
           items: { type: string }
@@ -88,10 +97,10 @@ input:
         # model input needed.
         memory_thread_label_prefix: { type: string, default: "summary" }
         force_resummarize: { type: boolean, default: false }
-
-timeout:
-  after:
-    hours: 24
+        issue_tracker_grpc_host: { type: string, default: "" }
+        issue_tracker_grpc_port: { type: integer, default: 0 }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+        policy_json: { type: string, default: "" }
 
 do:
   # Step 0c: Resolve the effective `last_message_after` lower bound (epoch ms).
@@ -199,10 +208,12 @@ do:
         as:
           all_threads: ${ .jsonBody | fromjson }
 
-  # Step 2: Filter by thread_ids if specified.
+  # Step 2: Filter by thread_ids if specified. Every target is dispatched:
+  # the single decides freshness before reading messages and skips an
+  # up-to-date thread cheaply.
   - filterThreads:
       set:
-        candidate_threads: >-
+        target_threads: >-
           ${ if ($workflow.input | has("target_thread_ids"))
              then $all_threads | map(select(
                .id.value as $tid | $workflow.input.target_thread_ids | any(. == ($tid | tostring))
@@ -214,127 +225,6 @@ do:
              else $all_threads
              end }
 
-  # Step 2a: Load existing per-thread summaries once. Without this bulk
-  # preflight, every up-to-date RAW thread still dispatches a child workflow
-  # only to discover that it should skip. Large backfills can spend hours on
-  # those serial checks and never reach the dependent daily stage.
-  - initExistingSummaries:
-      set:
-        existing_summary_entries: "${ [] }"
-        existing_summary_threads: "${ [] }"
-
-  - fetchExistingSummaries:
-      if: "${ $workflow.input.force_resummarize | not }"
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.MemoryService/FindListByCondition"
-            json_body: >-
-              ${ {
-                user_id: { value: $workflow.input.user_id },
-                roles: ["ROLE_ASSISTANT"],
-                content_types: ["TEXT"],
-                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
-                external_id_prefix: "summary:"
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          existing_summary_entries: ${ .jsonBody | fromjson }
-
-  - fetchExistingSummaryThreads:
-      if: "${ $workflow.input.force_resummarize | not }"
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.ThreadService/FindThreadListByUserId"
-            json_body: >-
-              ${ {
-                user_id: { value: $workflow.input.user_id },
-                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"]
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          existing_summary_threads: ${ .jsonBody | fromjson }
-
-  - indexExistingSummaries:
-      set:
-        existing_summary_by_external_id: >-
-          ${ reduce $existing_summary_entries[] as $entry
-             ({};
-              .[$entry.memory.data.externalId] = {
-                memory: $entry.memory,
-                thread_id: ($entry.threadId.value | tostring)
-              }) }
-        existing_summary_thread_by_id: >-
-          ${ reduce $existing_summary_threads[] as $thread
-             ({}; .[$thread.id.value | tostring] = $thread) }
-
-  - selectThreadsNeedingSummary:
-      set:
-        target_threads: >-
-          ${ if $workflow.input.force_resummarize
-             then $candidate_threads
-             else
-               $candidate_threads
-               | map(
-                   . as $thread
-                   | ($existing_summary_by_external_id[
-                        "summary:" + ($thread.id.value | tostring)
-                     ] // null) as $existing_summary
-                   | (($thread.data.labels
-                       // ["thread_" + ($thread.id.value | tostring)])
-                      + [$workflow.input.memory_thread_label_prefix]
-                      | unique) as $required_labels
-                   | (if $existing_summary == null
-                      then null
-                      else ($existing_summary_thread_by_id[
-                              $existing_summary.thread_id
-                            ] // null)
-                      end) as $existing_summary_thread
-                   | select(
-                       ($thread.data.description // "") == ""
-                       or $existing_summary == null
-                       or $existing_summary_thread == null
-                       or (($required_labels
-                            - ($existing_summary_thread.data.labels // []))
-                           | length) > 0
-                       or (
-                         (($thread.data.lastMessageAt // "0") | tostring)
-                           as $last_message_at
-                         | (($existing_summary.memory.data.updatedAt // "0")
-                            | tostring) as $summary_updated_at
-                         | (($last_message_at | length)
-                            > ($summary_updated_at | length))
-                           or ((($last_message_at | length)
-                               == ($summary_updated_at | length))
-                              and $last_message_at > $summary_updated_at)
-                       )
-                     )
-                 )
-             end }
-
-  - collectPreSkippedThreads:
-      set:
-        pre_skipped_threads: >-
-          ${ ($candidate_threads | map(.id.value | tostring))
-             - ($target_threads | map(.id.value | tostring)) }
-
   # Step 2.5: Initialize per-thread outcome accumulators. Lets the
   # pipeline parent distinguish "every thread failed" (fatal) from
   # "some succeeded" / "nothing to do" by reading succeeded_count /
@@ -342,18 +232,20 @@ do:
   - initOutcomeAccumulators:
       set:
         generated_threads: "${ [] }"
-        skipped_threads: "${ $pre_skipped_threads // [] }"
+        skipped_threads: "${ [] }"
         failed_threads: "${ [] }"
+        insufficient_message_threads: "${ [] }"
         last_error: "${ null }"
+        issue_extract_errors: "${ [] }"
+        issue_extract_outcomes: "${ [] }"
+        issue_resolution_errors: "${ [] }"
+        issue_resolution_outcomes: "${ [] }"
 
   # Step 3: Invoke the language-specific single-thread summary worker for
   # each thread. The `memories-thread-summary-single-<lang>` workers are
   # pre-registered by `memories-import upsert-generation-workers` with the
   # prompt context baked in, so the batch only forwards `output_language`.
   - summarizeEach:
-      timeout:
-        after:
-          hours: 24
       for:
         each: thread
         # `at` exposes the 0-based loop index so each iteration can publish a
@@ -373,9 +265,6 @@ do:
         - invokeSingleWithRetry:
             try:
               - invokeSingle:
-                  timeout:
-                    after:
-                      minutes: 120
                   run:
                     function:
                       # Resolve the language-specific single worker by name.
@@ -397,7 +286,23 @@ do:
                             max_context_chars: $workflow.input.max_context_chars,
                             memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
                             force_resummarize: $workflow.input.force_resummarize,
-                          } | tojson }
+                            issue_tracker_grpc_host: ($workflow.input.issue_tracker_grpc_host // ""),
+                            issue_tracker_grpc_port: ($workflow.input.issue_tracker_grpc_port // 0),
+                            issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                            policy_json: ($workflow.input.policy_json // "")
+                          }
+                          | ($thread.id.value | tostring) as $thread_id
+                          | ($workflow.input.rejected_candidate_ids_to_unsuppress_by_thread // {}) as $rejected_by_thread
+                          | if (($workflow.input | has("target_thread_ids"))
+                                and (($workflow.input.target_thread_ids | length) == 1)
+                                and (($workflow.input.target_thread_ids[0] | tostring) == $thread_id)
+                                and ($rejected_by_thread | has($thread_id)))
+                            then . + {
+                              rejected_candidate_ids_to_unsuppress: $rejected_by_thread[$thread_id]
+                            }
+                            else .
+                            end
+                          | tojson }
                   export:
                     as:
                       single_result: "${ .output | fromjson }"
@@ -422,6 +327,51 @@ do:
                   set:
                     skipped_threads: >-
                       ${ $skipped_threads + [($thread.id.value | tostring)] }
+              # Group summaries need to tell "too short to summarize" apart
+              # from a summary that should exist but is missing.
+              - recordInsufficientMessages:
+                  if: >-
+                    ${ ($single_result.skipped // false)
+                       and (($single_result.skip_reason // null)
+                            == "skipped: not enough messages") }
+                  set:
+                    insufficient_message_threads: >-
+                      ${ $insufficient_message_threads + [($thread.id.value | tostring)] }
+              - recordIssueExtractError:
+                  if: "${ ($single_result.extract_error // null) != null }"
+                  set:
+                    issue_extract_errors: >-
+                      ${ $issue_extract_errors + [{ thread_id: ($thread.id.value | tostring), message: ($single_result.extract_error | tostring) }] }
+              - recordIssueExtractOutcome:
+                  if: >-
+                    ${ ($single_result.completed // false)
+                       and (($single_result.skipped // false) | not) }
+                  set:
+                    issue_extract_outcomes: >-
+                      ${ $issue_extract_outcomes + [{ thread_id: ($thread.id.value | tostring), skipped: ($single_result.extract_skipped // false), run_state: ($single_result.extract_run_state // null) }] }
+              - recordIssueResolutionError:
+                  if: "${ ($single_result.resolution_error // null) != null }"
+                  set:
+                    issue_resolution_errors: >-
+                      ${ $issue_resolution_errors + [{
+                          thread_id: ($thread.id.value | tostring),
+                          status: ($single_result.resolution_status // "UNKNOWN"),
+                          message: ($single_result.resolution_error | tostring)
+                        }] }
+              - recordIssueResolutionOutcome:
+                  if: >-
+                    ${ (($single_result.resolution_status // null) != null)
+                       or (($single_result.resolution_outcome // null) != null) }
+                  set:
+                    issue_resolution_outcomes: >-
+                      ${ $issue_resolution_outcomes + [{
+                          thread_id: ($thread.id.value | tostring),
+                          status: ($single_result.resolution_status // "UNKNOWN"),
+                          complete: (if ($single_result | has("resolution_complete"))
+                                     then $single_result.resolution_complete
+                                     else null end),
+                          outcome: ($single_result.resolution_outcome // null)
+                        }] }
             catch:
               as: error
               do:
@@ -430,6 +380,21 @@ do:
                       failed_threads: >-
                         ${ $failed_threads + [($thread.id.value | tostring)] }
                       last_error: "${ $error }"
+
+  # An item whose own try timed out is skipped by `onError: continue` without
+  # reaching its catch. Count such items as failed so an incomplete run is
+  # never reported as completed.
+  - collectUnaccountedThreads:
+      set:
+        unaccounted_threads: >-
+          ${ ($target_threads | map(.id.value | tostring)) - $generated_threads - $skipped_threads - $failed_threads }
+  - recordUnaccountedThreads:
+      if: "${ ($unaccounted_threads | length) > 0 }"
+      set:
+        failed_threads: "${ $failed_threads + $unaccounted_threads }"
+        last_error: >-
+          ${ $last_error // ((($unaccounted_threads | length) | tostring)
+             + " item(s) ended without an outcome (timed out or aborted)") }
 
 output:
   as:
@@ -449,4 +414,9 @@ output:
     generated_threads: ${ $generated_threads }
     skipped_threads: ${ $skipped_threads }
     failed_threads: ${ $failed_threads }
+    insufficient_message_threads: ${ $insufficient_message_threads }
     last_error: ${ $last_error }
+    issue_extract_errors: ${ $issue_extract_errors }
+    issue_extract_outcomes: ${ $issue_extract_outcomes }
+    issue_resolution_errors: ${ $issue_resolution_errors }
+    issue_resolution_outcomes: ${ $issue_resolution_outcomes }

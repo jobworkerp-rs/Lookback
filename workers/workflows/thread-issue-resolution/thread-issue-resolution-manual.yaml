@@ -1,0 +1,413 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-issue-resolution-manual
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [thread_id]
+      properties:
+        thread_id: { type: string, minLength: 1 }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        issue_tracker_grpc_host: { type: string, default: "" }
+        issue_tracker_grpc_port: { type: integer, default: 0 }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+        policy_json: { type: string, default: "" }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  - initializeManualResolution:
+      set:
+        policy: '${ (try ($workflow.input.policy_json | fromjson)) // {} }'
+        resolution_status: '${ "FAILED" }'
+        failure_reason: '${ "manual_resolution_not_started" }'
+        summary_entries: '${ [] }'
+        saved_summary: '${ null }'
+        summary_data: '${ {} }'
+        summary_metadata: '${ {} }'
+        summary_memory_id: '${ "" }'
+        summary_external_id: '${ "" }'
+        summary_kind: '${ "" }'
+        summary_content_type: '${ "" }'
+        summary_content: '${ null }'
+        summary_checkpoint_memory_id: '${ "" }'
+        summary_checkpoint_at: '${ "" }'
+        summary_checkpoint_source: '${ "" }'
+        summary_checkpoint_timestamp: '${ null }'
+        summary_content_digest: '${ "" }'
+        resolution_child_output: '${ null }'
+        resolution_attempted: '${ false }'
+        requested_summary_status: '${ null }'
+        status_summary: '${ null }'
+        status_summary_metadata: '${ {} }'
+        status_summary_memory_id: '${ "" }'
+        status_summary_external_id: '${ "" }'
+        status_summary_source_thread_id: '${ "" }'
+        status_summary_checkpoint_memory_id: '${ "" }'
+        status_summary_checkpoint_at: '${ "" }'
+        status_summary_content_digest: '${ "" }'
+        status_summary_matches_snapshot: '${ false }'
+        summary_status_metadata: '${ null }'
+        summary_status_updated: '${ false }'
+        persisted_summary_status: '${ null }'
+        summary_status_update_error: '${ null }'
+
+  - normalizeManualPolicy:
+      set:
+        resolution_mode: '${ if (($policy | type) == "object") then ($policy.resolution_mode // "DISABLED") else "DISABLED" end }'
+
+  # Manual invocations never replay automatically while disabled.
+  - skipIfDisabled:
+      if: '${ $resolution_mode != "APPLY" or env.LOOKBACK_EXPERIMENTAL_ISSUES_ENABLED != "true" }'
+      set:
+        failure_reason: '${ "resolution_disabled" }'
+      then: exit
+
+  - rejectUnavailableTracker:
+      if: >-
+        ${ (($workflow.input.issue_tracker_grpc_host // "") == "")
+           or (($workflow.input.issue_tracker_grpc_port // 0) <= 0) }
+      set:
+        failure_reason: '${ "issue_tracker_endpoint_unavailable" }'
+      then: exit
+
+  - fetchSavedSummary:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/FindListByCondition"
+            json_body: >-
+              ${ {
+                  external_id: ("summary:" + ($workflow.input.thread_id | tostring)),
+                  memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
+                  content_types: ["TEXT"]
+                } | tojson }
+            as_json: true
+      export:
+        as:
+          summary_entries: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | if type == "array" then . else (.data // []) end
+               | map(.memory // .) }
+
+  - selectSavedSummary:
+      set:
+        saved_summary: '${ if ($summary_entries | length) == 1 then $summary_entries[0] else null end }'
+
+  - selectSavedSummaryData:
+      set:
+        summary_data: '${ $saved_summary.data // {} }'
+
+  - readSavedSummaryMetadata:
+      set:
+        summary_metadata: >-
+          ${ if (($summary_data.metadata // {}) | type) == "string"
+             then ((try ($summary_data.metadata | fromjson)) // {})
+             else ($summary_data.metadata // {}) end }
+
+  # The high-water pair exists only once the automatic path dispatched a
+  # resolution. A summary that never qualified still records which message it
+  # processed, and that is the range a manual re-evaluation judges, so fall
+  # back to it. Both members of a pair must be present.
+  - selectSummaryCheckpoint:
+      set:
+        summary_checkpoint: >-
+          ${ $summary_metadata as $metadata
+             | if ((($metadata.resolution_high_water_message_id // "") | tostring) != "")
+                  and (($metadata.resolution_high_water_message_at // null) != null)
+               then { source: "resolution_high_water",
+                      id: ($metadata.resolution_high_water_message_id | tostring),
+                      at: ($metadata.resolution_high_water_message_at | tostring) }
+               elif ((($metadata.last_processed_message_id // "") | tostring) != "")
+                    and (($metadata.last_processed_message_at // null) != null)
+               then { source: "last_processed",
+                      id: ($metadata.last_processed_message_id | tostring),
+                      at: ($metadata.last_processed_message_at | tostring) }
+               else { source: "", id: "", at: "" } end }
+
+  - extractSavedSummarySnapshot:
+      set:
+        summary_memory_id: '${ ($saved_summary.id.value // $saved_summary.id // "") | tostring }'
+        summary_external_id: '${ ($summary_data.externalId // $summary_data.external_id // "") | tostring }'
+        summary_kind: '${ ($summary_data.memoryKind // $summary_data.memory_kind // "MEMORY_KIND_THREAD_SUMMARY") | tostring }'
+        summary_content_type: '${ ($summary_data.contentType // $summary_data.content_type // "TEXT") | tostring }'
+        summary_content: '${ $summary_data.content // null }'
+        summary_checkpoint_source: '${ $summary_checkpoint.source }'
+        summary_checkpoint_memory_id: '${ $summary_checkpoint.id }'
+        summary_checkpoint_at: '${ $summary_checkpoint.at }'
+        summary_checkpoint_timestamp: '${ try ($summary_checkpoint.at | tonumber) catch null }'
+
+  - requireSavedSummary:
+      if: >-
+        ${ (($summary_entries | length) != 1)
+           or ($saved_summary == null)
+           or ($summary_memory_id == "")
+           or ($summary_external_id != ("summary:" + ($workflow.input.thread_id | tostring)))
+           or ($summary_kind != "MEMORY_KIND_THREAD_SUMMARY")
+           or (($summary_content_type != "TEXT")
+               and ($summary_content_type != "CONTENT_TYPE_TEXT")
+               and ($summary_content_type != "0"))
+           or (($summary_content | type) != "string")
+           or (($summary_content | length) == 0)
+           or ((($summary_metadata.source_thread_id // "") | tostring)
+               != ($workflow.input.thread_id | tostring))
+           or ($summary_checkpoint_memory_id == "")
+           or ($summary_checkpoint_timestamp == null) }
+      set:
+        failure_reason: '${ "saved_summary_missing_or_incomplete" }'
+      then: exit
+
+  - digestSavedSummary:
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v sha256sum >/dev/null 2>&1; then sha256sum; elif command -v shasum >/dev/null 2>&1; then shasum -a 256; else exit 127; fi"]
+            stdin: '${ $summary_content }'
+            treat_nonzero_as_error: true
+      export:
+        as:
+          summary_content_digest: '${ "sha256:" + (.stdout | split(" ")[0]) }'
+
+  - markResolutionAttempted:
+      set:
+        resolution_attempted: '${ true }'
+
+  - dispatchResolution:
+      try:
+        - invokeResolution:
+            run:
+              function:
+                workerName: lookback-thread-issue-resolution
+                arguments:
+                  input: >-
+                    ${ {
+                        thread_id: ($workflow.input.thread_id | tostring),
+                        summary_memory_id: $summary_memory_id,
+                        summary_content_digest: $summary_content_digest,
+                        summary_checkpoint_memory_id: $summary_checkpoint_memory_id,
+                        summary_checkpoint_at: $summary_checkpoint_at,
+                        memories_grpc_host: $workflow.input.memories_grpc_host,
+                        memories_grpc_port: $workflow.input.memories_grpc_port,
+                        memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                        issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                        issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                        issue_tracker_grpc_tls: $workflow.input.issue_tracker_grpc_tls,
+                        policy_json: $workflow.input.policy_json,
+                        llm_worker_name: $workflow.input.llm_worker_name,
+                        output_language: $workflow.input.output_language
+                      } | tojson }
+            export:
+              as:
+                resolution_child_output: '${ .output | fromjson }'
+
+        - requireChildOutcome:
+            if: '${ ($resolution_child_output | type) != "object" }'
+            raise:
+              error:
+                type: "https://lookback.local/errors/thread-issue-resolution/manual-child"
+                status: 502
+                title: "Same-thread resolution child returned no outcome"
+                detail: "child_outcome_missing"
+
+        - classifyChildOutcome:
+            set:
+              resolution_status: >-
+                ${ if ($resolution_child_output == null)
+                   then "FAILED"
+                   elif (($resolution_child_output.unconfirmed_count // 0) > 0)
+                        or ((($resolution_child_output.unconfirmed_candidates // []) | length) > 0)
+                   then "UNCONFIRMED"
+                   elif (($resolution_child_output.failed_count // 0) > 0)
+                        or ((($resolution_child_output.failed_candidates // []) | length) > 0)
+                   then "FAILED"
+                   elif ($resolution_child_output.complete == true)
+                   then "COMPLETE"
+                   else "FAILED" end }
+              failure_reason: >-
+                   ${ if ($resolution_child_output.complete == true)
+                       and (($resolution_child_output.failed_count // 0) == 0)
+                       and (($resolution_child_output.unconfirmed_count // 0) == 0)
+                       and ((($resolution_child_output.failed_candidates // []) | length) == 0)
+                       and ((($resolution_child_output.unconfirmed_candidates // []) | length) == 0)
+                   then ""
+                   elif (($resolution_child_output.unconfirmed_count // 0) > 0)
+                        or ((($resolution_child_output.unconfirmed_candidates // []) | length) > 0)
+                   then "resolution_child_unconfirmed"
+                   elif (($resolution_child_output.failed_count // 0) > 0)
+                        or ((($resolution_child_output.failed_candidates // []) | length) > 0)
+                   then "resolution_child_failed"
+                   else "resolution_child_incomplete" end }
+
+      catch:
+        as: child_invocation_error
+        do:
+          - recordChildInvocationFailure:
+              set:
+                resolution_status: '${ "FAILED" }'
+                failure_reason: '${ "resolution_child_failed: " + ($child_invocation_error | tostring) }'
+
+  - persistManualResolutionStatus:
+      if: >-
+        ${ ($resolution_mode == "APPLY") and ($resolution_attempted == true) }
+      try:
+        - readCurrentSummaryForStatus:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.MemoryService/Find"
+                  json_body: '${ { value: $summary_memory_id } | tojson }'
+                  as_json: true
+            export:
+              as:
+                status_summary: '${ .jsonBody | fromjson | .data // null }'
+
+        - parseCurrentSummaryMetadata:
+            set:
+              status_summary_metadata: >-
+                ${ if $status_summary != null
+                   then ((try (($status_summary.data.metadata // "{}") | fromjson)) // {})
+                   else {} end }
+
+        # Same selection as selectSummaryCheckpoint, so the snapshot comparison
+        # below compares like with like.
+        - selectCurrentSummaryCheckpoint:
+            set:
+              status_summary_checkpoint: >-
+                ${ $status_summary_metadata as $metadata
+                   | if ((($metadata.resolution_high_water_message_id // "") | tostring) != "")
+                        and (($metadata.resolution_high_water_message_at // null) != null)
+                     then { source: "resolution_high_water",
+                            id: ($metadata.resolution_high_water_message_id | tostring),
+                            at: ($metadata.resolution_high_water_message_at | tostring) }
+                     elif ((($metadata.last_processed_message_id // "") | tostring) != "")
+                          and (($metadata.last_processed_message_at // null) != null)
+                     then { source: "last_processed",
+                            id: ($metadata.last_processed_message_id | tostring),
+                            at: ($metadata.last_processed_message_at | tostring) }
+                     else { source: "", id: "", at: "" } end }
+
+        - digestCurrentSummaryContent:
+            run:
+              function:
+                runnerName: COMMAND
+                settings: {}
+                arguments:
+                  command: "/bin/sh"
+                  args: ["-c", "if command -v sha256sum >/dev/null 2>&1; then sha256sum; elif command -v shasum >/dev/null 2>&1; then shasum -a 256; else exit 127; fi"]
+                  stdin: '${ $status_summary.data.content // "" }'
+                  treat_nonzero_as_error: true
+            export:
+              as:
+                status_summary_content_digest: '${ "sha256:" + (.stdout | split(" ")[0]) }'
+
+        - extractCurrentSummarySnapshot:
+            set:
+              status_summary_memory_id: '${ ($status_summary.id.value // $status_summary.id // "") | tostring }'
+              status_summary_external_id: '${ ($status_summary.data.externalId // $status_summary.data.external_id // "") | tostring }'
+              status_summary_source_thread_id: '${ ($status_summary_metadata.source_thread_id // "") | tostring }'
+              status_summary_checkpoint_memory_id: '${ $status_summary_checkpoint.id }'
+              status_summary_checkpoint_at: '${ $status_summary_checkpoint.at }'
+
+        - verifyStatusSummarySnapshot:
+            set:
+              status_summary_matches_snapshot: >-
+                ${ ($status_summary != null)
+                   and ($status_summary_memory_id == $summary_memory_id)
+                   and ($status_summary_external_id == ("summary:" + ($workflow.input.thread_id | tostring)))
+                   and ($status_summary_source_thread_id == ($workflow.input.thread_id | tostring))
+                   and ($status_summary_content_digest == $summary_content_digest)
+                   and ($status_summary_checkpoint_memory_id == $summary_checkpoint_memory_id)
+                   and ($status_summary_checkpoint_at == $summary_checkpoint_at)
+                   and ((try ($status_summary_checkpoint_at | tonumber) catch null) != null) }
+
+        - skipSummaryStatusWriteOnSnapshotChange:
+            if: '${ ($status_summary_matches_snapshot | not) }'
+            set:
+              summary_status_update_error: '${ "saved_summary_changed_before_status_update" }'
+
+        - prepareSummaryResolutionStatus:
+            set:
+              requested_summary_status: '${ if $resolution_status == "COMPLETE" then "COMPLETE" else "UNKNOWN" end }'
+
+        - prepareSummaryStatusMetadata:
+            if: '${ $status_summary_matches_snapshot }'
+            set:
+              summary_status_metadata: >-
+                ${ ($status_summary_metadata
+                    + { issue_resolution_status: $requested_summary_status }) | tojson }
+
+        - persistStatusMetadataOnly:
+            if: '${ $status_summary_matches_snapshot }'
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.MemoryService/Update"
+                  json_body: >-
+                    ${ {
+                        id: $status_summary.id,
+                        data: ($status_summary.data
+                               | .metadata = $summary_status_metadata)
+                      } | tojson }
+                  as_json: true
+
+        - markSummaryStatusUpdated:
+            if: '${ $status_summary_matches_snapshot }'
+            set:
+              summary_status_updated: '${ true }'
+              persisted_summary_status: '${ $requested_summary_status }'
+
+      catch:
+        as: status_update_error
+        do:
+          - recordSummaryStatusUpdateFailure:
+              set:
+                summary_status_updated: '${ false }'
+                persisted_summary_status: '${ null }'
+                summary_status_update_error: '${ $status_update_error | tostring }'
+
+output:
+  as:
+    status: '${ $resolution_status }'
+    complete: '${ $resolution_status == "COMPLETE" }'
+    unconfirmed: '${ $resolution_status == "UNCONFIRMED" }'
+    failed: '${ $resolution_status == "FAILED" }'
+    failure_reason: '${ $failure_reason }'
+    checkpoint_source: '${ $summary_checkpoint_source }'
+    child_outcome: '${ $resolution_child_output }'
+    summary_status_updated: '${ $summary_status_updated }'
+    summary_status: '${ $persisted_summary_status }'
+    summary_status_update_error: '${ $summary_status_update_error }'

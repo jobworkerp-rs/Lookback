@@ -64,6 +64,8 @@ pub struct SearchThreadsRequest {
 pub struct ThreadHit {
     #[serde(with = "crate::serde_id")]
     pub thread_id: i64,
+    #[serde(with = "crate::serde_id::option")]
+    pub group_id: Option<i64>,
     pub thread_description: Option<String>,
     /// Score of the representative memory (max over the bucket).
     pub top_score: f32,
@@ -85,6 +87,9 @@ pub async fn search_memories_keyword(
     state: State<'_, AppState>,
     req: SearchThreadsRequest,
 ) -> AppResult<Vec<ThreadHit>> {
+    if requested_only_internal_thread_summaries(&req) {
+        return Ok(Vec::new());
+    }
     let mut client = MemoryVectorServiceClient::new(state.memories_channel().await?);
     let options = Some(build_search_options(&req));
     let request = mem_svc::TextSearchRequest {
@@ -105,6 +110,9 @@ pub async fn search_memories_semantic(
     state: State<'_, AppState>,
     req: SearchThreadsRequest,
 ) -> AppResult<Vec<ThreadHit>> {
+    if requested_only_internal_thread_summaries(&req) {
+        return Ok(Vec::new());
+    }
     // Server-side embedding of the query; unavailable when the local vector
     // store is degraded (local mode only — remote embeds on the remote side).
     state.ensure_local_embedding_available()?;
@@ -127,21 +135,24 @@ pub async fn search_memories_hybrid(
     state: State<'_, AppState>,
     req: SearchThreadsRequest,
 ) -> AppResult<Vec<ThreadHit>> {
+    if requested_only_internal_thread_summaries(&req) {
+        return Ok(Vec::new());
+    }
     // Client-side embed: hybrid needs `query_vectors` (the server fuses the
     // vector hits with its own BM25 pass over `query_text`). Gated when the
     // local vector store is degraded (local mode only).
     state.ensure_local_embedding_available()?;
-    let handle = state.jobworkerp().await?;
-    let vector = crate::jobworkerp::embedding::embed_query(&handle, &req.query_text).await?;
-
-    let mut client = MemoryVectorServiceClient::new(state.memories_channel().await?);
-    let request = build_hybrid_request(&req, vector);
-    let mut stream = client.hybrid_search(request).await?.into_inner();
-    let mut hits = Vec::new();
-    while let Some(item) = stream.next().await {
-        hits.push(item?);
-    }
-    Ok(aggregate_into_threads(hits))
+    super::embedding_space::with_query_embedding(&state, &req.query_text, |vector| async {
+        let mut client = MemoryVectorServiceClient::new(state.memories_channel().await?);
+        let request = build_hybrid_request(&req, vector);
+        let mut stream = client.hybrid_search(request).await?.into_inner();
+        let mut hits = Vec::new();
+        while let Some(item) = stream.next().await {
+            hits.push(item?);
+        }
+        Ok(aggregate_into_threads(hits))
+    })
+    .await
 }
 
 /// Build the `HybridSearchRequest` from the Tauri request plus a single
@@ -175,14 +186,14 @@ pub(crate) fn build_hybrid_request(
 ///
 /// Reused for summary search: callers pass the Lookback user ID and the
 /// selected summary `memory_kind`. Labels further narrow per-thread facets;
-/// they are not the lifecycle boundary. `MemorySearchFilter` has no
-/// `external_id` field, so it cannot use the list query's prefix filter.
+/// they are not the lifecycle boundary. The vector search used here does
+/// not support `external_id_prefix`; group summaries use HybridSearch.
 fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
     let user_id = req.user_id.unwrap_or(1);
     let memory_kinds = if req.memory_kinds.is_empty() {
         vec![mem_data::MemoryKind::Raw as i32]
     } else {
-        req.memory_kinds.clone()
+        visible_memory_kinds(req)
     };
     let thread_filter = if req.labels_any.is_empty() {
         None
@@ -201,6 +212,8 @@ fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
             last_message_after: None,
             last_message_before: None,
             memory_kinds: memory_kinds.clone(),
+            thread_group_id: None,
+            thread_id: None,
         })
     };
 
@@ -214,6 +227,7 @@ fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
         updated_before: None,
         thread_filter,
         memory_kinds,
+        external_id_prefix: None,
     };
     mem_data::SearchOptions {
         limit: req.limit.unwrap_or(50),
@@ -225,6 +239,18 @@ fn build_search_options(req: &SearchThreadsRequest) -> mem_data::SearchOptions {
         // a default flip on the memories side).
         include_content: Some(true),
     }
+}
+
+fn visible_memory_kinds(req: &SearchThreadsRequest) -> Vec<i32> {
+    req.memory_kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != mem_data::MemoryKind::ThreadSummary as i32)
+        .collect()
+}
+
+fn requested_only_internal_thread_summaries(req: &SearchThreadsRequest) -> bool {
+    !req.memory_kinds.is_empty() && visible_memory_kinds(req).is_empty()
 }
 
 /// Collapse memory-level hits into thread cards.
@@ -255,8 +281,10 @@ pub(crate) fn aggregate_into_threads(hits: Vec<mem_svc::MemorySearchResult>) -> 
                 continue;
             }
         };
+        let group_id = group_id_from_memory(&hit);
         let entry = by_thread.entry(thread_id).or_insert_with(|| ThreadHit {
             thread_id,
+            group_id: None,
             thread_description: hit.thread_description.clone(),
             top_score: f32::NEG_INFINITY,
             top_memory_id: 0,
@@ -279,6 +307,9 @@ pub(crate) fn aggregate_into_threads(hits: Vec<mem_svc::MemorySearchResult>) -> 
             if entry.thread_description.is_none() {
                 entry.thread_description = hit.thread_description;
             }
+            if let Some(group_id) = group_id {
+                entry.group_id = Some(group_id);
+            }
         }
     }
     let mut out: Vec<ThreadHit> = by_thread.into_values().collect();
@@ -289,6 +320,13 @@ pub(crate) fn aggregate_into_threads(hits: Vec<mem_svc::MemorySearchResult>) -> 
             .then(b.top_created_at_ms.cmp(&a.top_created_at_ms))
     });
     out
+}
+
+fn group_id_from_memory(hit: &mem_svc::MemorySearchResult) -> Option<i64> {
+    let external_id = hit.memory.as_ref()?.data.as_ref()?.external_id.as_deref()?;
+    external_id
+        .strip_prefix("thread-group-summary:")
+        .and_then(|id| id.parse().ok())
 }
 
 fn memory_excerpt(hit: &mem_svc::MemorySearchResult) -> Option<(i64, String, i64)> {
@@ -464,6 +502,51 @@ mod tests {
     }
 
     #[test]
+    fn build_search_options_filters_internal_thread_summaries_but_keeps_derived_kind() {
+        let req = SearchThreadsRequest {
+            query_text: "x".into(),
+            mode: SearchMode::Keyword,
+            user_id: Some(1),
+            created_after_ms: None,
+            created_before_ms: None,
+            labels_any: vec!["thread_group_summary".into()],
+            label_match: None,
+            memory_kinds: vec![
+                mem_data::MemoryKind::ThreadSummary as i32,
+                mem_data::MemoryKind::DerivedSummary as i32,
+            ],
+            limit: None,
+        };
+
+        let filter = build_search_options(&req).filter.expect("filter");
+        assert_eq!(
+            filter.memory_kinds,
+            vec![mem_data::MemoryKind::DerivedSummary as i32]
+        );
+        assert_eq!(
+            filter.thread_filter.expect("thread filter").memory_kinds,
+            vec![mem_data::MemoryKind::DerivedSummary as i32]
+        );
+    }
+
+    #[test]
+    fn internal_thread_summary_only_requests_are_rejected_before_search() {
+        let req = SearchThreadsRequest {
+            query_text: "x".into(),
+            mode: SearchMode::Keyword,
+            user_id: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            labels_any: vec![],
+            label_match: None,
+            memory_kinds: vec![mem_data::MemoryKind::ThreadSummary as i32],
+            limit: None,
+        };
+
+        assert!(requested_only_internal_thread_summaries(&req));
+    }
+
+    #[test]
     fn aggregate_groups_by_thread_id_keeps_max_score() {
         // Three hits on thread 10, one on thread 20. Thread 10's top
         // memory becomes the representative; hit_count tallies all
@@ -599,5 +682,22 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].top_snippet, "top");
         assert_eq!(out[0].thread_description.as_deref(), Some("Real name"));
+    }
+
+    #[test]
+    fn aggregate_exposes_the_group_id_for_group_summary_hits() {
+        let mut group_hit = hit(Some(7), 0.9, "group summary", 100, Some(1));
+        group_hit
+            .memory
+            .as_mut()
+            .expect("memory")
+            .data
+            .as_mut()
+            .expect("memory data")
+            .external_id = Some("thread-group-summary:42".into());
+
+        let out = aggregate_into_threads(vec![group_hit]);
+
+        assert_eq!(out[0].group_id, Some(42));
     }
 }

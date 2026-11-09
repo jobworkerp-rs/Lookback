@@ -102,6 +102,21 @@ message Job {
   map<string, string> metadata = 3;
 }
 
+// # Job Internal
+// Internal queue payload exchanged between the gRPC front and workers.
+// Never exposed through the public JobService API; it wraps a Job with
+// execution-mode flags that should not be settable by external clients.
+message JobInternal {
+  // The job to dispatch.
+  Job job = 1;
+
+  // # Load Only
+  // Config-check / pre-load mode. When true, the worker runs the Runner's
+  // load() (validating settings and, for use_static, warming up the pool)
+  // and skips run(). Used by WorkerService.Load.
+  bool load_only = 2;
+}
+
 // Internal transport message for feed data over Redis Pub/Sub.
 // Not part of the public gRPC API.
 message FeedDataTransport {

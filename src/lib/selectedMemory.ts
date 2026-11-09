@@ -24,7 +24,7 @@ export async function getSelectedMemoryLimits(): Promise<SelectedMemoryLimits> {
 }
 
 const SELECTABLE_MEMORY_KINDS: readonly SelectableMemoryKind[] = [
-  "per-thread",
+  "thread-group",
   "daily",
   "weekly",
   "monthly",
@@ -54,6 +54,7 @@ export function validateSelectedMemories(
     if (!Number.isFinite(item.captured_at_ms)) throw new Error("invalid captured_at_ms");
     for (const id of item.source_memory_ids ?? []) validateId(id, "source_memory_ids");
     for (const id of item.source_thread_ids ?? []) validateId(id, "source_thread_ids");
+    if (item.group_id !== undefined) validateId(item.group_id, "group_id");
   }
   return selected;
 }

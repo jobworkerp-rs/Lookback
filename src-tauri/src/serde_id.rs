@@ -36,6 +36,25 @@ pub mod option {
     }
 }
 
+pub mod vec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(values: &[i64], s: S) -> Result<S::Ok, S::Error> {
+        values
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<i64>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .into_iter()
+            .map(|s| s.parse::<i64>().map_err(serde::de::Error::custom))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -47,6 +66,18 @@ mod tests {
         assert_eq!(json, "\"7462752159340220411\"");
         let back: Wrap = serde_json::from_str(&json).unwrap();
         assert_eq!(back, v);
+    }
+
+    #[test]
+    fn vec_round_trips_ids_beyond_js_safe_integers() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+        struct Wrap(#[serde(with = "super::vec")] Vec<i64>);
+        let v = Wrap(vec![7_462_752_159_340_220_411, 1]);
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, "[\"7462752159340220411\",\"1\"]");
+        let back: Wrap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+        assert!(serde_json::from_str::<Wrap>("[\"x\"]").is_err());
     }
 
     #[test]

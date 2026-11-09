@@ -7,42 +7,39 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use jobworkerp_client::client::function_set_yaml;
 use jobworkerp_client::client::helper::UseJobworkerpClientHelper;
 use jobworkerp_client::client::worker_yaml;
 use jobworkerp_client::client::wrapper::JobworkerpClientWrapper;
 use jobworkerp_client::jobworkerp::data::{
-    JobId, ResultOutputItem, WorkerId, result_output_item::Item,
+    JobId, ProblemDetails, ResultOutputItem, ResultStatus, StreamError, Trailer, WorkerId,
+    result_output_item::Item,
 };
 use jobworkerp_client::jobworkerp::function::data::FunctionSetId;
 use jobworkerp_client::jobworkerp::service::{
     CountJobProcessingStatusRequest, CountJobProcessingStatusResponse, ListenRequest,
     LoadWorkerRequest, PurgeStaleJobsRequest, ReleaseStaticWorkerRequest, RunnerNameRequest,
-    listen_request, load_worker_request, release_static_worker_request,
+    WorkerNameRequest, listen_request, load_worker_request, release_static_worker_request,
 };
-use prost_reflect::{DynamicMessage, MessageDescriptor};
+use jobworkerp_client::stream_error::{describe_stream_error, stream_error_from_trailer};
+use prost_reflect::{DynamicMessage, MessageDescriptor, SerializeOptions};
 use serde::Serialize as _;
+use tokio::sync::OnceCell;
 use tokio_stream::StreamExt as _;
 use tonic::Streaming;
 use tracing::warn;
 
 use crate::error::{AppError, AppResult};
 
+pub mod coding_agent;
 pub mod embedding;
+pub mod job_timeouts;
 pub mod llm_chat;
 pub mod maintenance;
-
-/// jobworkerp's stream-end protocol: when a streaming runner (LLM /
-/// WORKFLOW) fails mid-stream the server still closes with a successful
-/// gRPC status, but the `Trailer.metadata` map carries the failure under
-/// this key. Mirrors `jobworkerp_runner::runner::plugins::impls::STREAM_ERROR_META_KEY`
-/// — the value is the wire contract, not an internal detail, so vendoring
-/// the literal here keeps agent-app free of the runner crate dependency.
-/// Without consuming this, an upstream LLM API error (e.g. Gemini 400
-/// invalid key) surfaces as a silent `End { final_text: None }` and the
-/// chat UI sits at "generating…" forever.
-const STREAM_ERROR_META_KEY: &str = "jobworkerp.stream.error";
+pub(crate) mod semantic_judge;
+pub(crate) mod workflow;
 
 /// `JobworkerpClientWrapper` takes seconds as `u32`, while job execution
 /// timeout is represented as `u64` milliseconds on the wire.
@@ -54,14 +51,78 @@ fn grpc_request_timeout_sec(job_timeout_sec: u64) -> AppResult<u32> {
     })
 }
 
-/// Inspect an `Item::End` trailer for a stream-level failure and lift it
-/// into an `AppError::Jobworkerp` so the drain returns `Err`. Returns
-/// `Ok(())` for a clean trailer (no error key, or an empty value).
-fn check_stream_trailer(trailer: &jobworkerp_client::jobworkerp::data::Trailer) -> AppResult<()> {
-    match trailer.metadata.get(STREAM_ERROR_META_KEY) {
-        Some(msg) if !msg.is_empty() => Err(AppError::Jobworkerp(msg.clone())),
-        _ => Ok(()),
+/// A failed stream still closes with a successful gRPC status: the failure
+/// rides only in the End trailer. Without lifting it into `Err`, an upstream
+/// error (e.g. an LLM provider rejecting the API key) looks like a clean
+/// finish and the chat UI sits at "generating…".
+fn check_stream_trailer(trailer: &Trailer) -> AppResult<()> {
+    match stream_error_from_trailer(trailer) {
+        Some(error) => Err(stream_end_error(&error)),
+        None => Ok(()),
     }
+}
+
+fn stream_end_error(error: &StreamError) -> AppError {
+    AppError::Jobworkerp(describe_stream_failure(error))
+}
+
+/// `"{origin} {CODE}: {reason}"`. The structured problem, when the failed
+/// component reported one, reads better than the flat diagnostic message
+/// (a WORKFLOW message joins title, detail and position with bare spaces).
+fn describe_stream_failure(error: &StreamError) -> String {
+    let reason = error
+        .problem
+        .as_ref()
+        .and_then(problem_reason)
+        .unwrap_or_else(|| error.message.clone());
+    // The client appends the full problem; the reason above already carries
+    // the part worth showing, so it is dropped here.
+    describe_stream_error(&StreamError {
+        message: reason,
+        problem: None,
+        ..error.clone()
+    })
+}
+
+/// User-facing reason of a typed problem. Job failures carry a generic title
+/// (e.g. "Failed to execute by jobworkerp") with the cause in `detail`, so
+/// both are kept. The position is left out: callers name it from the
+/// workflow `position`.
+fn problem_reason(problem: &ProblemDetails) -> Option<String> {
+    if problem.r#type.is_empty() {
+        return None;
+    }
+    join_problem_reason(problem.title.as_deref(), problem.detail.as_deref())
+}
+
+fn join_problem_reason(title: Option<&str>, detail: Option<&str>) -> Option<String> {
+    fn present(value: Option<&str>) -> Option<&str> {
+        value.filter(|value| !value.is_empty())
+    }
+    match (present(title), present(detail)) {
+        (Some(title), Some(detail)) => Some(format!("{title}: {detail}")),
+        (Some(reason), None) | (None, Some(reason)) => Some(reason.to_owned()),
+        (None, None) => None,
+    }
+}
+
+/// Key under which [`DispatchStream::drain`] attaches the End's problem to a
+/// failed workflow terminal. `WorkflowResult` has no such field.
+const TERMINAL_PROBLEM_KEY: &str = "problem";
+
+/// Reason recorded in the problem attached to a workflow terminal.
+fn workflow_problem_reason(terminal: &serde_json::Value) -> Option<String> {
+    let problem = terminal.get(TERMINAL_PROBLEM_KEY)?;
+    let field = |name| problem.get(name).and_then(serde_json::Value::as_str);
+    join_problem_reason(field("title"), field("detail"))
+}
+
+/// JSON form of a typed problem; an untyped one identifies nothing.
+fn problem_json(problem: &ProblemDetails) -> Option<serde_json::Value> {
+    if problem.r#type.is_empty() {
+        return None;
+    }
+    serde_json::to_value(problem).ok()
 }
 
 /// A streaming dispatch is successful only when jobworkerp sends an explicit
@@ -71,11 +132,112 @@ fn unexpected_dispatch_stream_close() -> AppError {
     AppError::Jobworkerp("dispatch stream closed without a terminal result".to_owned())
 }
 
+fn map_enqueue_error(error: anyhow::Error, action: &str) -> AppError {
+    if error
+        .downcast_ref::<jobworkerp_client::error::UniqueEnqueueError>()
+        .is_some()
+    {
+        AppError::Other(error.context(action.to_owned()))
+    } else {
+        AppError::Jobworkerp(format!("{action}: {error:#}"))
+    }
+}
+
+/// `WorkflowResult.status` values that mean the workflow itself failed.
+/// Mirrors `FAILURE_WORKFLOW_STATUSES` in the pinned jobworkerp-client: only
+/// `Faulted` is a hard failure — `Cancelled` / `Waiting` are deliberate
+/// non-failure terminations, and `Running` / `Pending` should never reach a
+/// terminal payload but are passed through rather than turned into errors.
+/// A cancelled run is still unsuccessful; see
+/// [`UNSUCCESSFUL_WORKFLOW_STATUSES`] for terminals reported to the user.
+const FAILURE_WORKFLOW_STATUSES: &[&str] = &["Faulted"];
+
+/// Terminal `WorkflowResult.status` values that end a run without success.
+/// [`DispatchStream::drain`] hands such a terminal over in place of a failed
+/// End, so callers must report every one of them as unsuccessful.
+const UNSUCCESSFUL_WORKFLOW_STATUSES: &[&str] = &["Faulted", "Cancelled"];
+
+/// The `status` of a decoded `WorkflowResult` when the run ended without
+/// success (faulted or cancelled).
+pub(crate) fn workflow_unsuccessful_status(output: &serde_json::Value) -> Option<&str> {
+    output
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .filter(|status| UNSUCCESSFUL_WORKFLOW_STATUSES.contains(status))
+}
+
+/// Why a workflow terminal failed: the problem the stream's End attached
+/// (its `error_message` is a flat rendering that cannot be split), else the
+/// engine error's title, else the whole message.
+pub(crate) fn workflow_terminal_reason(terminal: &serde_json::Value) -> Option<String> {
+    workflow_problem_reason(terminal).or_else(|| {
+        workflow_error_reason(terminal)
+            .map(|message| workflow_error_title(message).unwrap_or(message).to_owned())
+    })
+}
+
+/// The `title` of a workflow engine error rendered with `{:?}`
+/// (e.g. `Task 'x' timed out`). Older servers embed a child job's `{:?}`
+/// rendering in `WorkflowResult.error_message` and send no problem.
+fn workflow_error_title(message: &str) -> Option<&str> {
+    const MARKER: &str = "title: Some(\"";
+    let start = message.find(MARKER)? + MARKER.len();
+    let end = start + message[start..].find("\")")?;
+    Some(&message[start..end])
+}
+
+/// The `status` of a decoded `WorkflowResult` when it is a hard failure.
+pub(crate) fn workflow_failure_status(output: &serde_json::Value) -> Option<&str> {
+    output
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .filter(|status| FAILURE_WORKFLOW_STATUSES.contains(status))
+}
+
+/// Non-empty error message of a decoded `WorkflowResult`. Reads both the
+/// proto field name and its lowerCamelCase JSON variant because
+/// descriptor-driven serialization may use either.
+pub(crate) fn workflow_error_reason(output: &serde_json::Value) -> Option<&str> {
+    output
+        .get("error_message")
+        .or_else(|| output.get("errorMessage"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| !reason.is_empty())
+}
+
+/// Diagnostic for a decoded `WorkflowResult` that reports a hard failure, or
+/// `None` when the payload says the workflow finished without faulting.
+fn workflow_failure_message(output: &serde_json::Value) -> Option<String> {
+    let status = workflow_failure_status(output)?;
+    Some(match workflow_error_reason(output) {
+        Some(reason) => format!("reused workflow reported {status}: {reason}"),
+        None => format!("reused workflow reported {status}"),
+    })
+}
+
+fn is_duplicate_enqueue_error(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Other(error)
+            if error
+                .downcast_ref::<jobworkerp_client::error::UniqueEnqueueError>()
+                .is_some_and(|error| matches!(error, jobworkerp_client::error::UniqueEnqueueError::Duplicate(_)))
+    )
+}
+
 /// Owned wrapper around `JobworkerpClientWrapper` so we can hide the
 /// `anyhow::Error` boundary and stream-decoding details from callers.
+/// The llama.cpp plugin runner behind the local LLM worker.
+pub(crate) const LLM_PROMPT_RUNNER_NAME: &str = "LLMPromptRunner";
+
 #[derive(Clone)]
 pub struct JobworkerpHandle {
     inner: JobworkerpClientWrapper,
+    native_interactive: Arc<OnceCell<JobworkerpClientWrapper>>,
+    /// Server-side job deadline for jobs dispatched without an explicit one.
+    /// Equal to the client request deadline so a result stream is never
+    /// closed by the client before the server gives up on the job.
+    job_timeout_sec: u64,
 }
 
 impl JobworkerpHandle {
@@ -89,14 +251,49 @@ impl JobworkerpHandle {
         Self::connect_with_timeout(jw_url, Self::DEFAULT_JOB_TIMEOUT_SEC).await
     }
 
-    /// Create a client with a request deadline matching a long-running
-    /// workflow. The job deadline itself is sent separately as `u64`.
+    /// Create a client whose request deadline and default job deadline both
+    /// match a long-running workflow.
     pub async fn connect_with_timeout(jw_url: &str, timeout_sec: u64) -> AppResult<Self> {
         let inner =
             JobworkerpClientWrapper::new(jw_url, Some(grpc_request_timeout_sec(timeout_sec)?))
                 .await
                 .map_err(|e| AppError::Jobworkerp(format!("connect {jw_url}: {e}")))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            native_interactive: Arc::new(OnceCell::new()),
+            job_timeout_sec: timeout_sec,
+        })
+    }
+
+    /// Lazily create the native interactive transport against the same trusted
+    /// endpoint and TLS configuration as the normal client, but without a
+    /// channel request timeout. Native calls add bounded lookup/enqueue-open
+    /// timeouts individually; the returned result stream has no lifetime limit.
+    /// In the locked jobworkerp-client version, `GrpcConnection::new` applies
+    /// `Endpoint::timeout` only for `Some(duration)`; `None` does not select a
+    /// fallback request deadline.
+    pub(crate) async fn native_interactive_client(&self) -> AppResult<&JobworkerpClientWrapper> {
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let address = self.inner.address().to_owned();
+        self.native_interactive
+            .get_or_try_init(|| async move {
+                match tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    JobworkerpClientWrapper::new(&address, None),
+                )
+                .await
+                {
+                    Ok(Ok(client)) => Ok(client),
+                    Ok(Err(_)) => Err(AppError::Jobworkerp(
+                        "native interactive client connection failed".to_owned(),
+                    )),
+                    Err(_) => Err(AppError::Jobworkerp(
+                        "native interactive client connection timed out".to_owned(),
+                    )),
+                }
+            })
+            .await
     }
 
     /// Confirm that the Runner gRPC service can answer a real RPC.
@@ -105,11 +302,7 @@ impl JobworkerpHandle {
     /// completing its HTTP/2 setup. A missing runner is still a successful
     /// probe because the caller only needs to know that the service replied.
     pub async fn probe_runner_service(&self) -> AppResult<()> {
-        let mut client = self.inner.jobworkerp_client.runner_client().await;
-        client
-            .find_by_name(RunnerNameRequest {
-                name: "LLMPromptRunner".into(),
-            })
+        self.runner_exists(LLM_PROMPT_RUNNER_NAME)
             .await
             .map(|_| ())
             .map_err(|e| AppError::Jobworkerp(format!("probe RunnerService: {e}")))
@@ -137,6 +330,44 @@ impl JobworkerpHandle {
         })
     }
 
+    /// Whether a function set is registered on this jobworkerp.
+    pub async fn function_set_exists(&self, name: &str) -> AppResult<bool> {
+        use jobworkerp_client::jobworkerp::function::service::FindByNameRequest;
+        let mut client = self.inner.jobworkerp_client.function_set_client().await;
+        client
+            .find_by_name(FindByNameRequest { name: name.into() })
+            .await
+            .map(|response| response.into_inner().data.is_some())
+            .map_err(|e| AppError::Jobworkerp(format!("find function set {name}: {e}")))
+    }
+
+    /// Whether a runner (built-in or plugin) is loaded on this jobworkerp.
+    pub async fn runner_exists(&self, name: &str) -> AppResult<bool> {
+        let mut client = self.inner.jobworkerp_client.runner_client().await;
+        client
+            .find_by_name(RunnerNameRequest { name: name.into() })
+            .await
+            .map(|response| response.into_inner().data.is_some())
+            .map_err(|e| AppError::Jobworkerp(format!("find runner {name}: {e}")))
+    }
+
+    /// Channels some running worker instance of this jobworkerp processes.
+    pub async fn processed_channels(&self) -> AppResult<Vec<String>> {
+        let mut client = self.inner.jobworkerp_client.worker_instance_client().await;
+        client
+            .find_channel_list(jobworkerp_client::jobworkerp::data::Empty {})
+            .await
+            .map(|response| {
+                response
+                    .into_inner()
+                    .channels
+                    .into_iter()
+                    .map(|channel| channel.name)
+                    .collect()
+            })
+            .map_err(|e| AppError::Jobworkerp(format!("find channels: {e}")))
+    }
+
     /// Resolve a registered worker name to its stable numeric id.
     pub async fn worker_id_by_name(&self, name: &str) -> AppResult<Option<i64>> {
         self.inner
@@ -144,6 +375,47 @@ impl JobworkerpHandle {
             .await
             .map_err(|e| AppError::Jobworkerp(format!("find worker {name}: {e}")))
             .map(|found| found.map(|(id, _)| id.value))
+    }
+
+    /// Delete an app-owned Worker by name, treating an already-absent Worker as reconciled.
+    pub async fn delete_worker_by_name_if_present(&self, name: &str) -> AppResult<()> {
+        if let Some(value) = self.worker_id_by_name(name).await? {
+            let deleted = self
+                .inner
+                .jobworkerp_client
+                .worker_client()
+                .await
+                .delete(WorkerId { value })
+                .await
+                .map_err(|e| AppError::Jobworkerp(format!("delete worker {name}: {e}")))?
+                .into_inner();
+            if !deleted.is_success {
+                return Err(AppError::Jobworkerp(format!(
+                    "delete worker {name}: not deleted"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the exact description stored for a worker.  MCP interprets the
+    /// string later, so acceptance tests must verify this persistence boundary
+    /// without parsing or normalizing the value on the Lookback side.
+    pub async fn worker_description_by_name(&self, name: &str) -> AppResult<Option<String>> {
+        let mut client = self.inner.jobworkerp_client.worker_client().await;
+        client
+            .find_by_name(WorkerNameRequest {
+                name: name.to_owned(),
+            })
+            .await
+            .map(|response| {
+                response
+                    .into_inner()
+                    .data
+                    .and_then(|worker| worker.data)
+                    .map(|worker| worker.description)
+            })
+            .map_err(|error| AppError::Jobworkerp(format!("find worker {name}: {error}")))
     }
 
     /// Count active job_processing_status rows matching `request` on the
@@ -269,11 +541,12 @@ impl JobworkerpHandle {
         input_json: serde_json::Value,
         using: Option<&str>,
     ) -> AppResult<DispatchStream> {
-        self.dispatch_stream_with_timeout(
+        self.dispatch_stream_with_timeout_and_uniq_key(
             worker_name,
             input_json,
-            Self::DEFAULT_JOB_TIMEOUT_SEC,
+            self.job_timeout_sec,
             using,
+            None,
         )
         .await
     }
@@ -288,6 +561,24 @@ impl JobworkerpHandle {
         timeout_sec: u64,
         using: Option<&str>,
     ) -> AppResult<DispatchStream> {
+        self.dispatch_stream_with_timeout_and_uniq_key(
+            worker_name,
+            input_json,
+            timeout_sec,
+            using,
+            None,
+        )
+        .await
+    }
+
+    pub async fn dispatch_stream_with_timeout_and_uniq_key(
+        &self,
+        worker_name: &str,
+        input_json: serde_json::Value,
+        timeout_sec: u64,
+        using: Option<&str>,
+        uniq_key: Option<&str>,
+    ) -> AppResult<DispatchStream> {
         let (_worker_id, worker_data) = self
             .inner
             .find_worker_by_name(None, Arc::new(HashMap::new()), worker_name)
@@ -296,16 +587,17 @@ impl JobworkerpHandle {
             .ok_or_else(|| AppError::Jobworkerp(format!("worker not found: {worker_name}")))?;
         let (job_id, streaming, result_descriptor) = self
             .inner
-            .enqueue_stream_with_json(
+            .enqueue_stream_with_json_and_uniq_key(
                 None,
                 Arc::new(HashMap::new()),
                 &worker_data,
                 input_json,
                 timeout_sec,
                 using,
+                uniq_key,
             )
             .await
-            .map_err(|e| AppError::Jobworkerp(format!("enqueue stream {worker_name}: {e:#}")))?;
+            .map_err(|e| map_enqueue_error(e, &format!("enqueue stream {worker_name}")))?;
         Ok(DispatchStream {
             job_id,
             inner: streaming,
@@ -327,6 +619,17 @@ impl JobworkerpHandle {
         input_json: serde_json::Value,
         using: Option<&str>,
     ) -> AppResult<serde_json::Value> {
+        self.dispatch_unary_with_uniq_key(worker_name, input_json, using, None)
+            .await
+    }
+
+    pub async fn dispatch_unary_with_uniq_key(
+        &self,
+        worker_name: &str,
+        input_json: serde_json::Value,
+        using: Option<&str>,
+        uniq_key: Option<&str>,
+    ) -> AppResult<serde_json::Value> {
         let (_worker_id, worker_data) = self
             .inner
             .find_worker_by_name(None, Arc::new(HashMap::new()), worker_name)
@@ -334,16 +637,96 @@ impl JobworkerpHandle {
             .map_err(|e| AppError::Jobworkerp(format!("find worker {worker_name}: {e}")))?
             .ok_or_else(|| AppError::Jobworkerp(format!("worker not found: {worker_name}")))?;
         self.inner
-            .enqueue_with_json(
+            .enqueue_with_json_and_uniq_key(
                 None,
                 Arc::new(HashMap::new()),
                 &worker_data,
                 input_json,
-                Self::DEFAULT_JOB_TIMEOUT_SEC,
+                self.job_timeout_sec,
                 using,
+                uniq_key,
             )
             .await
-            .map_err(|e| AppError::Jobworkerp(format!("enqueue {worker_name}: {e:#}")))
+            .map_err(|e| map_enqueue_error(e, &format!("enqueue {worker_name}")))
+    }
+
+    pub async fn find_latest_job_result_by_uniq_key(
+        &self,
+        uniq_key: &str,
+    ) -> AppResult<Option<jobworkerp_client::jobworkerp::data::JobResult>> {
+        self.inner
+            .find_latest_job_result_by_uniq_key(uniq_key)
+            .await
+            .map_err(|e| AppError::Jobworkerp(format!("find job result by uniq_key: {e:#}")))
+    }
+
+    async fn find_latest_job_result_by_uniq_key_with_retry(
+        &self,
+        uniq_key: &str,
+    ) -> Option<jobworkerp_client::jobworkerp::data::JobResult> {
+        // `Ok(None)` polls the full window: the duplicate's terminal result is
+        // published shortly after ALREADY_EXISTS arrives. `Err` retries only a
+        // couple of times so a permanent failure (e.g. an older server without
+        // uniq lookup support) surfaces the original enqueue error promptly.
+        for attempt in 0..20 {
+            match self.find_latest_job_result_by_uniq_key(uniq_key).await {
+                Ok(Some(result)) => return Some(result),
+                Ok(None) if attempt < 19 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(_) if attempt < 2 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Ok(None) | Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// Decide whether a persisted result reused after a duplicate enqueue may
+    /// close the step as successful. `Ok(())` reuses it, `Err(diagnostic)`
+    /// surfaces the reason as a failed step.
+    ///
+    /// The protobuf `status` alone is not enough: the WORKFLOW runner closes
+    /// its stream cleanly while carrying its own verdict inside
+    /// `WorkflowResult.status`, so a faulted run persists as `Success` with a
+    /// `Faulted` payload (the same two-layer check jobworkerp-client applies
+    /// in `check_workflow_output_status`). When the payload or the worker's
+    /// result schema cannot be decoded we keep the envelope's verdict —
+    /// refusing to reuse a finished job over a decode hiccup would
+    /// re-dispatch an hours-long batch.
+    async fn classify_reused_job(
+        &self,
+        result: &jobworkerp_client::jobworkerp::data::JobResult,
+    ) -> Result<(), String> {
+        let not_success = || "existing job did not succeed".to_owned();
+        let Some(data) = result.data.as_ref() else {
+            return Err(not_success());
+        };
+        if data.status != ResultStatus::Success as i32 {
+            return Err(not_success());
+        }
+        let Some(items) = data.output.as_ref().map(|output| &output.items) else {
+            return Ok(());
+        };
+        if items.is_empty() {
+            return Ok(());
+        }
+        let descriptor = jobworkerp_client::proto::JobworkerpProto::resolve_result_descriptor(
+            &self.inner.jobworkerp_client,
+            &data.worker_name,
+            data.using.as_deref(),
+        )
+        .await;
+        let Some(descriptor) = descriptor else {
+            warn!(
+                worker = %data.worker_name,
+                "no result schema for reused job; trusting the protobuf status"
+            );
+            return Ok(());
+        };
+        workflow_failure_message(&decode_chunk_to_json(items, Some(&descriptor)))
+            .map_or(Ok(()), Err)
     }
 
     /// Best-effort cancellation invoked when the user dismisses the
@@ -418,6 +801,35 @@ impl JobworkerpHandle {
         let tools: Vec<serde_json::Value> = specs.iter().map(function_specs_to_tool).collect();
         serde_json::to_string(&tools)
             .map_err(|e| AppError::Jobworkerp(format!("serialize tools_json: {e}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn function_set_worker_ids_by_name(&self, name: &str) -> AppResult<Vec<i64>> {
+        use jobworkerp_client::jobworkerp::function::data::function_id::Id;
+        use jobworkerp_client::jobworkerp::function::service::FindByNameRequest;
+        let set = self
+            .inner
+            .jobworkerp_client
+            .function_set_client()
+            .await
+            .find_by_name(FindByNameRequest {
+                name: name.to_owned(),
+            })
+            .await
+            .map_err(|e| AppError::Jobworkerp(format!("find FunctionSet {name}: {e}")))?
+            .into_inner()
+            .data
+            .and_then(|set| set.data)
+            .ok_or_else(|| AppError::Jobworkerp(format!("FunctionSet {name} not found")))?;
+        set.targets
+            .into_iter()
+            .map(|target| match target.function_id.and_then(|id| id.id) {
+                Some(Id::WorkerId(id)) => Ok(id.value),
+                _ => Err(AppError::WorkerRegistration(format!(
+                    "unexpected target in FunctionSet {name}"
+                ))),
+            })
+            .collect()
     }
 
     /// Subscribe to `JobResultService::ListenStream` for a job already
@@ -537,8 +949,9 @@ pub enum ProgressEvent {
     Chunk {
         text: String,
     },
-    /// `final_text` is set on `STREAMING_TYPE_INTERNAL` (`final_collected`)
-    /// and `None` on plain `Trailer.end`.
+    /// `final_text` is the `FinalCollected` payload, or for a WORKFLOW
+    /// stream the terminal `WorkflowResult` JSON (see [`DispatchStream::drain`]);
+    /// `None` on a plain End of any other stream.
     End {
         final_text: Option<String>,
     },
@@ -556,8 +969,9 @@ impl std::fmt::Debug for ListenStream {
     }
 }
 
-/// `Final` arrives exactly once before the stream closes, with either the
-/// trailing `FinalCollected` payload or `None` for a plain `Trailer.end`.
+/// `Final` arrives once, on a `FinalCollected` payload or a clean End
+/// (`None`). A failed End or a close before either yields no `Final`; the
+/// drain returns an error instead.
 #[derive(Debug)]
 pub enum ListenChunk {
     Data(Vec<u8>),
@@ -646,6 +1060,36 @@ pub async fn run_cancellable_named_stream<F, J, Fut>(
     timeout_sec: Option<u64>,
     cancel: tokio_util::sync::CancellationToken,
     on_job_id: J,
+    emit: F,
+) where
+    F: FnMut(StreamEvent<'_>),
+    J: FnOnce(JobId) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    run_cancellable_named_stream_with_uniq_key(
+        handle,
+        worker_name,
+        input,
+        using,
+        timeout_sec,
+        None,
+        cancel,
+        on_job_id,
+        emit,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cancellable_named_stream_with_uniq_key<F, J, Fut>(
+    handle: &JobworkerpHandle,
+    worker_name: &str,
+    input: serde_json::Value,
+    using: Option<&str>,
+    timeout_sec: Option<u64>,
+    uniq_key: Option<&str>,
+    cancel: tokio_util::sync::CancellationToken,
+    on_job_id: J,
     mut emit: F,
 ) where
     F: FnMut(StreamEvent<'_>),
@@ -667,17 +1111,40 @@ pub async fn run_cancellable_named_stream<F, J, Fut>(
         emit(StreamEvent::Failed("cancelled"));
         return;
     }
-    let dispatched = match timeout_sec {
-        Some(timeout_sec) => {
-            handle
-                .dispatch_stream_with_timeout(worker_name, input, timeout_sec, using)
-                .await
-        }
-        None => handle.dispatch_stream(worker_name, input, using).await,
-    };
+    let dispatched = handle
+        .dispatch_stream_with_timeout_and_uniq_key(
+            worker_name,
+            input,
+            timeout_sec.unwrap_or(handle.job_timeout_sec),
+            using,
+            uniq_key,
+        )
+        .await;
     let stream = match dispatched {
         Ok(s) => s,
         Err(e) => {
+            if is_duplicate_enqueue_error(&e) {
+                // The server's uniq reservation spans active jobs only: the
+                // queue releases the key on dequeue and cleanup_job deletes the
+                // job row right after the terminal result is published. So
+                // ALREADY_EXISTS normally means a prior attempt of this same
+                // operation is still queued/running (or its result landed in the
+                // tiny publish→cleanup window). Only a terminal JobResult permits
+                // us to close the step; otherwise leave the retry visible as a
+                // failure instead of dispatching with a different key.
+                if let Some(result) = handle
+                    .find_latest_job_result_by_uniq_key_with_retry(
+                        uniq_key.expect("duplicate enqueue requires a unique key"),
+                    )
+                    .await
+                {
+                    match handle.classify_reused_job(&result).await {
+                        Ok(()) => emit(StreamEvent::Done(Some("reused existing job"))),
+                        Err(diagnostic) => emit(StreamEvent::Failed(&diagnostic)),
+                    }
+                    return;
+                }
+            }
             let msg = e.to_string();
             emit(StreamEvent::Failed(&msg));
             return;
@@ -763,46 +1230,21 @@ pub async fn run_cancellable_named_stream<F, J, Fut>(
 }
 
 impl DispatchStream {
-    /// Drive the stream to completion. `on_event` is invoked for every
-    /// chunk and exactly once with `End` (synthesized if the stream
-    /// closes silently).
-    pub async fn drain<F>(mut self, mut on_event: F) -> AppResult<()>
+    pub(crate) fn result_descriptor(&self) -> Option<MessageDescriptor> {
+        self.result_descriptor.clone()
+    }
+
+    /// Drive the stream to completion. `on_event` is invoked for every chunk
+    /// and once with `End` when the drain returns `Ok`. A failed End returns
+    /// `Err`, except on a WORKFLOW stream whose last result is faulted or
+    /// cancelled: that result is handed over as `final_text` (with the End's
+    /// problem attached), so callers must check its status before treating
+    /// `End` as success.
+    pub async fn drain<F>(self, on_event: F) -> AppResult<()>
     where
         F: FnMut(ProgressEvent),
     {
-        while let Some(item) = self.inner.next().await {
-            let item = item.map_err(AppError::Grpc)?;
-            match item.item {
-                Some(Item::Data(bytes)) => {
-                    let text = render_chunk(&bytes, self.result_descriptor.as_ref());
-                    on_event(ProgressEvent::Chunk { text });
-                }
-                Some(Item::FinalCollected(bytes)) => {
-                    let text = render_chunk(&bytes, self.result_descriptor.as_ref());
-                    on_event(ProgressEvent::End {
-                        final_text: Some(text),
-                    });
-                    return Ok(());
-                }
-                Some(Item::End(trailer)) => {
-                    // The gRPC stream closes successfully even when the
-                    // upstream runner (LLM / WORKFLOW) failed mid-stream;
-                    // the failure rides in `Trailer.metadata`. Surface it
-                    // so the consumer can show "API key invalid" etc.
-                    // instead of leaving the chat UI stuck at "generating…".
-                    check_stream_trailer(&trailer)?;
-                    on_event(ProgressEvent::End { final_text: None });
-                    return Ok(());
-                }
-                None => {
-                    warn!(
-                        stream = "DispatchStream",
-                        "result item with no oneof; skipping"
-                    );
-                }
-            }
-        }
-        Err(unexpected_dispatch_stream_close())
+        drain_dispatch_items(self.inner, self.result_descriptor.as_ref(), on_event).await
     }
 
     /// Variant of [`drain`] that hands the caller raw bytes instead of
@@ -814,6 +1256,14 @@ impl DispatchStream {
         F: FnMut(ListenChunk),
     {
         drain_listen_chunks(self.inner, "DispatchStream", on_chunk).await
+    }
+
+    /// Workspace effects require a real caller End and a clean subscription close.
+    pub async fn drain_confirmed_bytes<F>(self, on_chunk: F) -> AppResult<()>
+    where
+        F: FnMut(ListenChunk),
+    {
+        drain_confirmed_items(self.inner, on_chunk).await
     }
 }
 
@@ -830,16 +1280,116 @@ impl ListenStream {
     }
 }
 
-/// Drive a `ResultOutputItem` stream until the server closes it. Emits
-/// exactly one [`ListenChunk::Final`] before returning — synthesised if
-/// the stream ends without an explicit `End` / `FinalCollected`. `label`
-/// only tags the structured log when an empty oneof is observed.
-async fn drain_listen_chunks<F>(
-    mut stream: Streaming<ResultOutputItem>,
+/// Body of [`DispatchStream::drain`], generic over the item stream so it can
+/// be exercised without a gRPC server.
+async fn drain_dispatch_items<S, F>(
+    mut stream: S,
+    result_descriptor: Option<&MessageDescriptor>,
+    mut on_event: F,
+) -> AppResult<()>
+where
+    S: tokio_stream::Stream<Item = Result<ResultOutputItem, tonic::Status>> + Unpin,
+    F: FnMut(ProgressEvent),
+{
+    let mut workflow_terminal = WorkflowTerminal::for_descriptor(result_descriptor);
+    while let Some(item) = stream.next().await {
+        let item = item.map_err(AppError::Grpc)?;
+        match item.item {
+            Some(Item::Data(bytes)) => {
+                let text = render_chunk(&bytes, result_descriptor);
+                if let Some(terminal) = workflow_terminal.as_mut() {
+                    terminal.observe(bytes);
+                }
+                on_event(ProgressEvent::Chunk { text });
+            }
+            Some(Item::FinalCollected(bytes)) => {
+                let text = render_chunk(&bytes, result_descriptor);
+                on_event(ProgressEvent::End {
+                    final_text: Some(text),
+                });
+                return Ok(());
+            }
+            Some(Item::End(trailer)) => {
+                let final_text = match stream_error_from_trailer(&trailer) {
+                    None => workflow_terminal.and_then(WorkflowTerminal::finish),
+                    // A faulted or cancelled WorkflowResult names the failed
+                    // task, which callers report; the End only adds the
+                    // structured reason. Anything else is explained by the
+                    // End alone.
+                    Some(error) => Some(
+                        workflow_terminal
+                            .and_then(|terminal| terminal.finish_unsuccessful(&error))
+                            .ok_or_else(|| stream_end_error(&error))?,
+                    ),
+                };
+                on_event(ProgressEvent::End { final_text });
+                return Ok(());
+            }
+            None => {
+                warn!(
+                    stream = "DispatchStream",
+                    "result item with no oneof; skipping"
+                );
+            }
+        }
+    }
+    Err(unexpected_dispatch_stream_close())
+}
+
+/// Body of [`DispatchStream::drain_confirmed_bytes`].
+async fn drain_confirmed_items<S, F>(mut stream: S, mut on_chunk: F) -> AppResult<()>
+where
+    S: tokio_stream::Stream<Item = Result<ResultOutputItem, tonic::Status>> + Unpin,
+    F: FnMut(ListenChunk),
+{
+    let mut ended = false;
+    let mut collected = false;
+    while let Some(item) = stream.next().await {
+        let item = item.map_err(AppError::Grpc)?;
+        if ended {
+            return Err(AppError::Jobworkerp(
+                "Unexpected result after caller End".into(),
+            ));
+        }
+        match item.item {
+            Some(Item::Data(bytes)) if !collected => on_chunk(ListenChunk::Data(bytes)),
+            Some(Item::FinalCollected(bytes)) if !collected => {
+                collected = true;
+                on_chunk(ListenChunk::Final {
+                    collected: Some(bytes),
+                });
+            }
+            Some(Item::End(trailer)) => {
+                check_stream_trailer(&trailer)?;
+                ended = true;
+                on_chunk(ListenChunk::Final { collected: None });
+            }
+            _ => {
+                return Err(AppError::Jobworkerp(
+                    "Invalid confirmed result sequence".into(),
+                ));
+            }
+        }
+    }
+    if ended {
+        Ok(())
+    } else {
+        Err(unexpected_dispatch_stream_close())
+    }
+}
+
+/// Drive a `ResultOutputItem` stream until its terminal item. Emits exactly
+/// one [`ListenChunk::Final`] on an explicit `FinalCollected` or clean `End`;
+/// a failed `End` or a close before either is an error, since only the End
+/// tells that the job succeeded. `label` only tags the structured log when an
+/// empty oneof is observed.
+async fn drain_listen_chunks<S, F>(
+    mut stream: S,
     label: &'static str,
     mut on_chunk: F,
 ) -> AppResult<()>
 where
+    S: tokio_stream::Stream<Item = Result<ResultOutputItem, tonic::Status>> + Unpin,
     F: FnMut(ListenChunk),
 {
     while let Some(item) = stream.next().await {
@@ -853,11 +1403,6 @@ where
                 return Ok(());
             }
             Some(Item::End(trailer)) => {
-                // Surface upstream stream-level errors the same way
-                // `DispatchStream::drain` does — see `check_stream_trailer`.
-                // Without this the chat agent loop reads a clean End even
-                // when Gemini / Anthropic / OpenAI returned a 4xx, and the
-                // UI never moves off "generating…".
                 check_stream_trailer(&trailer)?;
                 on_chunk(ListenChunk::Final { collected: None });
                 return Ok(());
@@ -867,8 +1412,7 @@ where
             }
         }
     }
-    on_chunk(ListenChunk::Final { collected: None });
-    Ok(())
+    Err(unexpected_dispatch_stream_close())
 }
 
 /// `client_tools_json` is forwarded verbatim to llama.cpp's
@@ -925,6 +1469,91 @@ fn aggregate_tool_chunks(
     }
 }
 
+pub(crate) const WORKFLOW_RESULT_MESSAGE: &str = "jobworkerp.runner.WorkflowResult";
+
+/// Keeps the last chunk of a WORKFLOW result stream. jobworkerp streams
+/// `Data(WorkflowResult)* -> End` without `FinalCollected`, so the last Data
+/// is the run's terminal result (Completed with its output, Faulted or
+/// Cancelled).
+struct WorkflowTerminal {
+    descriptor: MessageDescriptor,
+    last: Option<Vec<u8>>,
+}
+
+impl WorkflowTerminal {
+    fn for_descriptor(descriptor: Option<&MessageDescriptor>) -> Option<Self> {
+        descriptor
+            .filter(|descriptor| descriptor.full_name() == WORKFLOW_RESULT_MESSAGE)
+            .map(|descriptor| Self {
+                descriptor: descriptor.clone(),
+                last: None,
+            })
+    }
+
+    fn observe(&mut self, bytes: Vec<u8>) {
+        self.last = Some(bytes);
+    }
+
+    /// Keeps default-valued fields: the default serializer omits `status`
+    /// for Completed (enum value 0).
+    fn finish(self) -> Option<String> {
+        let bytes = self.last?;
+        Some(
+            render_message_with_defaults(&bytes, &self.descriptor)
+                .unwrap_or_else(|| render_chunk(&bytes, Some(&self.descriptor))),
+        )
+    }
+
+    /// The terminal of a stream whose End reported `error`, when the last
+    /// result is itself a faulted or cancelled run. The End's problem is
+    /// attached under [`TERMINAL_PROBLEM_KEY`]: the run's `error_message` is
+    /// a flat rendering whose title and detail cannot be split apart.
+    /// `None` when the last result does not explain the failure.
+    fn finish_unsuccessful(self, error: &StreamError) -> Option<String> {
+        let mut terminal = DynamicMessage::decode(self.descriptor, self.last?.as_slice())
+            .ok()?
+            .serialize_with_options(
+                serde_json::value::Serializer,
+                &SerializeOptions::new().skip_default_fields(false),
+            )
+            .ok()?;
+        workflow_unsuccessful_status(&terminal)?;
+        if let (Some(fields), Some(problem)) = (
+            terminal.as_object_mut(),
+            error.problem.as_ref().and_then(problem_json),
+        ) {
+            fields.insert(TERMINAL_PROBLEM_KEY.to_owned(), problem);
+        }
+        Some(terminal.to_string())
+    }
+}
+
+/// Decode `bytes` against `descriptor` to JSON keeping default-valued fields,
+/// so enum value 0 and empty strings stay distinguishable from absent fields.
+pub(crate) fn render_message_with_defaults(
+    bytes: &[u8],
+    descriptor: &MessageDescriptor,
+) -> Option<String> {
+    render_message(
+        bytes,
+        descriptor,
+        &SerializeOptions::new().skip_default_fields(false),
+    )
+}
+
+fn render_message(
+    bytes: &[u8],
+    descriptor: &MessageDescriptor,
+    options: &SerializeOptions,
+) -> Option<String> {
+    let message = DynamicMessage::decode(descriptor.clone(), bytes).ok()?;
+    let mut output = Vec::new();
+    message
+        .serialize_with_options(&mut serde_json::Serializer::new(&mut output), options)
+        .ok()?;
+    String::from_utf8(output).ok()
+}
+
 /// Decode `bytes` against `desc` to a `serde_json::Value` directly,
 /// bypassing the String → re-parse round trip that `render_chunk` uses
 /// for log-only output. Falls back to a lossy-UTF8 wrapper Value when
@@ -945,24 +1574,15 @@ fn decode_chunk_to_json(bytes: &[u8], desc: Option<&MessageDescriptor>) -> serde
 /// UTF-8 when no descriptor is available (workers without a registered
 /// `result_proto`) or when decoding fails for any reason.
 fn render_chunk(bytes: &[u8], desc: Option<&MessageDescriptor>) -> String {
-    let lossy = || String::from_utf8_lossy(bytes).into_owned();
-    let Some(d) = desc else { return lossy() };
-    let Ok(msg) = DynamicMessage::decode(d.clone(), bytes) else {
-        return lossy();
-    };
-    let mut buf = Vec::new();
-    let mut ser = serde_json::Serializer::new(&mut buf);
-    if msg.serialize(&mut ser).is_err() {
-        return lossy();
-    }
-    String::from_utf8(buf).unwrap_or_else(|_| lossy())
+    desc.and_then(|d| render_message(bytes, d, &SerializeOptions::default()))
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use jobworkerp_client::jobworkerp::data::Trailer;
+    use jobworkerp_client::jobworkerp::data::StreamErrorCode;
     use jobworkerp_client::jobworkerp::function::data::{
         FunctionSpecs, MethodSchema, MethodSchemaMap,
     };
@@ -972,7 +1592,10 @@ mod tests {
         for (k, v) in pairs {
             metadata.insert((*k).to_string(), (*v).to_string());
         }
-        Trailer { metadata }
+        Trailer {
+            metadata,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -986,6 +1609,81 @@ mod tests {
     #[test]
     fn grpc_request_timeout_rejects_values_outside_the_client_api_range() {
         assert!(grpc_request_timeout_sec(u64::from(u32::MAX) + 1).is_err());
+    }
+
+    #[test]
+    fn unique_enqueue_errors_remain_downcastable_at_the_app_boundary() {
+        let error = map_enqueue_error(
+            anyhow::Error::new(jobworkerp_client::error::UniqueEnqueueError::Duplicate(
+                "duplicate".into(),
+            )),
+            "enqueue test",
+        );
+
+        assert!(
+            matches!(error, AppError::Other(ref error) if error.downcast_ref::<jobworkerp_client::error::UniqueEnqueueError>().is_some())
+        );
+    }
+
+    #[test]
+    fn uniq_enqueue_failure_keeps_the_reason_visible() {
+        // The toast renders `AppError::to_string()`; wrapping the client
+        // error in an action context must not swallow the reason (an
+        // ALREADY_EXISTS rejection would otherwise read as the bare
+        // "enqueue stream <worker>").
+        let error = map_enqueue_error(
+            anyhow::Error::new(jobworkerp_client::error::UniqueEnqueueError::Duplicate(
+                "job with the unique key already exists: op-key".into(),
+            )),
+            "enqueue stream memories-summarize-batch",
+        );
+
+        assert!(
+            error
+                .to_string()
+                .contains("enqueue stream memories-summarize-batch")
+        );
+        assert!(error.to_string().contains("already exists: op-key"));
+    }
+
+    #[test]
+    fn only_faulted_workflow_output_invalidates_a_reused_job() {
+        assert!(workflow_failure_message(&serde_json::json!({"status": "Completed"})).is_none());
+        // Non-failure terminations must not be reported as errors (they are
+        // intentional suspensions / cancellations).
+        assert!(workflow_failure_message(&serde_json::json!({"status": "Cancelled"})).is_none());
+        assert!(workflow_failure_message(&serde_json::json!({"status": "Waiting"})).is_none());
+        assert!(workflow_failure_message(&serde_json::json!({})).is_none());
+
+        assert_eq!(
+            workflow_failure_message(
+                &serde_json::json!({"status": "Faulted", "errorMessage": "gemini 429"})
+            ),
+            Some("reused workflow reported Faulted: gemini 429".to_owned())
+        );
+        assert_eq!(
+            workflow_failure_message(
+                &serde_json::json!({"status": "Faulted", "error_message": "boom"})
+            ),
+            Some("reused workflow reported Faulted: boom".to_owned())
+        );
+        assert_eq!(
+            workflow_failure_message(&serde_json::json!({"status": "Faulted"})),
+            Some("reused workflow reported Faulted".to_owned())
+        );
+    }
+
+    #[test]
+    fn only_duplicate_enqueue_errors_are_recoverable() {
+        let duplicate = AppError::Other(anyhow::Error::new(
+            jobworkerp_client::error::UniqueEnqueueError::Duplicate("duplicate".into()),
+        ));
+        let aborted = AppError::Other(anyhow::Error::new(
+            jobworkerp_client::error::UniqueEnqueueError::Aborted("aborted".into()),
+        ));
+
+        assert!(is_duplicate_enqueue_error(&duplicate));
+        assert!(!is_duplicate_enqueue_error(&aborted));
     }
 
     #[test]
@@ -1003,30 +1701,438 @@ mod tests {
         );
     }
 
+    // jobworkerp never wrote this key; treating it as a failure would turn
+    // caller-echoed metadata into a false error.
     #[test]
-    fn check_stream_trailer_passes_empty_error_value() {
-        // The server sets the key but leaves the value empty on success
-        // paths of some runners — only a non-empty error message is a
-        // failure signal.
-        assert!(check_stream_trailer(&trailer_with_meta(&[(STREAM_ERROR_META_KEY, "")])).is_ok());
+    fn check_stream_trailer_ignores_the_unused_legacy_key() {
+        assert!(
+            check_stream_trailer(&trailer_with_meta(&[("jobworkerp.stream.error", "boom")]))
+                .is_ok()
+        );
     }
 
     #[test]
-    fn check_stream_trailer_surfaces_non_empty_error() {
-        // Regression: a Gemini 4xx (or any provider-side stream error)
-        // ships its message under STREAM_ERROR_META_KEY on a successful
-        // gRPC close. Without lifting it to Err, the chat UI sits at
-        // "generating…" because the drain returns Ok(()) and no token
-        // ever arrives.
-        let trailer = trailer_with_meta(&[(
-            STREAM_ERROR_META_KEY,
+    fn check_stream_trailer_surfaces_the_typed_error() {
+        // Regression: a provider 4xx closes the gRPC stream successfully and
+        // reports the failure only in the End trailer. Without lifting it to
+        // Err the chat UI sits at "generating…".
+        let trailer = failed_trailer(stream_error(
+            StreamErrorCode::ProviderStreamFailed,
             "Gemini API error (HTTP 400): API key not valid.",
-        )]);
-        let err = check_stream_trailer(&trailer).unwrap_err();
-        let msg = err.to_string();
+            "LLM",
+            None,
+        ));
+        let message = check_stream_trailer(&trailer).unwrap_err().to_string();
         assert!(
-            msg.contains("Gemini API error"),
-            "error message must contain the provider message: {msg}"
+            message.contains("LLM PROVIDER_STREAM_FAILED: Gemini API error (HTTP 400)"),
+            "{message}"
+        );
+    }
+
+    // Older servers, or a hop that drops the typed field, still report
+    // failures through the deprecated metadata keys.
+    #[test]
+    fn check_stream_trailer_reads_the_deprecated_metadata_keys() {
+        let json_mirror = trailer_with_meta(&[(
+            "stream_error",
+            r#"{"version":1,"code":"TIMEOUT","message":"idle","origin":"SANDBOX"}"#,
+        )]);
+        assert!(
+            check_stream_trailer(&json_mirror)
+                .unwrap_err()
+                .to_string()
+                .contains("SANDBOX TIMEOUT: idle")
+        );
+        let plugin_key = trailer_with_meta(&[("jobworkerp.plugin.run_stream_error", "crashed")]);
+        assert!(
+            check_stream_trailer(&plugin_key)
+                .unwrap_err()
+                .to_string()
+                .contains("PLUGIN EXECUTION_FAILED: crashed")
+        );
+    }
+
+    // An unknown code from a newer server is still a failure.
+    #[test]
+    fn check_stream_trailer_fails_on_unknown_codes() {
+        let trailer = failed_trailer(StreamError {
+            code: 99,
+            message: "future".to_owned(),
+            origin: "X".to_owned(),
+            problem: None,
+        });
+        assert!(check_stream_trailer(&trailer).is_err());
+    }
+
+    fn stream_error(
+        code: StreamErrorCode,
+        message: &str,
+        origin: &str,
+        problem: Option<ProblemDetails>,
+    ) -> StreamError {
+        StreamError {
+            code: code as i32,
+            message: message.to_owned(),
+            origin: origin.to_owned(),
+            problem,
+        }
+    }
+
+    fn problem(title: Option<&str>, detail: Option<&str>) -> ProblemDetails {
+        ProblemDetails {
+            r#type: "https://open-workflow-specification.org/spec/1.0.0/errors/runtime".to_owned(),
+            status: 500,
+            title: title.map(str::to_owned),
+            detail: detail.map(str::to_owned),
+            instance: Some("/ROOT/do/2/summarizeEach".to_owned()),
+        }
+    }
+
+    #[test]
+    fn problem_reason_joins_the_title_and_detail() {
+        assert_eq!(
+            problem_reason(&problem(Some("t"), Some("d"))).as_deref(),
+            Some("t: d")
+        );
+        assert_eq!(
+            problem_reason(&problem(Some("t"), None)).as_deref(),
+            Some("t")
+        );
+        assert_eq!(
+            problem_reason(&problem(None, Some("d"))).as_deref(),
+            Some("d")
+        );
+        assert_eq!(problem_reason(&problem(None, None)), None);
+        assert_eq!(problem_reason(&problem(Some(""), Some(""))), None);
+    }
+
+    // A problem without a type identifies nothing (the contract's rule).
+    #[test]
+    fn problem_reason_ignores_an_untyped_problem() {
+        let untyped = ProblemDetails {
+            r#type: String::new(),
+            ..problem(Some("t"), Some("d"))
+        };
+        assert_eq!(problem_reason(&untyped), None);
+    }
+
+    #[test]
+    fn describe_stream_failure_prefers_the_problem_over_the_message() {
+        let error = stream_error(
+            StreamErrorCode::ExecutionFailed,
+            "Failed to execute workflow: Error: Failed to execute by jobworkerp runner 'X' not found /ROOT/do/0",
+            "WORKFLOW",
+            Some(problem(
+                Some("Failed to execute by jobworkerp"),
+                Some("runner 'X' not found"),
+            )),
+        );
+        assert_eq!(
+            describe_stream_failure(&error),
+            "WORKFLOW EXECUTION_FAILED: Failed to execute by jobworkerp: runner 'X' not found"
+        );
+    }
+
+    #[test]
+    fn describe_stream_failure_falls_back_to_the_message() {
+        let error = stream_error(
+            StreamErrorCode::ProviderStreamFailed,
+            "invalid api key",
+            "LLM",
+            None,
+        );
+        assert_eq!(
+            describe_stream_failure(&error),
+            "LLM PROVIDER_STREAM_FAILED: invalid api key"
+        );
+    }
+
+    fn item_stream(
+        items: Vec<Item>,
+    ) -> impl tokio_stream::Stream<Item = Result<ResultOutputItem, tonic::Status>> + Unpin {
+        futures::stream::iter(
+            items
+                .into_iter()
+                .map(|item| Ok(ResultOutputItem { item: Some(item) })),
+        )
+    }
+
+    fn failed_trailer(error: StreamError) -> Trailer {
+        Trailer {
+            error: Some(error),
+            ..Default::default()
+        }
+    }
+
+    fn failed_end(error: StreamError) -> Item {
+        Item::End(failed_trailer(error))
+    }
+
+    fn workflow_data(status: i32, error_message: Option<&str>) -> Item {
+        Item::Data(encode_workflow_result(
+            &workflow_result_descriptor(),
+            status,
+            "",
+            "/ROOT/do/2/summarizeEach/run/function",
+            error_message,
+        ))
+    }
+
+    async fn drain_workflow_items(items: Vec<Item>) -> (AppResult<()>, Vec<ProgressEvent>) {
+        let descriptor = workflow_result_descriptor();
+        let mut events = Vec::new();
+        let result = drain_dispatch_items(item_stream(items), Some(&descriptor), |event| {
+            events.push(event)
+        })
+        .await;
+        (result, events)
+    }
+
+    fn workflow_failure_end(problem: Option<ProblemDetails>) -> Item {
+        failed_end(stream_error(
+            StreamErrorCode::ExecutionFailed,
+            "Failed to execute workflow: Error: t d /ROOT",
+            "WORKFLOW",
+            problem,
+        ))
+    }
+
+    fn final_text(events: &[ProgressEvent]) -> serde_json::Value {
+        match events.last() {
+            Some(ProgressEvent::End {
+                final_text: Some(text),
+            }) => serde_json::from_str(text).unwrap(),
+            other => panic!("expected End with final_text, got {other:?}"),
+        }
+    }
+
+    // The faulted WorkflowResult names the failed task, so callers report the
+    // failure from it; the End's problem rides along as the structured reason.
+    #[tokio::test]
+    async fn dispatch_drain_hands_over_a_faulted_workflow_with_the_end_problem() {
+        let (result, events) = drain_workflow_items(vec![
+            workflow_data(4, None),
+            workflow_data(1, Some("Failed to execute workflow: Error: t d /ROOT")),
+            workflow_failure_end(Some(problem(Some("Task timed out"), Some("no output")))),
+        ])
+        .await;
+        result.unwrap();
+        let terminal = final_text(&events);
+        assert_eq!(terminal["status"], "Faulted");
+        assert_eq!(terminal["problem"]["title"], "Task timed out");
+        assert_eq!(terminal["problem"]["detail"], "no output");
+        assert_eq!(terminal["problem"]["status"], 500);
+        assert_eq!(
+            workflow_problem_reason(&terminal).as_deref(),
+            Some("Task timed out: no output")
+        );
+    }
+
+    // Older servers send no problem; the terminal is handed over unchanged.
+    #[tokio::test]
+    async fn dispatch_drain_hands_over_a_faulted_workflow_without_a_problem() {
+        let (result, events) = drain_workflow_items(vec![
+            workflow_data(1, Some("boom")),
+            workflow_failure_end(None),
+        ])
+        .await;
+        result.unwrap();
+        let terminal = final_text(&events);
+        assert_eq!(terminal["status"], "Faulted");
+        assert!(terminal.get("problem").is_none());
+        assert_eq!(workflow_problem_reason(&terminal), None);
+    }
+
+    #[tokio::test]
+    async fn dispatch_drain_hands_over_a_cancelled_workflow() {
+        let (result, events) = drain_workflow_items(vec![
+            workflow_data(2, None),
+            failed_end(stream_error(
+                StreamErrorCode::Cancelled,
+                "cancelled",
+                "WORKER",
+                None,
+            )),
+        ])
+        .await;
+        result.unwrap();
+        assert_eq!(final_text(&events)["status"], "Cancelled");
+    }
+
+    // Nothing explains the failure (still Running, or the stream failed
+    // before any result): the End's error is the only diagnostic.
+    #[tokio::test]
+    async fn dispatch_drain_fails_when_no_failed_workflow_result_preceded_the_end() {
+        for items in [
+            vec![workflow_data(4, None), workflow_failure_end(None)],
+            vec![workflow_failure_end(Some(problem(
+                Some("Invalid input"),
+                None,
+            )))],
+        ] {
+            let (result, events) = drain_workflow_items(items).await;
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("WORKFLOW EXECUTION_FAILED")
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProgressEvent::End { .. }))
+            );
+        }
+    }
+
+    // A close before End is not a success, even after a completed result:
+    // the subscription may have expired before the failure arrived.
+    #[tokio::test]
+    async fn dispatch_drain_fails_when_the_stream_closes_before_end() {
+        for items in [vec![workflow_data(0, None)], Vec::new()] {
+            let (result, events) = drain_workflow_items(items).await;
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("closed without a terminal result")
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProgressEvent::End { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_drain_keeps_a_completed_workflow() {
+        let (result, events) =
+            drain_workflow_items(vec![workflow_data(0, None), Item::End(Trailer::default())]).await;
+        result.unwrap();
+        let terminal = final_text(&events);
+        assert_eq!(terminal["status"], "Completed");
+        assert!(terminal.get("problem").is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_drain_fails_other_results_on_a_failed_end() {
+        let descriptor = test_message_descriptor();
+        let result = drain_dispatch_items(
+            item_stream(vec![
+                Item::Data(Vec::new()),
+                failed_end(stream_error(
+                    StreamErrorCode::ProviderStreamFailed,
+                    "interrupted",
+                    "LLM",
+                    None,
+                )),
+            ]),
+            Some(&descriptor),
+            |_| {},
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    async fn drain_listen_items(
+        stream: impl tokio_stream::Stream<Item = Result<ResultOutputItem, tonic::Status>> + Unpin,
+    ) -> (AppResult<()>, Vec<String>) {
+        let mut chunks = Vec::new();
+        let result = drain_listen_chunks(stream, "test", |chunk| {
+            chunks.push(match chunk {
+                ListenChunk::Data(_) => "data".to_owned(),
+                ListenChunk::Final { collected: None } => "final".to_owned(),
+                ListenChunk::Final { collected: Some(_) } => "collected".to_owned(),
+            })
+        })
+        .await;
+        (result, chunks)
+    }
+
+    #[tokio::test]
+    async fn listen_drain_ends_once_on_a_clean_end_or_final_collected() {
+        let (result, chunks) = drain_listen_items(item_stream(vec![
+            Item::Data(vec![1]),
+            Item::End(Trailer::default()),
+        ]))
+        .await;
+        result.unwrap();
+        assert_eq!(chunks, ["data", "final"]);
+        let (result, chunks) = drain_listen_items(item_stream(vec![
+            Item::Data(vec![1]),
+            Item::FinalCollected(vec![2]),
+        ]))
+        .await;
+        result.unwrap();
+        assert_eq!(chunks, ["data", "collected"]);
+    }
+
+    #[tokio::test]
+    async fn listen_drain_fails_on_a_failed_end_without_a_final_chunk() {
+        let (result, chunks) = drain_listen_items(item_stream(vec![
+            Item::Data(vec![1]),
+            failed_end(stream_error(
+                StreamErrorCode::ProviderStreamFailed,
+                "invalid api key",
+                "LLM",
+                None,
+            )),
+        ]))
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("LLM PROVIDER_STREAM_FAILED: invalid api key")
+        );
+        assert_eq!(chunks, ["data"]);
+    }
+
+    // A close before End is not a success (the stream error contract).
+    #[tokio::test]
+    async fn listen_drain_fails_when_the_stream_closes_before_end() {
+        for items in [vec![Item::Data(vec![1])], Vec::new()] {
+            let (result, chunks) = drain_listen_items(item_stream(items)).await;
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("closed without a terminal result")
+            );
+            assert!(!chunks.iter().any(|chunk| chunk == "final"));
+        }
+    }
+
+    #[tokio::test]
+    async fn listen_drain_surfaces_a_transport_error() {
+        let (result, _) = drain_listen_items(futures::stream::iter(vec![Err(
+            tonic::Status::unavailable("gone"),
+        )]))
+        .await;
+        assert!(matches!(result, Err(AppError::Grpc(_))));
+    }
+
+    #[tokio::test]
+    async fn confirmed_drain_fails_on_a_failed_end() {
+        let result = drain_confirmed_items(
+            item_stream(vec![
+                Item::Data(vec![1]),
+                failed_end(stream_error(
+                    StreamErrorCode::ExecutionFailed,
+                    "exit 1",
+                    "COMMAND",
+                    None,
+                )),
+            ]),
+            |_| {},
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("COMMAND EXECUTION_FAILED")
         );
     }
 
@@ -1109,6 +2215,94 @@ mod tests {
             tool["function"]["parameters"]["properties"]["url"]["type"],
             "string"
         );
+    }
+
+    fn workflow_result_descriptor() -> MessageDescriptor {
+        command_utils::protobuf::ProtobufDescriptor::new(
+            &include_str!("../../tests/fixtures/jobworkerp-proto/workflow_result.proto")
+                .to_string(),
+        )
+        .unwrap()
+        .get_message_by_name(WORKFLOW_RESULT_MESSAGE)
+        .unwrap()
+    }
+
+    fn encode_workflow_result(
+        descriptor: &MessageDescriptor,
+        status: i32,
+        output: &str,
+        position: &str,
+        error_message: Option<&str>,
+    ) -> Vec<u8> {
+        use prost::Message;
+        use prost_reflect::Value;
+        let mut message = DynamicMessage::new(descriptor.clone());
+        message.set_field_by_name("id", Value::String("run-1".into()));
+        message.set_field_by_name("output", Value::String(output.into()));
+        message.set_field_by_name("position", Value::String(position.into()));
+        message.set_field_by_name("status", Value::EnumNumber(status));
+        if let Some(error) = error_message {
+            message.set_field_by_name("error_message", Value::String(error.into()));
+        }
+        message.encode_to_vec()
+    }
+
+    const TIMEOUT_POSITION: &str = "/ROOT/do/3/threadGroupStage/do/0/runThreadGroupBatch/try/do/0/invokeThreadGroupBatch/run/function";
+    const TIMEOUT_ERROR: &str = "Failed to execute workflow: Error { detail: None, instance: Some(\"/ROOT\"), status: 408, title: Some(\"Task 'runThreadGroupBatch' timed out after 3600s\"), type_: UriTemplate(\"http-error://requesttimeout\") }";
+
+    #[test]
+    fn workflow_terminal_keeps_the_last_result_with_its_completed_status() {
+        let descriptor = workflow_result_descriptor();
+        let mut terminal = WorkflowTerminal::for_descriptor(Some(&descriptor)).unwrap();
+        terminal.observe(encode_workflow_result(
+            &descriptor,
+            4,
+            "{}",
+            "/ROOT/do/0",
+            None,
+        ));
+        terminal.observe(encode_workflow_result(
+            &descriptor,
+            0,
+            r#"{"completed":true}"#,
+            "",
+            None,
+        ));
+        let terminal: serde_json::Value =
+            serde_json::from_str(&terminal.finish().unwrap()).unwrap();
+        assert_eq!(terminal["status"], "Completed");
+        assert_eq!(terminal["output"], r#"{"completed":true}"#);
+    }
+
+    #[test]
+    fn workflow_terminal_is_absent_without_data_or_for_other_results() {
+        let descriptor = workflow_result_descriptor();
+        assert_eq!(
+            WorkflowTerminal::for_descriptor(Some(&descriptor))
+                .unwrap()
+                .finish(),
+            None
+        );
+        assert!(WorkflowTerminal::for_descriptor(Some(&test_message_descriptor())).is_none());
+        assert!(WorkflowTerminal::for_descriptor(None).is_none());
+    }
+
+    #[test]
+    fn faulted_terminal_keeps_its_failure_details() {
+        let descriptor = workflow_result_descriptor();
+        let mut terminal = WorkflowTerminal::for_descriptor(Some(&descriptor)).unwrap();
+        terminal.observe(encode_workflow_result(
+            &descriptor,
+            1,
+            "",
+            TIMEOUT_POSITION,
+            Some(TIMEOUT_ERROR),
+        ));
+        let terminal: serde_json::Value =
+            serde_json::from_str(&terminal.finish().unwrap()).unwrap();
+        assert_eq!(workflow_failure_status(&terminal), Some("Faulted"));
+        assert_eq!(terminal["position"], TIMEOUT_POSITION);
+        assert_eq!(workflow_error_reason(&terminal), Some(TIMEOUT_ERROR));
     }
 
     #[test]

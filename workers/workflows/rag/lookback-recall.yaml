@@ -5,8 +5,8 @@ document:
   version: "1.0.0"
   summary: >
     Search the user's past memories. A single call returns matches from
-    both the summary layer (overviews of single conversations and of each
-    day, week, and month) and the raw-message layer (the original
+    both the summary layer (thread-group overviews and each day, week, and
+    month) and the raw-message layer (the original
     messages), and each result is tagged with its kind so you can tell a
     high-level overview from a specific detail. Use the summary results to
     locate the right conversation or period, and the raw-message results
@@ -29,10 +29,10 @@ input:
           type: integer
           default: 5
           description: >-
-            Maximum number of results to return from each layer (the summary
-            layer and the raw-message layer). The two layers are searched
-            independently, so a single call returns up to twice this number
-            of results. Increase it when you need broader coverage.
+            Maximum number of results to return from each layer. Thread-group,
+            v2-period, legacy-period, and raw-message layers are searched
+            independently, so a single call can return up to four times this
+            number of results. Increase it when you need broader coverage.
         summary_labels:
           type: array
           items: { type: string }
@@ -40,11 +40,19 @@ input:
             Optional filter that restricts the summary layer to summaries of
             a specific kind or time period. Use it when the question targets
             a particular kind or period rather than a general topic.
-            Available labels: "daily_summary" / "weekly_summary" /
-            "monthly_summary" / "summary" (a single conversation), plus
-            period tags "date:YYYY-MM-DD" (a specific day),
-            "iso_week:YYYY-Www" (an ISO week), and "month:YYYY-MM"
-            (a month). Omit to search across all summary kinds.
+            Labels are exact stored labels. Available kind labels are
+             "thread_group_summary",
+             "daily_summary",
+            "weekly_summary", and "monthly_summary". Period labels are
+            "date:YYYY-MM-DD", "iso_week:YYYY-Www", and "month:YYYY-MM".
+            V2 period summaries also accept "summary_scope:overall" and
+            "summary_scope:path". A path summary accepts its complete stored
+            "path:<value>" label (never the abbreviated UI name), or the
+            reserved "summary_path:unassigned" / "summary_path:ambiguous".
+            Examples: a daily overall uses ["daily_summary",
+            "date:2026-09-03","summary_scope:overall"]; a monthly path
+            uses ["monthly_summary","month:2026-09","summary_scope:path",
+            "path:/workspace/example"]. Omit to use the configured default.
         summary_label_match:
           type: string
           enum: ["ANY", "ALL"]
@@ -55,8 +63,18 @@ input:
             period at once, e.g. the daily summary for a specific day:
             summary_labels=["daily_summary","date:2026-05-29"],
             summary_label_match="ALL". "ANY" matches a summary that carries
-            at least one of the labels, for broader lookups. Ignored when
-            `summary_labels` is omitted.
+            at least one of the labels, for broader lookups. Use ALL when
+            combining kind, period, scope, and path axes. A flat ANY cannot
+            express "one of several kinds AND one path"; make one call per
+            kind in that case. Ignored when `summary_labels` is omitted.
+        # MCP uses this default when the caller does not provide a scope
+        # label. The in-app chat path always injects overall_only, so this
+        # MCP setting never broadens chat recall.
+        mcp_default_period_scope:
+          type: string
+          enum: ["overall_only", "overall_and_path"]
+          default: "%{LOOKBACK_MCP_RAG_DEFAULT_PERIOD_SCOPE:-overall_only}"
+          x-hidden: true
         # The memories gRPC endpoint HybridSearch dials. Two callers, two
         # ways the value arrives:
         #   1. Chat (Tauri-mediated): the `chat_ask` command rewrites the
@@ -109,16 +127,16 @@ do:
   # multimodal embedding worker that memory rows were embedded with so
   # cosine similarity is in-space.
   #
-  # The embedding runner is registered on jobworkerp as the
-  # `memories-mm-embedding` worker (overridable via env to match the
-  # auto-embedding workflow's resolution). Calling it through
-  # `worker.name` keeps the call on jobworkerp — the memories gRPC
-  # frontend does NOT expose `/jobworkerp.runner.MultimodalEmbeddingRunner`,
-  # so a GRPC-runner call to the memories port would 404 every time.
+  # Resolve the mm-embedding worker in the same space as memories' stored
+  # vectors. Calling it through `worker.name` keeps the call on jobworkerp —
+  # the memories gRPC frontend does NOT expose
+  # `/jobworkerp.runner.MultimodalEmbeddingRunner`.
   - embedQuery:
       run:
         worker:
-          name: "%{LOOKBACK_EMBED_WORKER:-memories-mm-embedding}"
+          # The app resolves this from Memories' GetEmbeddingSpace response
+          # after Memories starts; do not fall back to a legacy worker name.
+          name: "%{LOOKBACK_MM_EMBEDDING_WORKER}"
           using: embed_text
           arguments:
             text: "${ $workflow.input.query }"
@@ -132,19 +150,10 @@ do:
           # caller (chat) sees a real error rather than a silent zero-hit.
           query_vector: "${ (.embeddings // [{}])[0].values // [] }"
 
-  # Step 2: Summary layer. The real owner is user 1; memory_kind separates
-  # the summary threads. `external_id_prefix` does not exist on
-  # MemorySearchFilter, so label matching is the only server-side
-  # narrowing path. When the caller supplies `summary_labels` we honour
-  # it (with `summary_label_match`, default ALL so a kind+period pair like
-  # ["daily_summary","date:2026-05-29"] pins exactly that summary). Without
-  # explicit labels, memory_kinds already selects all summary layers; avoid a
-  # redundant thread_filter because it expands every matching thread into
-  # memory IDs before the bounded FTS candidate search.
-  # `label_match_mode` is the proto enum NAME (LABEL_ANY / LABEL_ALL),
-  # mapped from the user-facing ANY/ALL here so the LLM never sees the
-  # proto prefix.
-  - searchSummaries:
+  # Step 2: Search thread-group summaries separately from period summaries.
+  # Period scope labels do not exist on group rows; keeping the queries
+  # separate avoids the broken flat condition `(group OR daily) AND scope`.
+  - searchThreadGroupSummaries:
       run:
         function:
           runnerName: GRPC
@@ -159,13 +168,8 @@ do:
             json_body: >-
               ${ ($workflow.input.summary_labels // []) as $req_labels
                | (($req_labels | length) > 0) as $has
-               | (if $has then $req_labels
-                  else ["summary", "daily_summary",
-                        "weekly_summary", "monthly_summary"]
-                  end) as $labels
-               | (if $has and ($workflow.input.summary_label_match // "ALL") == "ALL"
-                  then "LABEL_ALL" else "LABEL_ANY"
-                  end) as $match
+               | (if $has and ($workflow.input.summary_label_match // "ALL") == "ANY"
+                  then "LABEL_ANY" else "LABEL_ALL" end) as $match
                | {
                   query_vectors: [ { values: $query_vector } ],
                   query_text: $workflow.input.query,
@@ -174,9 +178,64 @@ do:
                     filter: (
                       {
                         user_id: "1",
-                        memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY", "MEMORY_KIND_DAILY_SUMMARY", "MEMORY_KIND_WEEKLY_SUMMARY", "MEMORY_KIND_MONTHLY_SUMMARY"]
+                        memory_kinds: ["MEMORY_KIND_DERIVED_SUMMARY"],
+                        externalIdPrefix: "thread-group-summary:"
                       }
                       + (if $has then {
+                           thread_filter: {
+                             user_id: "1",
+                             labels: $req_labels,
+                             label_match_mode: $match
+                           }
+                         } else {} end)
+                    )
+                  }
+                } | tojson }
+            as_json: true
+      export:
+        as:
+          thread_group_summary_hits: ${ (.jsonBody // "[]") | fromjson }
+
+  - searchPeriodSummaries:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryVectorService/HybridSearch"
+            json_body: >-
+              ${ ($workflow.input.summary_labels // []) as $req_labels
+               | (($req_labels | length) > 0) as $has
+               | ($req_labels
+                  | any(. == "summary_scope:overall" or . == "summary_scope:path")) as $has_scope
+               | (if $has
+                  then (if $has_scope
+                           or ($workflow.input.summary_label_match // "ALL") == "ANY"
+                           or $workflow.input.mcp_default_period_scope == "overall_and_path"
+                        then $req_labels
+                        else $req_labels + ["summary_scope:overall"] end)
+                  elif $workflow.input.mcp_default_period_scope == "overall_only"
+                  then ["summary_scope:overall"]
+                  else [] end) as $labels
+               | (($labels | length) > 0) as $has_labels
+               | (if $has and ($workflow.input.summary_label_match // "ALL") == "ANY"
+                  then "LABEL_ANY" else "LABEL_ALL" end) as $match
+               | {
+                  query_vectors: [ { values: $query_vector } ],
+                  query_text: $workflow.input.query,
+                  options: {
+                    limit: ($workflow.input.limit_per_layer // 5),
+                    filter: (
+                      {
+                        user_id: "1",
+                        memory_kinds: ["MEMORY_KIND_DAILY_SUMMARY", "MEMORY_KIND_WEEKLY_SUMMARY", "MEMORY_KIND_MONTHLY_SUMMARY"]
+                      }
+                      + (if $has_labels then {
                            thread_filter: {
                              user_id: "1",
                              labels: $labels,
@@ -189,7 +248,70 @@ do:
             as_json: true
       export:
         as:
-          summary_hits: ${ (.jsonBody // "[]") | fromjson }
+          period_summary_hits: ${ (.jsonBody // "[]") | fromjson }
+
+  # `summary_scope:*` did not exist before the path-scoped rollup model.
+  # HybridSearch has no "label is absent" predicate, so query the historical
+  # period rows separately and discard known v2 external-ID shapes locally.
+  # This preserves old daily/weekly/monthly recall without letting a v2 path
+  # rollup leak through the default `overall_only` query above.
+  - searchLegacyPeriodSummaries:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryVectorService/HybridSearch"
+            json_body: >-
+              ${ ($workflow.input.summary_labels // []) as $req_labels
+               | (($req_labels | length) > 0) as $has
+               | (if $has and ($workflow.input.summary_label_match // "ALL") == "ANY"
+                  then "LABEL_ANY" else "LABEL_ALL" end) as $match
+               | {
+                  query_vectors: [ { values: $query_vector } ],
+                  query_text: $workflow.input.query,
+                  options: {
+                    limit: ($workflow.input.limit_per_layer // 5),
+                    filter: (
+                      {
+                        user_id: "1",
+                        memory_kinds: ["MEMORY_KIND_DAILY_SUMMARY", "MEMORY_KIND_WEEKLY_SUMMARY", "MEMORY_KIND_MONTHLY_SUMMARY"]
+                      }
+                      + (if $has then {
+                           thread_filter: {
+                             user_id: "1",
+                             labels: $req_labels,
+                             label_match_mode: $match
+                           }
+                         } else {} end)
+                    )
+                  }
+                } | tojson }
+            as_json: true
+      export:
+        as:
+          legacy_period_summary_hits: >-
+            ${ (.jsonBody // "[]") | fromjson
+               | map(select((.memory.data.externalId // "")
+                            | (startswith("daily:v2:")
+                               or startswith("weekly:v2:")
+                               or startswith("monthly:v2:"))
+                             | not)) }
+
+  - combineSummaryHits:
+      set:
+        # A broad v2 period query also includes legacy rows. Keep the first
+        # (higher-priority) occurrence of each Memory ID so the compatibility
+        # query below cannot duplicate citations or consume result slots.
+        summary_hits: >-
+          ${ reduce ($thread_group_summary_hits + $period_summary_hits + $legacy_period_summary_hits)[] as $hit
+            ([]; if any(.[]; .memory.id.value == $hit.memory.id.value)
+                 then . else . + [$hit] end) }
 
   # Step 3: Raw-message layer. owner=user_id=1 (the human user; Lookback
   # currently runs as a single local user). Do not add a thread_filter here:
@@ -225,40 +347,47 @@ do:
         as:
           raw_hits: ${ (.jsonBody // "[]") | fromjson }
 
-  # Step 4: Project both layers into the compact { source_kind,
-  # memory_id, source_thread_id, period_key, scope_key, snippet, score }
+  # Step 4: Project all layers into the compact { source_kind,
+   # memory_id, source_thread_id, group_id, period_key, scope_key, snippet, score }
   # shape the chat command surfaces in `chat://step` Source events
   # source_kind is derived from `externalId` — the
-  # summaries pipeline (thread-summary-single / daily / weekly /
-  # monthly) always sets it on the memory it writes. Field names use
+  # summaries pipeline (thread-group / daily / weekly / monthly)
+  # always sets it on the memory it writes. Field names use
   # protobuf JSON's lowerCamelCase because the GRPC runner emits the
   # response via `prost`'s JSON serializer (matches `data.updatedAt`
   # access in thread-summary-single.yaml).
   - projectHits:
       set:
         sources: >-
-          ${ ([ $summary_hits[]
-                | . as $h
-                | ($h.memory.data.externalId // "") as $ext
-                | {
-                    source_kind: (
-                      if   ($ext | startswith("summary:")) then "thread_summary"
-                      elif ($ext | startswith("daily:"))   then "period_summary"
+           ${ ([ $summary_hits[]
+                 | . as $h
+                 | ($h.memory.data.externalId // "") as $ext
+                 | {
+                     source_kind: (
+                       if   ($ext | startswith("thread-group-summary:")) then "thread_group_summary"
+                       elif ($ext | startswith("daily:"))   then "period_summary"
                       elif ($ext | startswith("weekly:"))  then "period_summary"
                       elif ($ext | startswith("monthly:")) then "period_summary"
-                      else "thread_summary"
+                       else null
                       end
                     ),
-                    memory_id: $h.memory.id.value,
+                     memory_id: $h.memory.id.value,
+                     group_id: (
+                       if ($ext | startswith("thread-group-summary:"))
+                       then ($ext | sub("^thread-group-summary:"; ""))
+                       else null
+                       end
+                     ),
                     source_thread_id: (
-                      if ($ext | startswith("summary:"))
-                      then ($ext | sub("^summary:"; ""))
-                      else null
-                      end
+                       null
                     ),
                     period_key: (
-                      ($ext | capture("^(?<k>daily|weekly|monthly):1:(?<p>[^:]+):")
-                            | .p) // null
+                      if ($ext | test("^(daily|weekly|monthly):v2:"))
+                      then ($ext | capture("^(?<k>daily|weekly|monthly):v2:[^:]+:(?<p>[^:]+):") | .p)
+                      elif ($ext | test("^(daily|weekly|monthly):1:"))
+                      then ($ext | capture("^(?<k>daily|weekly|monthly):1:(?<p>[^:]+):") | .p)
+                      else null
+                      end
                     ),
                     scope_key: (
                       ($ext | capture(":(?<s>[^:]+)$") | .s) // null
@@ -266,7 +395,7 @@ do:
                     snippet: ($h.memory.data.content // "" | .[0:300]),
                     score: $h.score
                   }
-              ]
+               ] | map(select(.source_kind != null))
               + [ $raw_hits[]
                   | {
                       source_kind: "raw_memory",

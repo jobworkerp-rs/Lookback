@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getSidecarStatus } from "@/api";
 import type {
   ConnectionMode,
+  IssueTrackerAvailabilitySnapshot,
   SidecarEndpoints,
   SidecarErrorPayload,
   SidecarStartReport,
@@ -17,8 +18,10 @@ export interface SidecarStatus {
   phase: SidecarPhase;
   endpoints?: SidecarEndpoints;
   warnings: SidecarWarning[];
-  /** True only while a local memories database migration gate is running. */
+  /** True only while the memories migration tool is changing the local database. */
   databaseMigrationInProgress?: boolean;
+  /** Live primary/Gateway/mutation availability of the local Issue tracker. */
+  issueTrackerAvailability?: IssueTrackerAvailabilitySnapshot;
   /**
    * Failure payload from the most recent `sidecar://error` event.
    * Present iff `phase === "error"`. The BootError component branches
@@ -51,12 +54,9 @@ export function errorStatusFrom(payload: SidecarErrorPayload): SidecarStatus {
 /**
  * Fold a mount-time `get_sidecar_status` snapshot into the current status.
  *
- * The snapshot is consulted only while still in the `starting` phase —
- * if either lifecycle event already arrived we keep that, since the
- * event is the live source of truth. The snapshot's purpose is to
- * close the race window where Rust emitted the event *before* the
- * React listener attached, i.e. when memories crashed at init faster
- * than the boot screen could mount its hooks.
+ * The snapshot closes the race window where Rust emitted a lifecycle event
+ * before the React listener attached. Once ready, it also supplies the live
+ * health snapshot used for long-running sidecars such as Issue Tracker.
  *
  * Snapshot.failure takes precedence over snapshot.ready: a sidecar that
  * later failed must surface BootError even if a prior successful start
@@ -66,13 +66,35 @@ export function applySnapshot(
   prev: SidecarStatus,
   snapshot: SidecarStatusSnapshot | null,
 ): SidecarStatus {
-  if (prev.phase !== "starting" || snapshot == null) return prev;
+  if (prev.phase === "error" || snapshot == null) return prev;
   if (snapshot.failure) return errorStatusFrom(snapshot.failure);
-  if (snapshot.ready) return readyStatusFrom(snapshot.ready);
-  if (Boolean(prev.databaseMigrationInProgress) === snapshot.database_migration_in_progress) {
+  if (snapshot.ready) {
+    const ready = readyStatusFrom(snapshot.ready);
+    const next = snapshot.issue_tracker_availability
+      ? { ...ready, issueTrackerAvailability: snapshot.issue_tracker_availability }
+      : ready;
+    // Polled every second: reuse `prev` when nothing changed so the app does
+    // not re-render on every tick.
+    return sameStatus(prev, next) ? prev : next;
+  }
+  const availability = snapshot.issue_tracker_availability ?? prev.issueTrackerAvailability;
+  if (
+    Boolean(prev.databaseMigrationInProgress) === snapshot.database_migration_in_progress &&
+    availability === prev.issueTrackerAvailability
+  ) {
     return prev;
   }
-  return { ...prev, databaseMigrationInProgress: snapshot.database_migration_in_progress };
+  return {
+    ...prev,
+    databaseMigrationInProgress: snapshot.database_migration_in_progress,
+    ...(availability ? { issueTrackerAvailability: availability } : {}),
+  };
+}
+
+// Statuses are plain JSON data built in a fixed key order, so a serialized
+// comparison is an exact structural equality check.
+function sameStatus(a: SidecarStatus, b: SidecarStatus): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 /**
@@ -80,32 +102,43 @@ export function applySnapshot(
  * `sidecar://ready` carries a `SidecarStartReport` (endpoints + non-fatal
  * warnings); `sidecar://error` fires only on hard startup failure.
  *
- * On mount we also fetch `get_sidecar_status` once: a hook mounted after
- * the one-shot `sidecar://ready` event already fired would otherwise stay
- * stuck in `starting`. The snapshot only fills the gap (see `applySnapshot`).
+ * On mount we fetch `get_sidecar_status` to close the lifecycle-event race.
+ * We keep polling after readiness so runtime sidecar failures and recoveries
+ * are reflected without restarting the React application.
  */
 export function useSidecarStatus(): SidecarStatus {
   const [status, setStatus] = useState<SidecarStatus>({ phase: "starting", warnings: [] });
+  const phaseRef = useRef<SidecarPhase>("starting");
 
   useTauriEvent<SidecarStartReport>("sidecar://ready", (payload) => {
-    setStatus(readyStatusFrom(payload));
+    const next = readyStatusFrom(payload);
+    phaseRef.current = next.phase;
+    setStatus(next);
   });
   useTauriEvent<SidecarErrorPayload>("sidecar://error", (payload) => {
-    setStatus(errorStatusFrom(payload));
+    const next = errorStatusFrom(payload);
+    phaseRef.current = next.phase;
+    setStatus(next);
   });
 
   useEffect(() => {
-    if (status.phase !== "starting") return;
-
     let cancelled = false;
     let poll: number | undefined;
     const scheduleNext = () => {
-      if (!cancelled) poll = window.setTimeout(refresh, 500);
+      if (!cancelled && phaseRef.current !== "error") {
+        poll = window.setTimeout(refresh, phaseRef.current === "starting" ? 500 : 1_000);
+      }
     };
     const refresh = () => {
       getSidecarStatus()
         .then((snapshot) => {
-          if (!cancelled) setStatus((prev) => applySnapshot(prev, snapshot));
+          if (!cancelled) {
+            setStatus((prev) => {
+              const next = applySnapshot(prev, snapshot);
+              phaseRef.current = next.phase;
+              return next;
+            });
+          }
         })
         .catch((err) => {
           console.error("get_sidecar_status failed", err);
@@ -119,7 +152,7 @@ export function useSidecarStatus(): SidecarStatus {
       cancelled = true;
       if (poll !== undefined) window.clearTimeout(poll);
     };
-  }, [status.phase]);
+  }, []);
 
   return status;
 }
@@ -130,7 +163,11 @@ export function useSidecarStatus(): SidecarStatus {
 /// `Sidecars::llm_blocking_error` (sidecar/lifecycle.rs) — both layers must
 /// agree on which warnings mean "LLM init failed".
 export function hasLlmInitFailure(status: SidecarStatus): boolean {
-  const blocking: SidecarWarningKind[] = ["worker_apply_failed", "plugins_stage_failed"];
+  const blocking: SidecarWarningKind[] = [
+    "worker_apply_failed",
+    "plugins_stage_failed",
+    "remote_jobworkerp_unavailable",
+  ];
   return status.warnings.some((w) => blocking.includes(w.kind));
 }
 
@@ -146,14 +183,15 @@ export interface VectorDegradedInfo {
  * mirroring Rust's `DegradedInfo`); otherwise `null`. A present-but-unparsable
  * detail still returns `{}` — degraded is true, we just can't show the dims.
  * Mirror of `hasLlmInitFailure`: pages read this to disable embedding-dependent
- * search modes and App renders the degraded banner off it.
+ * search modes and App renders the degraded banner off it. Only a local
+ * memories reports this warning.
  */
 export function isVectorDegraded(
   status: SidecarStatus,
-  connectionMode: ConnectionMode | null = "local",
+  memoriesMode: ConnectionMode | null = "local",
 ): VectorDegradedInfo | null {
-  if (connectionMode == null) return null;
-  if (connectionMode === "remote") return null;
+  if (memoriesMode == null) return null;
+  if (memoriesMode === "remote") return null;
   const warning = status.warnings.find((w) => w.kind === "vector_store_degraded");
   if (!warning) return null;
   if (!warning.detail) return {};

@@ -309,6 +309,15 @@ do:
              else $indexed_turns
              end }
 
+  # The thread's createdAt is a server audit time (an import time for
+  # imported conversations); the LLM needs when the conversation started.
+  - resolveConversationStart:
+      set:
+        conversation_started_at: >-
+          ${ if (($thread.data.firstMessageAt // "") | tostring) == "" then "unknown"
+             else ($thread.data.firstMessageAt | tonumber / 1000 | floor
+                   | strftime("%Y-%m-%dT%H:%M:%SZ")) end }
+
   # ============================================================
   # Step 7-8: call the reflector LLM, wrapped in try/catch so that
   # any failure flows into the F-G9 fallback path (§5.2.1).
@@ -343,7 +352,7 @@ do:
                   prompt: >-
                     $${## Thread context
                     - Labels: {{ thread.data.labels | join: ", " }}
-                    - Created: {{ thread.data.createdAt }}
+                    - Started: {{ conversation_started_at }}
                     - Truncated: {{ truncated }}
 
                     ## Turns

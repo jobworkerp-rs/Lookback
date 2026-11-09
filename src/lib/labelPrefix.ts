@@ -1,13 +1,11 @@
-import type { LabelWithCount } from "@/types/api";
-
 /** Internal bucket key for prefix-less labels. Language-independent so it never
  *  collides with a real label prefix or leaks as a hardcoded UI string — the
  *  display name is resolved via `t("labelPrefix.category")` at render time. */
 export const CATEGORY_GROUP_KEY = "__category__";
 
-export interface LabelGroup {
+export interface LabelGroup<T extends { label: string }> {
   prefix: string;
-  labels: LabelWithCount[];
+  labels: T[];
 }
 
 export function splitLabelPrefix(label: string): { prefix: string | null; value: string } {
@@ -46,8 +44,8 @@ function prefixRank(prefix: string | null): number {
 /** Bucket the aggregate distinct-label list into per-prefix sections for the
  *  filter bar. Sections follow `LABEL_PREFIX_PRIORITY`; within a section labels
  *  are sorted by name, so the display stays stable regardless of usage. */
-export function groupByPrefix(labels: LabelWithCount[]): LabelGroup[] {
-  const buckets = new Map<string, LabelWithCount[]>();
+export function groupByPrefix<T extends { label: string }>(labels: T[]): LabelGroup<T>[] {
+  const buckets = new Map<string, T[]>();
   for (const l of labels) {
     const { prefix } = splitLabelPrefix(l.label);
     const key = prefix ?? CATEGORY_GROUP_KEY;

@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package lookback.chat.issue.v1;
+
+import "v1/issue_tracker_common.proto";
+
+// Chat-only Issue tools exposed through the loopback Lookback app facade.
+service LookbackChatIssueService {
+  rpc ListIssues(ListIssuesRequest) returns (ListIssuesResponse);
+  rpc GetIssue(GetIssueRequest) returns (GetIssueResponse);
+  rpc CreateIssue(CreateIssueRequest) returns (IssueChatMutationResponse);
+  rpc UpdateIssue(UpdateIssueRequest) returns (IssueChatMutationResponse);
+  rpc CancelIssue(CancelIssueRequest) returns (IssueChatMutationResponse);
+}
+
+// Proposals require human approval in the Issue UI; no execution RPC is exposed.
+service LookbackCodingAgentService {
+  rpc ProposeExecution(ProposeExecutionRequest) returns (ExecutionDelegationResponse);
+  rpc GetExecution(GetExecutionRequest) returns (ExecutionDelegationResponse);
+}
+
+message ProposeExecutionRequest {
+  string request_key = 1;
+  string input_json = 2;
+}
+
+message GetExecutionRequest {
+  string input_json = 1;
+}
+
+message ExecutionDelegationResponse {
+  oneof outcome {
+    string success = 1;
+    IssueChatError error = 2;
+  }
+}
+
+message ListIssuesRequest {
+  // Zero selects the facade's bounded default page size.
+  uint32 page_size = 1;
+  optional string page_token = 2;
+  optional string text_query = 3;
+  repeated issue_tracker.v1.IssueState states = 4;
+  // Added by the chat executor, not selected by the model.
+  string speech_id = 5;
+}
+
+message IssueSummary {
+  string issue_id = 1;
+  string title = 2;
+  string description_excerpt = 3;
+  string kind = 4;
+  string priority = 5;
+  string state = 6;
+  repeated string labels = 7;
+  uint64 revision = 8;
+  bool lookback_ready = 9;
+  string sync_state = 10;
+}
+
+message IssueListPage {
+  repeated IssueSummary issues = 1;
+  optional string next_page_token = 2;
+  optional uint64 total_size = 3;
+}
+
+message GetIssueRequest {
+  string issue_id = 1;
+  optional string relation_page_token = 2;
+  // Added by the chat executor, not selected by the model.
+  string speech_id = 3;
+}
+
+// The app injects speech_id and tool_call_id after the LLM call. Only
+// input_json is included in the manually-authored LLM worker schema; the
+// complete protobuf request is nevertheless covered by the one-shot permit.
+// input_json is decoded with the operation's deny-unknown-fields serde DTO.
+message CreateIssueRequest {
+  string speech_id = 1;
+  string tool_call_id = 2;
+  string input_json = 3;
+}
+
+message UpdateIssueRequest {
+  string speech_id = 1;
+  string tool_call_id = 2;
+  string input_json = 3;
+}
+
+message CancelIssueRequest {
+  string speech_id = 1;
+  string tool_call_id = 2;
+  string input_json = 3;
+}
+
+message IssueSourceEvidence {
+  string thread_id = 1;
+  string memory_id = 2;
+}
+
+message RelatedIssue {
+  string relation_id = 1;
+  string kind = 2;
+  string source_issue_id = 3;
+  string target_issue_id = 4;
+}
+
+message IssueDetail {
+  string issue_id = 1;
+  string title = 2;
+  string description = 3;
+  string kind = 4;
+  string priority = 5;
+  string state = 6;
+  repeated string labels = 7;
+  repeated string acceptance_criteria = 8;
+  repeated IssueSourceEvidence source_evidence = 9;
+  uint64 revision = 10;
+  bool lookback_ready = 11;
+  string sync_state = 12;
+  repeated RelatedIssue relations = 13;
+  optional string next_relation_page_token = 14;
+  string confirmation_status = 15;
+  string creation_basis = 16;
+}
+
+enum IssueChatErrorCode {
+  ISSUE_CHAT_ERROR_CODE_UNSPECIFIED = 0;
+  ISSUE_CHAT_ERROR_CODE_INVALID_REQUEST = 1;
+  ISSUE_CHAT_ERROR_CODE_PERMISSION_DENIED = 2;
+  ISSUE_CHAT_ERROR_CODE_NOT_FOUND = 3;
+  ISSUE_CHAT_ERROR_CODE_UNAVAILABLE = 4;
+  ISSUE_CHAT_ERROR_CODE_PAGE_TOKEN_EXPIRED = 5;
+  ISSUE_CHAT_ERROR_CODE_UPSTREAM_ERROR = 6;
+  ISSUE_CHAT_ERROR_CODE_INTERNAL = 7;
+}
+
+message IssueChatError {
+  IssueChatErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message ListIssuesResponse {
+  oneof outcome {
+    IssueListPage success = 1;
+    IssueChatError error = 2;
+  }
+}
+
+message GetIssueResponse {
+  oneof outcome {
+    IssueDetail success = 1;
+    IssueChatError error = 2;
+  }
+}
+
+message IssueChatMutationResult {
+  string issue_id = 1;
+  string operation_id = 2;
+  string operation_state = 3;
+  // Decimal string avoids loss of u64 revision precision in JSON consumers.
+  string revision = 4;
+  optional string resulting_state = 5;
+}
+
+message IssueChatMutationResponse {
+  oneof outcome {
+    IssueChatMutationResult success = 1;
+    IssueChatError error = 2;
+  }
+}

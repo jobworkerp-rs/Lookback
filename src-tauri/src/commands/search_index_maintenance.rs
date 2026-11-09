@@ -4,14 +4,13 @@ use serde::Deserialize;
 use tauri::State;
 
 use crate::commands::AppState;
-use crate::commands::connection::ConnectionMode;
 use crate::error::{AppError, AppResult};
 use crate::search_index_maintenance::{MaintenanceSchedule, MaintenanceStatus};
 
 fn require_local(state: &AppState) -> AppResult<()> {
-    if state.connection_mode() != ConnectionMode::Local {
+    if !state.is_service_local(super::connection::Service::Memories) {
         return Err(AppError::Config(
-            "リモート接続ではローカル index メンテナンスを実行できません".into(),
+            "memories がリモートのときはローカル index メンテナンスを実行できません".into(),
         ));
     }
     Ok(())

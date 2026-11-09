@@ -52,6 +52,7 @@ LINDERA=release
 LINDERA_ONLY=0
 JOBS=""
 NO_SUBMODULE=0
+MACOS_UNSIGNED_INTERMEDIATE=0
 
 usage() {
   cat >&2 <<'EOF'
@@ -68,13 +69,15 @@ Options:
   --workdir <dir>          Clone/build root (default: <agent-app>/.build-deps)
   --skip-clone             Reuse existing clones, do not fetch/pull
   --skip-frontend          Build/stage backend only, skip pnpm tauri build
-  --only <repos>           Comma list: jobworkerp,memory-store,conductor,llama,mm
+  --only <repos>           Comma list: jobworkerp,memory-store,conductor,llama,mm,issue-tracker-server
   --lindera release|cli|skip
                            Dictionary strategy (default: release; cli is a legacy alias)
   --lindera-only           Generate only the lindera dictionary, then exit
                            (useful for `pnpm tauri:dev` without a full build)
   --jobs N                 Parallel cargo jobs (sets CARGO_BUILD_JOBS)
   --no-submodule-update    Skip submodule init/update (faster re-runs)
+  --macos-unsigned-intermediate
+                           Build an unsigned .app only; never create a DMG
   -h, --help               Show this help
 
 Env: DRY_RUN=1 prints commands without executing.
@@ -96,6 +99,7 @@ while [[ $# -gt 0 ]]; do
     --lindera-only) LINDERA_ONLY=1; shift ;;
     --jobs)     JOBS=$2; shift 2 ;;
     --no-submodule-update) NO_SUBMODULE=1; shift ;;
+    --macos-unsigned-intermediate) MACOS_UNSIGNED_INTERMEDIATE=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -142,13 +146,12 @@ export AGENT_APP BIN_DIR PLUGINS_DIR TRIPLE LIBEXT GPU WORKDIR \
 # Preflight ----------------------------------------------------------------
 preflight() {
   log "preflight: platform=${PLATFORM} gpu=${GPU} triple=${TRIPLE} bundle=${BUNDLE}"
+  require_bundle_issue_tracker_dependencies
   # DRY_RUN only validates the command plan; skip host capability checks so a
   # machine without the toolchain can still preview the build.
   [[ "${DRY_RUN:-0}" == "1" ]] && { warn "DRY_RUN: skipping host capability checks"; return 0; }
   require_cmd git cargo rustc node pnpm cmake pkg-config curl unzip tar
-  # protoc is fetched from the official protobuf release (curl + unzip, already
-  # required above) and shipped as a self-contained externalBin, so the host
-  # does NOT need protoc installed — see lib/protoc-fetch.sh.
+  require_host_protobuf_tools
   rustc_at_least 1 85 || die "rustc >= 1.85 required for edition 2024 (have $(rustc --version))"
 
   # Ensure the target toolchain is installed when rustup is available.
@@ -159,6 +162,15 @@ preflight() {
 
   if [[ "${PLATFORM}" == mac ]]; then
     xcode-select -p >/dev/null 2>&1 || die "Xcode Command Line Tools required (xcode-select --install)"
+    if [[ "${SKIP_FRONTEND}" != "1" ]]; then
+      if [[ "${MACOS_UNSIGNED_INTERMEDIATE}" == "1" ]]; then
+        [[ ",${BUNDLE}," != *",dmg,"* ]] \
+          || die "--macos-unsigned-intermediate only permits --bundle app; unsigned output is not distributable"
+      else
+        [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]] \
+          || die "APPLE_SIGNING_IDENTITY is required for macOS release packaging (use --macos-unsigned-intermediate for an app-only local build)"
+      fi
+    fi
   fi
   if [[ "${PLATFORM}" == linux && ",${BUNDLE}," == *",appimage,"* ]]; then
     # appimagetool repackages Linux AppImages after runtime hook and driver-lib
@@ -219,6 +231,30 @@ dump_appimage_diagnostics() {
 }
 
 # Frontend build -----------------------------------------------------------
+run_tauri_build() {
+  local cuda_stub_dir=$1
+  local tauri_command=(pnpm tauri build)
+  [[ "${LOOKBACK_TAURI_VERBOSE:-0}" != "1" ]] || tauri_command+=(-v)
+  tauri_command+=(--bundles "${tauri_bundles}")
+  if [[ "${PLATFORM}" == "mac" ]]; then
+    # Prevent Tauri from rewriting externalBin bytes during assembly. The
+    # finalizer signs those exact, provenance-checked copies afterward. The
+    # explicit CLI option is required: empty signing identities alone do not
+    # disable Tauri's certificate-based signing path.
+    tauri_command+=(--no-sign)
+    (cd "${AGENT_APP}" && env \
+      APPLE_SIGNING_IDENTITY= TAURI_SIGNING_IDENTITY= \
+      APPLE_CERTIFICATE= APPLE_CERTIFICATE_PASSWORD= \
+      "${tauri_command[@]}")
+  elif [[ -n "${cuda_stub_dir}" ]]; then
+    (cd "${AGENT_APP}" && env \
+      LD_LIBRARY_PATH="${cuda_stub_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+      "${tauri_command[@]}")
+  else
+    (cd "${AGENT_APP}" && "${tauri_command[@]}")
+  fi
+}
+
 build_frontend() {
   [[ "${SKIP_FRONTEND}" == "1" ]] && { log "skip frontend (--skip-frontend)"; return 0; }
   # tauri.conf.json bundles "../dict/" as a resource; the dir is no longer in
@@ -226,6 +262,10 @@ build_frontend() {
   # resource glob doesn't fail when lindera was skipped — an empty dict just
   # ships nothing and the sidecar falls back to the ngram tokenizer.
   run mkdir -p "${AGENT_APP}/dict"
+  # `stage_binaries` / `stage_plugins` above own the release artifacts. Do
+  # not let the direct Tauri wrapper replace them with developer-workspace
+  # outputs while bundling.
+  export LOOKBACK_EXTERNAL_ARTIFACTS_PRESTAGED=1
   log "frontend: pnpm install + tauri build (${BUNDLE})"
   run sh -c 'cd "$1" && pnpm install --frozen-lockfile' _ "${AGENT_APP}"
   if [[ -n "${LOOKBACK_RELEASE_VERSION:-}" ]]; then
@@ -234,32 +274,66 @@ build_frontend() {
       "${AGENT_APP}/src-tauri/tauri.conf.json"
   fi
   local tauri_verbose_display=""
+  local tauri_sign_display=""
+  local tauri_bundles=${BUNDLE}
+  if [[ "${PLATFORM}" == "mac" ]]; then
+    # Tauri must only assemble the unsigned .app. Final signing mutates nested
+    # Mach-O bytes, so the DMG is created later from the sealed app.
+    tauri_bundles=app
+    tauri_sign_display=" --no-sign"
+    log "Tauri assembles an unsigned macOS app; signing is deferred until provenance checks complete"
+  fi
   if [[ "${LOOKBACK_TAURI_VERBOSE:-0}" == "1" ]]; then
     tauri_verbose_display=" -v"
   fi
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
-    log "   $ cd ${AGENT_APP} && pnpm tauri build${tauri_verbose_display} --bundles ${BUNDLE}"
+    log "   $ cd ${AGENT_APP} && pnpm tauri build${tauri_verbose_display} --bundles ${tauri_bundles}${tauri_sign_display}"
   else
-    log "   $ pnpm tauri build${tauri_verbose_display} --bundles ${BUNDLE}"
+    log "   $ pnpm tauri build${tauri_verbose_display} --bundles ${tauri_bundles}"
     local cuda_stub_dir="" status=0
     cuda_stub_dir=$(prepare_cuda_driver_stub_dir)
-    if [[ "${LOOKBACK_TAURI_VERBOSE:-0}" == "1" ]]; then
-      if [[ -n "${cuda_stub_dir}" ]]; then
-        (cd "${AGENT_APP}" && LD_LIBRARY_PATH="${cuda_stub_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" pnpm tauri build -v --bundles "${BUNDLE}") || status=$?
-      else
-        (cd "${AGENT_APP}" && pnpm tauri build -v --bundles "${BUNDLE}") || status=$?
-      fi
-    elif [[ -n "${cuda_stub_dir}" ]]; then
-      (cd "${AGENT_APP}" && LD_LIBRARY_PATH="${cuda_stub_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" pnpm tauri build --bundles "${BUNDLE}") || status=$?
-    else
-      (cd "${AGENT_APP}" && pnpm tauri build --bundles "${BUNDLE}") || status=$?
-    fi
+    run_tauri_build "${cuda_stub_dir}" || status=$?
     [[ -n "${cuda_stub_dir}" ]] && rm -rf "${cuda_stub_dir}"
     if [[ "${status}" != "0" ]]; then
       dump_appimage_diagnostics
       return "${status}"
     fi
   fi
+
+  if [[ "${PLATFORM}" == "mac" ]]; then
+    finalize_macos_release_bundle
+  fi
+}
+
+finalize_macos_release_bundle() {
+  [[ "${PLATFORM}" == "mac" ]] || return 0
+  local app="${AGENT_APP}/target/release/bundle/macos/Lookback.app"
+  local args=(--app "${app}" --source-root "${AGENT_APP}" --triple "${TRIPLE}")
+  local dmg="${AGENT_APP}/target/release/bundle/dmg/Lookback.dmg"
+  if [[ ",${BUNDLE}," == *",dmg,"* ]]; then
+    args+=(--dmg "${dmg}")
+  fi
+  if [[ "${MACOS_UNSIGNED_INTERMEDIATE}" == "1" ]]; then
+    args+=(--unsigned-intermediate)
+  fi
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    log "DRY_RUN: finalize unsigned macOS app and requested DMG after Tauri assembly"
+    return 0
+  fi
+  run bash "${SCRIPT_DIR}/finalize-macos-bundle.sh" "${args[@]}"
+}
+
+# Run only after the standalone Issue Tracker server has been staged. This
+# ensures the bundled external binary can serve the private gRPC integration.
+verify_issue_tracker_grpc_server() {
+  [[ "${SKIP_FRONTEND}" == "1" ]] && { log "skip Issue tracker E2E (--skip-frontend)"; return 0; }
+  local issue_tracker_server="${BIN_DIR}/issue-tracker-server-${TRIPLE}"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    log "Issue Tracker gRPC E2E: ${SCRIPT_DIR}/test-issue-tracker-grpc-e2e.sh"
+    return 0
+  fi
+  LOOKBACK_ISSUE_TRACKER_SERVER_BIN="${issue_tracker_server}" \
+    bash "${SCRIPT_DIR}/test-issue-tracker-grpc-e2e.sh"
 }
 
 # NVIDIA user-mode DRIVER libraries that must NEVER ship inside the bundle:
@@ -298,6 +372,17 @@ patch_linux_appimages() {
     local root="${work}/squashfs-root"
 
     local changed=0
+    local backend_patch_status=0
+    if patch_linuxdeploy_gtk_hook_for_wayland_backend "${root}"; then
+      log "  default GTK backend to Wayland with X11 fallback"
+      changed=1
+    else
+      backend_patch_status=$?
+      if [[ "${backend_patch_status}" == 2 ]]; then
+        die "AppImage GTK hook has an unrecognized GDK_BACKEND format; refusing to package an X11-forced AppImage"
+      fi
+    fi
+
     if patch_linuxdeploy_gtk_hook_for_host_ime "${root}"; then
       log "  allow host GTK IME modules for WebKitGTK text input"
       changed=1
@@ -351,13 +436,13 @@ main() {
   stage_binaries
   stage_plugins
   verify_fixed_atlas_lock
-  sign_macos_plugins
-  sign_macos_migration_binaries
-  record_signed_atlas_lock
   stage_lindera "${LINDERA}"
+  verify_issue_tracker_grpc_server
   build_frontend
   patch_linux_appimages
   report
 }
 
-main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main
+fi

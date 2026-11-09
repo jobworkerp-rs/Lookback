@@ -12,23 +12,24 @@
 //! `thread_count` and `signal_count` are bundled in the `get_personality`
 //! response so the persona-stats header (Threads / Signals / Categories /
 //! Profile version) renders without extra IPC round-trips. `thread_count`
-//! is derived via `FindThreadListByUserId` with a high limit because
-//! `ThreadService.Count` carries no user_id filter (proto has an empty
-//! `FindCondition` shape). `signal_count` is the number of
-//! `personality_signal`-tagged threads — exactly the row count of
-//! `list_personality_signals` — so the badge and the drawer never disagree.
+//! comes from `ThreadService.CountByUserId`; servers predating it fall
+//! back to counting a capped `FindThreadListByUserId` stream.
+//! `signal_count` is the number of `personality_signal`-tagged threads — exactly the row count across all
+//! `list_personality_signals` pages — so the badge and the drawer never
+//! disagree.
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use tokio_stream::StreamExt;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::grpc::proto::llm_memory::data as mem_data;
 use crate::grpc::proto::llm_memory::service as mem_svc;
 use crate::grpc::proto::llm_memory::service::memory_service_client::MemoryServiceClient;
 use crate::grpc::proto::llm_memory::service::thread_service_client::ThreadServiceClient;
 
 use super::AppState;
+use super::memories_rpc_support::MemoriesRpc;
 
 const PERSONALITY_USER_ID: i64 = 1;
 const PROFILE_EXTERNAL_ID_PREFIX: &str = "personality_profile:";
@@ -39,13 +40,22 @@ const SIGNAL_EXTERNAL_ID_PREFIX: &str = "personality:";
 /// exactly the evidence the merged profile was built from.
 const PERSONALITY_THREAD_LABEL: &str = "personality";
 const SIGNAL_THREAD_LABEL: &str = "personality_signal";
-/// Upper bound for the thread-count fallback. Threads count beyond this
-/// is surfaced as "10000+" in the UI; 587 imported threads today and a
-/// growth curve much smaller than this cap make it safe for the MVP.
+/// Display cap for the thread count (and row cap of the streaming
+/// fallback). Counts beyond this are surfaced as "10000+" in the UI; 587
+/// imported threads today and a growth curve much smaller than this cap
+/// make it safe for the MVP.
 const THREAD_COUNT_LIMIT: i32 = 10_000;
+/// Only RAW (imported) threads count as source threads; the scalar count
+/// and the streaming fallback must agree on this so the badge is stable
+/// across server versions.
+const THREAD_COUNT_MEMORY_KINDS: [i32; 1] = [mem_data::MemoryKind::Raw as i32];
 /// Upper bound for the signal-thread listing. Layer-1 signal threads are a
 /// strict subset of source threads, so the same cap is comfortably safe.
 const SIGNAL_THREAD_LIMIT: i32 = 10_000;
+/// The drawer pages raw signal rows instead of shipping up to
+/// `SIGNAL_THREAD_LIMIT` full payloads (and rendering them all) at once.
+const SIGNAL_PAGE_SIZE: i32 = 100;
+const SIGNAL_PAGE_MAX: i32 = 500;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PersonalityProfile {
@@ -96,6 +106,21 @@ pub struct GetPersonalityRequest {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ListPersonalitySignalsRequest {
     pub user_id: Option<i64>,
+    /// Raw rows to scan for this page (defaults to `SIGNAL_PAGE_SIZE`).
+    #[serde(default)]
+    pub limit: Option<i32>,
+    /// Raw-row offset returned as `next_offset` by the previous page.
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PersonalitySignalPage {
+    pub signals: Vec<PersonalitySignal>,
+    /// Offset of the next page, or `None` when the listing is exhausted.
+    /// Pages advance over raw rows, so a page may hold fewer signals than
+    /// its limit once no_signal rows are dropped.
+    pub next_offset: Option<i64>,
 }
 
 #[tauri::command]
@@ -103,17 +128,18 @@ pub async fn get_personality(
     state: State<'_, AppState>,
     req: GetPersonalityRequest,
 ) -> AppResult<PersonalityResponse> {
-    let channel = state.memories_channel().await?;
+    let (memories_url, channel) = state.memories_endpoint().await?;
     let user_id = req.user_id.unwrap_or(1);
 
-    // Profile is a single-row lookup; thread count walks up to
-    // THREAD_COUNT_LIMIT rows over HTTP/2. Running them in parallel
-    // overlaps the larger stream with the smaller one — tonic
-    // multiplexes streams on a shared channel. signal_count is a third
-    // independent query (a scalar CountByCondition) that joins the same way.
+    // The three reads are independent, so they share the multiplexed
+    // channel concurrently. The thread count is a scalar RPC unless the
+    // server predates it (then a capped stream). signal_count is a third
+    // independent stream; it cannot use CountByCondition because the
+    // no_signal metadata filter is applied client-side (see
+    // `fetch_signal_count`).
     let (profile_res, count_res, signal_res) = tokio::join!(
         fetch_profile(channel.clone(), user_id),
-        fetch_thread_count(channel.clone(), user_id),
+        fetch_thread_count(&state, &memories_url, channel.clone(), user_id),
         fetch_signal_count(channel, user_id),
     );
     let profile = profile_res?;
@@ -136,28 +162,44 @@ pub async fn get_personality(
 pub async fn list_personality_signals(
     state: State<'_, AppState>,
     req: ListPersonalitySignalsRequest,
-) -> AppResult<Vec<PersonalitySignal>> {
+) -> AppResult<PersonalitySignalPage> {
+    let (limit, offset) = signal_page_window(req.limit, req.offset);
+    if limit == 0 {
+        return Ok(PersonalitySignalPage {
+            signals: Vec::new(),
+            next_offset: None,
+        });
+    }
     let channel = state.memories_channel().await?;
-    fetch_signals(channel, req.user_id.unwrap_or(1)).await
+    let (signals, raw_rows) =
+        fetch_signals(channel, req.user_id.unwrap_or(1), limit, offset).await?;
+    Ok(PersonalitySignalPage {
+        signals,
+        next_offset: next_signal_offset(offset, limit, raw_rows),
+    })
 }
 
-/// Fetch every usable layer-1 signal for `user_id` in a single
-/// `FindListByCondition` (external_id_prefix + `personality_signal`
-/// thread_filter — the merge workflow / `list_summaries` shape). Drops
-/// no_signal rows via `memory_to_signal_entry`, so this is the single source
-/// of truth for both the drawer and the badge count: a thread that was once
-/// signal-bearing keeps its `personality_signal` label after a re-run flips
-/// it to no_signal, and `CountByCondition` has no metadata filter to exclude
-/// those — counting the filtered rows here is the only way the badge agrees
-/// with the drawer and the merged profile.
-async fn fetch_signals(
-    channel: tonic::transport::Channel,
-    user_id: i64,
-) -> AppResult<Vec<PersonalitySignal>> {
-    let mut client = MemoryServiceClient::new(channel);
-    let request = mem_svc::FindMemoryListRequest {
-        limit: Some(SIGNAL_THREAD_LIMIT),
-        offset: None,
+/// Clamp a requested page so the drawer never reads past the cap the full
+/// listing used.
+fn signal_page_window(limit: Option<i32>, offset: Option<i64>) -> (i32, i64) {
+    let offset = offset.unwrap_or(0).clamp(0, i64::from(SIGNAL_THREAD_LIMIT));
+    let remaining = i64::from(SIGNAL_THREAD_LIMIT) - offset;
+    let limit = limit.unwrap_or(SIGNAL_PAGE_SIZE).clamp(1, SIGNAL_PAGE_MAX);
+    (i64::from(limit).min(remaining) as i32, offset)
+}
+
+fn next_signal_offset(offset: i64, limit: i32, raw_rows: usize) -> Option<i64> {
+    let next = offset + i64::from(limit);
+    (limit > 0 && raw_rows == limit as usize && next < i64::from(SIGNAL_THREAD_LIMIT))
+        .then_some(next)
+}
+
+/// The single condition behind both the drawer pages and the badge count, so
+/// the two always select the same rows.
+fn signal_list_request(user_id: i64, limit: i32, offset: i64) -> mem_svc::FindMemoryListRequest {
+    mem_svc::FindMemoryListRequest {
+        limit: Some(limit),
+        offset: (offset > 0).then_some(offset),
         roles: vec![mem_data::MessageRole::RoleAssistant as i32],
         user_id: Some(mem_data::UserId {
             value: PERSONALITY_USER_ID,
@@ -175,15 +217,34 @@ async fn fetch_signals(
         sort: None,
         external_id_prefix: Some(SIGNAL_EXTERNAL_ID_PREFIX.to_string()),
         memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
-    };
-    let mut stream = client.find_list_by_condition(request).await?.into_inner();
+    }
+}
+
+/// Fetch one page of usable layer-1 signals for `user_id`. Drops no_signal
+/// rows via `memory_to_signal_entry` (a thread that was once signal-bearing
+/// keeps its `personality_signal` label after a re-run flips it to
+/// no_signal, and `CountByCondition` has no metadata filter to exclude
+/// those). Returns the signals and the number of raw rows scanned.
+async fn fetch_signals(
+    channel: tonic::transport::Channel,
+    user_id: i64,
+    limit: i32,
+    offset: i64,
+) -> AppResult<(Vec<PersonalitySignal>, usize)> {
+    let mut client = MemoryServiceClient::new(channel);
+    let mut stream = client
+        .find_list_by_condition(signal_list_request(user_id, limit, offset))
+        .await?
+        .into_inner();
     let mut out = Vec::new();
+    let mut raw_rows = 0;
     while let Some(item) = stream.next().await {
+        raw_rows += 1;
         if let Some(signal) = memory_to_signal_entry(item?) {
             out.push(signal);
         }
     }
-    Ok(out)
+    Ok((out, raw_rows))
 }
 
 async fn fetch_profile(
@@ -221,17 +282,44 @@ async fn fetch_profile(
 }
 
 async fn fetch_thread_count(
+    state: &AppState,
+    memories_url: &str,
     channel: tonic::transport::Channel,
     user_id: i64,
 ) -> AppResult<(i64, bool)> {
-    let mut client = ThreadServiceClient::new(channel);
-    // Request `limit + 1` so we can distinguish "exactly THREAD_COUNT_LIMIT
-    // threads exist" (returns THREAD_COUNT_LIMIT rows -> not truncated)
-    // from "more than THREAD_COUNT_LIMIT threads exist" (returns
-    // THREAD_COUNT_LIMIT+1 rows -> truncated). The prior
-    // `count == THREAD_COUNT_LIMIT` check reported truncated=true even
-    // when the count was exact, so the UI rendered "10000+" for a user
-    // with exactly 10_000 threads.
+    let client = ThreadServiceClient::new(channel);
+    let total = state
+        .unsupported_memories_rpcs()
+        .call(
+            memories_url,
+            MemoriesRpc::CountThreadsByUserId,
+            || {
+                let mut client = client.clone();
+                async move {
+                    let response = client
+                        .count_by_user_id(mem_svc::CountThreadsByUserIdRequest {
+                            user_id: Some(mem_data::UserId { value: user_id }),
+                            memory_kinds: THREAD_COUNT_MEMORY_KINDS.to_vec(),
+                        })
+                        .await?;
+                    Ok(response.into_inner().total)
+                }
+            },
+            AppError::Grpc,
+            // Fallback for memories servers predating CountByUserId; remove
+            // once the minimum supported memories includes it.
+            || stream_thread_count(client.clone(), user_id),
+        )
+        .await?;
+    Ok(clamp_thread_count(total))
+}
+
+/// Counts at most `THREAD_COUNT_LIMIT + 1` streamed rows: one extra row
+/// distinguishes "exactly the cap" (not truncated) from "more than the cap".
+async fn stream_thread_count(
+    mut client: ThreadServiceClient<tonic::transport::Channel>,
+    user_id: i64,
+) -> AppResult<i64> {
     let request = mem_svc::FindThreadListByUserIdRequest {
         user_id: Some(mem_data::UserId { value: user_id }),
         limit: Some(THREAD_COUNT_LIMIT + 1),
@@ -245,7 +333,7 @@ async fn fetch_thread_count(
         last_message_after: None,
         last_message_before: None,
         sort: None,
-        memory_kinds: vec![mem_data::MemoryKind::Raw as i32],
+        memory_kinds: THREAD_COUNT_MEMORY_KINDS.to_vec(),
     };
     let mut stream = client
         .find_thread_list_by_user_id(request)
@@ -257,11 +345,14 @@ async fn fetch_thread_count(
         let _ = item?;
         count += 1;
     }
-    let truncated = count > THREAD_COUNT_LIMIT as i64;
-    // Clamp to the documented cap so the UI never renders a value above
-    // the sentinel.
-    let count = count.min(THREAD_COUNT_LIMIT as i64);
-    Ok((count, truncated))
+    Ok(count)
+}
+
+/// Clamp to the documented cap so the UI never renders a value above the
+/// sentinel, flagging truncation only when the count exceeds the cap.
+fn clamp_thread_count(total: i64) -> (i64, bool) {
+    let limit = THREAD_COUNT_LIMIT as i64;
+    (total.min(limit), total > limit)
 }
 
 fn entry_to_profile(e: mem_svc::MemoryListEntry) -> Option<PersonalityProfile> {
@@ -624,6 +715,8 @@ fn signal_thread_filter(user_id: i64) -> mem_data::ThreadSearchFilter {
         last_message_after: None,
         last_message_before: None,
         memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
+        thread_group_id: None,
+        thread_id: None,
     }
 }
 
@@ -642,25 +735,7 @@ fn signal_thread_filter(user_id: i64) -> mem_data::ThreadSearchFilter {
 /// O(len(metadata)) instead of O(len(content)+len(metadata)).
 async fn fetch_signal_count(channel: tonic::transport::Channel, user_id: i64) -> AppResult<i64> {
     let mut client = MemoryServiceClient::new(channel);
-    let request = mem_svc::FindMemoryListRequest {
-        limit: Some(SIGNAL_THREAD_LIMIT),
-        offset: None,
-        roles: vec![mem_data::MessageRole::RoleAssistant as i32],
-        user_id: Some(mem_data::UserId {
-            value: PERSONALITY_USER_ID,
-        }),
-        thread_id: None,
-        updated_after: None,
-        updated_before: None,
-        external_id: None,
-        content_types: vec![mem_data::ContentType::Text as i32],
-        thread_filter: Some(signal_thread_filter(user_id)),
-        created_after: None,
-        created_before: None,
-        sort: None,
-        external_id_prefix: Some(SIGNAL_EXTERNAL_ID_PREFIX.to_string()),
-        memory_kinds: vec![mem_data::MemoryKind::Personality as i32],
-    };
+    let request = signal_list_request(user_id, SIGNAL_THREAD_LIMIT, 0);
     let mut stream = client.find_list_by_condition(request).await?.into_inner();
     let mut count: i64 = 0;
     while let Some(item) = stream.next().await {
@@ -765,6 +840,67 @@ fn parse_id_value(v: &serde_json::Value) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clamp_thread_count_caps_at_the_limit_and_flags_only_overflow() {
+        assert_eq!(clamp_thread_count(0), (0, false));
+        assert_eq!(clamp_thread_count(587), (587, false));
+        // Exactly the cap is an exact count, not "10000+".
+        let limit = THREAD_COUNT_LIMIT as i64;
+        assert_eq!(clamp_thread_count(limit), (limit, false));
+        assert_eq!(clamp_thread_count(limit + 1), (limit, true));
+        assert_eq!(clamp_thread_count(limit * 5), (limit, true));
+    }
+
+    #[test]
+    fn signal_page_window_defaults_clamps_and_respects_the_listing_cap() {
+        assert_eq!(signal_page_window(None, None), (SIGNAL_PAGE_SIZE, 0));
+        assert_eq!(signal_page_window(Some(0), Some(-5)), (1, 0));
+        assert_eq!(
+            signal_page_window(Some(SIGNAL_PAGE_MAX + 1), Some(10)),
+            (SIGNAL_PAGE_MAX, 10)
+        );
+        // The paged drawer never reaches past the cap the full listing used.
+        assert_eq!(
+            signal_page_window(Some(100), Some(i64::from(SIGNAL_THREAD_LIMIT) - 30)),
+            (30, i64::from(SIGNAL_THREAD_LIMIT) - 30)
+        );
+        assert_eq!(
+            signal_page_window(Some(100), Some(i64::from(SIGNAL_THREAD_LIMIT))),
+            (0, i64::from(SIGNAL_THREAD_LIMIT))
+        );
+    }
+
+    #[test]
+    fn next_signal_offset_continues_only_after_a_full_raw_page() {
+        assert_eq!(next_signal_offset(0, 100, 100), Some(100));
+        assert_eq!(next_signal_offset(100, 100, 99), None);
+        assert_eq!(next_signal_offset(0, 0, 0), None);
+        assert_eq!(
+            next_signal_offset(i64::from(SIGNAL_THREAD_LIMIT) - 100, 100, 100),
+            None
+        );
+    }
+
+    #[test]
+    fn signal_list_request_pages_the_same_condition_as_the_count() {
+        let paged = signal_list_request(7, 50, 100);
+        assert_eq!(paged.limit, Some(50));
+        assert_eq!(paged.offset, Some(100));
+        let count = signal_list_request(7, SIGNAL_THREAD_LIMIT, 0);
+        assert_eq!(
+            mem_svc::FindMemoryListRequest {
+                limit: None,
+                offset: None,
+                ..paged
+            },
+            mem_svc::FindMemoryListRequest {
+                limit: None,
+                offset: None,
+                ..count
+            }
+        );
+    }
+
     use super::*;
 
     #[test]

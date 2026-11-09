@@ -8,6 +8,7 @@ import {
   listPeriodicTaskStatuses,
   listPeriodicTasks,
   setEnabledPeriodicTask,
+  updatePeriodicTask,
 } from "@/api";
 import i18n from "@/i18n";
 import { renderWithProviders } from "@/test-utils";
@@ -32,6 +33,7 @@ vi.mock("@/api", () => ({
 
 const mockListPeriodicTasks = vi.mocked(listPeriodicTasks);
 const mockCreatePeriodicTask = vi.mocked(createPeriodicTask);
+const mockUpdatePeriodicTask = vi.mocked(updatePeriodicTask);
 const mockDeletePeriodicTask = vi.mocked(deletePeriodicTask);
 const mockSetEnabledPeriodicTask = vi.mocked(setEnabledPeriodicTask);
 const mockListStatuses = vi.mocked(listPeriodicTaskStatuses);
@@ -130,6 +132,7 @@ describe("PeriodicTasks", () => {
     i18n.changeLanguage("ja");
     mockListPeriodicTasks.mockReset();
     mockCreatePeriodicTask.mockReset();
+    mockUpdatePeriodicTask.mockReset();
     mockDeletePeriodicTask.mockReset();
     mockSetEnabledPeriodicTask.mockReset();
     mockListStatuses.mockReset();
@@ -137,6 +140,7 @@ describe("PeriodicTasks", () => {
     mockCancel.mockReset();
     mockListPeriodicTasks.mockResolvedValue([]);
     mockCreatePeriodicTask.mockResolvedValue("new-id");
+    mockUpdatePeriodicTask.mockResolvedValue(undefined);
     mockDeletePeriodicTask.mockResolvedValue(undefined);
     mockSetEnabledPeriodicTask.mockResolvedValue(undefined);
     mockListStatuses.mockResolvedValue([]);
@@ -196,7 +200,8 @@ describe("PeriodicTasks", () => {
       expect(mockCreatePeriodicTask).toHaveBeenCalledWith({
         task: expect.objectContaining({
           name: "昼の要約",
-          source: "codex",
+          source: "codex+claude-code+opencode",
+          sources: ["codex", "claude-code", "opencode"],
           task_kind: "regular",
           interval_hours: 24,
           lookback_days: 7,
@@ -209,6 +214,29 @@ describe("PeriodicTasks", () => {
         description: null,
       });
     });
+  });
+
+  it("shows a translated save error when the create command rejects with a msg_id", async () => {
+    mockCreatePeriodicTask.mockRejectedValueOnce("periodic.validation.sourceMismatch");
+    renderWithProviders(<PeriodicTasks />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "新規" }));
+    fireEvent.change(screen.getByLabelText("名前"), { target: { value: "失敗する要約" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByText("source と sources の指定が一致しません")).toBeInTheDocument();
+
+    let resolveCreate: (id: string) => void = () => {};
+    mockCreatePeriodicTask.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(mockCreatePeriodicTask).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("source と sources の指定が一致しません")).not.toBeInTheDocument();
+    resolveCreate("new-id");
   });
 
   it("lets regular tasks opt out of every generated output for an import-only run", async () => {
@@ -224,6 +252,7 @@ describe("PeriodicTasks", () => {
 
     // Explicitly opt out: daily first (it disables/forces thread), then thread.
     fireEvent.click(screen.getByLabelText("要約: 日次"));
+    fireEvent.click(screen.getByLabelText("要約: スレッドグループ"));
     fireEvent.click(screen.getByLabelText("要約: スレッド"));
     expect(screen.getByLabelText("要約: 日次")).not.toBeChecked();
     expect(screen.getByLabelText("要約: スレッド")).not.toBeChecked();
@@ -254,6 +283,8 @@ describe("PeriodicTasks", () => {
     expect(screen.getByLabelText("要約: スレッド")).toBeChecked();
     expect(screen.getByLabelText("要約: スレッド")).toBeDisabled();
 
+    // Disable the regular compatibility-default ThreadGroup stage first.
+    fireEvent.click(screen.getByLabelText("要約: スレッドグループ"));
     // Toggling daily off re-enables thread; turning it back on re-forces thread.
     fireEvent.click(screen.getByLabelText("要約: 日次"));
     expect(screen.getByLabelText("要約: スレッド")).not.toBeDisabled();
@@ -270,6 +301,31 @@ describe("PeriodicTasks", () => {
           name: "日次あり",
           force_thread_summary: true,
           run_summary_daily: true,
+        }),
+        enabled: true,
+        description: null,
+      });
+    });
+  });
+
+  it("shows ThreadGroup opt-in for weekly tasks and preserves its dependency", async () => {
+    renderWithProviders(<PeriodicTasks />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "新規" }));
+    fireEvent.change(screen.getByLabelText("名前"), { target: { value: "週次グループ" } });
+    fireEvent.change(screen.getByLabelText("種別"), { target: { value: "weekly" } });
+
+    const groupCheckbox = screen.getByLabelText("要約: スレッドグループ");
+    expect(groupCheckbox).not.toBeChecked();
+    fireEvent.click(groupCheckbox);
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => {
+      expect(mockCreatePeriodicTask).toHaveBeenCalledWith({
+        task: expect.objectContaining({
+          task_kind: "weekly",
+          run_summary_thread_group: true,
+          force_thread_summary: true,
         }),
         enabled: true,
         description: null,
@@ -304,27 +360,106 @@ describe("PeriodicTasks", () => {
     });
   });
 
-  it("offers supported source modes only and creates a combined-source task", async () => {
+  it("renders source choices as checkboxes covering all three sources", async () => {
     renderWithProviders(<PeriodicTasks />);
 
     fireEvent.click(await screen.findByRole("button", { name: "新規" }));
-    const sourceSelect = screen.getByLabelText("対象ソース");
-    expect(within(sourceSelect).queryByRole("option", { name: "plain" })).not.toBeInTheDocument();
 
+    // The default draft selects every supported source so a name-only save
+    // imports all agent logs.
+    for (const source of ["codex", "claude-code", "opencode"]) {
+      expect(screen.getByRole("checkbox", { name: source })).toBeChecked();
+    }
+    expect(screen.queryByLabelText("対象ソース")).not.toBeInTheDocument();
+  });
+
+  it("creates a task importing every source when all checkboxes are selected", async () => {
+    renderWithProviders(<PeriodicTasks />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "新規" }));
     fireEvent.change(screen.getByLabelText("名前"), { target: { value: "まとめて要約" } });
-    fireEvent.change(sourceSelect, { target: { value: "codex+claude-code" } });
+    // All three start checked in the default draft; save as-is.
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => {
       expect(mockCreatePeriodicTask).toHaveBeenCalledWith({
         task: expect.objectContaining({
           name: "まとめて要約",
-          source: "codex+claude-code",
-          sources: ["codex", "claude-code"],
+          source: "codex+claude-code+opencode",
+          sources: ["codex", "claude-code", "opencode"],
         }),
         enabled: true,
         description: null,
       });
+    });
+  });
+
+  it("creates a single-source OpenCode periodic task", async () => {
+    renderWithProviders(<PeriodicTasks />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "新規" }));
+    fireEvent.change(screen.getByLabelText("名前"), { target: { value: "OpenCode要約" } });
+    // Clear the default all-source selection so only opencode remains.
+    fireEvent.click(screen.getByRole("checkbox", { name: "codex" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "claude-code" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => {
+      expect(mockCreatePeriodicTask).toHaveBeenCalledWith({
+        task: expect.objectContaining({
+          name: "OpenCode要約",
+          source: "opencode",
+          sources: ["opencode"],
+        }),
+        enabled: true,
+        description: null,
+      });
+    });
+  });
+
+  it("restores the legacy combined source task as codex and claude-code checkboxes", async () => {
+    mockListPeriodicTasks.mockResolvedValue([
+      task({
+        name: "まとめて要約",
+        task: {
+          name: "まとめて要約",
+          source: "codex+claude-code",
+          sources: ["codex", "claude-code"],
+          task_kind: "regular",
+          hour: 9,
+          minute: 0,
+          interval_hours: 24,
+          interval_days: null,
+          weekly_day: null,
+          monthly_day: null,
+          lookback_days: 7,
+          force_thread_summary: true,
+          run_summary_daily: true,
+          run_personality: true,
+          run_reflection: true,
+        },
+      }),
+    ]);
+    renderWithProviders(<PeriodicTasks />);
+
+    expect(await screen.findByText("まとめて要約")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "編集" }));
+
+    const dialog = screen.getByRole("dialog", { name: "定期実行を編集" });
+    expect(within(dialog).getByRole("checkbox", { name: "codex" })).toBeChecked();
+    expect(within(dialog).getByRole("checkbox", { name: "claude-code" })).toBeChecked();
+    expect(within(dialog).getByRole("checkbox", { name: "opencode" })).not.toBeChecked();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+    await waitFor(() => {
+      expect(mockUpdatePeriodicTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          task: expect.objectContaining({
+            source: "codex+claude-code",
+            sources: ["codex", "claude-code"],
+          }),
+        }),
+      );
     });
   });
 
@@ -488,6 +623,19 @@ describe("PeriodicTasks", () => {
     expect(within(dialog).queryByText("削除中…")).not.toBeInTheDocument();
     await waitFor(() => expect(mockCancel).toHaveBeenCalledWith("777"));
     resolveCancel();
+  });
+
+  it("shows a translated cancel error when the cancel command rejects with a msg_id", async () => {
+    mockListPeriodicTasks.mockResolvedValue([task()]);
+    mockListStatuses.mockResolvedValue([summary("running")]);
+    mockCancel.mockRejectedValue("periodic.cancel.stopFailed");
+    renderWithProviders(<PeriodicTasks />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    const dialog = screen.getByRole("dialog", { name: "実行を停止します" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "停止" }));
+
+    expect(await within(dialog).findByText("停止要求を送信できませんでした")).toBeInTheDocument();
   });
 
   it("keeps unsupported schedulers' history available", async () => {

@@ -1,9 +1,17 @@
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { findMemoriesByThreadId, findThread } from "@/api";
+import {
+  enqueueThreadIssueResolutionJob,
+  findMemoriesByThreadId,
+  findThread,
+  getAppCapabilities,
+  getThreadIssueResolutionStatus,
+} from "@/api";
+import { useSummaryProgress } from "@/hooks/useStepStreamProgress";
 import { visibleConversationMemories } from "@/lib/codexMemoryVisibility";
 import { sortLabelsByPrefixPriority } from "@/lib/labelPrefix";
+import { isTerminalStepStatus } from "@/lib/stepStatus";
 import { parseThreadDescription } from "@/lib/threadDescription";
 import {
   flattenMemories,
@@ -70,6 +78,43 @@ export function ThreadDetail({
   onDelete?: () => void;
 }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [issueResolutionRequestPending, setIssueResolutionRequestPending] = useState(false);
+  const [issueResolutionRequestError, setIssueResolutionRequestError] = useState<string | null>(
+    null,
+  );
+  const [issueResolutionJobId, setIssueResolutionJobId] = useState<string | null>(null);
+  const appCapabilities = useQuery({
+    queryKey: ["app-capabilities"],
+    queryFn: getAppCapabilities,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const experimentalIssuesEnabled = appCapabilities.data?.experimental_issues_enabled === true;
+  const issueResolutionStatus = useQuery({
+    queryKey: ["thread-issue-resolution-status", thread.id],
+    queryFn: () => getThreadIssueResolutionStatus({ thread_id: thread.id }),
+    enabled: experimentalIssuesEnabled,
+    refetchOnMount: "always",
+    retry: false,
+  });
+  const retryIssueResolution = async () => {
+    setIssueResolutionRequestPending(true);
+    setIssueResolutionRequestError(null);
+    try {
+      const response = await enqueueThreadIssueResolutionJob({ target_thread_id: thread.id });
+      setIssueResolutionJobId(response.job_id_hint);
+      void queryClient.invalidateQueries({
+        queryKey: ["thread-issue-resolution-status", thread.id],
+        exact: true,
+      });
+    } catch (error) {
+      setIssueResolutionRequestError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIssueResolutionRequestPending(false);
+    }
+  };
+
+  const status = issueResolutionStatus.data?.status;
   const initial = initialOffset(highlight?.position);
   const query = useInfiniteQuery({
     // `initial` is part of the key: opening the same thread from a different
@@ -256,6 +301,61 @@ export function ThreadDetail({
             )}
           </details>
         )}
+        {experimentalIssuesEnabled && (
+          <div className="thread-issue-resolution">
+            <button
+              type="button"
+              className="btn"
+              disabled={issueResolutionRequestPending}
+              onClick={() => void retryIssueResolution()}
+            >
+              {issueResolutionRequestPending
+                ? t("threadDetail.issueResolutionStarting")
+                : t("threadDetail.issueResolution")}
+            </button>
+            <div className="empty-desc">{t("threadDetail.issueResolutionHint")}</div>
+            {issueResolutionJobId && (
+              <div className="empty-desc" role="status">
+                {t("threadDetail.issueResolutionJob", { jobId: issueResolutionJobId })}
+              </div>
+            )}
+            {(issueResolutionRequestPending || issueResolutionJobId) && (
+              <ThreadIssueResolutionProgress jobId={issueResolutionJobId} threadId={thread.id} />
+            )}
+            {status === "PENDING" && (
+              <div className="empty-desc" role="status">
+                {t("threadDetail.issueResolutionStatusPending")}
+              </div>
+            )}
+            {status === "COMPLETE" && (
+              <div className="empty-desc" role="status">
+                {t("threadDetail.issueResolutionStatusComplete")}
+              </div>
+            )}
+            {status === "UNKNOWN" && (
+              <div className="empty-desc" role="alert">
+                {t("threadDetail.issueResolutionStatusUnknown")}
+              </div>
+            )}
+            {issueResolutionStatus.isError && (
+              <div className="empty-desc" role="alert">
+                {t("threadDetail.issueResolutionStatusError", {
+                  error:
+                    issueResolutionStatus.error instanceof Error
+                      ? issueResolutionStatus.error.message
+                      : String(issueResolutionStatus.error),
+                })}
+              </div>
+            )}
+            {issueResolutionRequestError && (
+              <div className="empty-desc" role="alert">
+                {t("threadDetail.issueResolutionEnqueueError", {
+                  error: issueResolutionRequestError,
+                })}
+              </div>
+            )}
+          </div>
+        )}
       </div>
       <div className="modal-body" ref={scrollRef}>
         <div ref={topSentinel} style={{ overflowAnchor: "none" }} />
@@ -296,5 +396,40 @@ export function ThreadDetail({
         </button>
       </div>
     </Modal>
+  );
+}
+
+function ThreadIssueResolutionProgress({
+  jobId,
+  threadId,
+}: {
+  jobId: string | null;
+  threadId: string;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const progress = useSummaryProgress();
+
+  useEffect(() => {
+    if (jobId) progress.start(jobId);
+  }, [jobId, progress.start]);
+
+  useEffect(() => {
+    const update = progress.progress;
+    if (!jobId || update?.job_id !== jobId || !isTerminalStepStatus(update.status)) return;
+    void queryClient.invalidateQueries({
+      queryKey: ["thread-issue-resolution-status", threadId],
+      exact: true,
+    });
+  }, [jobId, progress.progress, queryClient, threadId]);
+
+  if (!jobId || progress.progress?.job_id !== jobId || progress.progress.status !== "active") {
+    return null;
+  }
+
+  return (
+    <div className="empty-desc" role="status">
+      {t("threadDetail.issueResolutionActive")}
+    </div>
   );
 }

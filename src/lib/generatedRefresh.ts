@@ -1,8 +1,12 @@
 import type { QueryClient } from "@tanstack/react-query";
-import { PERSONALITY_QUERY_KEY } from "@/lib/queryKeys";
+import { PERSONALITY_QUERY_KEY, THREAD_GROUP_SUMMARY_PREFIX } from "@/lib/queryKeys";
+import { incrementUiMemoryCounter } from "@/lib/uiMemoryDiagnostics";
 import type { GeneratedRefreshScope } from "@/types/api";
 
 function invalidate(queryClient: QueryClient, queryKey: readonly unknown[]) {
+  if (queryKey.length === 1 && queryKey[0] === "summaries") {
+    incrementUiMemoryCounter("summaries_invalidated_total");
+  }
   void queryClient.invalidateQueries({ queryKey });
 }
 
@@ -18,12 +22,25 @@ export function refreshGeneratedCaches(
     invalidate(queryClient, ["distinct-labels"]);
     invalidate(queryClient, ["co-occurring-labels"]);
     invalidate(queryClient, ["summaries"]);
-    invalidate(queryClient, ["count-summaries"]);
+    invalidate(queryClient, ["count-thread-group-summaries"]);
     invalidate(queryClient, ["summary-search"]);
     invalidate(queryClient, ["summary-distinct-labels"]);
     invalidate(queryClient, ["summary-co-occurring-labels"]);
     invalidate(queryClient, ["summary-hit"]);
     invalidate(queryClient, ["memories"]);
+    invalidate(queryClient, ["thread-row"]);
+    invalidate(queryClient, ["memory-reference"]);
+  }
+
+  if (unique.has("thread_group_summary")) {
+    invalidate(queryClient, ["thread-groups"]);
+    invalidate(queryClient, ["thread-group"]);
+    invalidate(queryClient, THREAD_GROUP_SUMMARY_PREFIX);
+    invalidate(queryClient, ["count-thread-groups"]);
+    invalidate(queryClient, ["summaries"]);
+    invalidate(queryClient, ["summary-search"]);
+    invalidate(queryClient, ["count-thread-group-summaries"]);
+    invalidate(queryClient, ["thread-group-recovery-status"]);
   }
 
   if (
@@ -34,8 +51,11 @@ export function refreshGeneratedCaches(
     invalidate(queryClient, ["summaries"]);
     invalidate(queryClient, ["summary-period-keys"]);
     invalidate(queryClient, ["summary-search"]);
-    invalidate(queryClient, ["count-summaries"]);
+    invalidate(queryClient, ["count-thread-group-summaries"]);
     invalidate(queryClient, ["summary-hit"]);
+    // Recovery reconciliation happens with the terminal period output, so the
+    // Summaries warning and calendar diagnostics must not wait for staleTime.
+    invalidate(queryClient, ["summary-recovery-status"]);
   }
 
   if (unique.has("personality")) {
@@ -53,9 +73,13 @@ export function refreshGeneratedCaches(
 
 export function refreshImportedThreadCaches(queryClient: QueryClient): void {
   invalidate(queryClient, ["threads"]);
+  invalidate(queryClient, ["thread-groups"]);
+  invalidate(queryClient, ["count-thread-groups"]);
   invalidate(queryClient, ["thread-search"]);
   invalidate(queryClient, ["distinct-labels"]);
   invalidate(queryClient, ["co-occurring-labels"]);
   invalidate(queryClient, PERSONALITY_QUERY_KEY);
   invalidate(queryClient, ["memories"]);
+  invalidate(queryClient, ["thread-row"]);
+  invalidate(queryClient, ["memory-reference"]);
 }

@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lookback.invalid/schemas/coding-agent-artifact-manifest-v1.json",
+  "title": "Coding-agent artifact provenance manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile",
+    "target",
+    "sources",
+    "executor",
+    "runtime_compatibility",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string", "enum": ["linux-kvm"] },
+        "version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["triple"],
+      "properties": {
+        "triple": { "type": "string", "minLength": 1, "maxLength": 80 }
+      }
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_app", "jobworkerp_runtime", "jobworkerp_client"],
+      "properties": {
+        "agent_app": { "$ref": "#/$defs/runtimeSource" },
+        "jobworkerp_runtime": { "$ref": "#/$defs/runtimeSource" },
+        "jobworkerp_client": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "revision", "lockfile_sha256"],
+          "properties": {
+            "repository": { "$ref": "#/$defs/repository" },
+            "revision": { "$ref": "#/$defs/revision" },
+            "lockfile_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+          }
+        }
+      }
+    },
+    "executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "protocol_version", "capabilities"],
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$"
+        },
+        "protocol_version": { "const": 2 },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 13,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "resolve_base",
+              "check_repository",
+              "inspect_source",
+              "prepare",
+              "capture",
+              "seal",
+              "resolve",
+              "artifact_only_publication",
+              "push",
+              "push_workspace",
+              "lookup_publication",
+              "pull_request",
+              "secret_scan_supported_formats_v1"
+            ]
+          },
+          "allOf": [
+            { "contains": { "const": "prepare" } },
+            {
+              "if": { "contains": { "const": "push" } },
+              "then": { "contains": { "const": "secret_scan_supported_formats_v1" } }
+            },
+            {
+              "if": { "contains": { "const": "secret_scan_supported_formats_v1" } },
+              "then": { "contains": { "const": "push" } }
+            },
+            {
+              "if": { "contains": { "const": "pull_request" } },
+              "then": { "contains": { "const": "push" } }
+            }
+          ]
+        }
+      }
+    },
+    "runtime_compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "config_version"],
+      "properties": {
+        "protocol_version": { "type": "null" },
+        "config_version": { "type": "null" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime", "executor", "configuration"],
+      "properties": {
+        "runtime": {
+          "allOf": [
+            { "$ref": "#/$defs/artifact" },
+            { "properties": { "path": { "const": "runtime/all-in-one" } } }
+          ]
+        },
+        "executor": {
+          "allOf": [
+            { "$ref": "#/$defs/artifact" },
+            { "properties": { "path": { "const": "bin/coding-agent-executor" } } }
+          ]
+        },
+        "configuration": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/artifact" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "revision": {
+      "type": "string",
+      "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+    },
+    "repository": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^(?:https://[^/@?#]+/[^?#]+|ssh://(?:git@)?[^/@?#]+/[^?#]+)$"
+    },
+    "runtimeSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "ref", "revision", "dirty", "submodules"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/repository" },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!main$|master$|HEAD$|latest$)(?!.*\\/(?:main|master|HEAD|latest)$)[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "revision": { "$ref": "#/$defs/revision" },
+        "dirty": { "const": false },
+        "submodules": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/submodule" }
+        }
+      }
+    },
+    "submodule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "revision", "dirty"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._/ -]+$"
+        },
+        "revision": { "$ref": "#/$defs/revision" },
+        "dirty": { "const": false }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._/-]+$"
+        },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

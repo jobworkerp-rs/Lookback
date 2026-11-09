@@ -55,32 +55,19 @@ impl KvCacheType {
 
 pub const DEFAULT_KV_CACHE_TYPE: KvCacheType = KvCacheType::Q4_0;
 
-/// What `chat_template_kwargs.enable_thinking` value to send for a given
-/// preset. Per-model because the jinja templates flip the meaning in
-/// opposite directions:
-///
-///   - **Qwen3**: `enable_thinking: false` SUPPRESSES the
-///     `<think>…</think>` block that swallows tool calls (QwenLM/Qwen3
-///     #1817, ggml-org/llama.cpp #20837).
-///   - **Gemma 4 26B-A4B**: `enable_thinking: true` SUPPRESSES the
-///     `<|channel>thought\n<channel|>` assistant prefix that the jinja
-///     otherwise injects, freeing position 0 for the PEG-Gemma4 grammar
-///     to emit `<|tool_call>call:…`. The 26B-A4B model card documents
-///     the empty-thought tag emission caveat; the plugin's
-///     `apply_oai_template_with_tools` then forwards this value both as
-///     the jinja kwarg AND as the `OpenAIChatTemplateParams.enable_thinking`
-///     bool that drives the C++ grammar/parser path.
-///   - **None**: skip the kwarg entirely. Models whose chat template
-///     does not branch on `enable_thinking` (most LFM/Functionary/etc.
-///     specialised templates, the custom free-text path).
+/// Retained per-preset metadata for the legacy
+/// `chat_template_kwargs.enable_thinking` option. It is exposed with preset
+/// metadata but is not included in current chat payloads. The values record
+/// the former model-specific preference: Qwen3 used `Disable`, Gemma 4
+/// 26B-A4B used `Enable`, and `None` means no preference was recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingKwarg {
-    /// Do not send `chat_template_kwargs`.
+    /// No legacy preference was recorded.
     None,
-    /// Send `chat_template_kwargs={"enable_thinking":false}`.
+    /// The former preference was `enable_thinking: false`.
     Disable,
-    /// Send `chat_template_kwargs={"enable_thinking":true}`.
+    /// The former preference was `enable_thinking: true`.
     Enable,
 }
 

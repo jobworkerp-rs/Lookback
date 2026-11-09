@@ -1,0 +1,657 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: cross-thread-issue-resolution-candidate
+  version: "1.0.0"
+
+# Resolves one review candidate from later threads of its project. Every
+# thread is judged on its own; the candidate is written only when all
+# judgements succeeded and name exactly one terminal decision. Every entry of
+# failed_candidates is a transient failure (a read, the LLM call or the
+# tracker write) worth retrying; answers that cannot be verified are skips.
+input:
+  schema:
+    document:
+      type: object
+      required: [review_row, candidate_keys, candidate_side, updated_thread_ids, user_id, manager_contract, manager_store_identity, memories_grpc_host, memories_grpc_port, issue_tracker_grpc_host, issue_tracker_grpc_port, resolution_min_confidence]
+      properties:
+        review_row: { type: object }
+        # Normalized repository identities and path labels of the candidate.
+        candidate_keys: { type: object }
+        # True when the candidate itself changed in the run range: every
+        # matching thread is then evidence, not only the updated ones.
+        candidate_side: { type: boolean }
+        updated_thread_ids: { type: array, items: { type: string } }
+        user_id: { type: integer, minimum: 1 }
+        manager_contract: { type: object }
+        manager_store_identity: { type: object }
+        memories_grpc_host: { type: string }
+        memories_grpc_port: { type: integer }
+        memories_grpc_tls: { type: boolean, default: false }
+        issue_tracker_grpc_host: { type: string }
+        issue_tracker_grpc_port: { type: integer }
+        issue_tracker_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        resolution_min_confidence: { type: number }
+        search_limit: { type: integer, minimum: 1, default: 20 }
+        search_score_min: { type: number, default: 0 }
+        dry_run: { type: boolean, default: false }
+
+timeout:
+  after:
+    hours: 6
+
+do:
+  - initState:
+      set:
+        candidate: "${ $workflow.input.review_row.candidate // {} }"
+        associated_issue: "${ $workflow.input.review_row.associatedIssue // $workflow.input.review_row.associated_issue // {} }"
+        candidate_id: '${ "" }'
+        candidate_status: '${ "" }'
+        candidate_revision: "${ 0 }"
+        associated_issue_id: '${ "" }'
+        source_thread_ids: "${ [] }"
+        query_text: '${ "" }'
+        search_labels: "${ [] }"
+        query_vector: "${ [] }"
+        raw_hits: "${ [] }"
+        hit_threads: "${ [] }"
+        targets: "${ { primary: [], others: [] } }"
+        candidate_source_latest_at: "${ null }"
+        checkpoints: "${ {} }"
+        checkpoint_errors: "${ [] }"
+        verdicts: "${ [] }"
+        judge_targets: "${ [] }"
+        aggregate: "${ null }"
+        prepared: "${ null }"
+        origin_result: "${ null }"
+        judged: "${ null }"
+        applied: "${ null }"
+        unmatched: "${ false }"
+        unmatched_reason: "${ null }"
+        search_mode: '${ "hybrid" }'
+        candidate_outcome_recorded: "${ false }"
+        applied_candidates: "${ [] }"
+        dry_run_candidates: "${ [] }"
+        kept_candidates: "${ [] }"
+        contradicted_candidates: "${ [] }"
+        protected_candidates: "${ [] }"
+        skipped_candidates: "${ [] }"
+        conflicted_candidates: "${ [] }"
+        failed_candidates: "${ [] }"
+
+  - selectCandidate:
+      set:
+        candidate_id: "${ ($candidate.candidateId // $candidate.candidate_id // \"\") | tostring }"
+        source_thread_ids: >-
+          ${ ($candidate.sourceEvidence // $candidate.source_evidence // [])
+             | map((.threadId // .thread_id // "") | tostring)
+             | map(select(. != ""))
+             | unique }
+
+  - buildQuery:
+      set:
+        query_text: >-
+          ${ ([$candidate.title, $candidate.description]
+              + ($candidate.acceptanceCriteria // $candidate.acceptance_criteria // []))
+             | map(select(. != null and . != ""))
+             | join("\n") }
+        search_labels: >-
+          ${ ($workflow.input.candidate_keys.repos // [] | map("repo:" + .))
+             + ($workflow.input.candidate_keys.paths // []) }
+
+  # Same embedding worker as the thread descriptions, so the hybrid search
+  # compares vectors of one space. When the worker cannot be used at all
+  # (missing or misconfigured, which stays so on every run) the search falls
+  # back to full text. Any other failure is retried on a later run: a
+  # degraded search could miss the evidence and let the watermark pass it.
+  - embedQuery:
+      try:
+        - runEmbedding:
+            run:
+              worker:
+                name: "%{LOOKBACK_MM_EMBEDDING_WORKER}"
+                using: embed_text
+                arguments:
+                  text: "${ $query_text }"
+                  prefix: "%{MEMORY_EMBEDDING_QUERY_PREFIX:-}"
+            export:
+              as:
+                query_vector: "${ (.embeddings // [{}])[0].values // [] }"
+      catch:
+        as: embedding_error
+        do:
+          - classifyEmbeddingError:
+              set:
+                embedding_unusable: >-
+                  ${ ($embedding_error.type? // "" | tostring)
+                     | (endswith("/configuration") or endswith("/validation")) }
+          - recordEmbeddingUnavailable:
+              if: "${ $embedding_unusable }"
+              set:
+                query_vector: "${ [] }"
+                search_mode: '${ "text" }'
+          - recordEmbeddingFailure:
+              if: "${ $embedding_unusable | not }"
+              set:
+                failed_candidates: >-
+                  ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($embedding_error | tostring), source: "embedding" }] }
+                candidate_outcome_recorded: "${ true }"
+
+  # The label filter is an exact match on the server; the project rule is
+  # applied to the results below.
+  - searchThreads:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      try:
+        - runThreadSearch:
+            run:
+              function:
+                runnerName: GRPC
+                using: streaming
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: >-
+                    ${ if ($query_vector | length) > 0
+                       then "/llm_memory.service.ThreadVectorService/HybridSearch"
+                       else "/llm_memory.service.ThreadVectorService/SearchByText" end }
+                  json_body: >-
+                    ${ (if ($query_vector | length) > 0 then { query_vectors: [{ values: $query_vector }] } else {} end)
+                       + {
+                        query_text: $query_text,
+                        options: {
+                          limit: (($workflow.input.search_limit // 20) * 4),
+                          include_description: false,
+                          filter: {
+                            user_id: $workflow.input.user_id,
+                            labels: $search_labels,
+                            label_match_mode: "LABEL_ANY"
+                          }
+                        }
+                      } | tojson }
+                  as_json: true
+            export:
+              as:
+                raw_hits: >-
+                  ${ (.jsonBody // "[]") | fromjson
+                     | if type == "array" then . else [.] end
+                     | map({ thread_id: ((.thread.id.value // "") | tostring),
+                             labels: (.thread.data.labels // []),
+                             score: ((.score // 0) | tonumber),
+                             last_message_at: ((.thread.data.lastMessageAt // .thread.data.last_message_at // null)
+                                               | if . == null then null else (try tonumber catch null) end) }) }
+      catch:
+        as: search_error
+        do:
+          - recordSearchFailure:
+              set:
+                failed_candidates: >-
+                  ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($search_error | tostring), source: "thread_search" }] }
+                candidate_outcome_recorded: "${ true }"
+
+  # Thread labels are canonical, so a thread's repo label is its identity.
+  - selectHits:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        hit_threads: >-
+          ${ def thread_keys:
+               { repos: (map(select(startswith("repo:")) | sub("^repo:"; "")
+                             | select(test("^[^/]+/.+"))) | unique),
+                 paths: (map(select(startswith("path:"))) | unique) };
+             def matches($a; $b):
+               if (($a.repos | length) > 0) and (($b.repos | length) > 0)
+               then any($a.repos[]; . as $repo | any($b.repos[]; . == $repo))
+               else any($a.paths[]; . as $path | any($b.paths[]; . == $path)) end;
+             $workflow.input.candidate_keys as $keys
+             | [ $raw_hits[]
+                 | select(.thread_id != "")
+                 | select(.thread_id as $thread | ($source_thread_ids | index($thread)) == null)
+                 | select(.score >= ($workflow.input.search_score_min // 0))
+                 | select(matches($keys; (.labels | thread_keys))) ]
+             | unique_by(.thread_id)
+             | sort_by(-.score)
+             | .[:($workflow.input.search_limit // 20)] }
+        # Later jq evaluations copy the whole context.
+        query_vector: "${ [] }"
+        raw_hits: "${ [] }"
+
+  # Threads updated in this run are judged first; the other hits only
+  # confirm a cancellation (judgeThread).
+  - pickTargets:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        targets: >-
+          ${ ($hit_threads | map(.thread_id)) as $ids
+             | ($workflow.input.updated_thread_ids // []) as $updated
+             | if $workflow.input.candidate_side
+               then { primary: $ids, others: [] }
+               else { primary: [ $ids[] | select(. as $id | ($updated | index($id)) != null) ],
+                      others: [ $ids[] | select(. as $id | ($updated | index($id)) == null) ] } end }
+
+  - skipWithoutTarget:
+      if: "${ ($candidate_outcome_recorded | not) and (($targets.primary | length) == 0) }"
+      set:
+        unmatched: "${ true }"
+        unmatched_reason: '${ "no_updated_hit" }'
+        candidate_outcome_recorded: "${ true }"
+
+  - prepareCandidate:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      try:
+        - invokePrepare:
+            run:
+              function:
+                workerName: lookback-issue-resolution-prepare
+                arguments:
+                  input: >-
+                    ${ {
+                        review_row: $workflow.input.review_row,
+                        manager_contract: $workflow.input.manager_contract,
+                        manager_store_identity: $workflow.input.manager_store_identity,
+                        issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                        issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                        issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false),
+                        correlation_prefix: "cross-thread-issue-resolution"
+                      } | tojson }
+            export:
+              as:
+                prepared: '${ .output | fromjson }'
+      catch:
+        as: prepare_error
+        do:
+          - recordPrepareFailure:
+              set:
+                failed_candidates: >-
+                  ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($prepare_error | tostring), source: "prepare" }] }
+                candidate_outcome_recorded: "${ true }"
+
+  # Prepare fails a candidate only when a tracker read failed.
+  - adoptPreparedCandidate:
+      if: "${ $prepared != null }"
+      set:
+        skipped_candidates: "${ $skipped_candidates + ($prepared.skipped_candidates // []) }"
+        protected_candidates: "${ $protected_candidates + ($prepared.protected_candidates // []) }"
+        failed_candidates: "${ $failed_candidates + ($prepared.failed_candidates // []) }"
+        candidate_outcome_recorded: "${ $prepared.candidate_outcome_recorded // false }"
+        candidate_status: '${ $prepared.candidate_status // "" }'
+        candidate_revision: "${ $prepared.candidate_revision // 0 }"
+        associated_issue_id: '${ $prepared.associated_issue_id // "" }'
+        prepared: "${ null }"
+
+  - resolveCandidateOrigin:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      try:
+        - invokeOrigin:
+            run:
+              function:
+                workerName: lookback-issue-resolution-origin
+                arguments:
+                  input: >-
+                    ${ {
+                        candidate_id: $candidate_id,
+                        source_evidence_refs: ($candidate.sourceEvidence // $candidate.source_evidence // []),
+                        memories_grpc_host: $workflow.input.memories_grpc_host,
+                        memories_grpc_port: $workflow.input.memories_grpc_port,
+                        memories_grpc_tls: ($workflow.input.memories_grpc_tls // false)
+                      } | tojson }
+            export:
+              as:
+                origin_result: '${ .output | fromjson }'
+      catch:
+        as: origin_error
+        do:
+          - recordOriginFailure:
+              set:
+                failed_candidates: >-
+                  ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($origin_error | tostring), source: "origin" }] }
+                candidate_outcome_recorded: "${ true }"
+
+  - adoptCandidateOrigin:
+      if: "${ $origin_result != null }"
+      set:
+        skipped_candidates: "${ $skipped_candidates + ($origin_result.skipped_candidates // []) }"
+        candidate_outcome_recorded: "${ $origin_result.candidate_outcome_recorded // false }"
+        candidate_source_latest_at: "${ $origin_result.candidate_source_latest_at }"
+        origin_result: "${ null }"
+
+  # A thread whose conversation ended before the candidate appeared cannot
+  # report on it.
+  - dropThreadsBeforeOrigin:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        targets: >-
+          ${ [ $hit_threads[]
+               | select(.last_message_at == null or .last_message_at > $candidate_source_latest_at)
+               | .thread_id ] as $later
+             | { primary: [ $targets.primary[] | select(. as $id | ($later | index($id)) != null) ],
+                 others: [ $targets.others[] | select(. as $id | ($later | index($id)) != null) ] } }
+
+  - skipWithoutLaterTarget:
+      if: "${ ($candidate_outcome_recorded | not) and (($targets.primary | length) == 0) }"
+      set:
+        unmatched: "${ true }"
+        unmatched_reason: '${ "no_thread_after_origin" }'
+        candidate_outcome_recorded: "${ true }"
+
+  # Messages after a thread's saved summary are not judged yet; that summary
+  # will bring the thread back into a later run. Summaries written before
+  # checkpoints existed are bounded by the summary memory's last write.
+  - fetchCheckpoints:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      for:
+        each: checkpoint_thread_id
+        in: "${ $targets.primary + $targets.others }"
+      do:
+        - readCheckpoint:
+            try:
+              - fetchThreadCheckpoint:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: streaming
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.MemoryService/FindListByCondition"
+                        json_body: >-
+                          ${ { external_id: ("summary:" + $checkpoint_thread_id) } | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      thread_checkpoint_at: >-
+                        ${ ((.jsonBody // "[]") | fromjson
+                            | if type == "array" then . else (.data // []) end
+                            | map(.memory // .)) as $entries
+                           | if ($entries | length) != 1 then null
+                             else (($entries[0].data.metadata // {})
+                                   | if type == "string" then (try fromjson catch {}) else . end) as $metadata
+                                  | ($metadata.resolution_high_water_message_at
+                                     // $metadata.last_processed_message_at
+                                     // $entries[0].data.updatedAt // $entries[0].data.updated_at // null)
+                                  | if . == null then null else (try tonumber catch null) end
+                             end }
+              - collectThreadCheckpoint:
+                  if: "${ $thread_checkpoint_at != null }"
+                  set:
+                    checkpoints: "${ $checkpoints + { ($checkpoint_thread_id | tostring): $thread_checkpoint_at } }"
+            catch:
+              as: checkpoint_error
+              do:
+                - recordCheckpointError:
+                    set:
+                      checkpoint_errors: "${ $checkpoint_errors + [$checkpoint_thread_id] }"
+
+  - failOnCheckpointError:
+      if: "${ ($candidate_outcome_recorded | not) and (($checkpoint_errors | length) > 0) }"
+      set:
+        failed_candidates: >-
+          ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($checkpoint_errors | tojson), source: "summary_checkpoint" }] }
+        candidate_outcome_recorded: "${ true }"
+
+  # Hits without a summary checkpoint are dropped below; when no updated hit
+  # is left, nothing can start a judgement and the candidate is not "kept".
+  - skipWithoutCheckpointedTarget:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ([ $targets.primary[] | select(. as $id | $checkpoints[$id] != null) ] | length) == 0 }
+      set:
+        unmatched: "${ true }"
+        unmatched_reason: '${ "no_summary_checkpoint" }'
+        candidate_outcome_recorded: "${ true }"
+
+  # A thread without a saved summary checkpoint is never evidence.
+  - listJudgeTargets:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        judge_targets: '${ ($targets.primary + $targets.others) | map(select(. as $id | $checkpoints[$id] != null)) }'
+
+  # Judgements of separate threads routinely differ, so one confident
+  # completion completes the candidate and ends the judging. A cancellation
+  # is held to more: a single LLM answer has been seen to call unrelated work
+  # a false positive with full confidence, so the remaining hits are judged
+  # to confirm it (round one) and each cancelling thread is judged again
+  # (round two); only a repeated, uncontradicted cancellation is written.
+  - judgeThreads:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      for:
+        each: judge_thread_id
+        at: judge_index
+        in: "${ $judge_targets + $judge_targets }"
+      do:
+        - judgeThread:
+            if: >-
+              ${ if any($verdicts[]; .kind == "terminal" and .ready and .decision == "COMPLETE")
+                 then false
+                 elif $judge_index < ($judge_targets | length)
+                 then (($targets.primary | index($judge_thread_id)) != null)
+                      or any($verdicts[]; .kind == "terminal" and .ready)
+                 else ($verdicts | map(select((.round // 1) == 1))) as $first
+                      | any($first[]; .thread_id == $judge_thread_id and .kind == "terminal" and .ready)
+                        and all($first[]; .kind == "keep" or .kind == "terminal")
+                        and (($first | map(select(.kind == "terminal") | .decision) | unique | length) == 1) end }
+            try:
+              - invokeJudge:
+                  run:
+                    function:
+                      workerName: lookback-issue-resolution-judge
+                      arguments:
+                        input: >-
+                          ${ {
+                              candidate: $candidate,
+                              candidate_id: $candidate_id,
+                              candidate_status: $candidate_status,
+                              source_thread_ids: $source_thread_ids,
+                              selected_member_thread_ids: [$judge_thread_id],
+                              max_message_at_by_thread: { ($judge_thread_id | tostring): $checkpoints[$judge_thread_id] },
+                              messages_after: $candidate_source_latest_at,
+                              candidate_source_latest_at: $candidate_source_latest_at,
+                              associated_issue: $associated_issue,
+                              associated_issue_id: $associated_issue_id,
+                              project_context: { unknown: false, member_match: true, matching_member_thread_ids: [$judge_thread_id] },
+                              resolution_min_confidence: $workflow.input.resolution_min_confidence,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              evidence_scope: "a later thread of the same project, not the candidate source thread. A thread about other work says nothing about this candidate: answer NO_CHANGE for it, never CANCEL",
+                              memories_grpc_host: $workflow.input.memories_grpc_host,
+                              memories_grpc_port: $workflow.input.memories_grpc_port,
+                              memories_grpc_tls: ($workflow.input.memories_grpc_tls // false)
+                            } | tojson }
+                  export:
+                    as:
+                      judged: '${ .output | fromjson }'
+              - classifyVerdict:
+                  set:
+                    verdicts: >-
+                      ${ ($judged.skipped_candidates // []) as $skips
+                         | ($judged.failed_candidates // []) as $fails
+                         | ($skips | map(.reason)) as $skip_reasons
+                         | $verdicts + [ { thread_id: $judge_thread_id,
+                                           round: (if $judge_index < ($judge_targets | length) then 1 else 2 end),
+                                           confidence: ($judged.llm_outcome.confidence // null),
+                                           rationale: (($judged.resolution_rationale // "") | .[0:400]),
+                                           reasons: ($skip_reasons + ($fails | map(.reason | tostring | .[0:200]))),
+                                           llm_response: ([$fails[].llm_response | values][0]) } +
+                             (if ($judged.transient_failure // false)
+                              then { kind: "transient", reason: ($fails[0].reason // "transient failure") }
+                              elif ($judged.evidence_ready // false) and ($judged.decision_payload != null)
+                              then { kind: "terminal", decision: $judged.resolution_decision, ready: true,
+                                     evidence_thread_ids: $judged.evidence_thread_ids,
+                                     evidence_memory_ids: $judged.evidence_memory_ids,
+                                     decision_audit: $judged.decision_audit,
+                                     decision_payload: $judged.decision_payload }
+                              elif ($skip_reasons | index("confidence_below_threshold")) != null
+                              then { kind: "terminal", decision: ($judged.llm_outcome.decision // ""), ready: false }
+                              elif (($fails | length) == 0) and (($skip_reasons | length) > 0)
+                                   and ((($skip_reasons - ["no_resolution", "cross_thread_raw_evidence_missing"]) | length) == 0)
+                              then { kind: "keep" }
+                              else { kind: "unverifiable",
+                                     reason: ($skip_reasons[0] // $fails[0].reason // "not_resolvable") } end) ] }
+                    judged: "${ null }"
+            catch:
+              as: judge_error
+              do:
+                - recordJudgeFailure:
+                    set:
+                      verdicts: >-
+                        ${ $verdicts + [{ thread_id: $judge_thread_id,
+                                          round: (if $judge_index < ($judge_targets | length) then 1 else 2 end),
+                                          kind: "transient", reason: ($judge_error | tostring) }] }
+
+  - aggregateVerdicts:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        aggregate: >-
+          ${ def applied($decision; $by):
+               { kind: "apply",
+                 decision: $decision,
+                 decision_payload: $by[0].decision_payload,
+                 evidence_thread_ids: ($by | map(.evidence_thread_ids[]) | unique),
+                 evidence_memory_ids: ($by | map(.evidence_memory_ids[]) | unique) }
+               | .audit_reason = ($by[0].decision_audit.rationale
+                                  + " [evidence_thread_ids=" + (.evidence_thread_ids | join(",")) + "]"
+                                  + " [evidence_memory_ids=" + (.evidence_memory_ids | join(",")) + "]");
+             ($verdicts | map(select((.round // 1) == 1))) as $first
+             | ($verdicts | map(select(.round == 2))) as $second
+             | ($first | map(select(.kind == "terminal") | .decision) | unique) as $types
+             | ($first | map(select(.kind == "terminal" and .ready))) as $ready
+             | ($ready | map(select(.decision == "COMPLETE"))) as $completed
+             | if ($completed | length) > 0
+               then applied("COMPLETE"; $completed)
+               elif any($verdicts[]; .kind == "transient")
+               then { kind: "transient", reasons: ($verdicts | map(select(.kind == "transient") | .reason)) }
+               elif any($first[]; .kind == "unverifiable")
+               then { kind: "unverifiable", reason: ($first | map(select(.kind == "unverifiable") | .reason) | first) }
+               elif ($types | length) > 1
+               then { kind: "contradicted", decisions: $types }
+               elif (($ready | length) > 0)
+                    and (all($ready[]; . as $verdict
+                             | any($second[]; .thread_id == $verdict.thread_id and .kind == "terminal"
+                                              and .ready and .decision == $verdict.decision)) | not)
+               then { kind: "unverifiable", reason: "judgement_not_repeated" }
+               elif ($ready | length) > 0
+               then applied($types[0]; $ready)
+               else { kind: "keep" } end }
+
+  - recordTransient:
+      if: "${ ($candidate_outcome_recorded | not) and ($aggregate.kind == \"transient\") }"
+      set:
+        failed_candidates: >-
+          ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($aggregate.reasons | tojson), source: "judge" }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - recordUnverifiable:
+      if: "${ ($candidate_outcome_recorded | not) and ($aggregate.kind == \"unverifiable\") }"
+      set:
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: $aggregate.reason, verdicts: $verdicts }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - recordContradicted:
+      if: "${ ($candidate_outcome_recorded | not) and ($aggregate.kind == \"contradicted\") }"
+      set:
+        contradicted_candidates: >-
+          ${ $contradicted_candidates + [{ candidate_id: $candidate_id, decisions: $aggregate.decisions,
+                                           thread_ids: ($verdicts | map(.thread_id)) }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - recordKept:
+      if: "${ ($candidate_outcome_recorded | not) and ($aggregate.kind == \"keep\") }"
+      set:
+        kept_candidates: "${ $kept_candidates + [{ candidate_id: $candidate_id, thread_ids: ($verdicts | map(.thread_id)) }] }"
+        candidate_outcome_recorded: "${ true }"
+
+  - recordDryRunDecision:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ($aggregate.kind == "apply")
+           and ($workflow.input.dry_run // false) }
+      set:
+        dry_run_candidates: >-
+          ${ $dry_run_candidates + [{ candidate_id: $candidate_id,
+                                      decision: $aggregate.decision,
+                                      evidence_thread_ids: $aggregate.evidence_thread_ids,
+                                      evidence_memory_ids: $aggregate.evidence_memory_ids,
+                                      judged_thread_ids: ($verdicts | map(.thread_id)) }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - applyDecision:
+      if: "${ ($candidate_outcome_recorded | not) and ($aggregate.kind == \"apply\") }"
+      try:
+        - invokeApply:
+            run:
+              function:
+                workerName: lookback-issue-resolution-apply
+                arguments:
+                  input: >-
+                    ${ {
+                        candidate_id: $candidate_id,
+                        candidate_revision: $candidate_revision,
+                        decision_payload: $aggregate.decision_payload,
+                        audit_reason: $aggregate.audit_reason,
+                        actor_id: "lookback-cross-thread-issue-resolution",
+                        idempotency_key: ("cross-thread-issue-resolution:" + $candidate_id + ":"
+                                          + ($candidate_revision | tostring) + ":" + $aggregate.decision),
+                        correlation_prefix: "cross-thread-issue-resolution",
+                        manager_contract: $workflow.input.manager_contract,
+                        manager_store_identity: $workflow.input.manager_store_identity,
+                        issue_tracker_grpc_host: $workflow.input.issue_tracker_grpc_host,
+                        issue_tracker_grpc_port: $workflow.input.issue_tracker_grpc_port,
+                        issue_tracker_grpc_tls: ($workflow.input.issue_tracker_grpc_tls // false)
+                      } | tojson }
+            export:
+              as:
+                applied: '${ .output | fromjson }'
+      catch:
+        as: apply_error
+        do:
+          - recordApplyWorkerFailure:
+              set:
+                failed_candidates: >-
+                  ${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($apply_error | tostring), source: "tracker" }] }
+                candidate_outcome_recorded: "${ true }"
+
+  # A revision conflict means someone changed the candidate meanwhile: it is
+  # reported, not retried.
+  - adoptApplyOutcome:
+      if: "${ $applied != null }"
+      set:
+        applied_candidates: >-
+          ${ if ($applied.operation_confirmed // false)
+             then $applied_candidates + [{ candidate_id: $candidate_id, operation_id: $applied.operation_id,
+                                           decision: $aggregate.decision,
+                                           evidence_thread_ids: $aggregate.evidence_thread_ids }]
+             else $applied_candidates end }
+        conflicted_candidates: "${ $conflicted_candidates + ($applied.conflicted_candidates // []) }"
+        failed_candidates: "${ $failed_candidates + ($applied.failed_candidates // []) }"
+        candidate_outcome_recorded: "${ true }"
+        applied: "${ null }"
+
+output:
+  as:
+    candidate_id: "${ $candidate_id }"
+    unmatched: "${ $unmatched }"
+    applied_candidates: "${ $applied_candidates }"
+    dry_run_candidates: "${ $dry_run_candidates }"
+    kept_candidates: "${ $kept_candidates }"
+    contradicted_candidates: "${ $contradicted_candidates }"
+    protected_candidates: "${ $protected_candidates }"
+    skipped_candidates: "${ $skipped_candidates }"
+    conflicted_candidates: "${ $conflicted_candidates }"
+    failed_candidates: "${ $failed_candidates }"
+    # What a dry run is evaluated on: the threads found and how each judged.
+    evaluation: >-
+      ${ if ($workflow.input.dry_run // false)
+         then { candidate_id: $candidate_id,
+                title: ($candidate.title // ""),
+                outcome: (if $unmatched then "unmatched:" + ($unmatched_reason // "unknown")
+                          else ($aggregate.kind // "not_judged") end),
+                search_mode: $search_mode,
+                hits: ($hit_threads | map({ thread_id, score })),
+                verdicts: ($verdicts | map({ thread_id, round, kind, decision, ready, confidence, reasons, rationale, llm_response }
+                                          | with_entries(select(.value != null)))) }
+         else null end }

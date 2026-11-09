@@ -1,15 +1,16 @@
+import { open as openDirectoryDialog } from "@tauri-apps/plugin-dialog";
 import { open } from "@tauri-apps/plugin-shell";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   openLogDir,
   quitApp,
-  recoverEvacuateLancedb,
-  recoverPurgeLancedb,
   recoverResetEmbeddingSettings,
   restoreDatabaseMigrationBackup,
   retryDatabaseMigration,
+  startFreshSetup,
 } from "@/api";
+import { EmbeddingMigrationPanel } from "@/components/EmbeddingMigrationPanel";
 import type {
   DatabaseRestoreResult,
   RecoveryResult,
@@ -23,12 +24,11 @@ import type {
  * idle-labelled but disabled), and as the discriminator for the
  * per-step progress messages. */
 type ActionId =
-  | "evacuate"
-  | "purge"
   | "reset_embedding"
   | "retry_migration"
   | "restore_migration"
   | "open_migration_release"
+  | "start_fresh_setup"
   | "open_log"
   | "quit";
 
@@ -74,22 +74,6 @@ interface RecoveryEscapeAction {
 
 type RecoveryAction = RecoveryRestartAction | DatabaseRestoreAction | RecoveryEscapeAction;
 
-const evacuateAction: RecoveryRestartAction = {
-  kind: "restart",
-  id: "evacuate",
-  labelKey: "bootError.action.evacuate.label",
-  intent: "primary",
-  pendingLabelKey: "bootError.action.evacuate.pending",
-  run: recoverEvacuateLancedb,
-};
-const purgeAction: RecoveryRestartAction = {
-  kind: "restart",
-  id: "purge",
-  labelKey: "bootError.action.purge.label",
-  intent: "danger",
-  pendingLabelKey: "bootError.action.purge.pending",
-  run: recoverPurgeLancedb,
-};
 const resetEmbeddingAction: RecoveryRestartAction = {
   kind: "restart",
   id: "reset_embedding",
@@ -118,12 +102,149 @@ const openMemoryKindMigrationReleaseAction: RecoveryEscapeAction = {
   intent: "primary",
   run: () => open(MEMORY_KIND_MIGRATION_RELEASE_URL),
 };
+/** Switches to a user-picked empty data root and restarts into setup. The
+ * old root is left untouched, so this is the way out when a failed migration
+ * cannot be restored. Cancelling the picker changes nothing. */
+const startFreshSetupAction: RecoveryEscapeAction = {
+  kind: "escape",
+  id: "start_fresh_setup",
+  labelKey: "bootError.action.startFreshSetup.label",
+  intent: "danger",
+  run: async () => {
+    const picked = await openDirectoryDialog({ directory: true, multiple: false });
+    if (typeof picked === "string") {
+      await startFreshSetup(picked);
+    }
+  },
+};
 const quitAction: RecoveryEscapeAction = {
   kind: "escape",
   id: "quit",
   labelKey: "bootError.action.quit.label",
   run: quitApp,
 };
+
+/** `error_code` vocabulary of `memories-db-migrate local apply`, plus the
+ * two codes Lookback reports itself when the tool cannot be started or ends
+ * without its result line. The tool's specification owns the meaning of each
+ * code; this table only decides what the user can do about it. */
+export const MIGRATION_ERROR_CODES = [
+  "unsupported_backend",
+  "backup_option_required",
+  "invalid_target",
+  "legacy_schema_unsupported",
+  "integrity_violation",
+  "restore_required",
+  "restore_required_no_backup",
+  "writer_active",
+  "db_newer_than_tool",
+  "unsupported_resource",
+  "insufficient_space",
+  "backup_failed",
+  "baseline_schema_mismatch",
+  "migration_failed",
+  "verify_failed",
+  "bundle_invalid",
+  "backup_incomplete",
+  "backup_newer_than_tool",
+  "restore_failed",
+  "tool_unavailable",
+  "tool_output_unrecognized",
+] as const;
+
+export type MigrationErrorCode = (typeof MIGRATION_ERROR_CODES)[number];
+
+/** What the user can do: run the migration again, restore the reported
+ * backup, start over in an empty data root, upgrade through the legacy
+ * release, or nothing in-app (update Lookback / inspect logs). */
+type MigrationRemedy = "retry" | "restore" | "start_fresh" | "legacy_release" | "none";
+
+export const MIGRATION_REMEDY: Record<MigrationErrorCode, MigrationRemedy> = {
+  unsupported_backend: "none",
+  backup_option_required: "none",
+  invalid_target: "none",
+  legacy_schema_unsupported: "legacy_release",
+  integrity_violation: "start_fresh",
+  restore_required: "restore",
+  restore_required_no_backup: "start_fresh",
+  writer_active: "retry",
+  db_newer_than_tool: "none",
+  unsupported_resource: "none",
+  insufficient_space: "retry",
+  backup_failed: "retry",
+  baseline_schema_mismatch: "none",
+  migration_failed: "retry",
+  verify_failed: "none",
+  bundle_invalid: "none",
+  backup_incomplete: "retry",
+  backup_newer_than_tool: "none",
+  restore_failed: "retry",
+  tool_unavailable: "none",
+  tool_output_unrecognized: "retry",
+};
+
+function isMigrationErrorCode(code: string): code is MigrationErrorCode {
+  return (MIGRATION_ERROR_CODES as readonly string[]).includes(code);
+}
+
+function migrationActions(remedy: MigrationRemedy, backupPath: string): RecoveryAction[] {
+  const restoreAction: DatabaseRestoreAction = {
+    kind: "restore",
+    id: "restore_migration",
+    labelKey: "bootError.action.restoreMigration.label",
+    intent: "danger",
+    pendingLabelKey: "bootError.action.restoreMigration.pending",
+    run: () => restoreDatabaseMigrationBackup(backupPath),
+  };
+  const remedyActions: Record<MigrationRemedy, RecoveryAction[]> = {
+    retry: [retryMigrationAction],
+    // Without a reported backup there is nothing to restore; the tool keeps
+    // refusing until one is, so only the escape hatches remain.
+    restore: backupPath ? [restoreAction, retryMigrationAction] : [],
+    start_fresh: [startFreshSetupAction],
+    legacy_release: [openMemoryKindMigrationReleaseAction],
+    none: [],
+  };
+  return [...remedyActions[remedy], openLogAction, quitAction];
+}
+
+function DatabaseMigrationBootError({
+  failure,
+}: {
+  failure: Extract<SidecarErrorPayload, { kind: "database_migration_failed" }>;
+}) {
+  const { t } = useTranslation();
+  const code = failure.error_code;
+  const known = isMigrationErrorCode(code);
+  // An unknown code comes from a newer tool; retrying is the least harmful
+  // offer because the tool refuses again if it must.
+  const remedy: MigrationRemedy = known ? MIGRATION_REMEDY[code] : "retry";
+  const message = t(
+    known
+      ? `bootError.databaseMigrationFailed.code.${code}`
+      : "bootError.databaseMigrationFailed.unknownCode",
+    { error_code: code },
+  );
+  return (
+    <BootErrorShell
+      title={t("bootError.databaseMigrationFailed.title")}
+      body={
+        <>
+          <p className="boot-error-message">{message}</p>
+          <pre className="boot-error-message">
+            {t("bootError.databaseMigrationFailed.facts", {
+              stage: failure.stage,
+              error_code: failure.error_code,
+              backup_path: failure.backup_path || t("bootError.databaseMigrationFailed.noBackup"),
+            })}
+          </pre>
+          {failure.detail && <pre className="boot-error-message">{failure.detail}</pre>}
+        </>
+      }
+      actions={migrationActions(remedy, failure.backup_path)}
+    />
+  );
+}
 
 /** One entry per `StartupFailureCode`. The title / body are owned here
  * (not derived from memories' `message` field) so a memories rephrase
@@ -153,13 +274,13 @@ export const RECOVERY_TABLE: RecoveryTable = {
     titleKey: "bootError.lancedbSchemaMismatch.title",
     bodyKey: "bootError.lancedbSchemaMismatch.body",
     bodyVars: (f) => ({ actualDim: f.actual_dim, expectedDim: f.expected_dim }),
-    actions: [evacuateAction, purgeAction, resetEmbeddingAction],
+    actions: [resetEmbeddingAction, openLogAction, quitAction],
   },
   lancedb_init_failed: {
     titleKey: "bootError.lancedbInitFailed.title",
     bodyKey: "bootError.lancedbInitFailed.body",
     bodyVars: (f) => ({ uri: f.uri, message: f.message }),
-    actions: [evacuateAction, openLogAction, quitAction],
+    actions: [openLogAction, quitAction],
   },
   embedding_dimension_mismatch: {
     titleKey: "bootError.embeddingDimensionMismatch.title",
@@ -169,7 +290,7 @@ export const RECOVERY_TABLE: RecoveryTable = {
       actualDim: f.actual_dim,
       expectedDim: f.expected_dim,
     }),
-    actions: [evacuateAction, purgeAction, resetEmbeddingAction],
+    actions: [resetEmbeddingAction, openLogAction, quitAction],
   },
   media_config_conflict: {
     titleKey: "bootError.mediaConfigConflict.title",
@@ -214,70 +335,7 @@ export const RECOVERY_TABLE: RecoveryTable = {
 export function BootError({ failure }: { failure: SidecarErrorPayload }) {
   const { t } = useTranslation();
   if (failure.kind === "database_migration_failed") {
-    const restoreInProgress = failure.phase === "restore pending recovery";
-    const restoreMigrationAction: DatabaseRestoreAction = {
-      kind: "restore",
-      id: "restore_migration",
-      labelKey: "bootError.action.restoreMigration.label",
-      intent: "danger",
-      pendingLabelKey: "bootError.action.restoreMigration.pending",
-      run: () => restoreDatabaseMigrationBackup(failure.backup_path),
-    };
-    return (
-      <BootErrorShell
-        title={t("bootError.databaseMigrationFailed.title")}
-        body={
-          <pre className="boot-error-message">
-            {t("bootError.databaseMigrationFailed.body", failure)}
-          </pre>
-        }
-        actions={[
-          ...(!restoreInProgress ? [retryMigrationAction] : []),
-          ...(failure.backup_path ? [restoreMigrationAction] : []),
-          openLogAction,
-          quitAction,
-        ]}
-      />
-    );
-  }
-  if (failure.kind === "memory_kind_migration_required") {
-    return (
-      <BootErrorShell
-        title={t("bootError.memoryKindMigrationRequired.title")}
-        body={
-          <pre className="boot-error-message">
-            {t("bootError.memoryKindMigrationRequired.body", failure)}
-          </pre>
-        }
-        actions={[openMemoryKindMigrationReleaseAction, openLogAction, quitAction]}
-      />
-    );
-  }
-  if (failure.kind === "memory_kind_database_check_failed") {
-    return (
-      <BootErrorShell
-        title={t("bootError.memoryKindDatabaseCheckFailed.title")}
-        body={
-          <pre className="boot-error-message">
-            {t("bootError.memoryKindDatabaseCheckFailed.body", failure)}
-          </pre>
-        }
-        actions={[openLogAction, quitAction]}
-      />
-    );
-  }
-  if (failure.kind === "memory_kind_database_schema_invalid") {
-    return (
-      <BootErrorShell
-        title={t("bootError.memoryKindDatabaseSchemaInvalid.title")}
-        body={
-          <pre className="boot-error-message">
-            {t("bootError.memoryKindDatabaseSchemaInvalid.body", failure)}
-          </pre>
-        }
-        actions={[openLogAction, quitAction]}
-      />
-    );
+    return <DatabaseMigrationBootError failure={failure} />;
   }
   if (failure.kind === "raw") {
     return (
@@ -289,6 +347,9 @@ export function BootError({ failure }: { failure: SidecarErrorPayload }) {
         actions={[openLogAction, quitAction]}
       />
     );
+  }
+  if (failure.kind === "recovery_failed") {
+    return <StructuredBootError failure={failure.failure} recoveryError={failure.recovery_error} />;
   }
   return <StructuredBootError failure={failure.failure} />;
 }
@@ -302,15 +363,25 @@ export function BootError({ failure }: { failure: SidecarErrorPayload }) {
  * supposed to give us. */
 function StructuredBootError<K extends StartupFailureCode>({
   failure,
+  recoveryError,
 }: {
   failure: Extract<StartupFailure, { code: K }>;
+  recoveryError?: string;
 }) {
   const { t } = useTranslation();
   const entry = RECOVERY_TABLE[failure.code as K];
+  const inspectEmbedding =
+    failure.code === "lancedb_schema_mismatch" || failure.code === "embedding_dimension_mismatch";
   return (
     <BootErrorShell
       title={t(entry.titleKey)}
-      body={<pre className="boot-error-message">{t(entry.bodyKey, entry.bodyVars(failure))}</pre>}
+      body={
+        <>
+          <pre className="boot-error-message">{t(entry.bodyKey, entry.bodyVars(failure))}</pre>
+          {recoveryError !== undefined && <pre className="boot-error-message">{recoveryError}</pre>}
+          {inspectEmbedding && <EmbeddingMigrationPanel mode="local" compact />}
+        </>
+      }
       actions={entry.actions}
     />
   );

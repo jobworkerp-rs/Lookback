@@ -1,0 +1,551 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: issue-resolution-judge
+  version: "1.0.0"
+
+# Judges one candidate against the raw messages of the given evidence threads
+# and, when the evidence holds, returns the ResolveCandidate decision to write.
+input:
+  schema:
+    document:
+      type: object
+      required: [candidate, candidate_id, candidate_status, source_thread_ids, selected_member_thread_ids, candidate_source_latest_at, associated_issue, project_context, resolution_min_confidence, evidence_scope, memories_grpc_host, memories_grpc_port]
+      properties:
+        candidate: { type: object }
+        candidate_id: { type: string, minLength: 1 }
+        candidate_status: { type: string }
+        source_thread_ids: { type: array, items: { type: string } }
+        # Threads whose raw messages may be cited as evidence.
+        selected_member_thread_ids: { type: array, items: { type: string }, minItems: 1 }
+        # Optional per-thread upper bound (epoch ms) on the messages read, e.g.
+        # the thread's saved summary checkpoint.
+        max_message_at_by_thread: { type: object, default: {} }
+        # Optional lower bound (epoch ms, exclusive): messages up to the
+        # candidate's origin cannot show it was later resolved.
+        messages_after: { type: ["number", "null"], default: null }
+        candidate_source_latest_at: { type: number }
+        associated_issue: { type: object }
+        associated_issue_id: { type: string, default: "" }
+        project_context: { type: object }
+        resolution_min_confidence: { type: number }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        # Completes "Evaluate only the raw messages below from ..." in the prompt.
+        evidence_scope: { type: string, minLength: 1 }
+        memories_grpc_host: { type: string }
+        memories_grpc_port: { type: integer }
+        memories_grpc_tls: { type: boolean, default: false }
+
+timeout:
+  after:
+    hours: 1
+
+do:
+  - initState:
+      set:
+        candidate: "${ $workflow.input.candidate }"
+        candidate_id: "${ $workflow.input.candidate_id }"
+        candidate_status: "${ $workflow.input.candidate_status }"
+        source_thread_ids: "${ $workflow.input.source_thread_ids }"
+        selected_member_thread_ids: "${ $workflow.input.selected_member_thread_ids }"
+        max_message_at_by_thread: "${ $workflow.input.max_message_at_by_thread // {} }"
+        messages_after: "${ $workflow.input.messages_after // null }"
+        candidate_source_latest_at: "${ $workflow.input.candidate_source_latest_at }"
+        associated_issue: "${ $workflow.input.associated_issue }"
+        associated_issue_id: "${ $workflow.input.associated_issue_id // \"\" }"
+        project_context: "${ $workflow.input.project_context }"
+        resolution_min_confidence: "${ $workflow.input.resolution_min_confidence }"
+        evidence_scope: "${ $workflow.input.evidence_scope }"
+        raw_input_char_limit: "${ 200000 }"
+        raw_member_messages: "${ [] }"
+        raw_input_window: "${ [] }"
+        raw_input_window_ids: "${ [] }"
+        raw_input_truncated: "${ false }"
+        raw_fetch_errors: "${ [] }"
+        decision_audit: '${ { rationale: "", reason: "" } }'
+        raw_evidence_contains_issue_reference: "${ false }"
+        evidence_time_complete: "${ false }"
+        raw_evidence_latest_at: "${ null }"
+        evidence_messages: "${ [] }"
+        evidence_memory_ids: "${ [] }"
+        evidence_thread_ids: "${ [] }"
+        llm_text: "${ \"\" }"
+        resolution_decision: "${ \"NO_CHANGE\" }"
+        resolution_rationale: "${ \"\" }"
+        llm_outcome: "${ null }"
+        llm_response: "${ null }"
+        llm_json: "${ null }"
+        llm_confidence: "${ null }"
+        evidence_ready: "${ false }"
+        decision_payload: "${ null }"
+        llm_parse_valid: "${ false }"
+        evidence_memory_ids_valid: "${ false }"
+        context_reference_valid: "${ false }"
+        different_member: "${ false }"
+        evidence_is_strictly_later: "${ false }"
+        transient_failure: "${ false }"
+        candidate_outcome_recorded: "${ false }"
+        skipped_candidate_ids: "${ [] }"
+        skipped_candidates: "${ [] }"
+        protected_candidates: "${ [] }"
+        failed_candidates: "${ [] }"
+
+  # Only user/assistant text is evidence; summaries never are.
+  - fetchCrossThreadRawMessages:
+      if: "${ ($candidate_outcome_recorded | not) and (($selected_member_thread_ids | length) > 0) }"
+      for:
+        each: selected_thread_id
+        in: "${ $selected_member_thread_ids }"
+      onError: continue
+      do:
+        - initRawFetch:
+            set:
+              selected_thread_raw_messages: "${ [] }"
+        - fetchRawMemberMessages:
+            try:
+              - findRawMemberMessages:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: streaming
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+                        json_body: >-
+                          ${ { thread_id: { value: $selected_thread_id },
+                               roles: ["ROLE_USER", "ROLE_ASSISTANT"],
+                               content_types: ["TEXT"] } | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      selected_thread_raw_messages: >-
+                        ${ (.jsonBody // "[]") | fromjson
+                           | if type == "array" then . else (.data // []) end
+                           | map(select((.data.role // .role // "") == "ROLE_USER"
+                                        or (.data.role // .role // "") == "ROLE_ASSISTANT")
+                                 | select((.data.content // .content // "") != "")
+                                 | ((.data.createdAt // .data.created_at // null)
+                                    | if . == null then null else (try tonumber catch null) end) as $at
+                                 | select($messages_after == null or (($at != null) and ($at > ($messages_after | tonumber))))
+                                 | select(($max_message_at_by_thread[$selected_thread_id] // null) as $cap
+                                          | ($cap == null) or (($at != null) and ($at <= ($cap | tonumber))))
+                                 | {
+                                     id: ((.id.value // .data.id.value // "") | tostring),
+                                     thread_id: $selected_thread_id,
+                                     role: (.data.role // .role // ""),
+                                     content: (.data.content // .content // ""),
+                                      created_at: ((.data.createdAt // .data.created_at // null)
+                                                   | if . == null then null
+                                                     else (try tonumber catch null) end)
+                                   }) }
+              - collectRawMemberMessages:
+                  set:
+                    raw_member_messages: "${ $raw_member_messages + ($selected_thread_raw_messages // []) }"
+            catch:
+              as: raw_fetch_error
+              do:
+                - recordRawFetchError:
+                    set:
+                      raw_fetch_errors: "${ $raw_fetch_errors + [{ thread_id: $selected_thread_id, reason: ($raw_fetch_error | tostring) }] }"
+
+  - failOnRawFetchError:
+      if: "${ ($candidate_outcome_recorded | not) and (($raw_fetch_errors | length) > 0) }"
+      set:
+        failed_candidates: "${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($raw_fetch_errors | tojson), source: \"raw_memory_fetch\" }] }"
+        candidate_outcome_recorded: "${ true }"
+        transient_failure: "${ true }"
+
+  - shapeRawInputWindow:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        raw_input_window: >-
+          ${ ($raw_member_messages | sort_by(.created_at)) as $all
+             | $raw_input_char_limit as $limit
+             | ($all | map(.content | length) | add // 0) as $total
+             | if $total <= $limit then $all
+               else (reduce ($all | reverse)[] as $message
+                       ({ kept: [], used: 0, stop: false };
+                        if .stop then .
+                        elif ((.kept | length) > 0) and ((.used + ($message.content | length)) > $limit)
+                        then .stop = true
+                        else .used += ($message.content | length) | .kept += [$message]
+                        end) | .kept | reverse)
+               end }
+
+  - indexRawInputWindow:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        raw_input_window_ids: "${ $raw_input_window | map(.id) | unique }"
+        raw_input_truncated: "${ ($raw_input_window | length) < ($raw_member_messages | length) }"
+
+  - skipWithoutRawEvidence:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($raw_input_window | length) == 0) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "cross_thread_raw_evidence_missing" }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - evaluateCrossThreadResolution:
+      if: "${ ($candidate_outcome_recorded | not) and (($raw_input_window | length) > 0) }"
+      try:
+        - runResolutionLlm:
+            run:
+              function:
+                workerName: "${ $workflow.input.llm_worker_name }"
+                using: completion
+                arguments:
+                  system_prompt: >-
+                    $${Evaluate only the raw messages below from {{ evidence_scope }}.
+                    Decide whether the associated Issue is complete or a false positive.
+                    Summary hints are deliberately excluded from this decision. Return only JSON.
+                    Every evidence_memory_ids entry must be an id from the supplied raw input window.
+                    Use COMPLETE only when the raw messages clearly establish completion, CANCEL only when they establish a false positive,
+                    and NO_CHANGE otherwise.}
+                  prompt: >-
+                    $${## Candidate
+                    - id: {{ candidate_id }}
+                    - title: {{ candidate.title }}
+                    - description: {{ candidate.description }}
+                    - source thread ids: {{ source_thread_ids | json_encode }}
+                    ## Raw cross-thread messages (source thread excluded)
+                    {% for message in raw_input_window %}
+                    [memory_id={{ message.id }} thread_id={{ message.thread_id }} role={{ message.role }} created_at={{ message.created_at }}] {{ message.content }}
+                    {% endfor %}}
+                  options:
+                    max_tokens: 16000
+                    temperature: 0.1
+                  json_schema: |
+                    {
+                      "type": "object",
+                      "required": ["decision", "rationale", "confidence", "evidence_memory_ids"],
+                      "properties": {
+                        "decision": {"type": "string", "enum": ["COMPLETE", "CANCEL", "NO_CHANGE"]},
+                        "rationale": {"type": "string", "minLength": 1},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "evidence_memory_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+                      }
+                    }
+            export:
+              as:
+                llm_text: "${ .content.text // \"\" }"
+      catch:
+        as: resolution_llm_error
+        do:
+          - recordResolutionLlmFailure:
+              set:
+                failed_candidates: "${ $failed_candidates + [{ candidate_id: $candidate_id, reason: ($resolution_llm_error | tostring), source: \"resolution_llm\" }] }"
+                candidate_outcome_recorded: "${ true }"
+                transient_failure: "${ true }"
+
+  # Parse once into an object or null so later checks never see a
+  # blank or non-object answer as valid (see jobworkerp-rs #357).
+  - parseResolution:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        llm_json: >-
+          ${ if ($llm_text | type) == "string" and ($llm_text | test("\\S"))
+             then (try ($llm_text | fromjson | if type == "object" then . else null end) catch null)
+             else null end }
+
+  - shapeResolution:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        # Recorded with every later skip so an operator can see what the
+        # LLM decided; the free-form rationale is left out on purpose.
+        llm_outcome: >-
+          ${ if $llm_json != null
+             then { decision: $llm_json.decision, confidence: $llm_json.confidence,
+                    evidence_memory_ids: $llm_json.evidence_memory_ids }
+             else null end }
+        llm_parse_valid: >-
+          ${ ($llm_json != null)
+             and ($llm_json.decision != null)
+             and (($llm_json.rationale // "") != "")
+             and ($llm_json.confidence != null)
+             and (($llm_json.evidence_memory_ids | type) == "array") }
+        resolution_decision: '${ $llm_json.decision // "NO_CHANGE" }'
+        resolution_rationale: '${ $llm_json.rationale // "cross-thread raw evidence was insufficient" }'
+        llm_confidence: "${ try ($llm_json.confidence | tonumber) catch null }"
+        evidence_memory_ids: '${ $llm_json.evidence_memory_ids // [] }'
+        # The length and both ends of the answer and the size of the input,
+        # for diagnosing an invalid one (an empty answer, a cut-off JSON,
+        # prose around the JSON).
+        llm_response: >-
+          ${ ($llm_text // "" | tostring) as $text
+             | { length: ($text | length), head: $text[:200], tail: $text[-200:],
+                 input_messages: ($raw_input_window | length),
+                 input_chars: ($raw_input_window | map(.content | length) | add // 0) } }
+        # Only the shaped fields are read from here on.
+        llm_text: '${ "" }'
+        llm_json: "${ null }"
+
+  - failOnInvalidLlmResponse:
+      if: "${ ($candidate_outcome_recorded | not) and (($llm_parse_valid // false) | not) }"
+      set:
+        failed_candidates: "${ $failed_candidates + [{ candidate_id: $candidate_id, reason: \"invalid resolution LLM response\", source: \"resolution_llm\", llm_response: $llm_response }] }"
+        candidate_outcome_recorded: "${ true }"
+
+  # The schema makes the LLM cite evidence even for NO_CHANGE, so check the
+  # decision first; otherwise a plain "no change" is reported as an
+  # evidence failure.
+  - skipNoResolution:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ($resolution_decision != "COMPLETE")
+           and ($resolution_decision != "CANCEL") }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "no_resolution", llm: $llm_outcome }] }
+        candidate_outcome_recorded: "${ true }"
+
+  # Evidence IDs are admissible only when they name messages in the exact LLM input window.
+  - validateEvidenceMemoryIds:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        evidence_memory_ids_valid: >-
+          ${ (($evidence_memory_ids | type) == "array")
+             and (($evidence_memory_ids | length) > 0)
+             and (($evidence_memory_ids | unique | length) == ($evidence_memory_ids | length))
+             and all($evidence_memory_ids[];
+               ((. | type) == "string")
+               and ((. | length) > 0)
+               and (. as $evidence_id | ($raw_input_window_ids | index($evidence_id)) != null)) }
+        evidence_messages: >-
+          ${ ($raw_input_window // [])
+             | map(. as $message
+                  | select(($evidence_memory_ids | index($message.id)) != null)) }
+
+  - indexEvidenceMessages:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        evidence_thread_ids: "${ $evidence_messages | map(.thread_id) | unique }"
+
+  - skipInvalidEvidenceMemoryIds:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($evidence_memory_ids_valid // false) | not) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "evidence_memory_ids_outside_input_window", llm: $llm_outcome }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - validateCrossThreadEvidence:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        different_member: >-
+          ${ (($evidence_messages | length) > 0)
+
+             and all($evidence_messages[];
+                . as $evidence
+                | (($source_thread_ids | index($evidence.thread_id)) == null)
+                  and (($selected_member_thread_ids | index($evidence.thread_id)) != null)) }
+
+  - validateEvidenceProjectContext:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        raw_evidence_contains_issue_reference: >-
+          ${ if ($associated_issue_id != "")
+             then (("[[issue:" + ($associated_issue_id | tostring | @uri) + "]]")) as $canonical_issue_reference
+                  | any(($evidence_messages // [])[];
+                      ((.content // "") | contains($canonical_issue_reference)))
+             else false end }
+
+  # A separate step: keys of one set read each other's previous values.
+  - decideEvidenceProjectContext:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        context_reference_valid: >-
+          ${ if $project_context.unknown
+             then (($different_member // false)
+                   and ($raw_evidence_contains_issue_reference // false))
+             else $project_context.member_match
+             end }
+
+  - skipInvalidProjectContext:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($context_reference_valid // false) | not) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id,
+              reason: (if $project_context.unknown
+                       then "issue_reference_required"
+                       else "project_context_mismatch" end),
+              llm: $llm_outcome }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - calculateRawEvidenceTime:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        evidence_time_complete: >-
+          ${ (($evidence_messages | length) > 0)
+             and all($evidence_messages[];
+               (.created_at != null)
+               and ((try (.created_at | tonumber) catch null) != null)) }
+
+  # A separate step: keys of one set read each other's previous values.
+  - calculateRawEvidenceLatestAt:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        raw_evidence_latest_at: >-
+          ${ if ($evidence_time_complete)
+             then (($evidence_messages | map(.created_at | tonumber) | max) // null)
+             else null end }
+
+  - skipWithoutEvidenceTimestamp:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and (($evidence_time_complete // false) | not) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "evidence_timestamp_missing", llm: $llm_outcome }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - verifyRawEvidenceTime:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        evidence_is_strictly_later: >-
+          ${ ($candidate_source_latest_at != null)
+             and ($raw_evidence_latest_at != null)
+             and ($raw_evidence_latest_at > $candidate_source_latest_at)
+             and all($evidence_messages[]; ((.created_at | tonumber) > ($candidate_source_latest_at | tonumber))) }
+
+  - evaluateEvidenceReadiness:
+      if: "${ ($candidate_outcome_recorded | not) }"
+      set:
+        evidence_ready: >-
+          ${ ($different_member // false)
+             and ($evidence_is_strictly_later // false)
+             and (($llm_confidence // -1) >= $resolution_min_confidence) }
+
+  - skipSameMemberEvidence:
+      if: "${ ($candidate_outcome_recorded | not) and (($different_member // false) | not) }"
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "evidence_not_from_different_member", llm: $llm_outcome }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - skipNonNewEvidence:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ($different_member // false)
+           and (($evidence_is_strictly_later // false) | not) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "raw_evidence_not_strictly_later", llm: $llm_outcome }] }
+        candidate_outcome_recorded: "${ true }"
+
+  - skipBelowConfidence:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ($different_member // false)
+           and ($evidence_is_strictly_later // false)
+           and (($llm_confidence // -1) < $resolution_min_confidence) }
+      set:
+        skipped_candidate_ids: "${ $skipped_candidate_ids + [$candidate_id] }"
+        skipped_candidates: >-
+          ${ $skipped_candidates + [{ candidate_id: $candidate_id, reason: "confidence_below_threshold", llm: $llm_outcome }] }
+        candidate_outcome_recorded: "${ true }"
+
+  # The tracker stores fixed text plus the verified evidence IDs; the LLM's
+  # free-form rationale is kept only in this workflow's output.
+  - prepareDecisionAudit:
+      if: "${ ($candidate_outcome_recorded | not) and ($evidence_ready // false) }"
+      set:
+        decision_audit: >-
+          ${ (if $resolution_decision == "COMPLETE"
+              then "Cross-thread conversation evidence explicitly establishes completion."
+              else "Cross-thread conversation evidence explicitly establishes a false positive." end) as $rationale
+             | { rationale: $rationale,
+                 reason: ($rationale
+                          + " [evidence_thread_ids=" + ($evidence_thread_ids | join(",")) + "]"
+                          + " [evidence_memory_ids=" + ($evidence_memory_ids | join(",")) + "]") } }
+
+  # PROPOSED candidates have no associated Issue; AUTO_REGISTERED candidates use the mapped Issue.
+  - prepareProposedReject:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ($evidence_ready // false)
+           and (($resolution_decision == "COMPLETE") or ($resolution_decision == "CANCEL"))
+           and (($candidate_status == "CANDIDATE_STATUS_PROPOSED") or ($candidate_status == "PROPOSED")) }
+      set:
+        decision_payload: >-
+          ${ { reject: {
+                reason_category: "RESOLUTION_REASON_CATEGORY_NOT_ACTIONABLE",
+                rationale: $decision_audit.rationale
+              } } }
+
+  - prepareCompletedResolution:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ($evidence_ready // false)
+           and ($resolution_decision == "COMPLETE")
+           and (($candidate_status == "CANDIDATE_STATUS_AUTO_REGISTERED") or ($candidate_status == "AUTO_REGISTERED")) }
+      set:
+        decision_payload: >-
+          ${ { confirm_associated_issue: {
+                issue_id: ($associated_issue.issueId // $associated_issue.issue_id // ""),
+                expected_revision: ($associated_issue.revision // 0),
+                update_mask: ["MANAGER_ISSUE_FIELD_CONFIRMATION_STATUS"],
+                patch: { confirmation_status: "CONFIRMATION_STATUS_CONFIRMED" },
+                basis: "RESOLUTION_BASIS_SOURCE_EVIDENCE",
+                target_state: "ISSUE_STATE_DONE",
+                completion: {
+                  unverified: {
+                    reason: $decision_audit.rationale,
+                    residual_risk: "Completion was reported in conversation and was not externally verified."
+                  }
+                }
+              } } }
+
+  - prepareCanceledResolution:
+      if: >-
+        ${ ($candidate_outcome_recorded | not)
+           and ($evidence_ready // false)
+           and ($resolution_decision == "CANCEL")
+           and (($candidate_status == "CANDIDATE_STATUS_AUTO_REGISTERED") or ($candidate_status == "AUTO_REGISTERED")) }
+      set:
+        decision_payload: >-
+          ${ { cancel_associated_issue: {
+                issue_id: ($associated_issue.issueId // $associated_issue.issue_id // ""),
+                expected_issue_revision: ($associated_issue.revision // 0),
+                expected_mapping_candidate_id: $candidate_id,
+                expected_mapping_issue_id: ($associated_issue.issueId // $associated_issue.issue_id // ""),
+                cancellation_report: { classification: "CANCELLATION_CLASS_FALSE_POSITIVE" },
+                reason_category: "RESOLUTION_REASON_CATEGORY_NOT_ACTIONABLE",
+                rationale: $decision_audit.rationale
+              } } }
+
+output:
+  as:
+    candidate_outcome_recorded: "${ $candidate_outcome_recorded }"
+    skipped_candidate_ids: "${ $skipped_candidate_ids }"
+    skipped_candidates: "${ $skipped_candidates }"
+    protected_candidates: "${ $protected_candidates }"
+    failed_candidates: "${ $failed_candidates }"
+    # Only infrastructure failures (fetch, LLM call) are worth retrying; an
+    # invalid or unverifiable answer is a result.
+    transient_failure: "${ $transient_failure }"
+    resolution_decision: "${ $resolution_decision }"
+    resolution_rationale: "${ $resolution_rationale }"
+    llm_confidence: "${ $llm_confidence }"
+    llm_outcome: "${ $llm_outcome }"
+    evidence_ready: "${ $evidence_ready }"
+    evidence_memory_ids: "${ $evidence_memory_ids }"
+    evidence_thread_ids: "${ $evidence_thread_ids }"
+    decision_audit: "${ $decision_audit }"
+    decision_payload: "${ $decision_payload }"
+    raw_input_truncated: "${ $raw_input_truncated }"
