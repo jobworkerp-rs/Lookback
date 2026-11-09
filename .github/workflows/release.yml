@@ -1,29 +1,40 @@
 name: Release
 
-# Triggered by the tag that scripts/sync-public.sh (run on the private gitea
-# source) forwards to this public repository. Builds the signed macOS DMG first,
-# then the Linux CPU bundles, and attaches them to the GitHub Release for the
-# tag. The Linux CUDA AppImage is built on the self-hosted GPU runner and
-# attached to the same GitHub Release with a `-cuda` suffix.
+# Maintained in the private gitea source and published to this repository by
+# its release sync together with the rest of .github/; edit it there, not here.
+# Triggered by the tag that the release sync forwards to this repository.
+# Builds the signed macOS DMG, the Linux CUDA AppImage (with a `-cuda` suffix),
+# and the Linux CPU bundles, and attaches them to the GitHub Release for the
+# tag. The Linux bundles are built on the shared self-hosted GPU runner, which
+# gets a read-only token and no secrets; a GitHub-hosted job publishes them.
+# Every job is limited to GitHub so that the private source, which tracks this
+# file, never runs it.
+#
+# A manual run (workflow_dispatch) rebuilds only the Linux jobs and publishes
+# nothing, so a runner image change can be verified without cutting a release.
 on:
   push:
     tags:
       - '*'
+  workflow_dispatch:
 
+# Only the jobs that publish raise this to write.
 permissions:
-  contents: write
+  contents: read
 
 # A re-pushed tag re-runs this; let a fresh run supersede an in-flight one
-# without cancelling (avoid a half-uploaded release).
+# without cancelling (avoid a half-uploaded release). A manual run uploads
+# nothing, so a newer one cancels it instead of holding the runner for hours.
 concurrency:
   group: release-${{ github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
   CARGO_INCREMENTAL: '0'
-  LOOKBACK_RELEASE_VERSION: ${{ github.ref_name }}
+  # A manual run's ref is a branch, so leave the version in tauri.conf.json.
+  LOOKBACK_RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || '' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -32,23 +43,24 @@ jobs:
   # ---------------------------------------------------------------------------
   test:
     name: Lint & unit test
+    if: github.server_url == 'https://github.com'
     runs-on: lookback-linux-cuda
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Install system dependencies
+      # The self-hosted runner gives jobs no root access, so every system tool
+      # the Linux jobs use comes from the runner image. Checking them here, on
+      # the same runner, fails a release before any job uploads an artifact.
+      # Keep the list in step with the preflight of scripts/build-release.sh.
+      - name: Verify runner image tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config protobuf-compiler libprotobuf-dev jq \
-            libssl-dev libdbus-1-dev \
-            libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev
-          command -v protoc >/dev/null || { echo "protoc missing" >&2; exit 1; }
-          command -v jq >/dev/null || { echo "jq missing" >&2; exit 1; }
+          source scripts/lib/build-common.sh
+          require_cmd protoc jq cmake pkg-config nvcc objdump \
+            patchelf appimagetool desktop-file-validate xdg-open
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -112,8 +124,11 @@ jobs:
   # ---------------------------------------------------------------------------
   build-macos:
     name: Build macOS DMG
+    if: github.server_url == 'https://github.com' && github.event_name == 'push'
     needs: test
     runs-on: [self-hosted, macOS, lookback-macos]
+    permissions:
+      contents: write
     timeout-minutes: 180
     steps:
       - name: Checkout
@@ -281,6 +296,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-cuda:
     name: Build Linux AppImage (cuda)
+    if: github.server_url == 'https://github.com'
     needs: test
     runs-on: lookback-linux-cuda
     timeout-minutes: 180
@@ -288,12 +304,13 @@ jobs:
       run:
         shell: bash
     env:
-      PUBLIC_REPO: jobworkerp-rs/Lookback
       RUSTFLAGS: "-C relocation-model=pic"
       CFLAGS: "-fPIC"
       CXXFLAGS: "-fPIC"
       CMAKE_POSITION_INDEPENDENT_CODE: "ON"
       CUDA_COMPUTE_CAP: "89"
+      # The self-hosted runner cannot mount FUSE, so AppImage tools
+      # (linuxdeploy, appimagetool) must extract themselves instead.
       APPIMAGE_EXTRACT_AND_RUN: "1"
       LOOKBACK_TAURI_VERBOSE: "1"
     steps:
@@ -301,6 +318,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: false
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -331,46 +349,6 @@ jobs:
         if: vars.CUDA_COMPUTE_CAP != ''
         run: echo "CUDA_COMPUTE_CAP=${{ vars.CUDA_COMPUTE_CAP }}" >> "$GITHUB_ENV"
 
-      - name: Disable NCCL detection for CUDA build
-        run: |
-          set -euo pipefail
-          hidden_paths=()
-          restore_nccl_paths() {
-            local disabled original
-            for disabled in "${hidden_paths[@]}"; do
-              original="${disabled%.disabled-for-build}"
-              if [ -e "$disabled" ] && [ ! -e "$original" ]; then
-                echo "Restoring NCCL path: $original"
-                sudo mv "$disabled" "$original" || true
-              fi
-            done
-          }
-          trap restore_nccl_paths EXIT
-          while IFS= read -r -d '' path; do
-            disabled="${path}.disabled-for-build"
-            echo "Hiding NCCL path: $path"
-            sudo mv "$path" "$disabled"
-            hidden_paths+=("$disabled")
-          done < <(
-            find /usr /opt/cuda /usr/local/cuda \
-              \( -name 'nccl.h' -o -name 'libnccl*' \) \
-              ! -name '*.disabled-for-build' \
-              -print0 2>/dev/null
-          )
-
-      - name: Install / verify AppImage bundling dependencies
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler desktop-file-utils file fuse libfuse2 patchelf jq xdg-utils
-          command -v protoc >/dev/null || { echo "protoc missing" >&2; exit 1; }
-          command -v appimagetool >/dev/null || { echo "appimagetool missing" >&2; exit 1; }
-          command -v patchelf >/dev/null || { echo "patchelf missing" >&2; exit 1; }
-          command -v desktop-file-validate >/dev/null || { echo "desktop-file-utils missing" >&2; exit 1; }
-          command -v xdg-open >/dev/null || { echo "xdg-utils missing xdg-open" >&2; exit 1; }
-          command -v jq >/dev/null || { echo "jq missing" >&2; exit 1; }
-
       - name: Build release AppImage (cuda)
         run: bash scripts/build-release.sh --profile linux-cuda --bundle appimage
 
@@ -385,59 +363,32 @@ jobs:
           appimages=("$out"/appimage/*-cuda.AppImage)
           [ ${#appimages[@]} -gt 0 ] || { echo "no -cuda .AppImage produced" >&2; exit 1; }
 
-      - name: Upload CUDA bundles to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          out=target/release/bundle
-          create_args=()
-          if [ "${TAG#*-}" != "${TAG}" ]; then
-            create_args+=(--prerelease)
-          fi
-          gh release view "${TAG}" -R "${PUBLIC_REPO}" >/dev/null 2>&1 \
-            || gh release create "${TAG}" -R "${PUBLIC_REPO}" \
-                 --title "${TAG}" --notes "Release ${TAG}" \
-                 "${create_args[@]}"
-          gh release upload "${TAG}" -R "${PUBLIC_REPO}" --clobber \
-            "$out"/appimage/*-cuda.AppImage
+      - name: Keep CUDA bundles for publishing
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-cuda
+          path: target/release/bundle/appimage/*-cuda.AppImage
+          compression-level: 0
+          retention-days: 3
 
   # ---------------------------------------------------------------------------
   # Stage 4: Linux CPU release build after CUDA on the same self-hosted runner pool.
   # ---------------------------------------------------------------------------
   build:
     name: Build Linux bundles (cpu)
+    if: github.server_url == 'https://github.com'
     needs: [test, build-cuda]
     runs-on: lookback-linux-cuda
     timeout-minutes: 120
+    env:
+      # The self-hosted runner cannot mount FUSE (see build-cuda).
+      APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Free runner disk space
-        run: bash scripts/ci-free-disk-space.sh
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential mold clang cmake pkg-config protobuf-compiler libprotobuf-dev \
-            curl unzip tar git ca-certificates \
-            libssl-dev libdbus-1-dev \
-            libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            fuse libfuse2 file desktop-file-utils patchelf jq xdg-utils
-          # build-release.sh patches the generated AppImage runtime hook and
-          # repackages it, so appimagetool is required even for CPU builds.
-          sudo curl -fsSL -o /usr/local/bin/appimagetool \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          sudo chmod +x /usr/local/bin/appimagetool
-          command -v appimagetool >/dev/null || { echo "appimagetool missing" >&2; exit 1; }
-          command -v protoc >/dev/null || { echo "protoc missing" >&2; exit 1; }
-          command -v jq >/dev/null || { echo "jq missing" >&2; exit 1; }
-          command -v xdg-open >/dev/null || { echo "xdg-utils missing xdg-open" >&2; exit 1; }
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -491,6 +442,37 @@ jobs:
           [ ${#debs[@]} -gt 0 ] || { echo "no .deb produced" >&2; exit 1; }
           [ ${#appimages[@]} -gt 0 ] || { echo "no .AppImage produced" >&2; exit 1; }
 
+      - name: Keep CPU bundles for publishing
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-cpu
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          compression-level: 0
+          retention-days: 3
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: attach the Linux bundles to the release from a GitHub-hosted runner,
+  # so that a write token never reaches the shared self-hosted runner.
+  # ---------------------------------------------------------------------------
+  publish-linux:
+    name: Publish Linux bundles
+    if: github.server_url == 'https://github.com' && github.event_name == 'push'
+    needs: [build-cuda, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download Linux bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          merge-multiple: true
+          path: dist
+
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -500,7 +482,5 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
           files: |
-            target/release/bundle/deb/*.deb
-            target/release/bundle/appimage/*.AppImage
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            dist/**/*.deb
+            dist/**/*.AppImage
