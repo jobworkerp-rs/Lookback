@@ -313,31 +313,43 @@ secrets. It runs the workflow and scripts currently on the public `main` branch:
 1. In the public GitHub repository, open Actions > Release and choose Run workflow on the default
    branch. The workflow must already contain `workflow_dispatch`, which reaches GitHub only through a
    release sync.
-2. The run executes `test`, `build-macos`, `build-cuda`, and `build`, and skips `publish-macos` and
-   `publish-linux`. It does not stamp a release version, keeps no artifacts, and does not upload to a
-   GitHub Release.
+2. The run executes `test`, `build-macos`, `sign-macos`, `build-cuda`, and `build`, and skips `publish-macos` and
+   `publish-linux`. It does not stamp a release version, keeps no bundles (only the
+   unsigned macOS app handed to `sign-macos`, for one day), and does not upload to a GitHub Release.
 3. If `Verify runner image tools` fails, send the listed tools to the runner administrator.
 
 ### GitHub Actions Signed macOS Release
 
-The public repository's `.github/workflows/release.yml` runs on tag pushes. After `test`, the signed
-macOS build and Linux CUDA build can run in parallel; the Linux CPU build waits for CUDA. The build
+The public repository's `.github/workflows/release.yml` runs on tag pushes. After `test`, the macOS
+build and Linux CUDA build can run in parallel; the Linux CPU build waits for CUDA. The build
 jobs keep a read-only token; the GitHub-hosted `publish-macos` and `publish-linux` jobs attach the
 bundles to the release. The macOS
-job uses the `self-hosted`, `macOS`, `lookback-macos` runner labels and installs host `protoc` and
+build job uses the `self-hosted`, `macOS`, `lookback-macos` runner labels and installs host `protoc` and
 `jq` with Homebrew; the Linux jobs take them from the runner image.
+
+macOS signing is split across two jobs so that the signing key never shares a machine with the
+dependency code the build runs. `build-macos` runs on the self-hosted runner without any secret: it
+builds the verified unsigned `.app` (`scripts/build-release.sh --profile mac
+--macos-unsigned-intermediate --bundle app`), packs it together with the build inputs the finalizer
+checks it against (`src-tauri/bin`, `src-tauri/plugins`, `src-tauri/migration-bundle`, `dict`,
+`resources/coding-agent`) into one tar, because artifacts drop symlinks and file modes, and publishes
+the tar's SHA-256 as a job output. `sign-macos` runs on a GitHub-hosted macOS runner in the
+`release-macos` environment, which alone holds the Apple secrets. It checks out the same commit,
+verifies the checksum, refuses any archive entry outside those paths (so the archive cannot replace the
+scripts it runs), unpacks it, and then signs, notarizes, and verifies as described below. A manual run
+signs and notarizes too; only keeping the DMG for publishing is limited to a tag push.
 The lint job also stages empty external-binary/plugin placeholders and creates the empty migration
 resource directory solely to let `tauri-build` validate paths; they are not release artifacts.
 
-For macOS, `scripts/build-release.sh --profile mac` asks Tauri to assemble an unsigned `.app` so Tauri
-cannot rewrite external-binary bytes before verification. The build then runs
-`scripts/finalize-macos-bundle.sh`, which validates the source and packaged migration provenance,
+For macOS, `scripts/build-release.sh` asks Tauri to assemble an unsigned `.app` so Tauri
+cannot rewrite external-binary bytes before verification. `sign-macos` then runs
+`scripts/finalize-macos-bundle.sh --dmg`, which validates the source and packaged migration provenance,
 Atlas lock, and packaged resource hashes before signing. It signs the verified nested Mach-O files and
 plugins first, records the signed migration/Atlas hashes while preserving their upstream source hashes,
 then seals the outer `.app`. Only after those checks does it create and sign the DMG. This replaces
-pre-Tauri plugin/migration signing; Linux `.so` plugins and CUDA runtime staging are unchanged. The
-workflow still imports the `.p12` into a run-scoped keychain, verifies the signing identity, and checks
-notarization credentials with `notarytool history` before the long build. The build step receives only
+pre-Tauri plugin/migration signing; Linux `.so` plugins and CUDA runtime staging are unchanged.
+`sign-macos` imports the `.p12` into a run-scoped keychain, verifies the signing identity, and checks
+notarization credentials with `notarytool history` before signing. The finalize step receives only
 `APPLE_SIGNING_IDENTITY`, and the last step deletes the run's keychain even when the job fails.
 Every action in `release.yml` is pinned to a commit SHA with the version in a trailing comment
 (`uses: owner/action@<sha> # vX.Y.Z`), so a moved tag cannot change the code that runs next to the Apple
@@ -348,8 +360,10 @@ rejects an unpinned reference.
 The workflow submits the finalized DMG with `notarytool submit --wait`, staples it, and then validates
 the sealed app's migration provenance against the actual packaged resource tree, all relevant code
 signatures, the stapled ticket, and Gatekeeper assessment before uploading the artifact. The finalizer's
-optional `--notarize` mode uses an existing `APPLE_NOTARY_KEYCHAIN_PROFILE`; the release workflow keeps
-its current separate notarization step using the Apple ID, Team ID, and app-specific password Secrets.
+optional `--notarize` mode uses an existing `APPLE_NOTARY_KEYCHAIN_PROFILE`; the release workflow uses its
+own notarization step with an App Store Connect API key instead of an Apple ID and app-specific password,
+because the key can be scoped to the team and revoked on its own. Only the step that writes the key to a
+file (readable only by the job user) receives its contents, and the final cleanup deletes that file.
 
 `.github/` (the release workflow and the actionlint runner labels) is maintained in the upstream source
 repository and published to the public repository by every release sync, which overwrites direct edits
@@ -372,20 +386,29 @@ To sign and notarize from the public repository:
    openssl base64 -A -in certificate.p12 -out certificate-base64.txt
    ```
 
-4. Register these GitHub Secrets.
+4. In the public repository, open Settings > Environments, create `release-macos`, limit its
+   deployment branches and tags to `main` (manual runs) and `v*` (releases), and register these
+   environment secrets. Do not keep them as repository secrets: only `sign-macos`, which runs on a
+   GitHub-hosted runner, should receive them.
 
    | Secret | Purpose |
    | --- | --- |
    | `APPLE_CERTIFICATE` | Base64-encoded `.p12` contents |
    | `APPLE_CERTIFICATE_PASSWORD` | Password used when exporting the `.p12` |
    | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: ...` signing identity |
-   | `APPLE_ID` | Apple ID for notarization |
-   | `APPLE_PASSWORD` | Apple ID app-specific password |
-   | `APPLE_TEAM_ID` | Apple Developer Team ID |
+   | `APPLE_NOTARY_KEY` | Contents of the App Store Connect API key (`AuthKey_<KEY_ID>.p8`) |
+   | `APPLE_NOTARY_KEY_ID` | Key ID of that API key |
+   | `APPLE_NOTARY_ISSUER_ID` | Issuer ID shown above the team keys |
+
+   To create the API key, open App Store Connect > Users and Access > Integrations > App Store Connect
+   API > Team Keys (the Account Holder or an Admin can do this), add a key with the Developer access
+   role, and download the `.p8`. Apple lets you download it only once; register it and delete the
+   local copy. To rotate it, add a new key, update the three secrets, and revoke the old key.
 
 5. Push the release tag. The macOS and CUDA jobs start after `test`; the CPU job starts after CUDA.
-6. If the macOS job fails, inspect `Build signed macOS bundles` and the following verification steps
-   to locate whether certificate import, provenance validation, codesign, or notarization failed.
+6. If `build-macos` fails, inspect `Build unsigned macOS app` for build or provenance errors. If
+   `sign-macos` fails, its steps show whether the hand-off check, certificate import, provenance
+   validation, codesign, or notarization failed.
 
 After changing the release workflow, run `node scripts/test-public-release-workflow.mjs` and
 `bash scripts/test-release-workflow.sh` to verify the GitHub-only guard, the macOS job, Linux dependency,

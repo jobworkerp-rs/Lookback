@@ -11,7 +11,8 @@ name: Release
 # which tracks this file, never runs it.
 #
 # A manual run (workflow_dispatch) builds everything and signs and notarizes the
-# macOS DMG like a release, but publishes nothing. It verifies changes outside
+# macOS DMG like a release, but publishes nothing. The macOS app is built on the
+# self-hosted runner without secrets and signed on a GitHub-hosted runner. It verifies changes outside
 # this file (runner images, the macOS runner host, rotated Apple credentials)
 # without cutting a release.
 on:
@@ -122,16 +123,18 @@ jobs:
         run: cargo test -p lookback-tauri --lib --bins -- --test-threads=1
 
   # ---------------------------------------------------------------------------
-  # Stage 2: signed macOS release build (DMG).
+  # Stage 2: macOS app built on the self-hosted runner without any Apple secret.
+  # The build runs third-party dependency code, so it stops at the verified
+  # unsigned app and hands that over; the signing key never reaches this runner.
   # ---------------------------------------------------------------------------
   build-macos:
-    name: Build macOS DMG
+    name: Build macOS app (unsigned)
     if: github.server_url == 'https://github.com'
     needs: test
     runs-on: [self-hosted, macOS, lookback-macos]
     timeout-minutes: 180
-    env:
-      SIGNING_KEYCHAIN: signing_temp_${{ github.run_id }}_${{ github.run_attempt }}
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -177,15 +180,66 @@ jobs:
           path: .build-deps/.lindera-cache
           key: lindera-${{ runner.os }}-x86_64-v0.44.1
 
-      # Catches keychains left by runs whose final cleanup never ran (e.g. a
-      # killed runner).
-      - name: Clean stale Apple signing keychains
+      - name: Build unsigned macOS app
+        run: bash scripts/build-release.sh --profile mac --macos-unsigned-intermediate --bundle app
+
+      # The app and the build inputs the signer checks it against travel as
+      # one tar (see scripts/macos-signing-handoff.sh).
+      - name: Package the unsigned app
+        id: package
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          for keychain in "${HOME}/Library/Keychains"/signing_temp*.keychain-db; do
-            security delete-keychain "$keychain" || true
-          done
+          sha256=$(bash scripts/macos-signing-handoff.sh pack "${RUNNER_TEMP}/macos-unsigned-app.tar")
+          echo "sha256=${sha256}" >>"${GITHUB_OUTPUT}"
+
+      - name: Keep the unsigned app for signing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-unsigned-app
+          path: ${{ runner.temp }}/macos-unsigned-app.tar
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Stage 2b: sign, notarize, and verify the macOS DMG on a GitHub-hosted runner.
+  # The Apple secrets live in the release-macos environment and only reach this
+  # disposable runner. A manual run signs and notarizes too; only keeping the
+  # DMG for publishing is limited to a tag push.
+  # ---------------------------------------------------------------------------
+  sign-macos:
+    name: Sign and notarize macOS DMG
+    if: github.server_url == 'https://github.com'
+    needs: build-macos
+    runs-on: macos-15
+    environment: release-macos
+    timeout-minutes: 60
+    env:
+      SIGNING_KEYCHAIN: signing_temp_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Download the unsigned app
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-unsigned-app
+          path: ${{ runner.temp }}
+
+      # The archive comes from the job that runs dependency code: the script
+      # checks its checksum and refuses members that could replace the scripts
+      # this job runs with the Apple secrets.
+      - name: Verify and unpack the unsigned app
+        run: |
+          bash scripts/macos-signing-handoff.sh unpack \
+            "${RUNNER_TEMP}/macos-unsigned-app.tar" "${EXPECTED_SHA256}" "${GITHUB_WORKSPACE}"
+        env:
+          EXPECTED_SHA256: ${{ needs.build-macos.outputs.sha256 }}
 
       - name: Import Apple signing certificate
         uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d # v3.0.0
@@ -203,23 +257,39 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
 
+      # Notarization uses an App Store Connect API key (scoped, revocable on
+      # its own). notarytool reads it from a file; only this step sees the key.
+      - name: Write the notarization API key
+        run: |
+          set -euo pipefail
+          umask 077
+          key_dir="${RUNNER_TEMP}/notary"
+          mkdir -p "${key_dir}"
+          printf '%s\n' "${APPLE_NOTARY_KEY}" >"${key_dir}/AuthKey.p8"
+          echo "NOTARY_KEY_PATH=${key_dir}/AuthKey.p8" >>"${GITHUB_ENV}"
+        env:
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+
       - name: Verify Apple notarization credentials
         run: |
           set -euo pipefail
           xcrun notarytool history \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
+            --key "${NOTARY_KEY_PATH}" \
+            --key-id "${APPLE_NOTARY_KEY_ID}" \
+            --issuer "${APPLE_NOTARY_ISSUER_ID}" \
             --output-format json >/dev/null
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
 
-      # Signing uses the imported keychain and needs only the identity name;
-      # the build runs dependency code that must not see the other secrets.
-      - name: Build signed macOS bundles
-        run: bash scripts/build-release.sh --profile mac
+      # Signing uses the imported keychain and needs only the identity name.
+      - name: Sign the app and create the DMG
+        run: |
+          bash scripts/finalize-macos-bundle.sh \
+            --app target/release/bundle/macos/Lookback.app \
+            --source-root "${GITHUB_WORKSPACE}" \
+            --triple aarch64-apple-darwin \
+            --dmg target/release/bundle/dmg/Lookback.dmg
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
 
@@ -235,16 +305,15 @@ jobs:
               continue
             fi
             xcrun notarytool submit "$dmg" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
+              --key "${NOTARY_KEY_PATH}" \
+              --key-id "${APPLE_NOTARY_KEY_ID}" \
+              --issuer "${APPLE_NOTARY_ISSUER_ID}" \
               --wait
             xcrun stapler staple "$dmg"
           done
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
 
       - name: Verify artifacts
         run: |
@@ -291,10 +360,12 @@ jobs:
           retention-days: 3
 
       # The import leaves the keychain unlocked for hours and never removes
-      # it; delete it so the signing key does not outlive the job.
-      - name: Delete Apple signing keychain
+      # it; delete it and the API key file so neither outlives the job.
+      - name: Delete Apple signing credentials
         if: always()
-        run: security delete-keychain "${HOME}/Library/Keychains/${SIGNING_KEYCHAIN}.keychain-db" || true
+        run: |
+          security delete-keychain "${HOME}/Library/Keychains/${SIGNING_KEYCHAIN}.keychain-db" || true
+          rm -f "${NOTARY_KEY_PATH:-}"
 
   # ---------------------------------------------------------------------------
   # Stage 3: Linux CUDA AppImage build on the self-hosted GPU runner.
@@ -490,12 +561,12 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Stage 6: attach the signed macOS DMG from a GitHub-hosted runner, so that
-  # the macOS build runner never holds a write token.
+  # the macOS jobs never hold a write token.
   # ---------------------------------------------------------------------------
   publish-macos:
     name: Publish macOS DMG
     if: github.server_url == 'https://github.com' && github.event_name == 'push'
-    needs: build-macos
+    needs: sign-macos
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

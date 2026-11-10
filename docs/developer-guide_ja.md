@@ -260,31 +260,41 @@ host の変更、Apple の証明書や secrets の更新）の後に、次の手
 1. 公開側の GitHub リポジトリで Actions > Release を開き、default branch で Run workflow を実行します。
    workflow に `workflow_dispatch` が入っている必要があります。workflow の変更は、リリースの同期でしか
    GitHub に反映されません。
-2. この run は `test`、`build-macos`、`build-cuda`、`build` を実行し、`publish-macos` と `publish-linux` は
-   スキップします。リリースのバージョンは埋め込まず、artifact も残さず、GitHub Release への upload も
-   行いません。
+2. この run は `test`、`build-macos`、`sign-macos`、`build-cuda`、`build` を実行し、`publish-macos` と `publish-linux` は
+   スキップします。リリースのバージョンは埋め込まず、bundle を残さず (`sign-macos` に渡す署名前の
+   macOS の app だけを 1 日保持します)、GitHub Release への upload も行いません。
 3. `Verify runner image tools` が失敗した場合は、表示されたツールを runner 管理者に連絡します。
 
 ### GitHub Actions の macOS 署名付きリリース
 
-公開リポジトリの `.github/workflows/release.yml` はタグ push で起動します。`test` の成功後、署名付き
+公開リポジトリの `.github/workflows/release.yml` はタグ push で起動します。`test` の成功後、
 macOS build と Linux CUDA build は並列実行でき、Linux CPU build は CUDA 完了後に開始します。build job は
 読み取り専用の token のままで、成果物は GitHub-hosted runner で動く `publish-macos` と `publish-linux` が
 リリースに添付します。
-macOS job は `self-hosted`、`macOS`、`lookback-macos` label の runner を使い、host `protoc` と `jq` を
+macOS の build job は `self-hosted`、`macOS`、`lookback-macos` label の runner を使い、host `protoc` と `jq` を
 Homebrew で install します。Linux の job は、これらを runner image から使います。
+
+macOS の署名は 2 つの job に分けています。署名の鍵を、build で動く依存のコードと同じマシンに置かないためです。
+`build-macos` は self-hosted runner で、secrets を一切受け取らずに、検証済みの署名前の `.app` を作ります
+(`scripts/build-release.sh --profile mac --macos-unsigned-intermediate --bundle app`)。finalizer が照合に使う
+build の成果物 (`src-tauri/bin`、`src-tauri/plugins`、`src-tauri/migration-bundle`、`dict`、
+`resources/coding-agent`) と一緒に 1 つの tar にまとめ (artifact はシンボリックリンクと実行権限を保持しないため)、
+tar の SHA-256 を job の出力にします。`sign-macos` は GitHub-hosted の macOS runner で、Apple の secrets を持つ
+Environment `release-macos` の中で動きます。同じコミットを checkout し、checksum を照合し、上の場所以外の
+エントリを含む tar を拒否してから (tar が、この job で動くスクリプトを置き換えられないようにするため) 展開し、
+以下のとおり署名・公証・検証します。手動実行でも署名・公証まで行い、DMG の保存だけをタグ push に限ります。
 lint job では、`tauri-build` の path validation を通すためだけに空の external-binary/plugin placeholder と
 空の migration resource directory も作成します。これらは release artifact ではありません。
 
-macOS では `scripts/build-release.sh --profile mac` が Tauri に unsigned `.app` の組み立てを依頼し、
-検証前に Tauri が external-binary bytes を書き換えないようにします。build 後に
-`scripts/finalize-macos-bundle.sh` が source/package の migration provenance、Atlas lock、実際に package された
+macOS では `scripts/build-release.sh` が Tauri に unsigned `.app` の組み立てを依頼し、
+検証前に Tauri が external-binary bytes を書き換えないようにします。その後 `sign-macos` で
+`scripts/finalize-macos-bundle.sh --dmg` が source/package の migration provenance、Atlas lock、実際に package された
 resource hash を検証してから signing します。検証済みの nested Mach-O file と plugin を先に署名し、upstream
 source hash を保持したまま署名後の migration/Atlas hash を記録した後、外側の `.app` を seal します。
 DMG の作成・署名はこれらの検査後に行います。これは Tauri packaging 前の plugin/migration signing に代わる処理です。
-Linux `.so` plugin と CUDA runtime staging は変更しません。workflow は従来どおり `.p12` を run ごとの keychain に
-import し、keychain の signing identity と長時間 build 前の `notarytool history` 認証確認を行います。
-build の step には `APPLE_SIGNING_IDENTITY` だけを渡し、最後の step で、job が失敗した場合も含めてその run の
+Linux `.so` plugin と CUDA runtime staging は変更しません。`sign-macos` は `.p12` を run ごとの keychain に
+import し、署名の前に keychain の signing identity と `notarytool history` の認証を確認します。
+finalize の step には `APPLE_SIGNING_IDENTITY` だけを渡し、最後の step で、job が失敗した場合も含めてその run の
 keychain を削除します。
 `release.yml` の action はすべてコミット SHA で固定し、バージョンを末尾のコメントに書いています
 (`uses: owner/action@<sha> # vX.Y.Z`)。タグが書き換えられても、Apple の secrets と同じ job で動くコードは変わりません。
@@ -294,8 +304,10 @@ SHA とコメントの両方を書き換えます。固定していない参照�
 workflow は finalizer が作成した DMG を `notarytool submit --wait` で送信して ticket を staple します。その後、
 実際に package された resource tree に対する migration provenance、code signature、stapled ticket、Gatekeeper 判定を
 確認してから artifact を upload します。finalizer の optional `--notarize` は既存の
-`APPLE_NOTARY_KEYCHAIN_PROFILE` を使いますが、release workflow は従来の Apple ID / Team ID / app-specific password
-Secrets を使う別の notarization step を維持します。
+`APPLE_NOTARY_KEYCHAIN_PROFILE` を使いますが、release workflow は Apple ID と app-specific password ではなく、
+App Store Connect の API キーを使う別の notarization step を持ちます。API キーはチームに限定でき、単独で失効できる
+ためです。キーの内容を受け取るのは、キーをファイル (job のユーザーだけが読める) に書き出す step だけで、最後の
+後片付けでそのファイルを削除します。
 
 `.github/` (release workflow と actionlint の runner label 設定) は上流の source リポジトリで管理され、
 リリースごとの同期で公開リポジトリに反映されます。公開側で直接編集しても次の同期で上書きされます。
@@ -318,20 +330,28 @@ macOS release build では、jobworkerp は plugin の検出と依存 dylib の�
    openssl base64 -A -in certificate.p12 -out certificate-base64.txt
    ```
 
-4. GitHub Secrets に以下を登録します。
+4. 公開リポジトリの Settings > Environments で `release-macos` を作り、deployment branches and tags を
+   `main` (手動実行) と `v*` (リリース) に限ってから、以下を environment secrets として登録します。
+   リポジトリの secrets には置きません。受け取るのは GitHub-hosted runner で動く `sign-macos` だけにします。
 
    | Secret | 用途 |
    | --- | --- |
    | `APPLE_CERTIFICATE` | base64 化した `.p12` の内容 |
    | `APPLE_CERTIFICATE_PASSWORD` | `.p12` 書き出し時のパスワード |
    | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: ...` の署名 identity |
-   | `APPLE_ID` | notarization に使う Apple ID |
-   | `APPLE_PASSWORD` | Apple ID の app-specific password |
-   | `APPLE_TEAM_ID` | Apple Developer Team ID |
+   | `APPLE_NOTARY_KEY` | App Store Connect の API キー (`AuthKey_<KEY_ID>.p8`) の内容 |
+   | `APPLE_NOTARY_KEY_ID` | その API キーの Key ID |
+   | `APPLE_NOTARY_ISSUER_ID` | チームキーの一覧の上に表示される Issuer ID |
+
+   API キーは、App Store Connect の「ユーザとアクセス」>「統合」>「App Store Connect API」>「チームキー」で
+   作ります (Account Holder か Admin の権限が必要)。アクセスは「Developer」にして作成し、`.p8` をダウンロードします。
+   `.p8` は一度しかダウンロードできないので、登録したら手元のファイルを削除します。入れ替えるときは、新しいキーを作って
+   3 つの secrets を更新し、古いキーを失効させます。
 
 5. リリースタグを push します。`test` 後に macOS と CUDA job が開始し、CPU job は CUDA 完了後に開始します。
-6. macOS job が失敗した場合は `Build signed macOS bundles` と後続 verification step のログから、証明書 import、
-   provenance validation、codesign、notarization のどこで止まったかを確認します。
+6. `build-macos` が失敗した場合は `Build unsigned macOS app` のログで build や provenance のエラーを確認します。
+   `sign-macos` が失敗した場合は、その step のログから、受け渡しの検査、証明書 import、provenance validation、
+   codesign、notarization のどこで止まったかを確認します。
 
 release workflow を変更した場合は、`node scripts/test-public-release-workflow.mjs` と
 `bash scripts/test-release-workflow.sh` を実行して、GitHub 限定の制限、macOS job、Linux dependency、署名用 Secrets、

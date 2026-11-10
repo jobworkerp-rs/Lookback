@@ -111,10 +111,11 @@ DMG を notarize して検証した後に Release へ添付します。macOS 署
    openssl base64 -A -in certificate.p12 -out certificate-base64.txt
    ```
 
-3. GitHub Secrets に `APPLE_CERTIFICATE`（`certificate-base64.txt` の中身）、
-   `APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_ID`、`APPLE_PASSWORD`、
-   `APPLE_TEAM_ID` を登録します。`APPLE_PASSWORD` は Apple ID の通常パスワードではなく、
-   app-specific password を使います。
+3. GitHub の Environment `release-macos`（`main` と `v*` のタグに限定）の secrets に
+   `APPLE_CERTIFICATE`（`certificate-base64.txt` の中身）、
+   `APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY` と、公証に使う App Store Connect の API キーの
+   `APPLE_NOTARY_KEY`（`.p8` の内容）、`APPLE_NOTARY_KEY_ID`、`APPLE_NOTARY_ISSUER_ID` を登録します。
+   詳しくは開発者ガイドを参照してください。
 
 ### 手動ビルド
 

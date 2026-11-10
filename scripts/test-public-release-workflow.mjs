@@ -111,47 +111,108 @@ assert.match(test, /mkdir -p src-tauri\/migration-bundle/,
 assert.match(test, /bash scripts\/ci-stage-placeholders\.sh/,
   "the test job must stage external-bin and plugin placeholders for tauri-build");
 
-// A manual run signs and notarizes the macOS DMG like a release.
+// The macOS app is built on the self-hosted runner without any Apple secret,
+// then signed and notarized on a GitHub-hosted runner, so the signing key
+// never shares a machine with the dependency code the build runs. A manual
+// run signs and notarizes like a release; only keeping the DMG is tag-only.
+const macApple = [
+  "APPLE_CERTIFICATE",
+  "APPLE_CERTIFICATE_PASSWORD",
+  "APPLE_SIGNING_IDENTITY",
+  "APPLE_NOTARY_KEY",
+  "APPLE_NOTARY_KEY_ID",
+  "APPLE_NOTARY_ISSUER_ID",
+];
+// Notarization uses an App Store Connect API key, which can be scoped and
+// revoked on its own, instead of an Apple ID app-specific password.
+assert.doesNotMatch(workflow, /APPLE_(?:ID|PASSWORD|TEAM_ID)\b|--apple-id|--password /,
+  "notarization must not use Apple ID credentials");
 const mac = jobBlock(workflow, "build-macos");
-assert.deepEqual(mac.match(/^ +if: .*github\.event_name.*$/gm),
-  [stepBlock(mac, "uses: actions/upload-artifact@").match(tagPushOnly)[0]],
-  "a manual run must run every macOS step except keeping the DMG");
+assert.match(mac, /^    runs-on: \[self-hosted, macOS, lookback-macos\]$/m);
+assert.doesNotMatch(mac, /\bsecrets\./, "the self-hosted macOS build must not receive any secret");
+assert.doesNotMatch(mac, /codesign|keychain|notarytool|import-codesign-certs/,
+  "the self-hosted macOS build must not sign or notarize");
+assert.doesNotMatch(mac, /^ +if: .*github\.event_name.*$/m, "a manual run must build the macOS app too");
 assert.doesNotMatch(mac, /^    permissions:/m, "the macOS build must keep the read-only token");
-assert.doesNotMatch(mac, /softprops\/action-gh-release/, "the macOS build must not publish the DMG itself");
 assert.match(mac, /brew install protobuf cmake pkgconf jq/);
 assert.match(mac, /command -v protoc/,
   "the macOS build must check the host protobuf compiler before the release build");
 assert.match(mac, /command -v jq/);
-for (const secret of [
-  "APPLE_CERTIFICATE",
-  "APPLE_CERTIFICATE_PASSWORD",
-  "APPLE_SIGNING_IDENTITY",
-  "APPLE_ID",
-  "APPLE_PASSWORD",
-  "APPLE_TEAM_ID",
-]) {
-  assert.ok(mac.includes(`secrets.${secret}`), `macOS signing must retain the ${secret} secret mapping`);
+assert.match(mac, /bash scripts\/build-release\.sh --profile mac --macos-unsigned-intermediate --bundle app$/m,
+  "the self-hosted macOS build must stop at the verified unsigned app");
+// What travels and how it is checked lives in scripts/macos-signing-handoff.sh
+// (covered by scripts/test-macos-signing-handoff.sh).
+const handoff = stepBlock(mac, "name: Package the unsigned app");
+assert.match(handoff, /bash scripts\/macos-signing-handoff\.sh pack /);
+assert.match(mac, /^      sha256: \$\{\{ steps\.package\.outputs\.sha256 \}\}$/m,
+  "the build must publish the hand-off checksum as a job output");
+const macKept = stepBlock(mac, "uses: actions/upload-artifact@").match(/^          name: (\S+)$/m);
+assert.equal(macKept?.[1], "macos-unsigned-app");
+
+const sign = jobBlock(workflow, "sign-macos");
+assert.match(sign, /^    runs-on: macos-\d+$/m, "signing must run on a GitHub-hosted macOS runner");
+assert.doesNotMatch(sign.match(/^    runs-on: .*$/m)?.[0] ?? "", /self-hosted/,
+  "signing must not run on the self-hosted runner");
+assert.match(sign, /^    needs: build-macos$/m);
+assert.match(sign, /^    environment: release-macos$/m, "the Apple secrets must come from the release-macos environment");
+assert.doesNotMatch(sign, /^    permissions:/m, "the signing job must keep the read-only token");
+for (const secret of macApple) {
+  assert.ok(sign.includes(`secrets.${secret}`), `macOS signing must retain the ${secret} secret mapping`);
 }
-const macBuild = stepBlock(mac, "bash scripts/build-release.sh --profile mac");
-assert.match(macBuild, /APPLE_SIGNING_IDENTITY: \$\{\{ secrets\.APPLE_SIGNING_IDENTITY \}\}/);
-assert.doesNotMatch(macBuild, /APPLE_(?:CERTIFICATE|ID|PASSWORD|TEAM_ID)\b/,
-  "the build step must not receive Apple secrets it does not use");
-assert.match(mac, /^      SIGNING_KEYCHAIN: signing_temp_\$\{\{ github\.run_id \}\}_\$\{\{ github\.run_attempt \}\}$/m,
+assert.equal(stepBlock(sign, "uses: actions/download-artifact@").match(/^          name: (\S+)$/m)?.[1],
+  "macos-unsigned-app", "signing must download the app the build kept");
+const verifyHandoff = stepBlock(sign, "name: Verify and unpack the unsigned app");
+assert.match(verifyHandoff, /bash scripts\/macos-signing-handoff\.sh unpack /,
+  "the hand-off must be unpacked by the script that checks its checksum and members");
+assert.ok(verifyHandoff.includes("${{ needs.build-macos.outputs.sha256 }}"),
+  "the hand-off must be checked against the checksum the build published");
+assert.doesNotMatch(verifyHandoff, /\btar -x/, "the hand-off must not be unpacked without its checks");
+const order = (first, second) => {
+  const a = sign.indexOf(first);
+  const b = sign.indexOf(second);
+  assert.ok(a !== -1 && b !== -1 && a < b, `expected ${first} before ${second} in sign-macos`);
+};
+order("name: Verify and unpack the unsigned app", "uses: apple-actions/import-codesign-certs@");
+order("uses: apple-actions/import-codesign-certs@", "bash scripts/finalize-macos-bundle.sh");
+order("bash scripts/finalize-macos-bundle.sh", "xcrun notarytool submit");
+order("xcrun notarytool submit", "spctl -a -t open --context context:primary-signature");
+const finalize = stepBlock(sign, "bash scripts/finalize-macos-bundle.sh");
+assert.match(finalize, /--dmg target\/release\/bundle\/dmg\/Lookback\.dmg/);
+assert.match(finalize, /APPLE_SIGNING_IDENTITY: \$\{\{ secrets\.APPLE_SIGNING_IDENTITY \}\}/);
+assert.doesNotMatch(finalize, /APPLE_(?:CERTIFICATE|ID|PASSWORD|TEAM_ID)\b/,
+  "the finalize step must not receive Apple secrets it does not use");
+assert.deepEqual(sign.match(/^ +if: .*github\.event_name.*$/gm),
+  [stepBlock(sign, "uses: actions/upload-artifact@").match(tagPushOnly)[0]],
+  "a manual run must sign and notarize; only keeping the DMG is tag-only");
+assert.match(sign, /^      SIGNING_KEYCHAIN: signing_temp_\$\{\{ github\.run_id \}\}_\$\{\{ github\.run_attempt \}\}$/m,
   "each run must sign from its own keychain");
-assert.ok(stepBlock(mac, "uses: apple-actions/import-codesign-certs@").includes("keychain: ${{ env.SIGNING_KEYCHAIN }}"),
+assert.ok(stepBlock(sign, "uses: apple-actions/import-codesign-certs@").includes("keychain: ${{ env.SIGNING_KEYCHAIN }}"),
   "the certificate must be imported into this run's keychain");
-const keychainCleanup = "name: Delete Apple signing keychain";
-const cleanup = stepBlock(mac, keychainCleanup);
+// The API key is a file only while this job runs; only the step that writes
+// it sees its contents.
+const writeKey = stepBlock(sign, "name: Write the notarization API key");
+assert.match(writeKey, /umask 077/, "the API key file must be readable only by the job user");
+assert.match(writeKey, /NOTARY_KEY_PATH=/, "the key path must be handed to the notarization steps");
+assert.equal(sign.split("secrets.APPLE_NOTARY_KEY }}").length - 1, 1,
+  "only the step writing the key file may receive the API key itself");
+order("name: Write the notarization API key", "xcrun notarytool history");
+for (const call of ["xcrun notarytool history", "xcrun notarytool submit"]) {
+  const block = stepBlock(sign, call);
+  assert.match(block, /--key "\$\{?NOTARY_KEY_PATH\}?"/, `${call} must use the API key file`);
+  assert.match(block, /--key-id "\$\{?APPLE_NOTARY_KEY_ID\}?"/);
+  assert.match(block, /--issuer "\$\{?APPLE_NOTARY_ISSUER_ID\}?"/);
+}
+const keychainCleanup = "name: Delete Apple signing credentials";
+const cleanup = stepBlock(sign, keychainCleanup);
 assert.match(cleanup, /^        if: always\(\)$/m, "the keychain must be deleted even when the job fails");
 assert.ok(cleanup.includes("${SIGNING_KEYCHAIN}.keychain-db"), "the cleanup must delete the keychain this run imported into");
-assert.equal(mac.indexOf("\n      - ", mac.indexOf(keychainCleanup)), -1,
+assert.ok(cleanup.includes("NOTARY_KEY_PATH"), "the cleanup must delete the API key file");
+assert.equal(sign.indexOf("\n      - ", sign.indexOf(keychainCleanup)), -1,
   "the keychain cleanup must stay the final step");
-assert.match(mac, /node scripts\/verify-migration-release\.mjs[\s\S]*?--distributed-assets/,
-  "the assembled app must be checked against signed migration provenance and packaged bytes");
-assert.match(mac, /xcrun notarytool submit/);
-assert.match(mac, /xcrun stapler staple/);
-assert.match(mac, /xcrun stapler validate/);
-assert.match(mac, /target\/release\/bundle\/dmg\/\*\.dmg/);
+assert.match(sign, /node scripts\/verify-migration-release\.mjs[\s\S]*?--distributed-assets/,
+  "the signed app must be checked against signed migration provenance and packaged bytes");
+assert.match(sign, /xcrun stapler staple/);
+assert.match(sign, /xcrun stapler validate/);
 
 const cuda = jobBlock(workflow, "build-cuda");
 assert.match(cuda, /needs: test/);
@@ -181,7 +242,7 @@ function assertPublishes(publishName, builds, files) {
   }
 }
 assertPublishes("publish-linux", ["build-cuda", "build"], ["*.deb", "*.AppImage"]);
-assertPublishes("publish-macos", ["build-macos"], ["*.dmg"]);
+assertPublishes("publish-macos", ["sign-macos"], ["*.dmg"]);
 
 // Releases ship the Issue Tracker server only with --experimental-issues, so
 // no release job builds it or caches its target directory.
