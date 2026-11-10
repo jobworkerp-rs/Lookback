@@ -303,22 +303,27 @@ The CUDA AppImage job sets `LOOKBACK_TAURI_VERBOSE=1` so linuxdeploy stderr is v
 Actions logs. If bundling fails, `scripts/build-release.sh` also dumps the AppDir tree and staged
 plugin `ldd` output.
 
-### Verifying a Runner Image Change
+### Verifying a Release Build Without Publishing
 
-A manual run of the release workflow rebuilds the Linux bundles without publishing anything. Use it
-after the runner administrator changes the `lookback-linux-cuda` image:
+A manual run of the release workflow builds every bundle, and signs and notarizes the macOS DMG, like
+a release without publishing anything. Use it after a change outside the repository: a new
+`lookback-linux-cuda` image, a change on the `lookback-macos` host, or rotated Apple certificates or
+secrets. It runs the workflow and scripts currently on the public `main` branch:
 
 1. In the public GitHub repository, open Actions > Release and choose Run workflow on the default
    branch. The workflow must already contain `workflow_dispatch`, which reaches GitHub only through a
    release sync.
-2. The run executes `test`, `build-cuda`, and `build`, and skips `build-macos` and `publish-linux`.
-   It does not stamp a release version, keeps no artifacts, and does not upload to a GitHub Release.
+2. The run executes `test`, `build-macos`, `build-cuda`, and `build`, and skips `publish-macos` and
+   `publish-linux`. It does not stamp a release version, keeps no artifacts, and does not upload to a
+   GitHub Release.
 3. If `Verify runner image tools` fails, send the listed tools to the runner administrator.
 
 ### GitHub Actions Signed macOS Release
 
 The public repository's `.github/workflows/release.yml` runs on tag pushes. After `test`, the signed
-macOS build and Linux CUDA build can run in parallel; the Linux CPU build waits for CUDA. The macOS
+macOS build and Linux CUDA build can run in parallel; the Linux CPU build waits for CUDA. The build
+jobs keep a read-only token; the GitHub-hosted `publish-macos` and `publish-linux` jobs attach the
+bundles to the release. The macOS
 job uses the `self-hosted`, `macOS`, `lookback-macos` runner labels and installs host `protoc` and
 `jq` with Homebrew; the Linux jobs take them from the runner image.
 The lint job also stages empty external-binary/plugin placeholders and creates the empty migration

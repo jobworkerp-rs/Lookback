@@ -67,7 +67,7 @@ assert.match(workflow, /^permissions:\n  contents: read$/m,
   "jobs must default to a read-only token");
 assert.deepEqual(
   jobNames.filter((name) => /^    permissions:\n      contents: write$/m.test(jobBlock(workflow, name))).sort(),
-  ["build-macos", "publish-linux"],
+  ["publish-linux", "publish-macos"],
   "only the publishing jobs may write to the release",
 );
 const selfHostedLinuxJobs = jobNames.filter((name) =>
@@ -111,8 +111,13 @@ assert.match(test, /mkdir -p src-tauri\/migration-bundle/,
 assert.match(test, /bash scripts\/ci-stage-placeholders\.sh/,
   "the test job must stage external-bin and plugin placeholders for tauri-build");
 
+// A manual run signs and notarizes the macOS DMG like a release.
 const mac = jobBlock(workflow, "build-macos");
-assert.match(mac, tagPushOnly, "a manual run must not sign, notarize, or publish the macOS DMG");
+assert.deepEqual(mac.match(/^ +if: .*github\.event_name.*$/gm),
+  [stepBlock(mac, "uses: actions/upload-artifact@").match(tagPushOnly)[0]],
+  "a manual run must run every macOS step except keeping the DMG");
+assert.doesNotMatch(mac, /^    permissions:/m, "the macOS build must keep the read-only token");
+assert.doesNotMatch(mac, /softprops\/action-gh-release/, "the macOS build must not publish the DMG itself");
 assert.match(mac, /brew install protobuf cmake pkgconf jq/);
 assert.match(mac, /command -v protoc/,
   "the macOS build must check the host protobuf compiler before the release build");
@@ -149,31 +154,34 @@ assert.match(mac, /xcrun stapler validate/);
 assert.match(mac, /target\/release\/bundle\/dmg\/\*\.dmg/);
 
 const cuda = jobBlock(workflow, "build-cuda");
-assert.match(stepBlock(cuda, "uses: actions/upload-artifact@"), tagPushOnly,
-  "a manual run must not keep the CUDA AppImage");
 assert.match(cuda, /needs: test/);
 
 const cpu = jobBlock(workflow, "build");
-assert.match(stepBlock(cpu, "uses: actions/upload-artifact@"), tagPushOnly,
-  "a manual run must not keep the CPU bundles");
 assert.match(cpu, /needs: \[test, build-cuda\]/,
   "the CPU build must retain its dependency on the CUDA release job");
 
-const publish = jobBlock(workflow, "publish-linux");
-assert.match(publish, /^    runs-on: ubuntu-latest$/m, "publishing must run off the shared self-hosted runner");
-assert.match(publish, /^    needs: \[build-cuda, build\]$/m);
-assert.match(publish, tagPushOnly, "a manual run must not publish the Linux bundles");
-const downloaded = stepBlock(publish, "uses: actions/download-artifact@").match(/^          pattern: (\S+)$/m);
-assert.ok(downloaded, "publish-linux must download the Linux bundles by pattern");
-const downloadPattern = new RegExp(`^${downloaded[1].replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
-for (const [name, job] of [["build-cuda", cuda], ["build", cpu]]) {
-  const kept = stepBlock(job, "uses: actions/upload-artifact@").match(/^          name: (\S+)$/m);
-  assert.ok(kept && downloadPattern.test(kept[1]), `publish-linux must download the bundles kept by ${name}`);
+function assertPublishes(publishName, builds, files) {
+  const publish = jobBlock(workflow, publishName);
+  assert.match(publish, /^    runs-on: ubuntu-latest$/m, `${publishName} must run off the self-hosted runners`);
+  const needs = publish.match(/^    needs: \[?([^\]\n]+)\]?$/m);
+  assert.deepEqual(needs?.[1].split(", "), builds, `${publishName} must wait for ${builds.join(", ")}`);
+  assert.match(publish, tagPushOnly, `a manual run must not run ${publishName}`);
+  const downloaded = stepBlock(publish, "uses: actions/download-artifact@").match(/^          pattern: (\S+)$/m);
+  assert.ok(downloaded, `${publishName} must download the bundles by pattern`);
+  const downloadPattern = new RegExp(`^${downloaded[1].replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
+  for (const name of builds) {
+    const upload = stepBlock(jobBlock(workflow, name), "uses: actions/upload-artifact@");
+    assert.match(upload, tagPushOnly, `a manual run must not keep the bundles of ${name}`);
+    const kept = upload.match(/^          name: (\S+)$/m);
+    assert.ok(kept && downloadPattern.test(kept[1]), `${publishName} must download the bundles kept by ${name}`);
+  }
+  const published = stepBlock(publish, "uses: softprops/action-gh-release@");
+  for (const file of files) {
+    assert.ok(published.includes(file), `${publishName} must attach ${file}`);
+  }
 }
-const published = stepBlock(publish, "uses: softprops/action-gh-release@");
-for (const files of ["*.deb", "*.AppImage"]) {
-  assert.ok(published.includes(files), `the Linux release must attach ${files}`);
-}
+assertPublishes("publish-linux", ["build-cuda", "build"], ["*.deb", "*.AppImage"]);
+assertPublishes("publish-macos", ["build-macos"], ["*.dmg"]);
 
 // Releases ship the Issue Tracker server only with --experimental-issues, so
 // no release job builds it or caches its target directory.

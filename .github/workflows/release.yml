@@ -5,13 +5,15 @@ name: Release
 # Triggered by the tag that the release sync forwards to this repository.
 # Builds the signed macOS DMG, the Linux CUDA AppImage (with a `-cuda` suffix),
 # and the Linux CPU bundles, and attaches them to the GitHub Release for the
-# tag. The Linux bundles are built on the shared self-hosted GPU runner, which
-# gets a read-only token and no secrets; a GitHub-hosted job publishes them.
-# Every job is limited to GitHub so that the private source, which tracks this
-# file, never runs it.
+# tag. The build jobs run on self-hosted runners with a read-only token (the
+# shared Linux GPU runner also gets no secrets); GitHub-hosted jobs publish
+# what they built. Every job is limited to GitHub so that the private source,
+# which tracks this file, never runs it.
 #
-# A manual run (workflow_dispatch) rebuilds only the Linux jobs and publishes
-# nothing, so a runner image change can be verified without cutting a release.
+# A manual run (workflow_dispatch) builds everything and signs and notarizes the
+# macOS DMG like a release, but publishes nothing. It verifies changes outside
+# this file (runner images, the macOS runner host, rotated Apple credentials)
+# without cutting a release.
 on:
   push:
     tags:
@@ -124,11 +126,9 @@ jobs:
   # ---------------------------------------------------------------------------
   build-macos:
     name: Build macOS DMG
-    if: github.server_url == 'https://github.com' && github.event_name == 'push'
+    if: github.server_url == 'https://github.com'
     needs: test
     runs-on: [self-hosted, macOS, lookback-macos]
-    permissions:
-      contents: write
     timeout-minutes: 180
     env:
       SIGNING_KEYCHAIN: signing_temp_${{ github.run_id }}_${{ github.run_attempt }}
@@ -281,17 +281,14 @@ jobs:
             spctl -a -t open --context context:primary-signature -vv "$dmg"
           done
 
-      - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      - name: Keep macOS DMG for publishing
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          fail_on_unmatched_files: true
-          files: |
-            target/release/bundle/dmg/*.dmg
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: macos-dmg
+          path: target/release/bundle/dmg/*.dmg
+          compression-level: 0
+          retention-days: 3
 
       # The import leaves the keychain unlocked for hours and never removes
       # it; delete it so the signing key does not outlive the job.
@@ -490,3 +487,34 @@ jobs:
           files: |
             dist/**/*.deb
             dist/**/*.AppImage
+
+  # ---------------------------------------------------------------------------
+  # Stage 6: attach the signed macOS DMG from a GitHub-hosted runner, so that
+  # the macOS build runner never holds a write token.
+  # ---------------------------------------------------------------------------
+  publish-macos:
+    name: Publish macOS DMG
+    if: github.server_url == 'https://github.com' && github.event_name == 'push'
+    needs: build-macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS DMG
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          # A hyphenated tag (v1.0.0-rc1 / -beta) is treated as a prerelease.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/**/*.dmg

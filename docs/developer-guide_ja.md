@@ -250,22 +250,27 @@ CUDA ビルドでは同じ展開 root で NVIDIA driver library の除去も行�
 bash scripts/test-appimage-hooks.sh
 ```
 
-### runner image の変更を確認する
+### 公開せずにリリースビルドを確認する
 
-release workflow を手動実行すると、何も公開せずに Linux の bundle を build し直せます。runner 管理者が
-`lookback-linux-cuda` の image を変更した後に、次の手順で確認します。
+release workflow を手動実行すると、何も公開せずに、リリースと同じようにすべての bundle を build し、macOS の
+DMG を署名・公証できます。リポジトリの外の変更（`lookback-linux-cuda` の image の更新、`lookback-macos` の
+host の変更、Apple の証明書や secrets の更新）の後に、次の手順で確認します。実行されるのは、公開側の
+`main` にある workflow とスクリプトです。
 
 1. 公開側の GitHub リポジトリで Actions > Release を開き、default branch で Run workflow を実行します。
    workflow に `workflow_dispatch` が入っている必要があります。workflow の変更は、リリースの同期でしか
    GitHub に反映されません。
-2. この run は `test`、`build-cuda`、`build` を実行し、`build-macos` と `publish-linux` はスキップします。
-   リリースのバージョンは埋め込まず、artifact も残さず、GitHub Release への upload も行いません。
+2. この run は `test`、`build-macos`、`build-cuda`、`build` を実行し、`publish-macos` と `publish-linux` は
+   スキップします。リリースのバージョンは埋め込まず、artifact も残さず、GitHub Release への upload も
+   行いません。
 3. `Verify runner image tools` が失敗した場合は、表示されたツールを runner 管理者に連絡します。
 
 ### GitHub Actions の macOS 署名付きリリース
 
 公開リポジトリの `.github/workflows/release.yml` はタグ push で起動します。`test` の成功後、署名付き
-macOS build と Linux CUDA build は並列実行でき、Linux CPU build は CUDA 完了後に開始します。
+macOS build と Linux CUDA build は並列実行でき、Linux CPU build は CUDA 完了後に開始します。build job は
+読み取り専用の token のままで、成果物は GitHub-hosted runner で動く `publish-macos` と `publish-linux` が
+リリースに添付します。
 macOS job は `self-hosted`、`macOS`、`lookback-macos` label の runner を使い、host `protoc` と `jq` を
 Homebrew で install します。Linux の job は、これらを runner image から使います。
 lint job では、`tauri-build` の path validation を通すためだけに空の external-binary/plugin placeholder と
