@@ -163,15 +163,6 @@ LOOKBACK_AGENT_APP="${BUILD_APP}" \
 grep -q '^build$' "${TMP_ROOT}/args-build.log"
 if [[ "$(uname -s)" == "Linux" ]]; then
   grep -q '^true$' "${TMP_ROOT}/no-strip-build.log"
-  staged_gtk_plugin="${TMP_ROOT}/github/agent-app-build/target/.tauri/linuxdeploy-plugin-gtk.sh"
-  [[ -x "${staged_gtk_plugin}" ]] || {
-    echo "expected build wrapper to stage the Linux GTK bundler plugin" >&2
-    exit 1
-  }
-  grep -Fq "export GDK_BACKEND=\"\${GDK_BACKEND:-wayland,x11}\"" "${staged_gtk_plugin}" || {
-    echo "expected staged GTK bundler plugin to prefer Wayland with X11 fallback" >&2
-    exit 1
-  }
 else
   grep -q '^$' "${TMP_ROOT}/no-strip-build.log"
 fi

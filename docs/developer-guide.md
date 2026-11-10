@@ -177,8 +177,10 @@ watching, so Cargo-created temporary directories such as
 For Linux development and packaged launches, Lookback defaults to
 `GDK_BACKEND=wayland,x11` and `WEBKIT_DISABLE_DMABUF_RENDERER=1`. GTK tries
 native Wayland first and falls back to X11 when Wayland is unavailable. The
-same backend rule is patched into AppImage's linuxdeploy GTK hook, while deb
-and rpm builds receive it from the application before GTK initializes.
+AppImage's linuxdeploy GTK hook from the pinned Tauri CLI (2.12.4) sets no
+backend, which has the same effect; `scripts/build-release.sh` rewrites a hook from an
+older CLI that forces X11 to the same rule. deb and rpm builds receive it from
+the application before GTK initializes.
 Explicit user values win: use `GDK_BACKEND=x11` to force X11, or
 `GDK_BACKEND=wayland WEBKIT_DISABLE_DMABUF_RENDERER=0` to try native Wayland
 with the DMA-BUF renderer enabled.
@@ -229,7 +231,7 @@ Release builds use these public GitHub tags and resolved commits:
 
 | Build input | Public repository | Tag | Peeled commit |
 | --- | --- | --- | --- |
-| `memory-store` (Memories) | [`jobworkerp-rs/memory-store`](https://github.com/jobworkerp-rs/memory-store) | `v0.0.19` | `8253e725708264592e131af3b92d1b4c7719054a` |
+| `memory-store` (Memories) | [`jobworkerp-rs/memory-store`](https://github.com/jobworkerp-rs/memory-store) | `v0.0.24` | `8d365fc792489a98035bb11aaa3fe7e040a1177f` |
 | `issue-tracker-server` | [`sutr-app/issue-tracker-server`](https://github.com/sutr-app/issue-tracker-server) | `v0.0.1` | `5974330a31ae19fb04db99841be73f305958d0d8` |
 
 The `memory-store` name is a compatibility identifier for the Memories dependency; it does not mean the incompatible `memory-store/main` branch. The release builds `front`, `memories-import`, and the SQLite migration CLI from one checkout at the pinned revision. The generated migration provenance must describe that same source and the staged target binaries.
@@ -262,7 +264,9 @@ checked-in Tauri config.
 ### Linux AppImage Post-Processing
 
 `scripts/build-release.sh` extracts each generated Linux AppImage, patches the GTK runtime hook
-created by linuxdeploy, and repackages the image. The stock linuxdeploy hook pins
+created by linuxdeploy, and repackages the image. The GTK plugin that the Tauri CLI uses for that
+hook needs `gtk-query-immodules-3.0` and `gdk-pixbuf-query-loaders` on the build host; without them
+the GTK module caches are missing and AppImage bundling fails. The stock linuxdeploy hook pins
 `GTK_IM_MODULE_FILE` to the bundled `immodules.cache`; that cache does not include host fcitx/ibus
 modules, so Japanese input can fall back to XIM and freeze WebKitGTK text fields on some desktops.
 
@@ -328,7 +332,13 @@ plugins first, records the signed migration/Atlas hashes while preserving their 
 then seals the outer `.app`. Only after those checks does it create and sign the DMG. This replaces
 pre-Tauri plugin/migration signing; Linux `.so` plugins and CUDA runtime staging are unchanged. The
 workflow still imports the `.p12` into a run-scoped keychain, verifies the signing identity, and checks
-notarization credentials with `notarytool history` before the long build.
+notarization credentials with `notarytool history` before the long build. The build step receives only
+`APPLE_SIGNING_IDENTITY`, and the last step deletes the run's keychain even when the job fails.
+Every action in `release.yml` is pinned to a commit SHA with the version in a trailing comment
+(`uses: owner/action@<sha> # vX.Y.Z`), so a moved tag cannot change the code that runs next to the Apple
+secrets. To update one, resolve the new tag with `git ls-remote https://github.com/<owner>/<action>
+'refs/tags/<tag>^{}'` and replace both the SHA and the comment; `scripts/test-public-release-workflow.mjs`
+rejects an unpinned reference.
 
 The workflow submits the finalized DMG with `notarytool submit --wait`, staples it, and then validates
 the sealed app's migration provenance against the actual packaged resource tree, all relevant code

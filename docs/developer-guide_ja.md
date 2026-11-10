@@ -110,7 +110,7 @@ macOS で動いて Linux で `resource path bin/all-in-one-x86_64-unknown-linux-
 
 Linux の `pnpm tauri:dev` は、Tauri が Rust crate をビルドしている間も Vite 開発サーバーを同時に起動します。Vite は `src-tauri/` と `target/` を監視対象から除外しているため、Cargo が `target/debug/build/*/rustc*` のような一時ディレクトリを作成・削除しても、Vite の file watcher はそのディレクトリを走査しません。
 
-Linux の開発時・パッケージ版の起動では、Lookback は既定で `GDK_BACKEND=wayland,x11` と `WEBKIT_DISABLE_DMABUF_RENDERER=1` を設定します。GTK はネイティブ Wayland を先に試し、利用できない場合は X11 へフォールバックします。AppImage では linuxdeploy の GTK hook にも同じ規則を適用し、deb / rpm では GTK 初期化前にアプリケーションが設定します。明示的な値が優先されるため、X11 を強制するには `GDK_BACKEND=x11`、DMA-BUF renderer 有効のネイティブ Wayland を試すには `GDK_BACKEND=wayland WEBKIT_DISABLE_DMABUF_RENDERER=0 pnpm tauri dev` のように指定します。
+Linux の開発時・パッケージ版の起動では、Lookback は既定で `GDK_BACKEND=wayland,x11` と `WEBKIT_DISABLE_DMABUF_RENDERER=1` を設定します。GTK はネイティブ Wayland を先に試し、利用できない場合は X11 へフォールバックします。AppImage の linuxdeploy の GTK hook は、固定している Tauri CLI（2.12.4）ではバックエンドを設定しないので同じ動作になります。X11 を強制する古い CLI の hook は、`scripts/build-release.sh` が同じ規則に書き換えます。deb / rpm では GTK 初期化前にアプリケーションが設定します。明示的な値が優先されるため、X11 を強制するには `GDK_BACKEND=x11`、DMA-BUF renderer 有効のネイティブ Wayland を試すには `GDK_BACKEND=wayland WEBKIT_DISABLE_DMABUF_RENDERER=0 pnpm tauri dev` のように指定します。
 
 `Unknown system error -116` の `scandir .../target/debug/build/.../rustc*` で停止する場合の確認手順:
 
@@ -145,7 +145,7 @@ pipeline の互換用論理名 `memory-store` は、非互換の `memory-store/m
 
 | Build input | 公開 repository | Tag | peeled commit |
 | --- | --- | --- | --- |
-| `memory-store`（Memories） | [`jobworkerp-rs/memory-store`](https://github.com/jobworkerp-rs/memory-store) | `v0.0.19` | `8253e725708264592e131af3b92d1b4c7719054a` |
+| `memory-store`（Memories） | [`jobworkerp-rs/memory-store`](https://github.com/jobworkerp-rs/memory-store) | `v0.0.24` | `8d365fc792489a98035bb11aaa3fe7e040a1177f` |
 | `issue-tracker-server` | [`sutr-app/issue-tracker-server`](https://github.com/sutr-app/issue-tracker-server) | `v0.0.1` | `5974330a31ae19fb04db99841be73f305958d0d8` |
 
 release は同じ pinned Memories checkout から `front`、`memories-import`、`memories-db-migrate` をビルドします。ビルド前に選択した ref が固定 full revision を含むことと、release に必要な入力が揃っていることを検査します。移行 task や schema の内容は Lookback では検査せず、Memories の build script が bundle 生成時に `memories-db-migrate bundle verify` で検査します。
@@ -210,7 +210,9 @@ Tauri のパッケージングを実行する前に、バックエンドバイ�
 ### Linux AppImage の後処理
 
 `scripts/build-release.sh` は Linux AppImage 生成後に AppImage を一度展開し、linuxdeploy が生成した
-GTK runtime hook を補正してから再梱包します。linuxdeploy の標準 hook は
+GTK runtime hook を補正してから再梱包します。この hook を作る Tauri CLI の GTK plugin は、ビルドするホストに
+`gtk-query-immodules-3.0` と `gdk-pixbuf-query-loaders` を必要とします。無い場合は GTK module の cache が
+作られず、AppImage の作成が失敗します。linuxdeploy の標準 hook は
 `GTK_IM_MODULE_FILE` を AppImage 内の `immodules.cache` に固定しますが、この cache にはホスト側の
 fcitx/ibus module が含まれないため、日本語入力が XIM 経由に落ちて WebKitGTK のテキスト入力欄で
 フリーズする環境があります。
@@ -277,6 +279,12 @@ source hash を保持したまま署名後の migration/Atlas hash を記録し�
 DMG の作成・署名はこれらの検査後に行います。これは Tauri packaging 前の plugin/migration signing に代わる処理です。
 Linux `.so` plugin と CUDA runtime staging は変更しません。workflow は従来どおり `.p12` を run ごとの keychain に
 import し、keychain の signing identity と長時間 build 前の `notarytool history` 認証確認を行います。
+build の step には `APPLE_SIGNING_IDENTITY` だけを渡し、最後の step で、job が失敗した場合も含めてその run の
+keychain を削除します。
+`release.yml` の action はすべてコミット SHA で固定し、バージョンを末尾のコメントに書いています
+(`uses: owner/action@<sha> # vX.Y.Z`)。タグが書き換えられても、Apple の secrets と同じ job で動くコードは変わりません。
+更新するときは `git ls-remote https://github.com/<owner>/<action> 'refs/tags/<tag>^{}'` で新しいタグの SHA を調べ、
+SHA とコメントの両方を書き換えます。固定していない参照は `scripts/test-public-release-workflow.mjs` が拒否します。
 
 workflow は finalizer が作成した DMG を `notarytool submit --wait` で送信して ticket を staple します。その後、
 実際に package された resource tree に対する migration provenance、code signature、stapled ticket、Gatekeeper 判定を

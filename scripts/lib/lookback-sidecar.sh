@@ -109,7 +109,7 @@ lookback_sidecar_init() {
 memories_grpc() {
   local method=$1 body=$2 transport=()
   [[ "${MEMORIES_TLS}" == "true" ]] || transport=(-plaintext)
-  grpcurl "${transport[@]}" -d "${body}" "${MEMORIES_HOST}:${MEMORIES_PORT}" "${method}"
+  grpcurl ${transport[@]+"${transport[@]}"} -d "${body}" "${MEMORIES_HOST}:${MEMORIES_PORT}" "${method}"
 }
 
 # Enqueues one WORKFLOW `run` job and waits for its DIRECT result. `--using

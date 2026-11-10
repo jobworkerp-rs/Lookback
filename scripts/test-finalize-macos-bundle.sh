@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AGENT_APP_SOURCE=$(cd "${SCRIPT_DIR}/.." && pwd)
-TMP_ROOT=$(mktemp -d)
+# The finalizer resolves the app with pwd -P; on macOS /var is a symlink to
+# /private/var, so compare against the resolved path.
+TMP_ROOT=$(cd "$(mktemp -d)" && pwd -P)
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 
 fail() {

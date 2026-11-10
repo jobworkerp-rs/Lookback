@@ -14,6 +14,9 @@ patch_linuxdeploy_gtk_hook_for_wayland_backend() {
   # shellcheck disable=SC2016 # This is the literal line written into the hook.
   local desired='export GDK_BACKEND="${GDK_BACKEND:-wayland,x11}"'
   grep -Fqx "${desired}" "${hook}" && return 1
+  # The GTK plugin embedded in Tauri CLI 2.12.4 no longer forces a backend,
+  # and an unset GDK_BACKEND already makes GTK try Wayland before X11.
+  grep -Eq '^[[:space:]]*export[[:space:]]+GDK_BACKEND=' "${hook}" || return 1
   if ! grep -Eq '^export GDK_BACKEND=x11([[:space:]]*(#.*)?)?$' "${hook}"; then
     echo "unrecognized linuxdeploy GTK backend hook: ${hook}" >&2
     return 2

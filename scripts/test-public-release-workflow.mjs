@@ -79,12 +79,26 @@ for (const name of selfHostedLinuxJobs) {
   assert.doesNotMatch(job, /\bapt(?:-get)?\b/, `job ${name} must take system packages from the runner image`);
   assert.doesNotMatch(job, /^    permissions:/m, `job ${name} must keep the read-only token on the shared runner`);
   assert.doesNotMatch(job, /\bsecrets\./, `job ${name} must not expose secrets to the shared runner`);
-  assert.match(stepBlock(job, "uses: actions/checkout@"), /^          persist-credentials: false$/m,
-    `job ${name} must not leave the token in the checkout on the shared runner`);
 }
 for (const name of ["build-cuda", "build"]) {
   assert.match(jobBlock(workflow, name), /^      APPIMAGE_EXTRACT_AND_RUN: "1"$/m,
     `job ${name} must extract AppImage tools instead of mounting them through FUSE`);
+}
+
+// Later steps run dependency code, so no checkout may leave the token in
+// .git/config.
+for (const name of jobNames.filter((job) => jobBlock(workflow, job).includes("uses: actions/checkout@"))) {
+  assert.match(stepBlock(jobBlock(workflow, name), "uses: actions/checkout@"), /^          persist-credentials: false$/m,
+    `job ${name} must not leave the token in the checkout`);
+}
+
+// A tag can be moved by the action's owner; only a commit SHA fixes the code
+// that runs next to the Apple secrets. The comment keeps the version readable.
+const actionRefs = [...workflow.matchAll(/^\s+(?:- )?uses: (.+)$/gm)].map((match) => match[1]);
+assert.ok(actionRefs.length > 0, "release workflow uses no actions");
+for (const ref of actionRefs) {
+  assert.match(ref, /^[\w.-]+\/[\w.\/-]+@[0-9a-f]{40} # \S+$/,
+    `action must be pinned to a commit SHA with a version comment: ${ref}`);
 }
 
 const test = jobBlock(workflow, "test");
@@ -113,7 +127,20 @@ for (const secret of [
 ]) {
   assert.ok(mac.includes(`secrets.${secret}`), `macOS signing must retain the ${secret} secret mapping`);
 }
-assert.match(mac, /bash scripts\/build-release\.sh --profile mac/);
+const macBuild = stepBlock(mac, "bash scripts/build-release.sh --profile mac");
+assert.match(macBuild, /APPLE_SIGNING_IDENTITY: \$\{\{ secrets\.APPLE_SIGNING_IDENTITY \}\}/);
+assert.doesNotMatch(macBuild, /APPLE_(?:CERTIFICATE|ID|PASSWORD|TEAM_ID)\b/,
+  "the build step must not receive Apple secrets it does not use");
+assert.match(mac, /^      SIGNING_KEYCHAIN: signing_temp_\$\{\{ github\.run_id \}\}_\$\{\{ github\.run_attempt \}\}$/m,
+  "each run must sign from its own keychain");
+assert.ok(stepBlock(mac, "uses: apple-actions/import-codesign-certs@").includes("keychain: ${{ env.SIGNING_KEYCHAIN }}"),
+  "the certificate must be imported into this run's keychain");
+const keychainCleanup = "name: Delete Apple signing keychain";
+const cleanup = stepBlock(mac, keychainCleanup);
+assert.match(cleanup, /^        if: always\(\)$/m, "the keychain must be deleted even when the job fails");
+assert.ok(cleanup.includes("${SIGNING_KEYCHAIN}.keychain-db"), "the cleanup must delete the keychain this run imported into");
+assert.equal(mac.indexOf("\n      - ", mac.indexOf(keychainCleanup)), -1,
+  "the keychain cleanup must stay the final step");
 assert.match(mac, /node scripts\/verify-migration-release\.mjs[\s\S]*?--distributed-assets/,
   "the assembled app must be checked against signed migration provenance and packaged bytes");
 assert.match(mac, /xcrun notarytool submit/);

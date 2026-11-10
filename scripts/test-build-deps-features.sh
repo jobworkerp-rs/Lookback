@@ -31,10 +31,10 @@ GPU=cpu
 
 [[ "$(repo_url memory-store)" == "https://github.com/jobworkerp-rs/memory-store.git" ]] \
   || fail "Memories must build from its public GitHub repository"
-[[ "$(repo_branch memory-store)" == "v0.0.19" ]] \
-  || fail "Memories must select the published v0.0.19 tag"
-[[ "$(repo_revision memory-store)" == "8253e725708264592e131af3b92d1b4c7719054a" ]] \
-  || fail "Memories must pin the peeled v0.0.19 commit"
+[[ "$(repo_branch memory-store)" == "v0.0.24" ]] \
+  || fail "Memories must select the published v0.0.24 tag"
+[[ "$(repo_revision memory-store)" == "8d365fc792489a98035bb11aaa3fe7e040a1177f" ]] \
+  || fail "Memories must pin the peeled v0.0.24 commit"
 [[ "$(repo_ref_kind memory-store)" == "tag" ]] \
   || fail "the default Memories release ref must be fetched as a tag"
 

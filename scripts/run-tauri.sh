@@ -5,7 +5,6 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-AGENT_APP="${LOOKBACK_AGENT_APP:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 
 host_triple() {
   case "$(uname -s):$(uname -m)" in
@@ -39,17 +38,19 @@ if [[ -n "${TARGET}" && "${TARGET}" != "${HOST_TARGET}" && "${LOOKBACK_EXTERNAL_
   exit 2
 fi
 
+# Empty arrays are expanded with ${a[@]+"${a[@]}"}: macOS ships bash 3.2,
+# where "${a[@]}" on an empty array fails under set -u.
 if [[ "${COMMAND}" == "dev" ]]; then
   stage_args=()
   [[ -z "${TARGET}" ]] || stage_args=(--triple "${TARGET}")
-  bash "${SCRIPT_DIR}/stage-dev-external-bins.sh" "${stage_args[@]}"
+  bash "${SCRIPT_DIR}/stage-dev-external-bins.sh" ${stage_args[@]+"${stage_args[@]}"}
 fi
 
 case "${COMMAND}" in
   build|bundle)
     verify_args=()
     [[ -z "${TARGET}" ]] || verify_args=(--triple "${TARGET}")
-    bash "${SCRIPT_DIR}/verify-packaging-migration-provenance.sh" "${verify_args[@]}"
+    bash "${SCRIPT_DIR}/verify-packaging-migration-provenance.sh" ${verify_args[@]+"${verify_args[@]}"}
     ;;
 esac
 
@@ -65,13 +66,6 @@ if [[ "${COMMAND}" == "build" && "$(uname -s)" == "Linux" ]]; then
   # The system libraries it copies are already stripped, so skipping that
   # redundant pass preserves AppImage bundling on current Linux hosts.
   export NO_STRIP=true
-  # Tauri searches this project-local tool cache before invoking linuxdeploy.
-  # Keep the GTK hook under version control so a freshly created cache does
-  # not regress to linuxdeploy's X11-only default on Wayland sessions.
-  tools_dir="${AGENT_APP}/target/.tauri"
-  mkdir -p "${tools_dir}"
-  install -m755 "${SCRIPT_DIR}/assets/linuxdeploy-plugin-gtk.sh" \
-    "${tools_dir}/linuxdeploy-plugin-gtk.sh"
 fi
 
 exec tauri "$@"

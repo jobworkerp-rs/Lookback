@@ -76,7 +76,7 @@ GPU バックエンドに応じた feature でビルドし、バイナリ / プ�
 `front`と同じmemory-store checkoutから公式SQLite migration bundleを生成・配置したうえで
 `pnpm tauri build` を実行します。
 
-この release pipeline では、互換性上の名前 `memory-store` を公開 GitHub の [`memory-store` v0.0.19](https://github.com/jobworkerp-rs/memory-store/tree/v0.0.19)（peeled commit `8253e725708264592e131af3b92d1b4c7719054a`）に固定し、`front`、`memories-import`、migration CLI を同じ checkout からビルドします。`--experimental-issues` を指定した場合の Issue Tracker server は公開 GitHub の [`issue-tracker-server` v0.0.1](https://github.com/sutr-app/issue-tracker-server/tree/v0.0.1)（peeled commit `5974330a31ae19fb04db99841be73f305958d0d8`）を使います。source pin の検証と override は [開発者ガイド](docs/developer-guide_ja.md#リリースビルドの詳細) を参照してください。
+この release pipeline では、互換性上の名前 `memory-store` を公開 GitHub の [`memory-store` v0.0.24](https://github.com/jobworkerp-rs/memory-store/tree/v0.0.24)（peeled commit `8d365fc792489a98035bb11aaa3fe7e040a1177f`）に固定し、`front`、`memories-import`、migration CLI を同じ checkout からビルドします。`--experimental-issues` を指定した場合の Issue Tracker server は公開 GitHub の [`issue-tracker-server` v0.0.1](https://github.com/sutr-app/issue-tracker-server/tree/v0.0.1)（peeled commit `5974330a31ae19fb04db99841be73f305958d0d8`）を使います。source pin の検証と override は [開発者ガイド](docs/developer-guide_ja.md#リリースビルドの詳細) を参照してください。
 
 ```bash
 # macOS（Metal GPU、DMG + .app）

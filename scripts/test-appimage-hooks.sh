@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib/appimage-hooks.sh
 source "${SCRIPT_DIR}/lib/appimage-hooks.sh"
-gtk_plugin="${SCRIPT_DIR}/assets/linuxdeploy-plugin-gtk.sh"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -24,12 +23,6 @@ assert_not_contains() {
 assert_no_exact_line() {
   local file=$1 unexpected=$2
   ! grep -Fxq "${unexpected}" "${file}" || fail "expected ${file} not to contain exact line: ${unexpected}"
-}
-
-assert_cache_normalization_is_guarded() {
-  local cache_var=$1
-  grep -Fq "if [ -f \"\$APPDIR/\$${cache_var}\" ]; then" "${gtk_plugin}" \
-    || fail "expected ${cache_var} normalization to skip a missing cache"
 }
 
 tmpdir=$(mktemp -d)
@@ -73,11 +66,6 @@ assert_contains "${hook}" 'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/gtk-3.0/3
 assert_no_exact_line "${hook}" 'export GTK_IM_MODULE_FILE="$APPDIR//usr/lib/gtk-3.0/3.0.0/immodules.cache"'
 assert_contains "${hook}" 'export GDK_PIXBUF_MODULE_FILE='
 
-# Optional host query tools may be unavailable. With `set -e`, normalizing a
-# cache that was not generated would otherwise abort the whole AppImage build.
-assert_cache_normalization_is_guarded "gtk3_immodules_cache_file"
-assert_cache_normalization_is_guarded "gdk_pixbuf_cache_file"
-
 before=$(mktemp)
 cp "${hook}" "${before}"
 if patch_linuxdeploy_gtk_hook_for_wayland_backend "${root}"; then
@@ -89,6 +77,20 @@ if patch_linuxdeploy_gtk_hook_for_host_ime "${root}"; then
   fail "expected already-patched hook to report no change"
 fi
 cmp -s "${before}" "${hook}" || fail "expected already-patched hook to stay unchanged"
+
+# The hook written by the Tauri CLI 2.12.4 GTK plugin.
+tauri_root="${tmpdir}/tauri-2.12-root"
+tauri_hook="${tauri_root}/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+mkdir -p "$(dirname "${tauri_hook}")"
+printf '%s\n' '# export GDK_BACKEND=x11 # Monitor this closely. AppImage used to crash on Wayland!' >"${tauri_hook}"
+cp "${tauri_hook}" "${before}"
+if patch_linuxdeploy_gtk_hook_for_wayland_backend "${tauri_root}"; then
+  fail "expected a hook that forces no backend to report no change"
+else
+  status=$?
+  [[ "${status}" == 1 ]] || fail "expected a hook that forces no backend to be accepted, got status ${status}"
+fi
+cmp -s "${before}" "${tauri_hook}" || fail "expected a hook that forces no backend to stay unchanged"
 
 debian_root="${tmpdir}/debian-root"
 debian_hook="${debian_root}/apprun-hooks/linuxdeploy-plugin-gtk.sh"
