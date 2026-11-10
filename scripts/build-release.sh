@@ -53,6 +53,8 @@ LINDERA_ONLY=0
 JOBS=""
 NO_SUBMODULE=0
 MACOS_UNSIGNED_INTERMEDIATE=0
+EXPERIMENTAL_ISSUES=0
+ISSUE_TRACKER_TAURI_ARGS=()
 
 usage() {
   cat >&2 <<'EOF'
@@ -70,6 +72,7 @@ Options:
   --skip-clone             Reuse existing clones, do not fetch/pull
   --skip-frontend          Build/stage backend only, skip pnpm tauri build
   --only <repos>           Comma list: jobworkerp,memory-store,conductor,llama,mm,issue-tracker-server
+                           (issue-tracker-server only with --experimental-issues)
   --lindera release|cli|skip
                            Dictionary strategy (default: release; cli is a legacy alias)
   --lindera-only           Generate only the lindera dictionary, then exit
@@ -78,6 +81,9 @@ Options:
   --no-submodule-update    Skip submodule init/update (faster re-runs)
   --macos-unsigned-intermediate
                            Build an unsigned .app only; never create a DMG
+  --experimental-issues    Enable the experimental Issue Tracker: build and
+                           bundle issue-tracker-server, compile Lookback with
+                           the experimental-issues feature, and run its E2E gate
   -h, --help               Show this help
 
 Env: DRY_RUN=1 prints commands without executing.
@@ -100,6 +106,7 @@ while [[ $# -gt 0 ]]; do
     --jobs)     JOBS=$2; shift 2 ;;
     --no-submodule-update) NO_SUBMODULE=1; shift ;;
     --macos-unsigned-intermediate) MACOS_UNSIGNED_INTERMEDIATE=1; shift ;;
+    --experimental-issues) EXPERIMENTAL_ISSUES=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -141,7 +148,7 @@ PLUGINS_DIR="${AGENT_APP}/src-tauri/plugins"
 [[ -n "${JOBS}" ]] && export CARGO_BUILD_JOBS="${JOBS}"
 
 export AGENT_APP BIN_DIR PLUGINS_DIR TRIPLE LIBEXT GPU WORKDIR \
-  SKIP_CLONE NO_SUBMODULE ONLY_REPOS
+  SKIP_CLONE NO_SUBMODULE ONLY_REPOS EXPERIMENTAL_ISSUES
 
 # Preflight ----------------------------------------------------------------
 preflight() {
@@ -231,27 +238,52 @@ dump_appimage_diagnostics() {
 }
 
 # Frontend build -----------------------------------------------------------
+# The app resolves the bundled Issue Tracker server at startup only when the
+# experimental-issues feature is compiled in, so the feature and the sidecar
+# must ship together. Without the feature the server is dropped from the
+# externalBin list that tauri.conf.json keeps for development.
+set_issue_tracker_tauri_args() {
+  if issue_tracker_bundled; then
+    ISSUE_TRACKER_TAURI_ARGS=(--features experimental-issues)
+    return 0
+  fi
+  local external_bins
+  external_bins=$(node -e '
+    const config = require(process.argv[1]);
+    const externalBin = config.bundle.externalBin.filter((bin) => bin !== "bin/issue-tracker-server");
+    process.stdout.write(JSON.stringify({ bundle: { externalBin } }));
+  ' "${AGENT_APP}/src-tauri/tauri.conf.json")
+  ISSUE_TRACKER_TAURI_ARGS=(--config "${external_bins}")
+}
+
+# tauri_build_command: fill TAURI_COMMAND with the exact `tauri build` argv, so
+# the logged command and the executed one cannot drift apart.
+tauri_build_command() {
+  TAURI_COMMAND=(pnpm tauri build)
+  [[ "${LOOKBACK_TAURI_VERBOSE:-0}" != "1" ]] || TAURI_COMMAND+=(-v)
+  TAURI_COMMAND+=(--bundles "${tauri_bundles}")
+  # Prevent Tauri from rewriting externalBin bytes during macOS assembly. The
+  # finalizer signs those exact, provenance-checked copies afterward. The
+  # explicit CLI option is required: empty signing identities alone do not
+  # disable Tauri's certificate-based signing path.
+  [[ "${PLATFORM}" != "mac" ]] || TAURI_COMMAND+=(--no-sign)
+  TAURI_COMMAND+=("${ISSUE_TRACKER_TAURI_ARGS[@]}")
+}
+
 run_tauri_build() {
   local cuda_stub_dir=$1
-  local tauri_command=(pnpm tauri build)
-  [[ "${LOOKBACK_TAURI_VERBOSE:-0}" != "1" ]] || tauri_command+=(-v)
-  tauri_command+=(--bundles "${tauri_bundles}")
+  tauri_build_command
   if [[ "${PLATFORM}" == "mac" ]]; then
-    # Prevent Tauri from rewriting externalBin bytes during assembly. The
-    # finalizer signs those exact, provenance-checked copies afterward. The
-    # explicit CLI option is required: empty signing identities alone do not
-    # disable Tauri's certificate-based signing path.
-    tauri_command+=(--no-sign)
     (cd "${AGENT_APP}" && env \
       APPLE_SIGNING_IDENTITY= TAURI_SIGNING_IDENTITY= \
       APPLE_CERTIFICATE= APPLE_CERTIFICATE_PASSWORD= \
-      "${tauri_command[@]}")
+      "${TAURI_COMMAND[@]}")
   elif [[ -n "${cuda_stub_dir}" ]]; then
     (cd "${AGENT_APP}" && env \
       LD_LIBRARY_PATH="${cuda_stub_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-      "${tauri_command[@]}")
+      "${TAURI_COMMAND[@]}")
   else
-    (cd "${AGENT_APP}" && "${tauri_command[@]}")
+    (cd "${AGENT_APP}" && "${TAURI_COMMAND[@]}")
   fi
 }
 
@@ -273,23 +305,19 @@ build_frontend() {
       "${LOOKBACK_RELEASE_VERSION}" \
       "${AGENT_APP}/src-tauri/tauri.conf.json"
   fi
-  local tauri_verbose_display=""
-  local tauri_sign_display=""
   local tauri_bundles=${BUNDLE}
   if [[ "${PLATFORM}" == "mac" ]]; then
     # Tauri must only assemble the unsigned .app. Final signing mutates nested
     # Mach-O bytes, so the DMG is created later from the sealed app.
     tauri_bundles=app
-    tauri_sign_display=" --no-sign"
     log "Tauri assembles an unsigned macOS app; signing is deferred until provenance checks complete"
   fi
-  if [[ "${LOOKBACK_TAURI_VERBOSE:-0}" == "1" ]]; then
-    tauri_verbose_display=" -v"
-  fi
+  set_issue_tracker_tauri_args
+  tauri_build_command
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
-    log "   $ cd ${AGENT_APP} && pnpm tauri build${tauri_verbose_display} --bundles ${tauri_bundles}${tauri_sign_display}"
+    log "   $ cd ${AGENT_APP} && ${TAURI_COMMAND[*]}"
   else
-    log "   $ pnpm tauri build${tauri_verbose_display} --bundles ${tauri_bundles}"
+    log "   $ ${TAURI_COMMAND[*]}"
     local cuda_stub_dir="" status=0
     cuda_stub_dir=$(prepare_cuda_driver_stub_dir)
     run_tauri_build "${cuda_stub_dir}" || status=$?
@@ -316,6 +344,9 @@ finalize_macos_release_bundle() {
   if [[ "${MACOS_UNSIGNED_INTERMEDIATE}" == "1" ]]; then
     args+=(--unsigned-intermediate)
   fi
+  if issue_tracker_bundled; then
+    args+=(--with-issue-tracker)
+  fi
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     log "DRY_RUN: finalize unsigned macOS app and requested DMG after Tauri assembly"
     return 0
@@ -327,12 +358,11 @@ finalize_macos_release_bundle() {
 # ensures the bundled external binary can serve the private gRPC integration.
 verify_issue_tracker_grpc_server() {
   [[ "${SKIP_FRONTEND}" == "1" ]] && { log "skip Issue tracker E2E (--skip-frontend)"; return 0; }
-  local issue_tracker_server="${BIN_DIR}/issue-tracker-server-${TRIPLE}"
-  if [[ "${DRY_RUN:-0}" == "1" ]]; then
-    log "Issue Tracker gRPC E2E: ${SCRIPT_DIR}/test-issue-tracker-grpc-e2e.sh"
-    return 0
-  fi
-  LOOKBACK_ISSUE_TRACKER_SERVER_BIN="${issue_tracker_server}" \
+  issue_tracker_bundled || { log "skip Issue tracker E2E (not bundled without --experimental-issues)"; return 0; }
+  log "Issue Tracker gRPC E2E"
+  run env \
+    LOOKBACK_ISSUE_TRACKER_SERVER_BIN="${BIN_DIR}/issue-tracker-server-${TRIPLE}" \
+    LOOKBACK_SIDECAR_BIN_DIR="${BIN_DIR}" \
     bash "${SCRIPT_DIR}/test-issue-tracker-grpc-e2e.sh"
 }
 

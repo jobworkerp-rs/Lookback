@@ -107,16 +107,27 @@ LOOKBACK_JOBWORKERP_REF="reviewed-jobworkerp-release"
   || fail "jobworkerp branch override must be honoured"
 unset LOOKBACK_JOBWORKERP_REF
 
-if (ONLY_REPOS="jobworkerp,llama" SKIP_FRONTEND=0 require_bundle_issue_tracker_dependencies) \
+# A release without --experimental-issues neither builds nor bundles the
+# Issue Tracker server, so packaging must not ask for it.
+for only in "" issue-tracker-server; do
+  if (ONLY_REPOS="${only}" EXPERIMENTAL_ISSUES=0 want_repo issue-tracker-server); then
+    fail "the Issue Tracker server must not be built without --experimental-issues (--only '${only}')"
+  fi
+done
+(ONLY_REPOS="" EXPERIMENTAL_ISSUES=1 want_repo issue-tracker-server) \
+  || fail "--experimental-issues must build the Issue Tracker server"
+ONLY_REPOS="jobworkerp,llama" SKIP_FRONTEND=0 EXPERIMENTAL_ISSUES=0 require_bundle_issue_tracker_dependencies
+
+if (ONLY_REPOS="jobworkerp,llama" SKIP_FRONTEND=0 EXPERIMENTAL_ISSUES=1 require_bundle_issue_tracker_dependencies) \
   >/tmp/lookback-missing-issue-tracker-server.out 2>/tmp/lookback-missing-issue-tracker-server.err; then
-  fail "bundle build must reject --only without the Issue Tracker server"
+  fail "an --experimental-issues bundle build must reject --only without the Issue Tracker server"
 fi
 grep -Fq "issue-tracker-server" /tmp/lookback-missing-issue-tracker-server.err \
   || fail "missing Issue Tracker server rejection must name the required repository"
 
-ONLY_REPOS="jobworkerp,llama" SKIP_FRONTEND=1 require_bundle_issue_tracker_dependencies
-ONLY_REPOS="jobworkerp,llama,issue-tracker-server" SKIP_FRONTEND=0 require_bundle_issue_tracker_dependencies
-ONLY_REPOS="none" SKIP_FRONTEND=0 DRY_RUN=1 require_bundle_issue_tracker_dependencies
+ONLY_REPOS="jobworkerp,llama" SKIP_FRONTEND=1 EXPERIMENTAL_ISSUES=1 require_bundle_issue_tracker_dependencies
+ONLY_REPOS="jobworkerp,llama,issue-tracker-server" SKIP_FRONTEND=0 EXPERIMENTAL_ISSUES=1 require_bundle_issue_tracker_dependencies
+ONLY_REPOS="none" SKIP_FRONTEND=0 EXPERIMENTAL_ISSUES=1 DRY_RUN=1 require_bundle_issue_tracker_dependencies
 
 incompatible_source="${TMP_ROOT}/incompatible-memories"
 mkdir -p "${incompatible_source}"

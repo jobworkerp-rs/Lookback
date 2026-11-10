@@ -36,6 +36,7 @@ The app UI lives in this repository, but running the complete desktop app also n
   the official SQLite migration bundle (`memories-db-migrate`, Atlas, and the migration catalog)
 - [`jobworkerp-conductor`](https://github.com/jobworkerp-rs/jobworkerp-conductor): `conductor-main`
 - [`issue-tracker-server`](https://github.com/sutr-app/issue-tracker-server): Issue Tracker sidecar
+  (experimental; bundled only by an `--experimental-issues` release build)
 - Runtime `protoc`: the official self-contained protobuf compiler, fetched automatically by the build
   (children run it to compile runner schemas at worker-registration time, so it is shipped as a
   bundled binary)
@@ -72,7 +73,7 @@ Install these on the build host before building:
 
 ### Automated build (recommended)
 
-`scripts/build-release.sh` clones the six public backend repositories, builds them with the
+`scripts/build-release.sh` clones the public backend repositories, builds them with the
 right features for your platform and GPU backend, stages the binaries / plugins / lindera
 dictionary, generates the official SQLite migration bundle from the same memory-store checkout
 as `front`, and runs `pnpm tauri build`:
@@ -87,8 +88,9 @@ scripts/build-release.sh --profile linux-cuda
 
 Useful flags: `--skip-clone` (reuse existing clones), `--only <repos>` (rebuild a subset),
 `--workdir <dir>` (clone/build location, default `.build-deps/`), `--skip-frontend`,
-`--lindera skip`. Run `scripts/build-release.sh --help` for the full list, or prefix with
-`DRY_RUN=1` to preview the commands without running them.
+`--lindera skip`, `--experimental-issues` (also build and bundle the experimental Issue Tracker).
+Run `scripts/build-release.sh --help` for the full list, or prefix with `DRY_RUN=1` to preview the
+commands without running them.
 
 The generated package, such as a macOS `.app` / DMG or a Linux package target, includes the UI,
 workers, optional search dictionary files, plugins, and bundled backend binaries according to

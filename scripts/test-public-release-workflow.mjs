@@ -103,8 +103,6 @@ assert.match(mac, /brew install protobuf cmake pkgconf jq/);
 assert.match(mac, /command -v protoc/,
   "the macOS build must check the host protobuf compiler before the release build");
 assert.match(mac, /command -v jq/);
-assert.match(mac, /\.build-deps\/issue-tracker-server/,
-  "the macOS build cache must include the newly pinned Issue Tracker dependency");
 for (const secret of [
   "APPLE_CERTIFICATE",
   "APPLE_CERTIFICATE_PASSWORD",
@@ -127,16 +125,12 @@ const cuda = jobBlock(workflow, "build-cuda");
 assert.match(stepBlock(cuda, "uses: actions/upload-artifact@"), tagPushOnly,
   "a manual run must not keep the CUDA AppImage");
 assert.match(cuda, /needs: test/);
-assert.match(cuda, /\.build-deps\/issue-tracker-server/,
-  "the CUDA build cache must include the newly pinned Issue Tracker dependency");
 
 const cpu = jobBlock(workflow, "build");
 assert.match(stepBlock(cpu, "uses: actions/upload-artifact@"), tagPushOnly,
   "a manual run must not keep the CPU bundles");
 assert.match(cpu, /needs: \[test, build-cuda\]/,
   "the CPU build must retain its dependency on the CUDA release job");
-assert.match(cpu, /\.build-deps\/issue-tracker-server/,
-  "the CPU build cache must include the newly pinned Issue Tracker dependency");
 
 const publish = jobBlock(workflow, "publish-linux");
 assert.match(publish, /^    runs-on: ubuntu-latest$/m, "publishing must run off the shared self-hosted runner");
@@ -152,6 +146,13 @@ for (const [name, job] of [["build-cuda", cuda], ["build", cpu]]) {
 const published = stepBlock(publish, "uses: softprops/action-gh-release@");
 for (const files of ["*.deb", "*.AppImage"]) {
   assert.ok(published.includes(files), `the Linux release must attach ${files}`);
+}
+
+// Releases ship the Issue Tracker server only with --experimental-issues, so
+// no release job builds it or caches its target directory.
+for (const name of jobNames) {
+  assert.doesNotMatch(jobBlock(workflow, name), /issue-tracker-server|--experimental-issues/,
+    `job ${name} must not build or bundle the experimental Issue Tracker server`);
 }
 
 console.log("public release workflow checks passed");

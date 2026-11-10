@@ -9,7 +9,7 @@ memories リポジトリのオリジナル YAML は変更せず、ここに **�
 バイナリ自体は無改修で sidecar 起動するため、ワークフロー側だけを
 ここで差し替える）。
 
-Issue tracking の正本は同梱の standalone `issue-tracker-server` です。Lookback は loopback gRPC で接続し、生の manager method は MCP / FunctionSet / UI / Tauri command に出しません。jobworkerp 側に載せるのは次の系統です。
+Issue tracking の正本は standalone の `issue-tracker-server` です（release に同梱する条件は [開発者ガイド](../docs/developer-guide_ja.md#experimental-issues-ビルド) を参照）。Lookback は loopback gRPC で接続し、生の manager method は MCP / FunctionSet / UI / Tauri command に出しません。jobworkerp 側に載せるのは次の系統です。
 
 - `lookback-issue-extract`（`issue_extract` チャネルの WORKFLOW）。tracker 未 READY でも登録する。DISABLED またはシグナル偽なら LLM / RPC せず skip する。host 空（未 READY）は失敗ログのみで run もキューも作らない。
 - `lookback-thread-issue-resolution`（`issue_extract`）。スレッド要約保存後の後続メッセージを照合し、既存 Manager API により確定する。再起動後のジョブ再送は行わない。`ListReviewCandidates` は server が page_size を 100 に丸め `totalSize` を返さないため、全ページを走査し、token 消尽・composite snapshot の一致・candidate ID の一意性で完走を保証する（件数照合はしない）。走査中に保持するのはこの thread を source とする候補行と全候補の ID だけで、ページ応答は走査後に破棄する。engine は jq 式の評価ごとに workflow context 全体を複製するため、全件を保持すると候補 1 件あたり数分かかる。

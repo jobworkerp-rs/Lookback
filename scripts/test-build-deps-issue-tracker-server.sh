@@ -22,6 +22,7 @@ test_stages_issue_tracker_server_binary() {
   GPU=cpu
   ONLY_REPOS=issue-tracker-server
   SKIP_FRONTEND=1
+  EXPERIMENTAL_ISSUES=1
   mkdir -p "$(dirname "${source}")"
   printf 'issue-tracker-server\n' >"${source}"
 

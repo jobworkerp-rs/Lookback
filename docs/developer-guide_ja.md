@@ -86,11 +86,13 @@ Linux x86_64 では同じ staging が `coding-agent-executor` を debug build �
 
 ### Experimental Issues ビルド
 
-Issue 候補の抽出は debug ビルドで有効です。通常の release ビルドでは Issues UI を非表示にし、利用者が以前に有効なポリシーを保存していても抽出を強制的に無効化します。experimental として明示的に有効化した release を作成するには、Tauri 経由でアプリの Cargo feature を指定します。
+Issue 候補の抽出は debug ビルドで有効です。通常の release ビルドでは Issues UI を非表示にし、利用者が以前に有効なポリシーを保存していても抽出を強制的に無効化します。`issue-tracker-server` も同梱しません。experimental として明示的に有効化した release を作成するには、release スクリプトに `--experimental-issues` を指定します。
 
 ```bash
-pnpm tauri build --features experimental-issues
+scripts/build-release.sh --profile linux-cuda --experimental-issues
 ```
+
+このフラグは次の 3 つを必ず同時に有効にします。`issue-tracker-server` のビルドと同梱、アプリの Cargo feature `experimental-issues`、Issue Tracker の E2E ゲート（`scripts/test-issue-tracker-grpc-e2e.sh`）。feature を有効にしたのに server を同梱しないビルドは起動時に失敗するので、`pnpm tauri build` に `--features experimental-issues` だけを付けないでください。手動の `pnpm tauri build` は、開発用に `issue-tracker-server` を含めている `src-tauri/tauri.conf.json` の `externalBin` をそのまま使うので、常に server を同梱します。通常の release は `build-release.sh` で作ってください。
 
 `pnpm tauri build`（`pnpm tauri:build` を含む）は開発用 staging や migration bundle の生成・再利用を行いません。package 前に、同じ pinned Memories build から得た target-specific `front`、`memories-import`、migration bundle が配置され、各 artifact digest が provenance manifest と一致する必要があります。wrapper と Tauri の build/bundle hook は provenance 欠損や不一致を拒否します。pinned source からの build/staging には `scripts/build-release.sh` を使ってください。手動 package の場合は clean な pinned source と release pin を `scripts/lib/write-migration-source-provenance.mjs` に渡し、`pnpm verify:packaging-migration` を通してから build します。`pnpm tauri:dev` は起動のたびに隣接する `../memories` の `scripts/build-memories-db-migrate-sqlite.sh` で migration bundle を生成し、`bundle-manifest.json` の content digest がステージ済みの bundle と異なる場合だけ差し替えます。memories の作業ツリーを変更すれば、次の `pnpm tauri:dev` で反映されます。
 
@@ -191,7 +193,7 @@ Tauri のパッケージングを実行する前に、バックエンドバイ�
 1. `all-in-one`、`front`、`conductor-main`、`memories-import`、`issue-tracker-server`、`protoc` のリリースバイナリをビルドします。
 2. [../src-tauri/tauri.conf.json](../src-tauri/tauri.conf.json) の `externalBin` ベース名と一致する名前で `src-tauri/bin/` に配置します。
 3. Tauri のパッケージング用に、対象プラットフォームに対応したプラットフォームトリプルのサフィックス付きバイナリも用意します。レビュー済みの jobworkerp revision を使う場合は `LOOKBACK_JOBWORKERP_REF` を指定します。
-4. [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner) と [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner) のランナープラグイン共有ライブラリを対象 OS 向けにビルドし、`src-tauri/plugins/` に配置します。`issue-tracker-front` crate から `issue-tracker-server` をビルドし、target-triple サフィックス付きで `src-tauri/bin/` に配置します。`--only` で Tauri packaging を行う場合も `issue-tracker-server` を含める必要があります。部分的な backend build だけを行う場合は `--skip-frontend` を指定します。
+4. [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner) と [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner) のランナープラグイン共有ライブラリを対象 OS 向けにビルドし、`src-tauri/plugins/` に配置します。`issue-tracker-front` crate から `issue-tracker-server` をビルドし、target-triple サフィックス付きで `src-tauri/bin/` に配置します。`--experimental-issues` を指定して `--only` で Tauri packaging を行う場合は、`issue-tracker-server` を含める必要があります。部分的な backend build だけを行う場合は `--skip-frontend` を指定します。
 5. パッケージに含める `memory-store` の `front` ビルドが Lindera FTS を必要とする場合は、
    `dict/lindera/ipadic` に IPADIC 検索用辞書を配置します。`dict/` 配下は **git 管理外** です。
    `scripts/build-release.sh --lindera-only` で lindera 3.0.7 release 辞書を取得すると、IPADIC

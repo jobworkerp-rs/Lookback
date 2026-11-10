@@ -9,6 +9,7 @@ TRIPLE=""
 DMG=""
 UNSIGNED_INTERMEDIATE=0
 NOTARIZE=0
+WITH_ISSUE_TRACKER=0
 
 usage() {
   cat >&2 <<'EOF'
@@ -20,6 +21,8 @@ Options:
                               APPLE_NOTARY_KEYCHAIN_PROFILE
   --unsigned-intermediate     Validate an unsigned app without signing or DMG
                               creation; this output is not distributable
+  --with-issue-tracker        The app ships issue-tracker-server (an
+                              --experimental-issues release)
 EOF
 }
 
@@ -37,6 +40,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --unsigned-intermediate) UNSIGNED_INTERMEDIATE=1; shift ;;
     --notarize) NOTARIZE=1; shift ;;
+    --with-issue-tracker) WITH_ISSUE_TRACKER=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -54,6 +58,12 @@ esac
   || { echo "trusted agent-app build root is missing or not a real directory" >&2; exit 1; }
 APP=$(cd "${APP}" && pwd -P)
 SOURCE_ROOT=$(cd "${SOURCE_ROOT}" && pwd -P)
+
+# The externalBin sidecars Tauri copies into Contents/MacOS. They must match
+# the trusted build inputs, are the only expected Mach-O files there, and are
+# all required.
+EXTERNAL_BINS=(all-in-one front conductor-main memories-import protoc)
+[[ "${WITH_ISSUE_TRACKER}" == "0" ]] || EXTERNAL_BINS+=(issue-tracker-server)
 
 if [[ "${UNSIGNED_INTERMEDIATE}" == "1" ]]; then
   [[ -z "${DMG}" && "${NOTARIZE}" == "0" ]] \
@@ -139,7 +149,8 @@ node "${SCRIPT_DIR}/verify-atlas-lock.mjs" "${SOURCE_BUNDLE}/atlas" "${ATLAS_PLA
 
 # Tauri must have copied these inputs exactly. In particular, sidecars and Atlas
 # must remain unsigned until this check has established their source hashes.
-node --input-type=module - "${SOURCE_ROOT}" "${APP}" "${TRIPLE}" <<'NODE'
+EXTERNAL_BIN_NAMES="${EXTERNAL_BINS[*]}" \
+  node --input-type=module - "${SOURCE_ROOT}" "${APP}" "${TRIPLE}" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -192,7 +203,7 @@ compareTree(path.join(sourceRoot, "dict"), path.join(resources, "dict"), "dictio
 compareTree(path.join(sourceRoot, "resources", "coding-agent"),
   path.join(resources, "coding-agent"), "coding-agent resources");
 
-for (const name of ["all-in-one", "front", "conductor-main", "issue-tracker-server", "memories-import", "protoc"]) {
+for (const name of process.env.EXTERNAL_BIN_NAMES.split(" ")) {
   compareFile(path.join(sourceRoot, "src-tauri", "bin", `${name}-${triple}`),
     path.join(appRoot, "Contents", "MacOS", name), `external binary ${name}`);
 }
@@ -220,6 +231,13 @@ process.stdout.write(value);
 NODE
 )
 MAIN_PATH="${APP}/Contents/MacOS/${MAIN_EXECUTABLE}"
+is_external_bin() {
+  local name
+  for name in "${EXTERNAL_BINS[@]}"; do
+    [[ "$1" == "${name}" ]] && return 0
+  done
+  return 1
+}
 MACH_O_FILES=()
 SEEN_MAIN=0
 while IFS= read -r -d '' candidate; do
@@ -228,7 +246,8 @@ while IFS= read -r -d '' candidate; do
   relative=${candidate#"${APP}/"}
   case "${relative}" in
     "Contents/MacOS/${MAIN_EXECUTABLE}") SEEN_MAIN=1 ;;
-    Contents/MacOS/all-in-one|Contents/MacOS/front|Contents/MacOS/conductor-main|Contents/MacOS/issue-tracker-server|Contents/MacOS/memories-import|Contents/MacOS/protoc) ;;
+    Contents/MacOS/*) is_external_bin "${relative#Contents/MacOS/}" \
+      || { echo "unexpected Mach-O artifact in assembled app: ${relative}" >&2; exit 1; } ;;
     Contents/Resources/plugins/*.dylib) ;;
     Contents/Resources/memories-db-migrate/memories-db-migrate|Contents/Resources/memories-db-migrate/atlas/bin/atlas) ;;
     *) echo "unexpected Mach-O artifact in assembled app: ${relative}" >&2; exit 1 ;;
@@ -238,7 +257,7 @@ done < <(find "${APP}" -type f -print0)
 
 [[ "${SEEN_MAIN}" == "1" ]] \
   || { echo "assembled app main executable is not a Mach-O file" >&2; exit 1; }
-for required in all-in-one front conductor-main issue-tracker-server memories-import protoc; do
+for required in "${EXTERNAL_BINS[@]}"; do
   found=0
   for candidate in "${MACH_O_FILES[@]}"; do
     [[ "${candidate}" == "${APP}/Contents/MacOS/${required}" ]] && found=1

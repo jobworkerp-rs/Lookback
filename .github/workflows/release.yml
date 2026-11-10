@@ -157,7 +157,6 @@ jobs:
             .build-deps/jobworkerp-conductor
             .build-deps/llama-cpp-runner
             .build-deps/mm-embedding-runner
-            .build-deps/issue-tracker-server
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -337,7 +336,6 @@ jobs:
             .build-deps/jobworkerp-conductor
             .build-deps/llama-cpp-runner
             .build-deps/mm-embedding-runner
-            .build-deps/issue-tracker-server
 
       - name: Cache lindera artifacts
         uses: actions/cache@v4
@@ -410,7 +408,6 @@ jobs:
             .build-deps/jobworkerp-conductor
             .build-deps/llama-cpp-runner
             .build-deps/mm-embedding-runner
-            .build-deps/issue-tracker-server
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

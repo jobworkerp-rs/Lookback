@@ -86,8 +86,12 @@ copy_tree_if_present() {
   fi
 }
 
+# prepare_fixture ROOT [with-issue-tracker]: a default release app, or one that
+# also ships the Issue Tracker server (an --experimental-issues release).
 prepare_fixture() {
   local root=$1 source app triple=aarch64-apple-darwin name
+  local bins=(all-in-one front conductor-main memories-import protoc)
+  [[ "${2:-}" != with-issue-tracker ]] || bins+=(issue-tracker-server)
   source="${root}/source"
   app="${root}/Lookback.app"
   mkdir -p "${source}/scripts/lib" "${source}/src-tauri/bin" \
@@ -114,7 +118,7 @@ prepare_fixture() {
     >"${app}/Contents/Info.plist"
   printf '#!/bin/sh\nexit 0\n' >"${app}/Contents/MacOS/Lookback"
   chmod +x "${app}/Contents/MacOS/Lookback"
-  for name in all-in-one front conductor-main issue-tracker-server memories-import protoc; do
+  for name in "${bins[@]}"; do
     cp "${source}/src-tauri/bin/${name}-${triple}" "${app}/Contents/MacOS/${name}"
   done
   cp -R "${source}/src-tauri/migration-bundle" \
@@ -141,7 +145,7 @@ run_finalizer() {
 
 test_signs_and_records_final_macos_bytes() {
   local root="${TMP_ROOT}/valid" paths source app source_atlas source_front package bundle manifest
-  paths=$(prepare_fixture "${root}")
+  paths=$(prepare_fixture "${root}" with-issue-tracker)
   source=$(printf '%s\n' "${paths}" | sed -n '1p')
   app=$(printf '%s\n' "${paths}" | sed -n '2p')
   local log="${TMP_ROOT}/codesign-valid.log"
@@ -150,7 +154,7 @@ test_signs_and_records_final_macos_bytes() {
   source_front=$(shasum -a 256 "${source}/src-tauri/bin/front-aarch64-apple-darwin" | awk '{print $1}')
   export APPLE_SIGNING_IDENTITY=fixture-identity
   export APPLE_NOTARY_KEYCHAIN_PROFILE=fixture-profile
-  run_finalizer "${source}" "${app}" --dmg "${root}/Lookback.dmg" --notarize
+  run_finalizer "${source}" "${app}" --dmg "${root}/Lookback.dmg" --notarize --with-issue-tracker
 
   for path in \
     "${app}/Contents/MacOS/Lookback" \
@@ -339,7 +343,60 @@ test_signing_failure_and_post_sign_tampering_are_rejected() {
   unset TAMPER_AFTER_SIGN_TARGET
 }
 
+test_default_app_is_finalized_without_the_issue_tracker() {
+  local root="${TMP_ROOT}/no-issue-tracker" paths source app log
+  paths=$(prepare_fixture "${root}")
+  source=$(printf '%s\n' "${paths}" | sed -n '1p')
+  app=$(printf '%s\n' "${paths}" | sed -n '2p')
+  log="${TMP_ROOT}/codesign-no-issue-tracker.log"
+  make_tools "${TMP_ROOT}/tools-no-issue-tracker" "${log}"
+  export APPLE_SIGNING_IDENTITY=fixture-identity
+  run_finalizer "${source}" "${app}" >"${TMP_ROOT}/no-issue-tracker.out" 2>&1 \
+    || { cat "${TMP_ROOT}/no-issue-tracker.out" >&2; fail "a release app without the Issue Tracker server must finalize"; }
+  grep -Fq "sign ${app}/Contents/MacOS/all-in-one" "${log}" || fail "the default app's sidecars must still be signed"
+  if grep -Fq "issue-tracker-server" "${log}"; then
+    fail "the default app must not sign an Issue Tracker server"
+  fi
+}
+
+test_requested_issue_tracker_must_be_bundled() {
+  local root="${TMP_ROOT}/missing-issue-tracker" paths source app log
+  paths=$(prepare_fixture "${root}")
+  source=$(printf '%s\n' "${paths}" | sed -n '1p')
+  app=$(printf '%s\n' "${paths}" | sed -n '2p')
+  log="${TMP_ROOT}/codesign-missing-issue-tracker.log"
+  make_tools "${TMP_ROOT}/tools-missing-issue-tracker" "${log}"
+  export APPLE_SIGNING_IDENTITY=fixture-identity
+  if run_finalizer "${source}" "${app}" --with-issue-tracker \
+    >"${TMP_ROOT}/missing-issue-tracker.out" 2>"${TMP_ROOT}/missing-issue-tracker.err"; then
+    fail "--with-issue-tracker must reject an app without the Issue Tracker server"
+  fi
+  grep -Fq "issue-tracker-server" "${TMP_ROOT}/missing-issue-tracker.err" \
+    || fail "the missing Issue Tracker server must be named"
+  [[ ! -s "${log}" ]] || fail "a missing Issue Tracker server must be rejected before signing"
+}
+
+test_unrequested_issue_tracker_is_rejected() {
+  local root="${TMP_ROOT}/unrequested-issue-tracker" paths source app log
+  paths=$(prepare_fixture "${root}" with-issue-tracker)
+  source=$(printf '%s\n' "${paths}" | sed -n '1p')
+  app=$(printf '%s\n' "${paths}" | sed -n '2p')
+  log="${TMP_ROOT}/codesign-unrequested-issue-tracker.log"
+  make_tools "${TMP_ROOT}/tools-unrequested-issue-tracker" "${log}"
+  export APPLE_SIGNING_IDENTITY=fixture-identity
+  if run_finalizer "${source}" "${app}" \
+    >"${TMP_ROOT}/unrequested-issue-tracker.out" 2>"${TMP_ROOT}/unrequested-issue-tracker.err"; then
+    fail "a default release must not ship an Issue Tracker server"
+  fi
+  grep -Fq "unexpected Mach-O artifact" "${TMP_ROOT}/unrequested-issue-tracker.err" \
+    || fail "an unrequested Issue Tracker server must be rejected as unexpected"
+  [[ ! -s "${log}" ]] || fail "an unrequested Issue Tracker server must be rejected before signing"
+}
+
 test_signs_and_records_final_macos_bytes
+test_default_app_is_finalized_without_the_issue_tracker
+test_requested_issue_tracker_must_be_bundled
+test_unrequested_issue_tracker_is_rejected
 test_missing_identity_fails_closed
 test_unsigned_intermediate_is_explicit_and_app_only
 test_tampered_assembly_is_rejected_before_signing

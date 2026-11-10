@@ -100,12 +100,22 @@ the requirements and overrides.
 
 Issues candidate extraction is enabled in debug builds. Standard release builds
 hide the Issues UI and force extraction off, even when a user previously saved
-an enabled policy. To produce an explicitly experimental release build, pass
-the app Cargo feature through Tauri:
+an enabled policy, and do not bundle `issue-tracker-server`. To produce an
+explicitly experimental release build, pass `--experimental-issues` to the
+release script:
 
 ```bash
-pnpm tauri build --features experimental-issues
+scripts/build-release.sh --profile linux-cuda --experimental-issues
 ```
+
+The flag keeps three things together: it builds and bundles
+`issue-tracker-server`, compiles the app with the `experimental-issues` Cargo
+feature, and runs the Issue Tracker E2E gate (`scripts/test-issue-tracker-grpc-e2e.sh`).
+A build with the feature but without the bundled server fails at startup, so do
+not pass `--features experimental-issues` to `pnpm tauri build` on its own.
+A manual `pnpm tauri build` uses the `externalBin` list in
+`src-tauri/tauri.conf.json`, which keeps `issue-tracker-server` for development,
+so it always bundles the server; use `build-release.sh` for a standard release.
 
 `pnpm tauri build` (including `pnpm tauri:build`) does not perform development
 staging or generate/reuse a development migration bundle. Before packaging, the
@@ -235,7 +245,7 @@ for example `scripts/build-release.sh --profile mac --workdir "$HOME/.cache/look
 1. Build release binaries for `all-in-one`, `front`, `conductor-main`, `memories-import`, `issue-tracker-server`, and `protoc`.
 2. Copy the binaries into `src-tauri/bin/` using the exact external binary basenames configured in [../src-tauri/tauri.conf.json](../src-tauri/tauri.conf.json).
 3. For Tauri packaging, ensure each binary is also available with the platform-triple suffix Tauri expects for the target platform. `LOOKBACK_JOBWORKERP_REF` may select a reviewed compatible jobworkerp revision.
-4. Build runner plugin shared libraries from [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner) and [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner) for the target OS, then place them under `src-tauri/plugins/`. Build `issue-tracker-server` from the `issue-tracker-front` crate and stage it in `src-tauri/bin/` with its target-triple suffix. A packaging build using `--only` must include `issue-tracker-server`; use `--skip-frontend` for a partial backend-only build.
+4. Build runner plugin shared libraries from [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner) and [`mm-embedding-runner`](https://github.com/jobworkerp-rs/mm-embedding-runner) for the target OS, then place them under `src-tauri/plugins/`. Build `issue-tracker-server` from the `issue-tracker-front` crate and stage it in `src-tauri/bin/` with its target-triple suffix. With `--experimental-issues`, a packaging build using `--only` must include `issue-tracker-server`; use `--skip-frontend` for a partial backend-only build.
 5. If the packaged `memory-store` `front` build needs Lindera FTS, populate `dict/lindera/ipadic`
    with the IPADIC search dictionary. Nothing under `dict/` is committed — generate it with
    `scripts/build-release.sh --lindera-only`, which downloads the lindera 3.0.7 release dictionary

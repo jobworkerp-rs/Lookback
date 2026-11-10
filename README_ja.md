@@ -36,6 +36,7 @@ Lookback は Tauri が対応するデスクトップ環境を対象にします�
   公式 SQLite migration bundle（`memories-db-migrate`、Atlas、migration catalog）
 - [`jobworkerp-conductor`](https://github.com/jobworkerp-rs/jobworkerp-conductor): `conductor-main`
 - [`issue-tracker-server`](https://github.com/sutr-app/issue-tracker-server): Issue Tracker sidecar
+  （実験的機能。`--experimental-issues` を指定した release build でのみ同梱）
 - runtime `protoc`: 自己完結した公式 protobuf コンパイラ。build 時に自動取得します（子プロセスが worker 登録時に
   runner スキーマをコンパイルするため実行時必須で、同梱バイナリとして配布します）
 - [`llama-cpp-runner`](https://github.com/jobworkerp-rs/llama-cpp-runner): ローカル LLM ランナープラグイン
@@ -70,12 +71,12 @@ Lookback は Tauri が対応するデスクトップ環境を対象にします�
 
 ### 自動ビルド（推奨）
 
-`scripts/build-release.sh` は、6 つの公開バックエンドリポジトリを clone し、プラットフォームと
+`scripts/build-release.sh` は、公開バックエンドリポジトリを clone し、プラットフォームと
 GPU バックエンドに応じた feature でビルドし、バイナリ / プラグイン / lindera 辞書に加えて
 `front`と同じmemory-store checkoutから公式SQLite migration bundleを生成・配置したうえで
 `pnpm tauri build` を実行します。
 
-この release pipeline では、互換性上の名前 `memory-store` を公開 GitHub の [`memory-store` v0.0.19](https://github.com/jobworkerp-rs/memory-store/tree/v0.0.19)（peeled commit `8253e725708264592e131af3b92d1b4c7719054a`）に固定し、`front`、`memories-import`、migration CLI を同じ checkout からビルドします。Issue Tracker server は公開 GitHub の [`issue-tracker-server` v0.0.1](https://github.com/sutr-app/issue-tracker-server/tree/v0.0.1)（peeled commit `5974330a31ae19fb04db99841be73f305958d0d8`）を使います。source pin の検証と override は [開発者ガイド](docs/developer-guide_ja.md#リリースビルドの詳細) を参照してください。
+この release pipeline では、互換性上の名前 `memory-store` を公開 GitHub の [`memory-store` v0.0.19](https://github.com/jobworkerp-rs/memory-store/tree/v0.0.19)（peeled commit `8253e725708264592e131af3b92d1b4c7719054a`）に固定し、`front`、`memories-import`、migration CLI を同じ checkout からビルドします。`--experimental-issues` を指定した場合の Issue Tracker server は公開 GitHub の [`issue-tracker-server` v0.0.1](https://github.com/sutr-app/issue-tracker-server/tree/v0.0.1)（peeled commit `5974330a31ae19fb04db99841be73f305958d0d8`）を使います。source pin の検証と override は [開発者ガイド](docs/developer-guide_ja.md#リリースビルドの詳細) を参照してください。
 
 ```bash
 # macOS（Metal GPU、DMG + .app）
@@ -86,7 +87,8 @@ scripts/build-release.sh --profile linux-cuda
 ```
 
 便利なフラグ: `--skip-clone`（既存 clone を再利用）、`--only <repos>`（一部のみ再ビルド）、
-`--workdir <dir>`（clone/ビルド先、既定 `.build-deps/`）、`--skip-frontend`、`--lindera skip`。
+`--workdir <dir>`（clone/ビルド先、既定 `.build-deps/`）、`--skip-frontend`、`--lindera skip`、
+`--experimental-issues`（実験的な Issue Tracker もビルドして同梱）。
 全オプションは `scripts/build-release.sh --help` を参照してください。`DRY_RUN=1` を前置すると
 実行せずにコマンドだけ表示できます。
 

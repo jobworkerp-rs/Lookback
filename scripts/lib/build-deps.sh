@@ -529,16 +529,25 @@ validate_issue_tracker_source_config() {
   validate_pinned_dependency_config issue-tracker-server
 }
 
+# The Issue Tracker is experimental and disabled in a normal release build, so
+# its server is built and bundled only for an --experimental-issues release.
+issue_tracker_bundled() {
+  [[ "${EXPERIMENTAL_ISSUES:-0}" == "1" ]]
+}
+
 # want_repo NAME -> 0 (build it) / 1 (skip), honouring --only.
 want_repo() {
+  [[ "$1" != issue-tracker-server ]] || issue_tracker_bundled || return 1
   [[ -z "${ONLY_REPOS}" ]] && return 0
   [[ ",${ONLY_REPOS}," == *",$1,"* ]] && return 0
   return 1
 }
 
-# A packaged Lookback always ships its Issue Tracker gRPC server. A partial
-# backend build may omit it only when it does not invoke Tauri packaging.
+# A packaged --experimental-issues release ships its Issue Tracker gRPC server.
+# A partial backend build may omit it only when it does not invoke Tauri
+# packaging.
 require_bundle_issue_tracker_dependencies() {
+  issue_tracker_bundled || return 0
   # DRY_RUN validates the build plan without creating a distributable bundle.
   # Permit partial repositories so command-plan tests can exercise packaging.
   [[ "${DRY_RUN:-0}" == "1" ]] && return 0
@@ -897,7 +906,7 @@ build_all() {
   local name
   validate_coding_agent_build_config
   for name in jobworkerp memory-store conductor llama mm issue-tracker-server; do
-    want_repo "${name}" || { log "skip ${name} (--only)"; continue; }
+    want_repo "${name}" || { log "skip ${name} (--only, or not bundled without --experimental-issues)"; continue; }
     clone_or_pull "${name}"
     init_submodules "${name}"
     build_one "${name}"
